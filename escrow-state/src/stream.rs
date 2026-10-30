@@ -61,6 +61,32 @@
 //! to `amend_stream_cliff_secs` (that is the first-payout gate, this
 //! item is the window length), and to `stream_cancel` (that is
 //! lifecycle, this item is a parameter revision).
+//!
+//! AV-300: the stream *start* itself may be renegotiated mid-flight
+//! with `amend_stream_start_ts` — dual-signed like the rate, the
+//! cliff, and the duration — but only while the stream has not
+//! started yet: `now` must be before the live `start_ts` and the new
+//! start must be after `now`, so a revision only moves a future
+//! start moment and never backdates the stream open. Only the
+//! window's start moves (`end_ts = start_ts + duration_secs` shifts
+//! with it): the window slides, it does not stretch —
+//! `duration_secs` and `total_funded` (`rate × duration`,
+//! independent of start) never move, and no checkpoint is needed:
+//! with no accrual or withdrawal history the checkpoint is `(0, 0)`
+//! and `earned` / `stream_withdraw` read the live `start_ts` on
+//! every call, so the new start takes effect from the next
+//! evaluation. A stream with any history — a non-`(0, 0)`
+//! checkpoint pair or a non-zero `withdrawn` — is refused outright,
+//! fail-closed: changing the start after accrual began would rewrite
+//! accrued history, and the gate blocks bypassing the
+//! `now < start_ts` check by pre-setting a checkpoint with a future
+//! `now`. Orthogonal to `update_stream_rate` (that is the per-second
+//! price, this item is the window start), to
+//! `amend_stream_cliff_secs` (that is the first-payout gate, this
+//! item is the window start), to `amend_stream_duration_secs` (that
+//! is the window length, this item is the window start), and to
+//! `stream_cancel` (that is lifecycle, this item is a parameter
+//! revision).
 
 use crate::EscrowError;
 
@@ -548,6 +574,87 @@ impl PaymentStream {
         s.push_str(&old_duration_secs.to_string());
         s.push_str(",\"new_duration_secs\":");
         s.push_str(&new_duration_secs.to_string());
+        s.push_str(",\"at\":");
+        s.push_str(&at.to_string());
+        s.push('}');
+        s
+    }
+
+    /// Renegotiates the stream start time mid-flight — dual-signed:
+    /// *both* the initializer and the recipient must present, so
+    /// neither side can move the accrual window alone. Either party
+    /// absent, or a stranger in either slot, is
+    /// [`EscrowError::StreamUnauthorized`] (code 305).
+    ///
+    /// Only the window's start moves (`end_ts = start_ts +
+    /// duration_secs` shifts with it): the window slides, it does
+    /// not stretch — `duration_secs` and `total_funded` (`rate ×
+    /// duration`, independent of start) never move. Only a stream
+    /// that has not started yet may move its start: `now` must be
+    /// before the live `start_ts`, and the new start must be after
+    /// `now` — a revision only moves a future start moment, it must
+    /// not retroactively open the stream by backdating. Changing
+    /// the start after accrual began would rewrite accrued history
+    /// (`accruing_seconds` / `earned` are both computed from
+    /// `start_ts`), so a stream with any accrual or withdrawal
+    /// history — a non-`(0, 0)` checkpoint pair or a non-zero
+    /// `withdrawn` — is refused outright, fail-closed: that blocks
+    /// bypassing the `now < start_ts` gate by pre-setting a
+    /// checkpoint with a future `now` and then amending with an
+    /// earlier one. No checkpoint is needed for the change itself:
+    /// with no history the checkpoint is `(0, 0)` and `earned` /
+    /// `stream_withdraw` read the live `start_ts` on every call, so
+    /// the new start takes effect from the next evaluation. Rate,
+    /// duration, cliff, `total_funded`, `withdrawn`, and the
+    /// checkpoint pair are untouched.
+    ///
+    /// Check order is authority → state → config: `now >= start_ts`
+    /// or `new_start_ts <= now` is [`EscrowError::InvalidStream`]
+    /// (code 304), the original start untouched, as is any
+    /// accrual/withdrawal history. A change to the current start is
+    /// an idempotent no-op. Allowed while paused — accrual has not
+    /// begun, so the new start applies from resume exactly as
+    /// [`Self::amend_stream_duration_secs`] does.
+    pub fn amend_stream_start_ts(
+        &mut self,
+        initializer: [u8; 32],
+        recipient: [u8; 32],
+        new_start_ts: u64,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // Authority first: dual signature — both parties must present.
+        if initializer != self.initializer || recipient != self.recipient {
+            return Err(EscrowError::StreamUnauthorized);
+        }
+        self.require_active()?;
+        // The stream must not have started yet: `now` before the
+        // live start, and the new start after `now` — a revision
+        // only moves a future start moment, never backdates it open.
+        if now >= self.start_ts || new_start_ts <= now {
+            return Err(EscrowError::InvalidStream);
+        }
+        // Defense gate, fail-closed: any accrual or withdrawal
+        // history (a checkpoint set with a future `now`, or funds
+        // already withdrawn) means the start is already written
+        // into earned history and cannot move.
+        if self.checkpoint_earned != 0 || self.checkpoint_seconds != 0 || self.withdrawn != 0 {
+            return Err(EscrowError::InvalidStream);
+        }
+        if new_start_ts == self.start_ts {
+            return Ok(());
+        }
+        self.start_ts = new_start_ts;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a start change (hand-written, no serde —
+    /// same convention as [`Self::duration_update_audit_json`]):
+    /// `{"event":"stream_start_updated","old_start_ts":100,"new_start_ts":200,"at":50}`.
+    pub fn start_update_audit_json(old_start_ts: u64, new_start_ts: u64, at: u64) -> String {
+        let mut s = String::from("{\"event\":\"stream_start_updated\",\"old_start_ts\":");
+        s.push_str(&old_start_ts.to_string());
+        s.push_str(",\"new_start_ts\":");
+        s.push_str(&new_start_ts.to_string());
         s.push_str(",\"at\":");
         s.push_str(&at.to_string());
         s.push('}');

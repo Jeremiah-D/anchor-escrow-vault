@@ -7941,6 +7941,41 @@ intervals are tracked and permanently excluded from accrual.
   `amend_stream_cliff_secs` (that is the first-payout gate, this item
   is the window length), and to `stream_cancel` (that is lifecycle,
   this item is a parameter revision).
+- Start renegotiation (AV-300): `amend_stream_start_ts(initializer,
+  recipient, new_start_ts, now)` moves the accrual window's start
+  (`end_ts = start_ts + duration_secs` shifts with it) mid-flight,
+  but only when *both* parties sign — either party absent, or a
+  stranger in either slot, is `StreamUnauthorized` (code 305). Only a
+  stream that has not started yet may move its start: `now` must be
+  before the live `start_ts` and the new start must be after `now`,
+  else `InvalidStream` (code 304), the original start untouched — a
+  revision only moves a future start moment, it never backdates the
+  stream open. The window slides, it does not stretch: `duration_secs`
+  and `total_funded` (`rate × duration`, independent of start) never
+  move, and no checkpoint is needed — with no history the checkpoint
+  is `(0, 0)` and `earned` / `stream_withdraw` read the live start on
+  every call, so the new start takes effect from the next evaluation.
+  A stream with any accrual or withdrawal history — a non-`(0, 0)`
+  checkpoint pair or a non-zero `withdrawn` — is refused outright,
+  fail-closed: changing the start after accrual began would rewrite
+  accrued history, and the gate blocks bypassing the `now < start_ts`
+  check by pre-setting a checkpoint with a future `now`. Changing to
+  the current start is an idempotent no-op; terminal streams are
+  `StreamNotActive` (code 306); a change while paused is legal and
+  applies from resume. Emits the `stream_start_updated` audit event
+  (`PaymentStream::start_update_audit_json`, hand-written JSON, no new
+  error codes — 304–308 unchanged). `earned()` / `stream_withdraw`
+  read the live start on every call, so any consumer sees the new
+  window with no separate integration — same as the rate, cliff, and
+  duration changes, there is no stored/scanned stream state in
+  `keeper.rs` or `snapshot.rs` to pass through, and the Anchor IDL
+  carries no standalone-stream instructions. Orthogonal to
+  `update_stream_rate` (that is the per-second price, this item is the
+  window start), to `amend_stream_cliff_secs` (that is the
+  first-payout gate, this item is the window start), to
+  `amend_stream_duration_secs` (that is the window length, this item
+  is the window start), and to `stream_cancel` (that is lifecycle,
+  this item is a parameter revision).
 
 New error codes 304–308: `InvalidStream`, `StreamUnauthorized`,
 `StreamNotActive`, `StreamAlreadyPaused`, `StreamNotPaused`. Pure
