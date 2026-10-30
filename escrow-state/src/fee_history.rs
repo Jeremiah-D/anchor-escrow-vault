@@ -443,6 +443,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // so the linear schedule table, the cliff, and the locked amount
         // are untouched, while the next claim prices through the live curve.
         | EscrowEventKind::VestingCurveAmended
+        // AV-293: rebalanced split shares move no funds and never
+        // restate a release already settled — only the share amounts
+        // move, so the recipient set and order, the locked amount,
+        // and the state are untouched, while the next split release
+        // prorates over the live shares.
+        | EscrowEventKind::PayoutSplitSharesAmended
         // AV-278: an amended recovery threshold moves no funds and
         // never restates a settled request — only the threshold
         // changes, so the guardians, the count and the timelock
@@ -1381,6 +1387,12 @@ mod fee_history_tests {
                 // so the linear schedule table, the cliff, and the locked amount
                 // are untouched, while the next claim prices through the live curve.
         | EscrowEventKind::VestingCurveAmended
+        // AV-293: rebalanced split shares move no funds and never
+        // restate a release already settled — only the share amounts
+        // move, so the recipient set and order, the locked amount,
+        // and the state are untouched, while the next split release
+        // prorates over the live shares.
+        | EscrowEventKind::PayoutSplitSharesAmended
                 // AV-278: an amended recovery threshold moves no funds and
                 // never restates a settled request — only the threshold
                 // changes, so the guardians, the count and the timelock

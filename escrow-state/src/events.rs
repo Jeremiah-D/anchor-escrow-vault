@@ -646,6 +646,17 @@
 //!   claimed keeps the shape it settled under. A failed revision
 //!   emits nothing, and a no-op re-affirmation of the current
 //!   curve emits nothing either.
+//! - `amend_payout_split_shares` emits
+//!   [`EscrowEventKind::PayoutSplitSharesAmended`] on every
+//!   successful revision that actually rebalances the shares
+//!   (AV-293) — `from == to ==` the current state, all amounts
+//!   zero; only the share amounts move, so the recipient set
+//!   and order, the locked amount, and the state are untouched,
+//!   and the next `release_payout_split` prorates over the live
+//!   shares, so a release after the amendment pays the new split
+//!   while a release already settled keeps the shares it settled
+//!   under. A failed revision emits nothing, and a no-op
+//!   re-affirmation of the current shares emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -891,6 +902,7 @@
 //! | DutchAuctionWindowAmended (AV-288) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a claim already priced; only the window moves, so the reserve floor is untouched, and claim prices through the live window at the next call — `is_live` and the linear decay both read the new window — so a claim after the amendment prices against the new window while a claim already settled keeps the cap it settled under, and the `escalate` mutual exclusion follows the new window too |
 //! | SubscriptionPeriodSecsAmended (AV-289) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a period already released; only the cadence moves, so the period count, the per-period amount, the next-period cursor and the released bitmap are untouched, and due dates of unreleased periods move with the new cadence at the next `subscription_period_due_at` call — back-scheduled from `expires_at`, so the last period stays pinned to expiry — while a period already released keeps the due date it released under |
 //! | VestingCurveAmended (AV-290) | 0 | 0 | 0 | 0 — amending moves no funds and never restates an amount already claimed; only the unlock shape moves, so the linear schedule table, the cliff, and the locked amount are untouched, and the next `claim` prices through the live curve — a claim after the amendment unlocks under the new shape while an amount already claimed keeps the shape it settled under |
+//! | PayoutSplitSharesAmended (AV-293) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a release already settled; only the share amounts move, so the recipient set and order, the locked amount, and the state are untouched, and the next `release_payout_split` prorates over the live shares — a release after the amendment pays the new split while a release already settled keeps the shares it settled under |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2637,6 +2649,16 @@ pub enum EscrowEventKind {
     /// needs no extra field. A no-op re-affirmation of the
     /// current curve emits nothing.
     VestingCurveAmended,
+    /// Revise the payout-split shares after funding (AV-293):
+    /// only the share amounts move, so the recipient set and
+    /// order, the locked amount, and the state are untouched —
+    /// the next `release_payout_split` prorates over the live
+    /// shares, so a release after the amendment pays the new
+    /// split while a release already settled keeps the shares
+    /// it settled under. The new shares are read from the
+    /// vault, so the event needs no extra field. A no-op
+    /// re-affirmation of the current shares emits nothing.
+    PayoutSplitSharesAmended,
 }
 
 impl EscrowEventKind {
@@ -3116,6 +3138,10 @@ impl EscrowEventKind {
             // discriminants 0–151 stay stable for already-serialized
             // histories.
             152 => Self::VestingCurveAmended,
+            // AV-293: appended after VestingCurveAmended so
+            // discriminants 0–152 stay stable for already-serialized
+            // histories.
+            153 => Self::PayoutSplitSharesAmended,
             _ => return None,
         })
     }
@@ -3344,6 +3370,7 @@ impl EscrowEventKind {
             Self::DutchAuctionWindowAmended => "dutch_auction_window_amended",
             Self::SubscriptionPeriodSecsAmended => "subscription_period_secs_amended",
             Self::VestingCurveAmended => "vesting_curve_amended",
+            Self::PayoutSplitSharesAmended => "payout_split_shares_amended",
         }
     }
 
@@ -3576,6 +3603,7 @@ impl EscrowEventKind {
             "dutch_auction_window_amended" => Self::DutchAuctionWindowAmended,
             "subscription_period_secs_amended" => Self::SubscriptionPeriodSecsAmended,
             "vesting_curve_amended" => Self::VestingCurveAmended,
+            "payout_split_shares_amended" => Self::PayoutSplitSharesAmended,
             _ => return None,
         })
     }
@@ -8628,6 +8656,44 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the payout-split shares after funding (mirrors
+    /// [`Escrow::amend_payout_split_shares`]). Emits
+    /// `PayoutSplitSharesAmended` only when the shares actually
+    /// change; `from == to ==` the current state. `at` is the
+    /// caller-supplied event timestamp, and the state machine's
+    /// `now` for the auto-recovery and released gates.
+    pub fn amend_payout_split_shares(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_shares: &[([u8; 32], u64)],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.payout_split();
+        self.inner
+            .amend_payout_split_shares(initializer, taker, new_shares, at)?;
+        let after = self.inner.payout_split();
+        // The inner call rejects bad input, strangers, and wrong states,
+        // so changed shares here always mean real governance — and a
+        // same-shares no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::PayoutSplitSharesAmended,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
 
     /// Revise the milestone deadline table after funding (mirrors
     /// [`Escrow::amend_milestone_due_dates`]). Emits
@@ -13589,6 +13655,69 @@ mod event_tests {
     }
 
     #[test]
+    fn amend_payout_split_shares_emits_event_and_failed_amend_emits_nothing() {
+        // AV-293: a dual-signed revision emits PayoutSplitSharesAmended
+        // (discriminant 153, appended last) with zero amounts — a
+        // config change, not a settlement — and the amended shares
+        // are read from the vault. A refused revision emits nothing,
+        // and a no-op re-affirmation emits nothing either.
+        assert_eq!(EscrowEventKind::PayoutSplitSharesAmended.discriminant(), 153);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(153),
+            Some(EscrowEventKind::PayoutSplitSharesAmended)
+        );
+        assert_eq!(
+            EscrowEventKind::PayoutSplitSharesAmended.name(),
+            "payout_split_shares_amended"
+        );
+        assert_eq!(
+            EscrowEventKind::from_name("payout_split_shares_amended"),
+            Some(EscrowEventKind::PayoutSplitSharesAmended)
+        );
+        let mut inner =
+            crate::Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        inner = inner
+            .with_payout_split(&[(ALICE, 600_000), (BOB, 400_000)])
+            .unwrap();
+        inner.fund(ALICE, T0 + 1).unwrap();
+        let mut e = IndexedEscrow::wrap(ESCROW_ID, inner);
+        let before = e.event_count();
+        // A one-party revision fails and emits nothing.
+        assert_eq!(
+            e.amend_payout_split_shares(ALICE, ALICE, &[(ALICE, 700_000), (BOB, 300_000)], T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_payout_split_shares(ALICE, BOB, &[(ALICE, 700_000), (BOB, 300_000)], T0 + 2)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        assert_event(
+            &last(&e),
+            EscrowEventKind::PayoutSplitSharesAmended,
+            0,
+            EscrowState::Funded,
+            EscrowState::Funded,
+            0,
+            0,
+            0,
+            T0 + 2,
+        );
+        assert_eq!(
+            e.inner().payout_split().as_slice(),
+            vec![(ALICE, 700_000), (BOB, 300_000)]
+        );
+        // Re-affirming the same shares is a no-op: no new event.
+        e.amend_payout_split_shares(ALICE, BOB, &[(ALICE, 700_000), (BOB, 300_000)], T0 + 3)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        let history = e.inner().event_history();
+        assert_eq!(
+            history.last().unwrap().kind,
+            EscrowEventKind::PayoutSplitSharesAmended
+        );
+    }
+
+    #[test]
     fn amend_milestone_due_dates_emits_event_and_failed_amend_emits_nothing() {
         // AV-231: a dual-signed revision emits MilestoneDueDatesAmended
         // (discriminant 95, appended last) with zero amounts — a
@@ -15049,7 +15178,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -15190,7 +15320,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -15765,7 +15896,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -15818,7 +15950,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -15868,7 +16001,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -15918,7 +16052,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -15968,7 +16103,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16021,7 +16157,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16074,7 +16211,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16124,7 +16262,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16174,7 +16313,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16224,7 +16364,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16274,7 +16415,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16324,7 +16466,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16374,7 +16517,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16428,7 +16572,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16481,7 +16626,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16534,7 +16680,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16587,7 +16734,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16640,7 +16788,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16694,7 +16843,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16748,7 +16898,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16802,7 +16953,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16855,7 +17007,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
@@ -16925,7 +17078,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
-        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
     }
 
     #[test]
