@@ -27283,6 +27283,167 @@ let fee = self.charge_protocol_fee(taker_amount)?;
         Ok(())
     }
 
+    /// Revise the pre-agreed arbitration default judgment after funding
+    /// (AV-286 — Solana arbitration-fallback governance): both the
+    /// initializer and the taker must authorize the change
+    /// (dual-signature governance, reusing the AV-12 / AV-25 concept),
+    /// on an escrow that is `Funded`.
+    ///
+    /// Why: the fallback split is fixed before funding
+    /// ([`Escrow::with_arbitration_deadline`]), but the parties'
+    /// view of a fair fallback can move after funding — a longer
+    /// ruling window, or a different split, may fit the deal better
+    /// than the optimistic terms negotiated at setup. One party
+    /// alone cannot rewrite the fallback: a single-signature
+    /// revision would let that party re-price the split in their
+    /// own favour after the other party funded under the old terms,
+    /// so the revision needs both signatures, exactly like the
+    /// AV-242 deadline amendment — except this revision moves the
+    /// whole terms, not just the deadline, and therefore resets the
+    /// taker's confirmation.
+    ///
+    /// Only the terms move: `default_judgment` is replaced with the
+    /// new `{deadline_secs, default_taker_amount}` and
+    /// `default_confirmed` resets to `false` — the old confirmation
+    /// countersigned the OLD terms, and a revised fallback must be
+    /// re-confirmed via [`Escrow::confirm_default_judgment`] before
+    /// [`Escrow::trigger_default_judgment`] can fire on it, or a
+    /// one-sided revision could smuggle a new split past the
+    /// bilateral agreement. Until re-confirmed, the trigger fails
+    /// `DefaultJudgmentNotDue` — the escrow is no worse off than an
+    /// unconfirmed judgment, and the arbiter path is untouched.
+    /// The escrow's `amount`, state, and dispute clock are untouched:
+    /// a live dispute can never be amended — it is `Disputed`, not
+    /// `Funded` — so a dispute escalated after the amendment
+    /// measures its window from the new terms (the trigger reads
+    /// `default_judgment` and `default_confirmed` live), while an
+    /// in-flight dispute keeps its original fallback.
+    ///
+    /// Check order is deliberate: pause first (AV-46), then dual
+    /// authority, then the AV-158 governance-delay routing gate,
+    /// then state, then configuration, then the terms gates — a
+    /// stranger learns nothing about the escrow's configuration
+    /// from the error alone, and a failed revision leaves the
+    /// original terms and confirmation exactly as they were.
+    ///
+    /// The new terms reuse the
+    /// [`Escrow::with_arbitration_deadline`] gates: a zero
+    /// `deadline_secs` is [`EscrowError::DefaultJudgmentNotDue`]
+    /// (the builder's rejection — a judgment due immediately would
+    /// fire before the arbiter had any chance to rule) and a
+    /// `default_taker_amount` above the locked `amount` is
+    /// [`EscrowError::ReleaseExceedsLocked`]. No judgment configured
+    /// is [`EscrowError::DefaultJudgmentNotDue`] — post-funding
+    /// installation of a fallback the taker never funded under is
+    /// refused fail-closed, mirroring the
+    /// [`Escrow::with_arbitration_deadline`] `Uninitialized`-only
+    /// precedent. Re-affirming the current terms byte-for-byte is a
+    /// no-op that writes nothing, resets nothing, and emits nothing
+    /// — the confirmation stands, since the terms it covers are
+    /// unchanged.
+    ///
+    /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits
+    /// [`EscrowEventKind::DefaultJudgmentAmended`](crate::EscrowEventKind::DefaultJudgmentAmended).
+    ///
+    /// Orthogonal to [`Escrow::with_arbitration_deadline`] (the
+    /// `Uninitialized`-only initial set), to
+    /// [`Escrow::confirm_default_judgment`] (the confirmation this
+    /// revision resets), and to AV-242's
+    /// [`Escrow::amend_arbitration_deadline`] (deadline-only, and it
+    /// leaves `default_confirmed` untouched — this revision moves
+    /// both terms and therefore resets it).
+    pub fn amend_default_judgment(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        deadline_secs: u64,
+        default_taker_amount: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-158: the direct entry always takes `via_delayed = false`
+        // — on a delay-opted-in escrow the terms move only through
+        // the propose/execute protocol. Thin by design: one terms
+        // implementation, zero gate drift (see
+        // `update_quorum_impl`). No new proposal variant is staged,
+        // mirroring `amend_jury_panel_size_impl` (AV-281) and
+        // `update_arbiter_panel_members_impl` (AV-283), which
+        // likewise refuse the direct path on delay-opted escrows.
+        self.amend_default_judgment_impl(
+            initializer,
+            taker,
+            deadline_secs,
+            default_taker_amount,
+            false,
+        )
+    }
+
+    /// The terms engine behind [`Escrow::amend_default_judgment`].
+    /// The `via_delayed` parameter carries the AV-158 routing gate:
+    /// the direct entry always passes `false`, so on a
+    /// delay-opted-in escrow the terms move only through the
+    /// two-step propose/execute protocol and a direct call is
+    /// refused — mirroring `amend_jury_panel_size_impl` (AV-281).
+    fn amend_default_judgment_impl(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        deadline_secs: u64,
+        default_taker_amount: u64,
+        via_delayed: bool,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Both parties must sign: either key alone (or a stranger)
+        // is Unauthorized. Independent `==` checks (not `||`): the
+        // degenerate initializer == taker self-escrow authorizes with
+        // one key passed twice, like AV-12's activation.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        // AV-158: the governance-delay routing gate — on a
+        // delay-opted-in escrow the terms move only through the
+        // two-step propose/execute protocol, never a direct call
+        // (see `update_quorum_impl` for the placement rationale).
+        if !via_delayed && self.governance_delay_secs != 0 {
+            return Err(EscrowError::GovernanceActionNotProposed);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow with a configured judgment may
+        // revise its terms — post-funding installation would add a
+        // fallback split the taker never funded under.
+        let current = self
+            .default_judgment
+            .ok_or(EscrowError::DefaultJudgmentNotDue)?;
+        // The new terms reuse the `with_arbitration_deadline` gates,
+        // validated before any write, so a failed revision leaves
+        // the original terms and confirmation exactly as they were.
+        if deadline_secs == 0 {
+            return Err(EscrowError::DefaultJudgmentNotDue);
+        }
+        if default_taker_amount > self.amount {
+            return Err(EscrowError::ReleaseExceedsLocked);
+        }
+        // No-op: re-affirming the current terms writes nothing and
+        // resets nothing, so the event layer emits nothing for it
+        // and the standing confirmation keeps covering the terms.
+        if current.deadline_secs == deadline_secs
+            && current.default_taker_amount == default_taker_amount
+        {
+            return Ok(());
+        }
+        self.default_judgment = Some(DefaultJudgment {
+            deadline_secs,
+            default_taker_amount,
+        });
+        // The old confirmation covered the old terms only — the new
+        // terms need a fresh taker countersign before the trigger
+        // can fire on them.
+        self.default_confirmed = false;
+        Ok(())
+    }
+
     /// Trigger the pre-agreed arbitration default judgment (AV-55):
     /// `Disputed -> Settled`. Either party may call once the dispute
     /// has outlived the arbitration deadline (`now >= disputed_at +
@@ -49463,7 +49624,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
-        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
     }
 
     #[test]
@@ -66492,7 +66654,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
-        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -66722,9 +66885,10 @@ mod event_history_tests {
         // `JuryPanelSizeAmended` (AV-281), 145 is
         // `EventCapacityAmended` (AV-282), 146 is
         // `ArbiterPanelMembersUpdated` (AV-283), 147 is
-        // `CounterOfferAmended` (AV-285) and 148 is the
+        // `CounterOfferAmended` (AV-285), 148 is
+        // `DefaultJudgmentAmended` (AV-286) and 149 is the
         // first still-unknown byte.
-        for bad in [148u8, 255] {
+        for bad in [149u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -81128,6 +81292,259 @@ mod amend_counter_offer_tests {
         e.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW)
             .unwrap();
         assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+}
+
+mod amend_default_judgment_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const FUND_AT: u64 = EXPIRES_AT - 3_600;
+    const DEADLINE: u64 = 3_600;
+    const TAKER_SHARE: u64 = 600_000;
+
+    /// Funded escrow with a taker-confirmed default judgment
+    /// (deadline 3_600, taker share 600_000 of 1_000_000).
+    fn funded() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        e.confirm_default_judgment(BOB).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert!(e.default_judgment_confirmed(), "starts confirmed");
+        e
+    }
+
+    #[test]
+    fn amend_revises_both_terms_and_resets_confirmation() {
+        let mut e = funded();
+        e.amend_default_judgment(ALICE, BOB, 7_200, 400_000)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Funded, "state untouched");
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: 7_200,
+                default_taker_amount: 400_000,
+            }),
+            "both terms replaced"
+        );
+        assert!(
+            !e.default_judgment_confirmed(),
+            "old confirmation covered the old terms only"
+        );
+        assert_eq!(e.amount(), 1_000_000, "lockup untouched");
+    }
+
+    #[test]
+    fn amend_requires_reconfirmation_before_trigger_uses_new_terms() {
+        let mut e = funded();
+        e.amend_default_judgment(ALICE, BOB, 7_200, 400_000)
+            .unwrap();
+        let disputed_at = EXPIRES_AT - 10_000;
+        e.escalate(ALICE, disputed_at, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        // Unconfirmed under the new terms: the trigger refuses even
+        // past the new deadline.
+        assert_eq!(
+            e.trigger_default_judgment(ALICE, disputed_at + 7_200, None, BOB),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+        assert_eq!(e.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn trigger_after_reconfirmation_settles_on_new_terms() {
+        let mut e = funded();
+        e.amend_default_judgment(ALICE, BOB, 7_200, 400_000)
+            .unwrap();
+        e.confirm_default_judgment(BOB).unwrap();
+        let disputed_at = EXPIRES_AT - 10_000;
+        e.escalate(ALICE, disputed_at, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        // The OLD deadline has passed but the NEW one has not: the
+        // trigger still refuses — the new terms govern, not the old.
+        assert_eq!(
+            e.trigger_default_judgment(ALICE, disputed_at + DEADLINE, None, BOB),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+        let (payout, fee, refund) = e
+            .trigger_default_judgment(ALICE, disputed_at + 7_200, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee, refund), (400_000, 0, 600_000));
+        assert_eq!(e.released_amount(), 400_000, "gross is the new share");
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn amend_rejects_single_party_and_stranger() {
+        let mut e = funded();
+        assert_eq!(
+            e.amend_default_judgment(ALICE, MALLORY, 7_200, 400_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_default_judgment(MALLORY, BOB, 7_200, 400_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_default_judgment(MALLORY, MALLORY, 7_200, 400_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: DEADLINE,
+                default_taker_amount: TAKER_SHARE,
+            }),
+            "original terms untouched"
+        );
+        assert!(
+            e.default_judgment_confirmed(),
+            "confirmation untouched by rejected revisions"
+        );
+    }
+
+    #[test]
+    fn amend_rejects_unconfigured_judgment() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            e.amend_default_judgment(ALICE, BOB, 7_200, 400_000),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+        assert_eq!(e.default_judgment(), None, "nothing installed");
+    }
+
+    #[test]
+    fn amend_rejects_live_dispute_and_terminal_states() {
+        let mut e = funded();
+        let disputed_at = EXPIRES_AT - 10_000;
+        e.escalate(ALICE, disputed_at, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(
+            e.amend_default_judgment(ALICE, BOB, 7_200, 400_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: DEADLINE,
+                default_taker_amount: TAKER_SHARE,
+            }),
+            "in-flight dispute keeps its original fallback"
+        );
+
+        let mut cancelled = funded();
+        cancelled.cancel(ALICE, None, ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            cancelled.amend_default_judgment(ALICE, BOB, 7_200, 400_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_rejects_bad_terms_without_touching_originals() {
+        let mut e = funded();
+        assert_eq!(
+            e.amend_default_judgment(ALICE, BOB, 0, 400_000),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+        assert_eq!(
+            e.amend_default_judgment(ALICE, BOB, 7_200, 1_000_001),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: DEADLINE,
+                default_taker_amount: TAKER_SHARE,
+            }),
+            "original terms untouched"
+        );
+        assert!(
+            e.default_judgment_confirmed(),
+            "confirmation untouched by rejected revisions"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_rejects_paused_escrow() {
+        let mut e = funded();
+        e.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            e.amend_default_judgment(ALICE, BOB, 7_200, 400_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: DEADLINE,
+                default_taker_amount: TAKER_SHARE,
+            }),
+            "original terms untouched"
+        );
+        assert!(e.default_judgment_confirmed());
+    }
+
+    #[test]
+    fn amend_refused_directly_on_governance_delay_escrow() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(DEADLINE, TAKER_SHARE)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap();
+        e.confirm_default_judgment(BOB).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            e.amend_default_judgment(ALICE, BOB, 7_200, 400_000),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: DEADLINE,
+                default_taker_amount: TAKER_SHARE,
+            }),
+            "original terms untouched"
+        );
+        assert!(e.default_judgment_confirmed());
+    }
+
+    #[test]
+    fn amend_noop_keeps_confirmation() {
+        let mut e = funded();
+        e.amend_default_judgment(ALICE, BOB, DEADLINE, TAKER_SHARE)
+            .unwrap();
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: DEADLINE,
+                default_taker_amount: TAKER_SHARE,
+            })
+        );
+        assert!(
+            e.default_judgment_confirmed(),
+            "re-affirming identical terms resets nothing"
+        );
     }
 }
 

@@ -426,6 +426,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // amount, expiry and state are untouched, while the next
         // accept re-prices under the live offer.
         | EscrowEventKind::CounterOfferAmended
+        // AV-286: revised fallback terms move no funds and
+        // never restate a settlement already made — only the
+        // judgment terms change, so the escrow's amount and state
+        // are untouched, while the next trigger reads the live
+        // terms plus the live confirmation.
+        | EscrowEventKind::DefaultJudgmentAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1332,6 +1338,12 @@ mod event_sourcing_tests {
                 // amount, expiry and state are untouched, while the next
                 // accept re-prices under the live offer.
                 | EscrowEventKind::CounterOfferAmended
+                // AV-286: revised fallback terms move no funds and
+                // never restate a settlement already made — only the
+                // judgment terms change, so the escrow's amount and state
+                // are untouched, while the next trigger reads the live
+                // terms plus the live confirmation.
+                | EscrowEventKind::DefaultJudgmentAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
