@@ -622,6 +622,19 @@
 //!   while a claim already settled keeps the cap it settled under.
 //!   A failed revision emits nothing, and a no-op re-affirmation
 //!   of the current window emits nothing either.
+//! - `amend_subscription_period_secs` emits
+//!   [`EscrowEventKind::SubscriptionPeriodSecsAmended`] on every
+//!   successful revision that actually moves the cadence (AV-289)
+//!   — `from == to ==` the current state, all amounts zero;
+//!   only the period length moves, so the period count, the
+//!   per-period amount, the next-period cursor and the released
+//!   bitmap are untouched, and due dates of unreleased periods
+//!   move with the new cadence at the next
+//!   `subscription_period_due_at` call, so a period released after
+//!   the amendment becomes due under the new cadence while a
+//!   period already released keeps the due date it released under.
+//!   A failed revision emits nothing, and a no-op re-affirmation
+//!   of the current cadence emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -865,6 +878,7 @@
 //! | DefaultJudgmentAmended (AV-286) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a settlement already made; only the fallback terms change, so the escrow's amount and state are untouched, and the taker's confirmation resets — the trigger reads the live terms plus the live confirmation, so a dispute escalated after the amendment settles on the new split only once re-confirmed, while an in-flight dispute keeps its original fallback |
 //! | AutoUnpauseAtAmended (AV-287) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a recovery already fired; only the schedule changes, so the pause flag and the pause authority are untouched — the next clock-bearing transition reads the live schedule, so a revised moment fires exactly once at the new time and a cleared schedule never fires, while an already-fired recovery is never rewritten |
 //! | DutchAuctionWindowAmended (AV-288) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a claim already priced; only the window moves, so the reserve floor is untouched, and claim prices through the live window at the next call — `is_live` and the linear decay both read the new window — so a claim after the amendment prices against the new window while a claim already settled keeps the cap it settled under, and the `escalate` mutual exclusion follows the new window too |
+//! | SubscriptionPeriodSecsAmended (AV-289) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a period already released; only the cadence moves, so the period count, the per-period amount, the next-period cursor and the released bitmap are untouched, and due dates of unreleased periods move with the new cadence at the next `subscription_period_due_at` call — back-scheduled from `expires_at`, so the last period stays pinned to expiry — while a period already released keeps the due date it released under |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2583,6 +2597,24 @@ pub enum EscrowEventKind {
     /// from the vault, so the event needs no extra field. A no-op
     /// re-affirmation of the current window emits nothing.
     DutchAuctionWindowAmended,
+    /// AV-289: the subscription period cadence was amended by
+    /// governed post-funding amendment
+    /// ([`Escrow::amend_subscription_period_secs`](crate::Escrow::amend_subscription_period_secs)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::DutchAuctionWindowAmended`]); all amounts are
+    /// zero — amending moves no funds and never restates a period
+    /// already released; only the cadence moves, so the period
+    /// count, the per-period amount, the next-period cursor and
+    /// the released bitmap are untouched — due dates of
+    /// unreleased periods move with the new cadence at the next
+    /// `subscription_period_due_at` call (back-scheduled from
+    /// `expires_at`, so the last period stays pinned to expiry),
+    /// while a period already released keeps the due date it
+    /// released under. The new cadence is read from the vault, so
+    /// the event needs no extra field. A no-op re-affirmation of
+    /// the current cadence emits nothing.
+    SubscriptionPeriodSecsAmended,
 }
 
 impl EscrowEventKind {
@@ -3054,6 +3086,10 @@ impl EscrowEventKind {
             // discriminants 0–149 stay stable for already-serialized
             // histories.
             150 => Self::DutchAuctionWindowAmended,
+            // AV-289: appended after DutchAuctionWindowAmended so
+            // discriminants 0–150 stay stable for already-serialized
+            // histories.
+            151 => Self::SubscriptionPeriodSecsAmended,
             _ => return None,
         })
     }
@@ -3280,6 +3316,7 @@ impl EscrowEventKind {
             Self::DefaultJudgmentAmended => "default_judgment_amended",
             Self::AutoUnpauseAtAmended => "auto_unpause_at_amended",
             Self::DutchAuctionWindowAmended => "dutch_auction_window_amended",
+            Self::SubscriptionPeriodSecsAmended => "subscription_period_secs_amended",
         }
     }
 
@@ -3510,6 +3547,7 @@ impl EscrowEventKind {
             "default_judgment_amended" => Self::DefaultJudgmentAmended,
             "auto_unpause_at_amended" => Self::AutoUnpauseAtAmended,
             "dutch_auction_window_amended" => Self::DutchAuctionWindowAmended,
+            "subscription_period_secs_amended" => Self::SubscriptionPeriodSecsAmended,
             _ => return None,
         })
     }
@@ -7200,6 +7238,43 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
                 EscrowEventKind::DutchAuctionWindowAmended,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// Revise a subscription's period cadence after funding (mirrors
+    /// [`Escrow::amend_subscription_period_secs`]). Emits
+    /// `SubscriptionPeriodSecsAmended` only when the cadence actually
+    /// changes; `from == to ==` the current state. `at` is the
+    /// caller-supplied event timestamp.
+    pub fn amend_subscription_period_secs(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_period_secs: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.subscription_schedule().map(|s| s.period_secs);
+        self.inner
+            .amend_subscription_period_secs(initializer, taker, new_period_secs)?;
+        let after = self.inner.subscription_schedule().map(|s| s.period_secs);
+        // The inner call rejects bad input, strangers, and wrong states,
+        // so a changed cadence here always means real governance — and a
+        // same-cadence no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::SubscriptionPeriodSecsAmended,
                 state,
                 state,
                 EventAmounts::none(),
@@ -14831,7 +14906,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -14970,7 +15046,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -15543,7 +15620,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -15594,7 +15672,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -15642,7 +15721,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -15690,7 +15770,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -15738,7 +15819,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -15789,7 +15871,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -15840,7 +15923,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -15888,7 +15972,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -15936,7 +16021,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -15984,7 +16070,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -16032,7 +16119,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -16080,7 +16168,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -16128,7 +16217,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -16180,7 +16270,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -16231,7 +16322,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -16282,7 +16374,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -16333,7 +16426,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -16384,7 +16478,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -16436,7 +16531,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -16488,7 +16584,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -16540,7 +16637,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -16591,7 +16689,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]
@@ -16659,7 +16758,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
     }
 
     #[test]

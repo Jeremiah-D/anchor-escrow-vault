@@ -432,6 +432,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // so the floor is untouched, while the next claim prices
         // through the live window.
         | EscrowEventKind::DutchAuctionWindowAmended
+        // AV-289: a revised subscription cadence moves no funds and never
+        // restates a period already released — only the period length moves,
+        // so the period count, the per-period amount, the next-period cursor
+        // and the released bitmap are untouched, while the next period
+        // becomes due under the live cadence.
+        | EscrowEventKind::SubscriptionPeriodSecsAmended
         // AV-278: an amended recovery threshold moves no funds and
         // never restates a settled request — only the threshold
         // changes, so the guardians, the count and the timelock
@@ -1359,6 +1365,12 @@ mod fee_history_tests {
                 // so the floor is untouched, while the next claim prices
                 // through the live window.
         | EscrowEventKind::DutchAuctionWindowAmended
+                // AV-289: a revised subscription cadence moves no funds and never
+                // restates a period already released — only the period length moves,
+                // so the period count, the per-period amount, the next-period cursor
+                // and the released bitmap are untouched, while the next period
+                // becomes due under the live cadence.
+        | EscrowEventKind::SubscriptionPeriodSecsAmended
                 // AV-278: an amended recovery threshold moves no funds and
                 // never restates a settled request — only the threshold
                 // changes, so the guardians, the count and the timelock
