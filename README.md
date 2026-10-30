@@ -7556,6 +7556,20 @@ expires, custody returns to the owner automatically.
   the live schedule, so the new terms govern from the next billing —
   a fee already settled by a return is never restated. No event is
   emitted — `RentalEscrow` has no event layer.
+- **Extending the term (AV-292)**: `extend_term_end` moves the term
+  end on an `Active` rental, authorized by owner + renter together —
+  the term is a bilateral use-right window. Extension only, never
+  shrinkage: the new end must lie strictly past the current end (an
+  equal-value call is an invalid extension, not a re-affirmation),
+  and an already-overdue rental cannot extend at all — its fee has
+  already accrued against the old window, so extending it would
+  retroactively erase overdue days (both refusals are
+  `InvalidRentalTerms`, code 268, with the window untouched). Only
+  `term_end_slot` changes — the rent amount is not repriced, since
+  the same total rent covers the longer window — and `is_in_term` /
+  `is_overdue` / `late_fee_due` / `return_asset` read the live
+  window, so the new window governs from the revision. No event is
+  emitted — `RentalEscrow` has no event layer.
 
 New error codes (never renumbered): `InvalidRentalTerms` (268),
 `RentalNotActive` (269), `RentalCancelNotAllowed` (270). Pure logic:

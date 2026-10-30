@@ -337,6 +337,73 @@ impl RentalEscrow {
         Ok(())
     }
 
+    /// Extend the term end on an `Active` rental (AV-292 — Solana
+    /// rental governance): both parties authorize the change (the
+    /// term is a bilateral use-right window — a unilateral extension
+    /// would let one side stretch the other's custody or use
+    /// alone). Check order is authority → state → window, mirroring
+    /// AV-284's `NftEscrow` precedent, so a stranger learns nothing
+    /// about the rental's state from the error alone.
+    ///
+    /// Why: the window is fixed at construction
+    /// ([`RentalEscrow::new`]), but the parties may agree to keep
+    /// the asset out longer — a window that cannot be extended
+    /// would force a fresh rental (and a fresh custody transfer)
+    /// for a legitimate longer stay. Only an `Active` rental may
+    /// extend, and only while it is not yet overdue: an overdue
+    /// rental's fee has already been accruing against the old
+    /// window, so extending that window would retroactively erase
+    /// accrued overdue days. Extension only, never shrinkage: the
+    /// new end must lie strictly past the current end, so an
+    /// equal-value call is not a re-affirmation but an invalid
+    /// extension. Only `term_end_slot` changes — the rent amount
+    /// is not repriced (the same total rent covers the longer
+    /// window, confirmed by both signatures), and the term start,
+    /// `slots_per_day`, late fee, and state are untouched — and
+    /// [`RentalEscrow::is_in_term`], [`RentalEscrow::is_overdue`],
+    /// [`RentalEscrow::late_fee_due`], and
+    /// [`RentalEscrow::return_asset`] read the live window, so the
+    /// new window governs from the revision (a term already counted
+    /// as overdue is re-judged against the new end; a return
+    /// already executed is unaffected). There is no event layer on
+    /// `RentalEscrow`, so no event is emitted for the extension.
+    /// Orthogonal to [`RentalEscrow::new`] (that installs the window
+    /// at build time, this extends it while `Active`), to AV-190
+    /// (that is the rental mechanism itself, this is its window
+    /// revision), and to AV-291 (that revises the late-fee terms,
+    /// this revises the term window).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller pair that is not exactly owner + renter,
+    /// ([`EscrowError::RentalNotActive`], code 269) once the rental
+    /// is in a terminal state, and
+    /// ([`EscrowError::InvalidRentalTerms`], code 268) when the
+    /// rental is already overdue at `current_slot` or when
+    /// `new_end_slot` does not lie strictly past the current term
+    /// end — either way the current window is untouched.
+    pub fn extend_term_end(
+        &mut self,
+        owner: [u8; 32],
+        renter: [u8; 32],
+        new_end_slot: u64,
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if owner != self.owner || renter != self.renter {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != RentalState::Active {
+            return Err(EscrowError::RentalNotActive);
+        }
+        if current_slot > self.term_end_slot {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        if new_end_slot <= self.term_end_slot {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        self.term_end_slot = new_end_slot;
+        Ok(())
+    }
+
     /// Audit-event JSON for a return (hand-written):
     /// `{"event":"rental_returned","asset":"<64hex>","late_fee":<u64>,
     /// "overdue_days":<u64>,"late":<bool>}`.
@@ -771,6 +838,115 @@ mod rental_escrow_tests {
                 .unwrap();
         r2.amend_late_fee(key(0xAA), key(0xBB), None).unwrap();
         assert_eq!(r2.late_fee(), None);
+    }
+
+    #[test]
+    fn extend_term_end_moves_the_live_window() {
+        // AV-292: dual-signed extension re-judges term and overdue
+        // against the new end, and reprices nothing else.
+        let mut r = open_rental();
+        // Under the old window slot 250 is 50 slots overdue: 1 day.
+        assert!(r.is_overdue(250));
+        assert_eq!(r.late_fee_due(250), 10_000);
+        r.extend_term_end(key(0xAA), key(0xBB), 300, 150).unwrap();
+        assert_eq!(r.term_end_slot(), 300);
+        assert!(r.is_in_term(250));
+        assert!(!r.is_overdue(250));
+        assert_eq!(r.late_fee_due(250), 0);
+        // Nothing else moved.
+        assert_eq!(r.owner(), key(0xAA));
+        assert_eq!(r.renter(), key(0xBB));
+        assert_eq!(r.asset_id(), key(0xCC));
+        assert_eq!(r.rent_amount(), 1_000_000);
+        assert_eq!(r.term_start_slot(), 100);
+        assert_eq!(r.state(), RentalState::Active);
+        assert_eq!(r.late_fee(), terms());
+        // The extended window governs the return settlement.
+        let receipt = r.return_asset(250).unwrap();
+        assert_eq!(receipt.late_fee_due, 0);
+        assert!(!receipt.was_overdue);
+        assert_eq!(r.state(), RentalState::Returned);
+    }
+
+    #[test]
+    fn extend_term_end_governs_later_overdue_returns() {
+        // AV-292: past the new end, overdue is priced against the
+        // new window, not the old one.
+        let mut r = open_rental();
+        r.extend_term_end(key(0xAA), key(0xBB), 300, 150).unwrap();
+        let receipt = r.return_asset(350).unwrap();
+        assert!(receipt.was_overdue);
+        assert_eq!(receipt.overdue_slots, 50);
+        assert_eq!(receipt.overdue_days, 1);
+        assert_eq!(receipt.late_fee_due, 10_000);
+        assert_eq!(r.state(), RentalState::ReturnedLate);
+    }
+
+    #[test]
+    fn extend_term_end_rejects_shrink_and_equal() {
+        // AV-292: extension only — a shorter or equal window is an
+        // invalid extension, not a re-affirmation, and the current
+        // window is untouched.
+        let mut r = open_rental();
+        let err = r.extend_term_end(key(0xAA), key(0xBB), 150, 150).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.term_end_slot(), 200);
+        let err = r.extend_term_end(key(0xAA), key(0xBB), 200, 150).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.term_end_slot(), 200);
+        // The boundary the other way is legal: one slot past the end.
+        r.extend_term_end(key(0xAA), key(0xBB), 201, 150).unwrap();
+        assert_eq!(r.term_end_slot(), 201);
+    }
+
+    #[test]
+    fn extend_term_end_rejects_already_overdue_rentals() {
+        // AV-292: once overdue, the old window's fee has already
+        // accrued — extending it would retroactively erase overdue
+        // days, so the window is frozen.
+        let mut r = open_rental();
+        let err = r.extend_term_end(key(0xAA), key(0xBB), 300, 201).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.term_end_slot(), 200);
+        // The end itself is inclusive: extending exactly at the term
+        // end is still in term, not overdue.
+        let mut r2 = open_rental();
+        r2.extend_term_end(key(0xAA), key(0xBB), 300, 200).unwrap();
+        assert_eq!(r2.term_end_slot(), 300);
+        // Extending before the term even starts is allowed — the
+        // only window gate is "not yet overdue".
+        let mut r3 = open_rental();
+        r3.extend_term_end(key(0xAA), key(0xBB), 300, 50).unwrap();
+        assert_eq!(r3.term_end_slot(), 300);
+    }
+
+    #[test]
+    fn extend_term_end_is_dual_signed_and_active_only() {
+        // AV-292: a stranger, or either party alone, is refused and
+        // the window is untouched.
+        let mut r = open_rental();
+        let err = r.extend_term_end(key(9), key(0xBB), 300, 150).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = r.extend_term_end(key(0xAA), key(9), 300, 150).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(r.term_end_slot(), 200);
+        // Authority is checked before state: a stranger on a
+        // terminal rental still gets Unauthorized.
+        let mut r2 = open_rental();
+        r2.return_asset(150).unwrap();
+        let err = r2.extend_term_end(key(9), key(0xBB), 300, 150).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        // The parties on a terminal rental get RentalNotActive.
+        let err = r2.extend_term_end(key(0xAA), key(0xBB), 300, 150).unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(err.code(), 269);
+        let mut r3 = open_rental();
+        r3.cancel(key(0xAA), 50).unwrap();
+        let err = r3.extend_term_end(key(0xAA), key(0xBB), 300, 50).unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(r3.term_end_slot(), 200);
     }
 
     #[test]
