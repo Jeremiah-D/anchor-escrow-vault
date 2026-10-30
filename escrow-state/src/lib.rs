@@ -19720,6 +19720,148 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Revise the vesting unlock curve's shape after funding (AV-290
+    /// — Solana vesting governance): the initializer and the taker
+    /// may jointly reshape a live escrow's non-linear unlock curve
+    /// (a back-loaded team unlock proves too steep, or a
+    /// front-loaded one too generous) without cancelling and
+    /// re-locking the escrow.
+    ///
+    /// Check order mirrors [`Escrow::amend_vesting_schedule`]:
+    /// pause, then dual-signature authority (both parties must
+    /// authorize — one party alone cannot rewrite the unlock
+    /// timeline), then the AV-158 governance-delay routing gate,
+    /// then `Funded` state, then an already-configured curve (a
+    /// curve-less escrow has nothing to amend — `InvalidVesting`,
+    /// not an invitation to attach one mid-flight; attaching a
+    /// curve after funding would price the unlock under a shape
+    /// the taker never funded under, and
+    /// [`Escrow::with_vesting_curve`] stays `Uninitialized`-only),
+    /// then the new curve's window against the live schedule, then
+    /// the anti-clawback floor. Validation completes before any
+    /// write, so a failed amendment leaves the curve untouched.
+    ///
+    /// Shape semantics (fail-closed throughout):
+    /// - the new curve's tier window must fall inside the live
+    ///   schedule's `[start, end]` — the same gate
+    ///   [`Escrow::with_vesting_curve`] applies at attach time,
+    ///   judged here against the live schedule (which
+    ///   `amend_vesting_schedule` may itself have moved since
+    ///   creation), via [`EscrowError::InvalidVestingCurve`];
+    ///   a curve built for a different window would silently
+    ///   misprice the unlock timeline;
+    /// - the anti-clawback floor mirrors `amend_vesting_schedule`:
+    ///   the new curve, priced at `now` over the live schedule,
+    ///   must vest at least what the taker already claimed
+    ///   (`released`) — otherwise the amendment would claw back
+    ///   unlocked funds — via [`EscrowError::InvalidVesting`].
+    ///   The AV-51 cliff gates inside the pricing
+    ///   ([`VestingCurve::vested_amount`] returns zero before
+    ///   the cliff), so the floor is judged on the same unlock
+    ///   figure `claim` would pay;
+    /// - revising to the current curve is a no-op (succeeds,
+    ///   writes nothing, emits no event, paralleling
+    ///   `rotate_arbiter`).
+    ///
+    /// Only `vesting_curve` changes — the linear schedule table,
+    /// the cliff, the locked amount, and the state are untouched —
+    /// so the new shape governs from the next `claim`
+    /// ([`Escrow::claim`] and [`Escrow::claimable_amount`] price
+    /// through the live curve at every call, so a claim after the
+    /// amendment unlocks under the new shape while an amount
+    /// already claimed keeps the shape it settled under).
+    /// Orthogonal to [`Escrow::with_vesting_curve`] (AV-90): that
+    /// builder sets the initial shape `Uninitialized`-only; this
+    /// revises it `Funded`-only and never installs one. Orthogonal
+    /// to [`Escrow::amend_vesting_schedule`]: that changes the
+    /// linear table (start / end / cliff) the shape prices over;
+    /// this changes the non-linear shape itself. Emits
+    /// `VestingCurveAmended` on the event layer, except for the
+    /// no-op re-affirmation.
+    pub fn amend_vesting_curve(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        curve: VestingCurve,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-158: the direct entry always takes `via_delayed = false`
+        // — on a delay-opted-in escrow the curve moves only
+        // through the propose/execute protocol. Thin by design: one
+        // curve implementation, zero gate drift (see
+        // `update_quorum_impl`).
+        self.amend_vesting_curve_impl(initializer, taker, curve, now, false)
+    }
+
+    /// The curve engine behind [`Escrow::amend_vesting_curve`]. The
+    /// `via_delayed` parameter carries the AV-158 routing gate: the
+    /// direct entry always passes `false`, so on a delay-opted-in
+    /// escrow the curve moves only through the two-step
+    /// propose/execute protocol and a direct call is refused —
+    /// mirroring `amend_subscription_period_secs_impl` (AV-289),
+    /// which likewise stages no new proposal variant and simply
+    /// refuses the direct path on delay-opted escrows.
+    fn amend_vesting_curve_impl(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        curve: VestingCurve,
+        now: u64,
+        via_delayed: bool,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_vesting_schedule`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        // AV-158: the governance-delay routing gate — on a
+        // delay-opted-in escrow the curve moves only through the
+        // two-step propose/execute protocol, never a direct call
+        // (see `update_quorum_impl` for the placement rationale).
+        if !via_delayed && self.governance_delay_secs != 0 {
+            return Err(EscrowError::GovernanceActionNotProposed);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow with a curve already
+        // configured may revise it — amendment never installs a
+        // curve after funding.
+        if self.vesting_curve.is_none() {
+            return Err(EscrowError::InvalidVesting);
+        }
+        // The live schedule is the window the new curve must fit:
+        // a schedule-less escrow cannot carry a curve (the builder
+        // attaches curve and schedule together), so this is
+        // defensive — but a live schedule that moved since
+        // creation is judged as it stands, not as it was created.
+        let schedule = self.vesting.ok_or(EscrowError::InvalidVesting)?;
+        for i in 0..curve.tier_count() as usize {
+            // `tier(i)` is `Some` for `i < tier_count` by construction.
+            let (at, _) = curve.tier(i).ok_or(EscrowError::InvalidVestingCurve)?;
+            if at < schedule.start() || at > schedule.end() {
+                return Err(EscrowError::InvalidVestingCurve);
+            }
+        }
+        // Anti-clawback floor: the new curve must vest at least
+        // what the taker already claimed, priced exactly the way
+        // `claim` prices — through the new curve over the live
+        // schedule, with the cliff gating inside the pricing.
+        if curve.vested_amount(&schedule, self.amount, now) < self.released {
+            return Err(EscrowError::InvalidVesting);
+        }
+        // No-op: re-affirming the current curve writes nothing, so
+        // the event layer emits nothing for it.
+        if Some(curve) == self.vesting_curve {
+            return Ok(());
+        }
+        self.vesting_curve = Some(curve);
+        Ok(())
+    }
+
     /// Revise the milestone deadline table after funding (AV-231
     /// — Solana milestone payments / payment fintech): the
     /// initializer and the taker may jointly move the per-tranche
@@ -50025,7 +50167,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
     }
 
     #[test]
@@ -53953,6 +54096,176 @@ mod vesting_tests {
         let (payout, _) = e.claim(BOB, (START + END) / 2, None, BOB).unwrap();
         assert_eq!(payout, 500_000, "at the midpoint the linear curve applies");
     }
+
+    // ----- AV-290: vesting curve amendment -----
+
+    fn funded_curved_vesting_escrow() -> Escrow {
+        let curve =
+            VestingCurve::stepped(&[(1_750_000_000, 2_500), (END, 10_000)], START, END).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting_curve(VestingSchedule::new(START, END).unwrap(), curve)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_vesting_curve_reshapes_only_the_unclaimed_part() {
+        // Claim a quarter under the original shape, then reshape
+        // the curve: the new shape still vests at least the
+        // claimed quarter at amendment time, and later claims
+        // price against the new shape, not the old one — while
+        // the linear table, the cliff, and the amount are
+        // untouched.
+        let mut e = funded_curved_vesting_escrow();
+        let midpoint = 1_750_000_000;
+        let (payout, _) = e.claim(BOB, midpoint, None, BOB).unwrap();
+        assert_eq!(payout, 250_000);
+        let reshaped =
+            VestingCurve::stepped(&[(1_750_000_000, 5_000), (END, 10_000)], START, END).unwrap();
+        e.amend_vesting_curve(ALICE, BOB, reshaped, midpoint).unwrap();
+        assert_eq!(e.vesting_curve(), Some(reshaped));
+        assert_eq!(
+            e.vesting_schedule(),
+            Some(VestingSchedule::new(START, END).unwrap()),
+            "the linear table is untouched"
+        );
+        assert_eq!(e.amount(), 1_000_000, "the locked amount is untouched");
+        // At the end the new shape has vested everything, so the
+        // next pull is everything minus the quarter already claimed.
+        let (payout, _) = e.claim(BOB, END, None, BOB).unwrap();
+        assert_eq!(payout, 750_000);
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_vesting_curve_rejects_clawback_below_claimed() {
+        // A quarter claimed at the midpoint; a reshaped curve
+        // that would vest only a tenth at that moment rewrites
+        // the settled quarter backwards — refused, curve untouched.
+        let mut e = funded_curved_vesting_escrow();
+        let midpoint = 1_750_000_000;
+        e.claim(BOB, midpoint, None, BOB).unwrap();
+        assert_eq!(e.released_amount(), 250_000);
+        let original =
+            VestingCurve::stepped(&[(1_750_000_000, 2_500), (END, 10_000)], START, END).unwrap();
+        let clawback =
+            VestingCurve::stepped(&[(1_750_000_000, 1_000), (END, 10_000)], START, END).unwrap();
+        assert_eq!(
+            e.amend_vesting_curve(ALICE, BOB, clawback, midpoint),
+            Err(EscrowError::InvalidVesting)
+        );
+        assert_eq!(
+            e.vesting_curve(),
+            Some(original),
+            "a failed amendment leaves the curve untouched"
+        );
+        assert_eq!(e.released_amount(), 250_000);
+    }
+
+    #[test]
+    fn amend_vesting_curve_requires_dual_signature_funded_state_and_curve() {
+        // One party alone cannot rewrite the unlock shape, and
+        // a stranger pair cannot either.
+        let mut e = funded_curved_vesting_escrow();
+        let reshaped =
+            VestingCurve::stepped(&[(1_750_000_000, 5_000), (END, 10_000)], START, END).unwrap();
+        assert_eq!(
+            e.amend_vesting_curve(ALICE, MALLORY, reshaped, START),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_vesting_curve(MALLORY, BOB, reshaped, START),
+            Err(EscrowError::Unauthorized)
+        );
+        // Uninitialized: the builder owns the initial shape.
+        let curve =
+            VestingCurve::stepped(&[(1_750_000_000, 2_500), (END, 10_000)], START, END).unwrap();
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting_curve(VestingSchedule::new(START, END).unwrap(), curve)
+            .unwrap();
+        assert_eq!(
+            bare.amend_vesting_curve(ALICE, BOB, reshaped, START),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Funded but curve-less: amendment never installs a curve.
+        let mut plain = funded_vesting_escrow();
+        assert_eq!(
+            plain.amend_vesting_curve(ALICE, BOB, reshaped, START),
+            Err(EscrowError::InvalidVesting)
+        );
+        // A curve whose tier window escapes the live schedule is
+        // refused: the construction window is wider than the live
+        // one, so the final tier lands past the live end.
+        let wide = VestingCurve::stepped(
+            &[(1_750_000_000, 5_000), (1_900_000_000, 10_000)],
+            START,
+            1_900_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            e.amend_vesting_curve(ALICE, BOB, wide, START),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+        assert_eq!(
+            e.vesting_curve(),
+            Some(curve),
+            "a failed amendment leaves the curve untouched"
+        );
+    }
+
+    #[test]
+    fn amend_vesting_curve_paused_and_delayed_refuse_direct_call() {
+        // The pause guard fires before the authority and state
+        // gates: even a stranger's revision on a paused escrow
+        // is `Paused`.
+        let curve =
+            VestingCurve::stepped(&[(1_750_000_000, 2_500), (END, 10_000)], START, END).unwrap();
+        let reshaped =
+            VestingCurve::stepped(&[(1_750_000_000, 5_000), (END, 10_000)], START, END).unwrap();
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_vesting_curve(VestingSchedule::new(START, END).unwrap(), curve)
+            .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_vesting_curve(MALLORY, BOB, reshaped, START),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.vesting_curve(), Some(curve));
+        // The governance-delay routing gate: on a delay-opted-in
+        // escrow the direct call is refused, whatever the shape.
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_vesting_curve(VestingSchedule::new(START, END).unwrap(), curve)
+            .unwrap();
+        delayed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            delayed.amend_vesting_curve(ALICE, BOB, reshaped, START),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(delayed.vesting_curve(), Some(curve));
+    }
+
+    #[test]
+    fn amend_vesting_curve_same_curve_is_a_noop() {
+        // Re-affirming the current shape succeeds but changes
+        // nothing observable; the event layer emits nothing.
+        let mut e = funded_curved_vesting_escrow();
+        let current = e.vesting_curve().expect("curve configured");
+        e.amend_vesting_curve(ALICE, BOB, current, START).unwrap();
+        assert_eq!(e.vesting_curve(), Some(current));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
 
     // ----- AV-231: milestone due-date amendment -----
 
@@ -67058,7 +67371,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
-        assert_eq!(EscrowEventKind::from_discriminant(152), None); // AV-289: 151 is SubscriptionPeriodSecsAmended
+        assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
+        assert_eq!(EscrowEventKind::from_discriminant(153), None); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -67292,9 +67606,10 @@ mod event_history_tests {
         // `DefaultJudgmentAmended` (AV-286), 149 is
         // `AutoUnpauseAtAmended` (AV-287), 150 is
         // `DutchAuctionWindowAmended` (AV-288), 151 is
-        // `SubscriptionPeriodSecsAmended` (AV-289) and 152 is the
+        // `SubscriptionPeriodSecsAmended` (AV-289), 152 is
+        // `VestingCurveAmended` (AV-290) and 153 is the
         // first still-unknown byte.
-        for bad in [152u8, 255] {
+        for bad in [153u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

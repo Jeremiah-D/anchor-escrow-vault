@@ -438,6 +438,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // and the released bitmap are untouched, while the next period
         // becomes due under the live cadence.
         | EscrowEventKind::SubscriptionPeriodSecsAmended
+        // AV-290: a revised vesting curve moves no funds and never
+        // restates an amount already claimed — only the unlock shape moves,
+        // so the linear schedule table, the cliff, and the locked amount
+        // are untouched, while the next claim prices through the live curve.
+        | EscrowEventKind::VestingCurveAmended
         // AV-278: an amended recovery threshold moves no funds and
         // never restates a settled request — only the threshold
         // changes, so the guardians, the count and the timelock
@@ -1371,6 +1376,11 @@ mod fee_history_tests {
                 // and the released bitmap are untouched, while the next period
                 // becomes due under the live cadence.
         | EscrowEventKind::SubscriptionPeriodSecsAmended
+                // AV-290: a revised vesting curve moves no funds and never
+                // restates an amount already claimed — only the unlock shape moves,
+                // so the linear schedule table, the cliff, and the locked amount
+                // are untouched, while the next claim prices through the live curve.
+        | EscrowEventKind::VestingCurveAmended
                 // AV-278: an amended recovery threshold moves no funds and
                 // never restates a settled request — only the threshold
                 // changes, so the guardians, the count and the timelock
