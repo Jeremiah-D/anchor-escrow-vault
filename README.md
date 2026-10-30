@@ -166,6 +166,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `propose_counter_offer(authority, amount, expiry, now)` (AV-122) | `Funded` | `CounterOffered` | taker only, only before any claim; `amount` must be nonzero and `expiry` in the future (`InvalidCounterOffer`, code 180, otherwise); stores the offer — fund movements and `escalate` frozen until the initializer answers; resets the deadman clock; emits `CounterOfferProposed` |
 | `accept_counter_offer(authority, now)` (AV-122) | `CounterOffered` | `Funded` | initializer only; atomically re-sets `amount`/`expires_at` to the offered terms (terms-only — no funds move); resets the deadman clock; emits `CounterOfferAccepted` |
 | `reject_counter_offer(authority, now)` (AV-122) | `CounterOffered` | `Funded` | initializer only; drops the offer, terms unchanged; resets the deadman clock; emits `CounterOfferRejected` |
+| `amend_counter_offer(authority, amount, expiry, now)` (AV-285) | `CounterOffered` | `CounterOffered` | taker only (the offer is the proposer's — initializer/stranger is `Unauthorized`, checked before state validity); `Funded` or terminal states are `InvalidStateTransition` (no live offer to revise); new terms reuse the propose gates (`amount` nonzero, `expiry` in the future, nothing released — `InvalidCounterOffer` otherwise, original offer untouched); a paused escrow fails fast (`Paused`, with a due auto-recovery schedule lifting first, AV-133); only `counter_offer` moves — the escrow's `amount`/`expires_at` and state are untouched until the initializer answers, and the next accept re-prices under the amended terms; re-affirming the identical terms is a no-op (writes nothing, emits nothing); emits `CounterOfferAmended` (discriminant 147), all amounts zero |
 | `initialize_dutch_auction(start_at, end_at, reserve_bps)` (AV-97) | `Uninitialized` | `Uninitialized` | initializer (once, before funding; the descending-price settlement window: `start_at < end_at`, `reserve_bps` in 0–10000 — `InvalidAuctionParams`, code 155, otherwise); the taker's pull path becomes the auction cap `max(amount * (end_at - now) / (end_at - start_at), amount * reserve_bps / 10000)` inside the window — early claimers keep more, the `reserve_bps` floor is the initializer's guaranteed keep; mutually exclusive with the AV-13/AV-90 unlock paths (last-wins) and with dispute arbitration while the window is live (`escalate` is refused with `AuctionNotActive`, code 156) |
 | `fund(authority, now)`                      | `Uninitialized` (plain) / `Activated` (dual-sig) | `Funded`  | initializer (`now` <- clock sysvar, recorded as `fund_at` — the origin the AV-64 relative timelock measures from); AV-104: a live FUND-scoped operator may call for the initializer instead (same checks, operator pays nothing — delegation covers transition rights only); AV-134: with a funding window configured, the deposit must sit inside `[min_funding_amount, max_funding_amount]` (`AmountOutOfBounds`, code 197, otherwise) |
 | `with_dual_control(checker)` (AV-130)               | `Uninitialized`| `Uninitialized` | initializer (once, before funding; binds the checker key for the maker-checker release protocol — a zero `checker` key is `InvalidDualControl`, code 188) |
@@ -407,6 +408,14 @@ terms and returns to `Funded`, or `reject_counter_offer` (initializer-only)
 drops the offer and returns to `Funded` with the original terms. The
 four transitions emit `Declined` / `CounterOfferProposed` /
 `CounterOfferAccepted` / `CounterOfferRejected` (discriminants 62–65). The
+taker may also revise their own live offer in flight
+(`amend_counter_offer`, AV-285, taker-only, `CounterOffered`-only): the
+new terms reuse the propose gates and only the stored offer moves — the
+deal amount, expiry, and state are untouched, so the initializer still
+answers via accept or reject, and the next accept re-prices under the
+amended terms; a paused escrow fails fast, and re-affirming the identical
+terms is a silent no-op. The revision emits `CounterOfferAmended`
+(discriminant 147), all amounts zero. The
 negotiation is orthogonal to the AV-103 appeal bond and the dispute flow —
 a `CounterOffered` escrow cannot be disputed.
 

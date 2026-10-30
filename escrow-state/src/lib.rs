@@ -26277,6 +26277,78 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// The taker revises their own live counter-offer (AV-285): new
+    /// amount and expiry terms replacing the in-flight offer, for
+    /// the initializer to accept or reject. Only the taker may call
+    /// this (`Unauthorized` otherwise, checked before state
+    /// validity — the offer is the proposer's, along the
+    /// [`Escrow::propose_counter_offer`] taker-only precedent);
+    /// only from `CounterOffered` (`InvalidStateTransition`
+    /// otherwise — a `Funded` escrow has no live offer to revise,
+    /// and a terminal escrow has no negotiation left to revise).
+    ///
+    /// The new terms reuse the propose gates: `amount` must be
+    /// nonzero and `expiry` must be in the future
+    /// (`InvalidCounterOffer` otherwise), and nothing may have
+    /// been released yet (`InvalidStateTransition` otherwise —
+    /// defensive: the propose gate already forbids proposing after
+    /// a claim, so a live offer always sits on an unclaimed
+    /// escrow). A failed revision leaves the original offer
+    /// exactly as it was — the initializer still answers the
+    /// terms they were shown, never a half-written revision.
+    ///
+    /// Only `counter_offer` moves: the escrow's `amount` and
+    /// `expires_at` are untouched until the initializer answers
+    /// (accept re-prices from the live offer, reject drops it),
+    /// and the state stays `CounterOffered` — the initializer
+    /// still decides via [`Escrow::accept_counter_offer`] /
+    /// [`Escrow::reject_counter_offer`]. Re-affirming the current
+    /// terms byte-for-byte is a no-op that writes nothing and
+    /// emits nothing.
+    ///
+    /// Check order: pause (with scheduled auto-recovery first) →
+    /// reentrancy → authority → state → no-prior-claim → live
+    /// offer present (defensive — the state implies it) → terms
+    /// validity → no-op.
+    ///
+    /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits
+    /// [`EscrowEventKind::CounterOfferAmended`](crate::EscrowEventKind::CounterOfferAmended).
+    pub fn amend_counter_offer(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        expiry: u64,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
+        self.require_not_paused()?;
+        self.require_not_reentrant()?;
+        if authority != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::CounterOffered => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if self.released != 0 {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        let offer = self.counter_offer.ok_or(EscrowError::InvalidCounterOffer)?;
+        if amount == 0 || expiry <= now {
+            return Err(EscrowError::InvalidCounterOffer);
+        }
+        // No-op: re-affirming the live terms writes nothing, so
+        // the event layer emits nothing for it.
+        if offer.amount == amount && offer.expiry == expiry {
+            return Ok(());
+        }
+        self.counter_offer = Some(CounterOffer { amount, expiry });
+        self.touch_deadman_clock(now);
+        Ok(())
+    }
+
     /// Opt in to emergency timelock-unlock governance (AV-41).
     /// Builder-style: only valid on an `Uninitialized` escrow, so the
     /// governance capability is fixed before any funds move — mirroring
@@ -49390,7 +49462,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -66418,7 +66491,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -66647,9 +66721,10 @@ mod event_history_tests {
         // `TieredQuorumUpdated` (AV-280), 144 is
         // `JuryPanelSizeAmended` (AV-281), 145 is
         // `EventCapacityAmended` (AV-282), 146 is
-        // `ArbiterPanelMembersUpdated` (AV-283) and 147 is the
+        // `ArbiterPanelMembersUpdated` (AV-283), 147 is
+        // `CounterOfferAmended` (AV-285) and 148 is the
         // first still-unknown byte.
-        for bad in [147u8, 255] {
+        for bad in [148u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -80881,6 +80956,178 @@ mod update_arbiter_panel_members_tests {
             e.arbiter_panel().unwrap().voted, 0b100,
             "the seated member's vote lands in its new slot"
         );
+    }
+}
+
+mod amend_counter_offer_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const FUND_AT: u64 = EXPIRES_AT - 3_600;
+    const NOW: u64 = 1_750_000_000;
+
+    fn offered() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e.propose_counter_offer(BOB, 900_000, EXPIRES_AT + 3_600, FUND_AT)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::CounterOffered);
+        e
+    }
+
+    #[test]
+    fn amend_revises_only_offer_terms_and_next_accept_uses_them() {
+        // Only the live offer moves: the escrow's amount, expiry,
+        // and state are untouched until the initializer answers —
+        // and the answer then re-prices under the new terms, not
+        // the terms the escrow funded under or first proposed.
+        let mut e = offered();
+        e.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::CounterOffered);
+        let offer = e.counter_offer().expect("offer still live");
+        assert_eq!(offer.amount, 850_000, "offer amount replaced");
+        assert_eq!(offer.expiry, EXPIRES_AT + 7_200, "offer expiry replaced");
+        assert_eq!(e.amount(), 1_000_000, "deal amount untouched");
+        assert_eq!(e.expires_at(), EXPIRES_AT, "deal expiry untouched");
+        assert_eq!(e.released_amount(), 0, "nothing released");
+        e.accept_counter_offer(ALICE, NOW + 10).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 850_000, "accept re-prices under amended terms");
+        assert_eq!(e.expires_at(), EXPIRES_AT + 7_200);
+        assert_eq!(e.counter_offer(), None, "offer consumed");
+    }
+
+    #[test]
+    fn amend_rejects_non_taker() {
+        // The offer is the proposer's: the initializer and a
+        // stranger are both Unauthorized, and the live offer is
+        // untouched by either attempt.
+        let mut e = offered();
+        assert_eq!(
+            e.amend_counter_offer(ALICE, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_counter_offer(MALLORY, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        let offer = e.counter_offer().expect("offer still live");
+        assert_eq!(offer.amount, 900_000, "original offer untouched");
+        assert_eq!(offer.expiry, EXPIRES_AT + 3_600);
+        assert_eq!(e.state(), EscrowState::CounterOffered);
+    }
+
+    #[test]
+    fn amend_rejects_without_live_offer() {
+        // A Funded escrow has no offer to revise, and a terminal
+        // escrow has no negotiation left — both fail closed with
+        // InvalidStateTransition, not with a silent no-op.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            e.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        let mut cancelled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        cancelled.fund(ALICE, FUND_AT).unwrap();
+        cancelled.cancel(ALICE, None, ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            cancelled.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_rejects_bad_terms_and_keeps_original() {
+        // Every propose gate, each leaving the original offer
+        // exactly as it was — the initializer still answers the
+        // terms they were shown, never a half-written revision.
+        let mut e = offered();
+        for (amount, expiry) in [
+            (0, EXPIRES_AT + 7_200),
+            (850_000, NOW),
+            (850_000, NOW - 1),
+        ] {
+            assert_eq!(
+                e.amend_counter_offer(BOB, amount, expiry, NOW),
+                Err(EscrowError::InvalidCounterOffer),
+                "amount {amount} expiry {expiry} must be refused"
+            );
+            let offer = e.counter_offer().expect("offer still live");
+            assert_eq!(offer.amount, 900_000, "original amount untouched");
+            assert_eq!(offer.expiry, EXPIRES_AT + 3_600, "original expiry untouched");
+        }
+        assert_eq!(e.state(), EscrowState::CounterOffered);
+    }
+
+    #[test]
+    fn amend_rejects_on_paused_and_recovers_on_due_schedule() {
+        // The pause guard fires before the authority and state
+        // gates: even the taker's own amendment on a manually
+        // paused escrow is `Paused`, and the offer is untouched.
+        let mut paused = offered();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_counter_offer(MALLORY, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::Paused),
+            "pause beats authority"
+        );
+        let offer = paused.counter_offer().expect("offer still live");
+        assert_eq!(offer.amount, 900_000, "original offer untouched");
+        // A due auto-recovery schedule lifts first (AV-133): the
+        // same call at now >= t succeeds and consumes the schedule.
+        let mut scheduled = offered();
+        scheduled.pause(PAUSER, Some(NOW)).unwrap();
+        scheduled
+            .amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW)
+            .unwrap();
+        assert!(!scheduled.is_paused(), "schedule consumed");
+        assert_eq!(scheduled.auto_unpause_at(), None);
+        let offer = scheduled.counter_offer().expect("offer revised");
+        assert_eq!(offer.amount, 850_000);
+    }
+
+    #[test]
+    fn amend_indexed_emits_event_noop_and_failed_emit_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::wrap([0xE0; 32], offered());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_counter_offer(ALICE, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_counter_offer(BOB, 0, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::InvalidCounterOffer)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::CounterOfferAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::CounterOffered, EscrowState::CounterOffered)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the amended terms is a no-op: no new event.
+        e.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
     }
 }
 

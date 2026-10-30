@@ -578,6 +578,17 @@
 //!   and a seated member votes. A failed revision emits nothing,
 //!   and a no-op re-affirmation of the identical roster in the
 //!   identical slot order emits nothing either.
+//! - `amend_counter_offer` emits
+//!   [`EscrowEventKind::CounterOfferAmended`] on every successful
+//!   revision that actually changes the live offer (AV-285) —
+//!   `from == to == CounterOffered`, all amounts zero; only the
+//!   offered amount and expiry change, so the escrow's amount,
+//!   expiry, and state are untouched, and the initializer still
+//!   answers via accept or reject — the accept path reads the
+//!   live offer, so an acceptance after the amendment re-prices
+//!   under the new terms. A failed revision emits nothing, and
+//!   a no-op re-affirmation of the identical terms emits nothing
+//!   either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -817,6 +828,7 @@
 //! | JuryPanelSizeAmended (AV-281) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a verdict already settled; only the jury size changes, so the arbiter slot, the arbiter panel and the juror registry are untouched, and the draw reads the live size at the next dispute, so a panel drawn after the amendment seats the new size while no panel is ever re-drawn in flight (the draw runs only on a `Disputed` escrow, and this revision is `Funded`-only) |
 //! | EventCapacityAmended (AV-282) | 0 | 0 | 0 | 0 — amending moves no funds and never restates an entry already recorded; only the capacity changes, so the slots, the head, the count and the total are untouched, and the retained entries survive verbatim — the new capacity governs from the next `record_history` call, so a ring amended while filling keeps filling under the new bound and wraps modulo the new capacity once it fills, while a wrapped ring never revises at all |
 //! | ArbiterPanelMembersUpdated (AV-283) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a vote already cast; only the roster changes, so the threshold, the blind mode and the reveal window are untouched, and the vote state is necessarily zero on a `Funded` escrow — the new roster governs from the next dispute, so a removed member is refused and a seated member votes, while no vote is ever re-attributed in flight (a reordering is a revision precisely because slot order is vote identity) |
+//! | CounterOfferAmended (AV-285) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a settlement already made; only the offered amount and expiry change, so the escrow's amount, expiry, and state are untouched, and the initializer still answers via accept or reject — the accept path reads the live offer, so an acceptance after the amendment re-prices under the new terms while an acceptance already settled keeps the terms it settled under |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2470,6 +2482,22 @@ pub enum EscrowEventKind {
     /// identical roster in the identical slot order emits nothing,
     /// while a reordering emits (slot order is vote identity).
     ArbiterPanelMembersUpdated,
+    /// AV-285: the taker's live counter-offer was revised by
+    /// governed post-proposal amendment
+    /// ([`Escrow::amend_counter_offer`](crate::Escrow::amend_counter_offer)).
+    /// `from == to == CounterOffered` (a negotiation revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::ArbiterPanelMembersUpdated`]); all amounts
+    /// are zero — amending moves no funds and never restates a
+    /// verdict already settled; only the offered amount and expiry
+    /// change, so the escrow's amount, expiry, and state are
+    /// untouched — the accept path reads the live offer, so an
+    /// acceptance after the amendment re-prices under the new
+    /// terms while an acceptance already settled keeps the terms
+    /// it settled under. The new terms are read from the vault, so
+    /// the event needs no extra field. A no-op re-affirmation of
+    /// the identical terms emits nothing.
+    CounterOfferAmended,
 }
 
 impl EscrowEventKind {
@@ -2925,6 +2953,10 @@ impl EscrowEventKind {
             // discriminants 0–145 stay stable for already-serialized
             // histories.
             146 => Self::ArbiterPanelMembersUpdated,
+            // AV-285: appended after ArbiterPanelMembersUpdated so
+            // discriminants 0–146 stay stable for already-serialized
+            // histories.
+            147 => Self::CounterOfferAmended,
             _ => return None,
         })
     }
@@ -3147,6 +3179,7 @@ impl EscrowEventKind {
             Self::JuryPanelSizeAmended => "jury_panel_size_amended",
             Self::EventCapacityAmended => "event_capacity_amended",
             Self::ArbiterPanelMembersUpdated => "arbiter_panel_members_updated",
+            Self::CounterOfferAmended => "counter_offer_amended",
         }
     }
 
@@ -3373,6 +3406,7 @@ impl EscrowEventKind {
             "jury_panel_size_amended" => Self::JuryPanelSizeAmended,
             "event_capacity_amended" => Self::EventCapacityAmended,
             "arbiter_panel_members_updated" => Self::ArbiterPanelMembersUpdated,
+            "counter_offer_amended" => Self::CounterOfferAmended,
             _ => return None,
         })
     }
@@ -5357,6 +5391,59 @@ impl IndexedEscrow {
             None,
             Some(authority),
         );
+        Ok(())
+    }
+
+    /// The taker revises their own live counter-offer (mirrors
+    /// [`Escrow::amend_counter_offer`], AV-285).
+    ///
+    /// Emits `CounterOfferAmended` only when the offer actually
+    /// changes (`from == to == CounterOffered`, all amounts zero);
+    /// the new terms are read from the vault. A failed revision
+    /// emits nothing, and a no-op re-affirmation of the identical
+    /// terms emits nothing. The actor is the taker.
+    pub fn amend_counter_offer(
+        &mut self,
+        authority: [u8; 32],
+        amount: u64,
+        expiry: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.counter_offer();
+        // AV-36: see `fund` — a rejected reentrant entry emits
+        // `ReentryRejected`.
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
+        let result = self.inner.amend_counter_offer(authority, amount, expiry, at);
+        match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return self.map_reentrant(Err(e), at);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
+        // The inner call rejects bad input, strangers, and wrong
+        // states, so a changed offer here always means a real
+        // revision — and a same-terms no-op stays silent.
+        let after = self.inner.counter_offer();
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::CounterOfferAmended,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                Some(authority),
+            );
+        }
         Ok(())
     }
 
@@ -14507,7 +14594,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -14642,7 +14730,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15211,7 +15300,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15258,7 +15348,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15302,7 +15393,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15346,7 +15438,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15390,7 +15483,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15437,7 +15531,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15484,7 +15579,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15528,7 +15624,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15572,7 +15669,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15616,7 +15714,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15660,7 +15759,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15704,7 +15804,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15748,7 +15849,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15796,7 +15898,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15843,7 +15946,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15890,7 +15994,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15937,7 +16042,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -15984,7 +16090,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -16032,7 +16139,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -16080,7 +16188,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -16128,7 +16237,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -16175,7 +16285,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]
@@ -16239,7 +16350,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(144), Some(EscrowEventKind::JuryPanelSizeAmended)); // AV-281: 144 is JuryPanelSizeAmended
         assert_eq!(EscrowEventKind::from_discriminant(145), Some(EscrowEventKind::EventCapacityAmended)); // AV-282: 145 is EventCapacityAmended
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(147), None); // AV-283: 146 is ArbiterPanelMembersUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
+        assert_eq!(EscrowEventKind::from_discriminant(148), None); // AV-285: 147 is CounterOfferAmended
     }
 
     #[test]

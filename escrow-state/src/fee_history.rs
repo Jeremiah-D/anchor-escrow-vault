@@ -462,6 +462,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // are untouched, while the next dispute seats the live
         // roster.
         | EscrowEventKind::ArbiterPanelMembersUpdated
+        // AV-285: a revised counter-offer moves no funds and
+        // never restates a settlement already made — only the
+        // offered amount and expiry change, so the escrow's
+        // amount, expiry and state are untouched, while the next
+        // accept re-prices under the live offer.
+        | EscrowEventKind::CounterOfferAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1366,6 +1372,12 @@ mod fee_history_tests {
                 // are untouched, while the next dispute seats the live
                 // roster.
                 | EscrowEventKind::ArbiterPanelMembersUpdated
+                // AV-285: a revised counter-offer moves no funds and
+                // never restates a settlement already made — only the
+                // offered amount and expiry change, so the escrow's
+                // amount, expiry and state are untouched, while the next
+                // accept re-prices under the live offer.
+                | EscrowEventKind::CounterOfferAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted
