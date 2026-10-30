@@ -7544,6 +7544,18 @@ expires, custody returns to the owner automatically.
 - **Fail-closed terms**: zero owner/renter keys, a self-lease, zero
   rent, an empty term, a zero `slots_per_day`, or a rate/cap above
   10_000 bps are all refused at construction.
+- **Revising the late fee (AV-291)**: `amend_late_fee` revises the
+  schedule on an `Active` rental, authorized by owner + renter
+  together — the late fee is a bilateral economic term, so a
+  unilateral rewrite would let one side reprice the other's overdue
+  cost alone. The new terms reuse the construction gate (a rate/cap
+  above 10_000 bps fails closed with `InvalidRentalTerms`, code 268,
+  and the current schedule is untouched); an explicit `None` clears
+  back to opt-out, and re-affirming the current schedule is a no-op.
+  Only `late_fee` changes, and `late_fee_due` / `return_asset` read
+  the live schedule, so the new terms govern from the next billing —
+  a fee already settled by a return is never restated. No event is
+  emitted — `RentalEscrow` has no event layer.
 
 New error codes (never renumbered): `InvalidRentalTerms` (268),
 `RentalNotActive` (269), `RentalCancelNotAllowed` (270). Pure logic:

@@ -274,6 +274,69 @@ impl RentalEscrow {
         Ok(())
     }
 
+    /// Revise the late-fee schedule on an `Active` rental (AV-291 —
+    /// Solana rental governance): both parties authorize the change
+    /// (the late fee is a bilateral economic term — a unilateral
+    /// rewrite would let one side reprice the other's overdue cost
+    /// alone). Check order is authority → state, mirroring AV-284's
+    /// `NftEscrow` precedent, so a stranger learns nothing about
+    /// the rental's state from the error alone.
+    ///
+    /// Why: the schedule is fixed at construction
+    /// ([`RentalEscrow::new`]), but the parties may renegotiate the
+    /// overdue price mid-term — a schedule that cannot be revised
+    /// would either strand the renter under a stale rate or force a
+    /// fresh rental (and a fresh custody transfer) for a legitimate
+    /// new rate. Only an `Active` rental may revise: a returned or
+    /// cancelled rental is terminal, so revising it could never
+    /// govern a future return, and a fee already settled by
+    /// `return_asset` is never restated.
+    ///
+    /// The new schedule reuses the [`RentalEscrow::new`] gate
+    /// exactly: a rate or cap above 10_000 bps fails closed with
+    /// [`EscrowError::InvalidRentalTerms`] (code 268), leaving the
+    /// current schedule untouched, because the new terms are
+    /// validated before any write. An explicit `None` clears the
+    /// schedule back to opt-out (the `new` `None` = opt-out
+    /// precedent) — after clearing, overdue returns are free but
+    /// still recorded as late. Re-affirming the current schedule is
+    /// a no-op that writes nothing. Only `late_fee` changes — the
+    /// owner, renter, asset, rent amount, term slots,
+    /// `slots_per_day`, and state are untouched — and
+    /// [`RentalEscrow::late_fee_due`] / [`RentalEscrow::return_asset`]
+    /// read the live schedule, so the new terms govern from the
+    /// next billing; a return already executed is unaffected. There
+    /// is no event layer on `RentalEscrow`, so no event is emitted
+    /// for the revision or its no-op. Orthogonal to
+    /// [`RentalEscrow::new`] (that installs the schedule at build
+    /// time, this revises it while `Active`) and to AV-190 (that is
+    /// the rental mechanism itself, this is its terms revision).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller pair that is not exactly owner + renter, and
+    /// ([`EscrowError::RentalNotActive`], code 269) once the rental
+    /// is in a terminal state.
+    pub fn amend_late_fee(
+        &mut self,
+        owner: [u8; 32],
+        renter: [u8; 32],
+        late_fee: Option<LateFeeTerms>,
+    ) -> Result<(), EscrowError> {
+        if owner != self.owner || renter != self.renter {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != RentalState::Active {
+            return Err(EscrowError::RentalNotActive);
+        }
+        if let Some(terms) = late_fee {
+            if terms.bps_per_day > MAX_LATE_FEE_BPS || terms.cap_bps > MAX_LATE_FEE_BPS {
+                return Err(EscrowError::InvalidRentalTerms);
+            }
+        }
+        self.late_fee = late_fee;
+        Ok(())
+    }
+
     /// Audit-event JSON for a return (hand-written):
     /// `{"event":"rental_returned","asset":"<64hex>","late_fee":<u64>,
     /// "overdue_days":<u64>,"late":<bool>}`.
@@ -535,6 +598,179 @@ mod rental_escrow_tests {
         assert_eq!(r.late_fee_due(200), 0);
         // One slot past the end: 1 overdue slot = 1 charged day.
         assert_eq!(r.late_fee_due(201), 10_000);
+    }
+
+    #[test]
+    fn amend_late_fee_revises_the_live_schedule() {
+        // AV-291: dual-signed revision reprices future billings only.
+        let mut r = open_rental();
+        assert_eq!(r.late_fee_due(300), 10_000);
+        r.amend_late_fee(
+            key(0xAA),
+            key(0xBB),
+            Some(LateFeeTerms {
+                bps_per_day: 200,
+                cap_bps: 5000,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            r.late_fee(),
+            Some(LateFeeTerms {
+                bps_per_day: 200,
+                cap_bps: 5000,
+            })
+        );
+        // The live schedule prices the same overdue slot: 2%/day now.
+        assert_eq!(r.late_fee_due(300), 20_000);
+        // Nothing else moved.
+        assert_eq!(r.owner(), key(0xAA));
+        assert_eq!(r.renter(), key(0xBB));
+        assert_eq!(r.asset_id(), key(0xCC));
+        assert_eq!(r.rent_amount(), 1_000_000);
+        assert_eq!(r.term_start_slot(), 100);
+        assert_eq!(r.term_end_slot(), 200);
+        assert_eq!(r.state(), RentalState::Active);
+        // The amended schedule governs the return settlement.
+        let receipt = r.return_asset(300).unwrap();
+        assert_eq!(receipt.late_fee_due, 20_000);
+        assert_eq!(r.state(), RentalState::ReturnedLate);
+    }
+
+    #[test]
+    fn amend_late_fee_clear_to_none_opts_out() {
+        // AV-291: an explicit None clears back to no late fee.
+        let mut r = open_rental();
+        r.amend_late_fee(key(0xAA), key(0xBB), None).unwrap();
+        assert_eq!(r.late_fee(), None);
+        assert_eq!(r.late_fee_due(9999), 0);
+        let receipt = r.return_asset(9999).unwrap();
+        assert!(receipt.was_overdue);
+        assert_eq!(receipt.late_fee_due, 0);
+        // No schedule: recorded clean even though late.
+        assert_eq!(r.state(), RentalState::Returned);
+    }
+
+    #[test]
+    fn amend_late_fee_is_dual_signed() {
+        // AV-291: a stranger, or either party alone, is refused and
+        // the schedule is untouched.
+        let mut r = open_rental();
+        let err = r
+            .amend_late_fee(key(9), key(0xBB), None)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = r
+            .amend_late_fee(
+                key(0xAA),
+                key(9),
+                Some(LateFeeTerms {
+                    bps_per_day: 200,
+                    cap_bps: 5000,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = r
+            .amend_late_fee(
+                key(9),
+                key(9),
+                Some(LateFeeTerms {
+                    bps_per_day: 200,
+                    cap_bps: 5000,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(r.late_fee(), terms());
+        // Authority is checked before state: a stranger on a
+        // terminal rental still gets Unauthorized, not RentalNotActive.
+        let mut r2 = open_rental();
+        r2.return_asset(150).unwrap();
+        let err = r2.amend_late_fee(key(9), key(0xBB), None).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_late_fee_rejects_terminal_rentals() {
+        // AV-291: Returned / ReturnedLate / Cancelled are terminal.
+        let mut r = open_rental();
+        r.return_asset(150).unwrap();
+        let err = r.amend_late_fee(key(0xAA), key(0xBB), None).unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(err.code(), 269);
+        assert_eq!(r.late_fee(), terms());
+
+        let mut r2 = open_rental();
+        r2.return_asset(300).unwrap();
+        assert_eq!(r2.state(), RentalState::ReturnedLate);
+        let err = r2.amend_late_fee(key(0xAA), key(0xBB), None).unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+
+        let mut r3 = open_rental();
+        r3.cancel(key(0xAA), 50).unwrap();
+        let err = r3.amend_late_fee(key(0xAA), key(0xBB), None).unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+    }
+
+    #[test]
+    fn amend_late_fee_reuses_the_construction_gate() {
+        // AV-291: a rate or cap above 10_000 bps fails closed with
+        // the original schedule untouched.
+        let mut r = open_rental();
+        let bad_rate = Some(LateFeeTerms {
+            bps_per_day: 10_001,
+            cap_bps: 2000,
+        });
+        let err = r
+            .amend_late_fee(key(0xAA), key(0xBB), bad_rate)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.late_fee(), terms());
+        let bad_cap = Some(LateFeeTerms {
+            bps_per_day: 100,
+            cap_bps: 10_001,
+        });
+        let err = r
+            .amend_late_fee(key(0xAA), key(0xBB), bad_cap)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.late_fee(), terms());
+        // The boundary itself is legal: exactly 10_000 bps passes.
+        r.amend_late_fee(
+            key(0xAA),
+            key(0xBB),
+            Some(LateFeeTerms {
+                bps_per_day: 10_000,
+                cap_bps: 10_000,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            r.late_fee(),
+            Some(LateFeeTerms {
+                bps_per_day: 10_000,
+                cap_bps: 10_000,
+            })
+        );
+    }
+
+    #[test]
+    fn amend_late_fee_identical_terms_is_a_noop() {
+        // AV-291: re-affirming the current schedule writes nothing.
+        let mut r = open_rental();
+        r.amend_late_fee(key(0xAA), key(0xBB), terms()).unwrap();
+        assert_eq!(r.late_fee(), terms());
+        assert_eq!(r.state(), RentalState::Active);
+        assert_eq!(r.late_fee_due(300), 10_000);
+        // Clearing an already-cleared schedule is likewise a no-op.
+        let mut r2 =
+            RentalEscrow::new(key(0xAA), key(0xBB), key(0xCC), 1_000_000, 100, 200, 100, None)
+                .unwrap();
+        r2.amend_late_fee(key(0xAA), key(0xBB), None).unwrap();
+        assert_eq!(r2.late_fee(), None);
     }
 
     #[test]
