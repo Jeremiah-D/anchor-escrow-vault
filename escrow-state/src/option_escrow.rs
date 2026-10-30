@@ -98,12 +98,13 @@ pub struct OptionExpiry {
 /// A fixed-strike call option over a locked underlying amount.
 ///
 /// Fixed-size and `Copy`, like the other pure-logic sidecars: the
-/// option's terms are set once at construction — with one
-/// governed exception, the strike, which the two parties may
-/// revise together while the option is `Active`
-/// ([`OptionEscrow::amend_option_strike`], AV-294). An expiry
-/// that could move after the premium was paid would let one
-/// side rewrite the deal's window, so the expiry never moves.
+/// option's terms are set once at construction — with two
+/// governed exceptions, the strike and the expiry, which the two
+/// parties may revise together while the option is `Active`
+/// ([`OptionEscrow::amend_option_strike`], AV-294;
+/// [`OptionEscrow::amend_option_expiry`], AV-299). A unilateral
+/// move of either would let one side rewrite the deal alone, so
+/// both revisions need seller + buyer together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OptionEscrow {
     seller: [u8; 32],
@@ -184,7 +185,9 @@ impl OptionEscrow {
     }
 
     /// The expiry timestamp: exercise needs `now < expiry`,
-    /// expiry settles at `now >= expiry`.
+    /// expiry settles at `now >= expiry` — fixed at construction,
+    /// revisable only by the dual-signed
+    /// [`OptionEscrow::amend_option_expiry`] while `Active`.
     pub fn expiry(&self) -> u64 {
         self.expiry
     }
@@ -333,6 +336,95 @@ impl OptionEscrow {
             return Ok(());
         }
         self.strike = new_strike;
+        Ok(())
+    }
+
+    /// Revise the expiry on an `Active` option (AV-299 — Solana
+    /// option governance): both parties authorize the change
+    /// (the expiry is a bilateral time term — a unilateral
+    /// rewrite would let one side re-time the other's exercise
+    /// window alone). Check order is authority → state → value,
+    /// mirroring [`OptionEscrow::amend_option_strike`] and
+    /// [`OptionEscrow::exercise`], so a stranger learns nothing
+    /// about the option's state from the error alone.
+    ///
+    /// Why: the expiry is fixed at construction
+    /// ([`OptionEscrow::new`]), but the parties may agree the
+    /// bargained window no longer fits the deal — an expiry
+    /// that cannot move would force a fresh option (and a fresh
+    /// premium) for a legitimate rescheduling. Only an `Active`
+    /// option may revise: an exercised option has already
+    /// settled ([`EscrowError::OptionAlreadySettled`]), and an
+    /// expired option's window has lapsed
+    /// ([`EscrowError::OptionExpired`] — the lapsed-window
+    /// error `exercise` returns once the window closes, since
+    /// expiry settlement is then the only remaining path).
+    /// The revision is judged by state, not by the clock, like
+    /// `amend_option_strike`: an `Active` option whose expiry
+    /// instant has passed but which has not yet been expired
+    /// may still revise — and that is the point of the dual
+    /// signature, a strike revision never revives the exercise
+    /// window but an expiry revision agreed by both parties
+    /// and extended to a future point reopens it (shortening
+    /// to a point still above `now` likewise moves the
+    /// window, never below it). The new expiry reuses the
+    /// `new` gate (it must be positive — 0 is "no expiry",
+    /// a perpetual, a different instrument — and strictly
+    /// later than `now`, [`EscrowError::InvalidOptionTerms`]
+    /// otherwise, and the current expiry is untouched either
+    /// way): a revision only moves the window, it never
+    /// forces expiry through the back door — forcing expiry
+    /// is [`OptionEscrow::expire`]'s job. Only `expiry`
+    /// changes — seller, buyer, underlying, premium, strike
+    /// and state are untouched — and re-affirming the current
+    /// expiry is a no-op, provided the current expiry is
+    /// still in the future (re-affirming an already-lapsed
+    /// expiry fails the `> now` gate). [`OptionEscrow::exercise`]
+    /// and [`OptionEscrow::expire`] read the live expiry, so
+    /// the new expiry governs the next exercise or expiry
+    /// (a settlement already made keeps the expiry it
+    /// settled under). There is no event layer on
+    /// `OptionEscrow`, so no event is emitted for the revision.
+    /// Orthogonal to [`OptionEscrow::new`] (that installs the
+    /// expiry at build time, this revises it while `Active`),
+    /// to `amend_option_strike` (that reprices, this
+    /// reschedules), and to `exercise` / `expire` (those
+    /// settle at the expiry, this moves it).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller pair that is not exactly seller + buyer,
+    /// ([`EscrowError::OptionAlreadySettled`], code 343) once
+    /// the option has been exercised,
+    /// ([`EscrowError::OptionExpired`], code 341) once the
+    /// option has expired, and
+    /// ([`EscrowError::InvalidOptionTerms`], code 339) for a
+    /// zero new expiry or one at or before `now` — either way
+    /// the current expiry is untouched.
+    pub fn amend_option_expiry(
+        &mut self,
+        seller: [u8; 32],
+        buyer: [u8; 32],
+        new_expiry: u64,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        if seller != self.seller || buyer != self.buyer {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            OptionState::Active => {}
+            OptionState::Exercised => return Err(EscrowError::OptionAlreadySettled),
+            OptionState::Expired => return Err(EscrowError::OptionExpired),
+        }
+        if new_expiry == 0 {
+            return Err(EscrowError::InvalidOptionTerms);
+        }
+        if new_expiry <= now {
+            return Err(EscrowError::InvalidOptionTerms);
+        }
+        if new_expiry == self.expiry {
+            return Ok(());
+        }
+        self.expiry = new_expiry;
         Ok(())
     }
 }
@@ -560,5 +652,154 @@ mod tests {
         assert_eq!(err, EscrowError::OptionExpired);
         assert_eq!(err.code(), 341);
         assert_eq!(expired.strike(), STRIKE);
+    }
+
+    #[test]
+    fn amend_option_expiry_moves_the_live_expiry() {
+        // AV-299: the revised expiry governs the next exercise
+        // and expiry, and nothing else moves.
+        let mut o = option();
+        o.amend_option_expiry(SELLER, BUYER, EXPIRY + 1_000, EXPIRY - 1)
+            .unwrap();
+        assert_eq!(o.expiry(), EXPIRY + 1_000);
+        assert_eq!(o.seller(), SELLER);
+        assert_eq!(o.buyer(), BUYER);
+        assert_eq!(o.underlying(), UNDERLYING);
+        assert_eq!(o.premium(), PREMIUM);
+        assert_eq!(o.strike(), STRIKE);
+        assert_eq!(o.state(), OptionState::Active);
+        // The old expiry no longer closes the window: at the old
+        // instant the option is neither expirable nor closed.
+        assert_eq!(o.expire(EXPIRY), Err(EscrowError::OptionNotExpired));
+        let legs = o.exercise(BUYER, EXPIRY, STRIKE).unwrap();
+        assert_eq!(legs.underlying_to_buyer, UNDERLYING);
+        assert_eq!(legs.strike_to_seller, STRIKE);
+        assert_eq!(legs.premium_to_seller, PREMIUM);
+    }
+
+    #[test]
+    fn amend_option_expiry_can_extend_a_lapsed_window_and_shorten() {
+        // AV-299: unlike a strike revision, a dual-signed expiry
+        // revision to a future point reopens a lapsed window —
+        // that is the point of the dual signature — and shortening
+        // to a point still above `now` moves the window too.
+        let mut o = option();
+        // Lapsed (now past expiry) but not yet expired: exercise
+        // is closed, expiry is open — yet the parties may extend.
+        assert_eq!(
+            o.exercise(BUYER, EXPIRY, STRIKE),
+            Err(EscrowError::OptionExpired)
+        );
+        o.amend_option_expiry(SELLER, BUYER, EXPIRY + 1_000, EXPIRY)
+            .unwrap();
+        assert_eq!(o.expiry(), EXPIRY + 1_000);
+        // The window is open again at the old expiry instant.
+        assert!(o.exercise_window_open(EXPIRY));
+        let legs = o.exercise(BUYER, EXPIRY, STRIKE).unwrap();
+        assert_eq!(legs.underlying_to_buyer, UNDERLYING);
+
+        // Shortening: the new expiry still sits above `now`, so
+        // the option lives until then and expires at it.
+        let mut o2 = option();
+        o2.amend_option_expiry(SELLER, BUYER, EXPIRY - 1_000, EXPIRY - 2_000)
+            .unwrap();
+        assert_eq!(o2.expiry(), EXPIRY - 1_000);
+        assert_eq!(
+            o2.exercise(BUYER, EXPIRY - 1_000, STRIKE),
+            Err(EscrowError::OptionExpired)
+        );
+        let legs = o2.expire(EXPIRY - 1_000).unwrap();
+        assert_eq!(legs.underlying_to_seller, UNDERLYING);
+        assert_eq!(legs.premium_to_seller, PREMIUM);
+    }
+
+    #[test]
+    fn amend_option_expiry_rejects_zero_past_and_reaffirmation_is_noop() {
+        // AV-299: a zero expiry reuses the `new` gate (0 is "no
+        // expiry", a perpetual); an expiry at or before `now`
+        // would force expiry through the back door, so it fails
+        // closed too — either way the current expiry is untouched.
+        // Re-affirming the current expiry (still in the future)
+        // succeeds and changes nothing.
+        let mut o = option();
+        let err = o
+            .amend_option_expiry(SELLER, BUYER, 0, EXPIRY - 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidOptionTerms);
+        assert_eq!(err.code(), 339);
+        assert_eq!(o.expiry(), EXPIRY);
+        for bad in [EXPIRY - 1, EXPIRY - 2] {
+            let err = o
+                .amend_option_expiry(SELLER, BUYER, bad, EXPIRY - 1)
+                .unwrap_err();
+            assert_eq!(err, EscrowError::InvalidOptionTerms);
+            assert_eq!(o.expiry(), EXPIRY);
+        }
+        // At the expiry instant itself the new expiry must still
+        // be in the future — `now` itself is not a valid expiry.
+        let err = o
+            .amend_option_expiry(SELLER, BUYER, EXPIRY, EXPIRY)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidOptionTerms);
+        assert_eq!(o.expiry(), EXPIRY);
+        // Re-affirming an already-lapsed expiry fails the same
+        // gate: the requested expiry is not in the future.
+        let err = o
+            .amend_option_expiry(SELLER, BUYER, EXPIRY, EXPIRY + 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidOptionTerms);
+        assert_eq!(o.expiry(), EXPIRY);
+        // Re-affirming the current (future) expiry is a no-op.
+        o.amend_option_expiry(SELLER, BUYER, EXPIRY, EXPIRY - 1)
+            .unwrap();
+        assert_eq!(o.expiry(), EXPIRY);
+        // Still exercisable at the affirmed expiry.
+        o.exercise(BUYER, EXPIRY - 1, STRIKE).unwrap();
+    }
+
+    #[test]
+    fn amend_option_expiry_is_dual_signed_and_active_only() {
+        // AV-299: a stranger, either party alone, or the parties
+        // swapped is refused, and the expiry is untouched.
+        let mut o = option();
+        let err = o
+            .amend_option_expiry(STRANGER, BUYER, EXPIRY + 1_000, EXPIRY - 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = o
+            .amend_option_expiry(SELLER, STRANGER, EXPIRY + 1_000, EXPIRY - 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        let err = o
+            .amend_option_expiry(BUYER, SELLER, EXPIRY + 1_000, EXPIRY - 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(o.expiry(), EXPIRY);
+        // Authority is checked before state: a stranger on a
+        // settled option still gets Unauthorized.
+        let mut exercised = option();
+        exercised.exercise(BUYER, EXPIRY - 1, STRIKE).unwrap();
+        let err = exercised
+            .amend_option_expiry(STRANGER, BUYER, EXPIRY + 1_000, EXPIRY - 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(exercised.expiry(), EXPIRY);
+        // The parties on an exercised option get AlreadySettled.
+        let err = exercised
+            .amend_option_expiry(SELLER, BUYER, EXPIRY + 1_000, EXPIRY - 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::OptionAlreadySettled);
+        assert_eq!(err.code(), 343);
+        assert_eq!(exercised.expiry(), EXPIRY);
+        // The parties on an expired option get OptionExpired.
+        let mut expired = option();
+        expired.expire(EXPIRY).unwrap();
+        let err = expired
+            .amend_option_expiry(SELLER, BUYER, EXPIRY + 1_000, EXPIRY - 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::OptionExpired);
+        assert_eq!(err.code(), 341);
+        assert_eq!(expired.expiry(), EXPIRY);
     }
 }

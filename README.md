@@ -3285,6 +3285,28 @@ error they get.
   already settled keeps the strike it settled under. No
   event is emitted — `OptionEscrow` has no event layer.
   (Solana: option governance.)
+- **Revising the expiry (AV-299)**: `amend_option_expiry`
+  revises the expiry on an `Active` option, authorized by
+  seller + buyer together — the expiry is a bilateral time
+  term, so a unilateral rewrite would let one side re-time
+  the other's exercise window alone. The new expiry reuses
+  the construction gate (it must be positive — 0 is "no
+  expiry", a perpetual, a different instrument — and strictly
+  later than `now`, `InvalidOptionTerms`, code 339, either
+  way, and the current expiry is untouched); an exercised
+  option is `OptionAlreadySettled` (code 343) and an expired
+  option is `OptionExpired` (code 341). Re-affirming the
+  current expiry is a no-op, provided it is still in the
+  future. Only `expiry` changes, and `exercise` / `expire`
+  read the live expiry, so the new expiry governs the next
+  exercise or expiry — a settlement already made keeps the
+  expiry it settled under. Unlike a strike revision, a
+  dual-signed expiry revision to a future point reopens a
+  lapsed-but-not-yet-expired window — that is the point of
+  the dual signature; shortening to a point still above
+  `now` moves the window too, never below it. No event is
+  emitted — `OptionEscrow` has no event layer.
+  (Solana: option governance.)
 
 New error codes (never renumbered): `InvalidOptionTerms`
 (339), `OptionNotBuyer` (340), `OptionExpired` (341),
