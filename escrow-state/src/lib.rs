@@ -25019,6 +25019,139 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Revise the Dutch-auction window after funding (AV-288):
+    /// the post-funding counterpart to [`Escrow::with_dutch_auction`]
+    /// (`Uninitialized`-only initial configuration). The parties may
+    /// need to move the sale window — a launch slipped, or the
+    /// market moved — without cancelling and re-locking the escrow.
+    ///
+    /// Dual-signed governance: *both* parties must sign — one party
+    /// alone cannot move the window on the other's share,
+    /// paralleling [`Escrow::amend_dutch_auction_reserve_bps`]
+    /// (AV-277). Valid on `Funded` only (the builder owns the
+    /// initial set, and terminal states have no future claim left
+    /// to price). Check order is pause, then authority, then the
+    /// governance-delay routing gate, then state, then the
+    /// already-configured gate, then the window phase, then the new
+    /// window's validity — the AV-46 / AV-49 convention, with the
+    /// AV-158 gate in the AV-281 placement.
+    ///
+    /// Fail-closed: only an escrow already carrying an auction may
+    /// revise it — an auction-less escrow is refused with
+    /// [`EscrowError::InvalidAuctionParams`] (post-funding
+    /// installation would add a pricing curve the taker never
+    /// funded under, so an auction can never be installed after
+    /// funding). Only before the window opens may the window move:
+    /// both `now <` the current `start_at` *and* `now <` the new
+    /// `start_at` must hold, else [`EscrowError::AuctionNotActive`]
+    /// — a window that already opened (or closed) would re-price
+    /// claims already in flight, and a new window that already
+    /// opened would rewrite the [`Escrow::escalate`] mutual
+    /// exclusion mid-flight, so the whole window freezes once
+    /// either side opens. The new window reuses the
+    /// [`DutchAuction::new`] gate (`new_start_at >= new_end_at` is
+    /// [`EscrowError::InvalidAuctionParams`]), with the current
+    /// reserve floor carried along for re-validation, and a failed
+    /// revision leaves the original window untouched.
+    ///
+    /// Only `start_at` and `end_at` change — `reserve_bps` is
+    /// untouched, so the window and the floor stay orthogonal
+    /// (the floor moves via AV-277, the window here). The new
+    /// window governs from the next [`Escrow::claim`]: claim prices
+    /// through [`DutchAuction::payout_cap`], which reads the live
+    /// auction at every call (`is_live` and the linear decay both
+    /// follow the new window), so a claim after the amendment
+    /// prices against the new window while a claim already settled
+    /// keeps the cap it settled under — and the `escalate`
+    /// mutual exclusion follows the new window the same way.
+    /// Revising to the current window is a no-op: it succeeds and
+    /// writes nothing, so the event layer emits nothing for it
+    /// (paralleling `rotate_arbiter`). Orthogonal to
+    /// [`Escrow::with_dutch_auction`] (that is the initial
+    /// configuration, this item is the post-funding revision) and
+    /// to AV-277 (that is the floor, this item is the window).
+    /// Emits `DutchAuctionWindowAmended` on the event layer,
+    /// except for the no-op re-affirmation.
+    pub fn amend_dutch_auction_window(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_start_at: u64,
+        new_end_at: u64,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-158: the direct entry always takes `via_delayed = false`
+        // — on a delay-opted-in escrow the window moves only
+        // through the propose/execute protocol. Thin by design: one
+        // window implementation, zero gate drift (see
+        // `update_quorum_impl`).
+        self.amend_dutch_auction_window_impl(initializer, taker, new_start_at, new_end_at, now, false)
+    }
+
+    /// The window engine behind
+    /// [`Escrow::amend_dutch_auction_window`]. The `via_delayed`
+    /// parameter carries the AV-158 routing gate: the direct
+    /// entry always passes `false`, so on a delay-opted-in
+    /// escrow the window moves only through the two-step
+    /// propose/execute protocol and a direct call is refused —
+    /// mirroring `amend_jury_panel_size_impl` (AV-281), which
+    /// likewise stages no new proposal variant and simply
+    /// refuses the direct path on delay-opted escrows.
+    fn amend_dutch_auction_window_impl(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_start_at: u64,
+        new_end_at: u64,
+        now: u64,
+        via_delayed: bool,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_dutch_auction_reserve_bps`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        // AV-158: the governance-delay routing gate — on a
+        // delay-opted-in escrow the window moves only through the
+        // two-step propose/execute protocol, never a direct call
+        // (see `update_quorum_impl` for the placement rationale).
+        if !via_delayed && self.governance_delay_secs != 0 {
+            return Err(EscrowError::GovernanceActionNotProposed);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow already carrying an auction
+        // may revise it — amendment never installs an auction
+        // after funding.
+        let auction = self.auction.ok_or(EscrowError::InvalidAuctionParams)?;
+        // Pre-open only, on both windows: once the current window
+        // opens (or after it closes), the window is frozen for
+        // claims already priced — and a new window that already
+        // opened (or closed) would re-price in-flight claims and
+        // rewrite the escalate mutual exclusion, so it is refused
+        // with the same error rather than installed.
+        if now >= auction.start_at() || now >= new_start_at {
+            return Err(EscrowError::AuctionNotActive);
+        }
+        // Reuse the `DutchAuction::new` gate so the window rules
+        // stay in one place: the current reserve floor rides along
+        // unchanged, so only the `start_at >= end_at` check can
+        // fire here.
+        let revised =
+            DutchAuction::new(new_start_at, new_end_at, auction.reserve_bps())?;
+        // No-op: re-affirming the current window writes nothing, so
+        // the event layer emits nothing for it.
+        if revised == auction {
+            return Ok(());
+        }
+        self.auction = Some(revised);
+        Ok(())
+    }
+
     /// Opt in to a CPI target-program allowlist (AV-83 — Solana
     /// security): pin the third-party programs a
     /// [`Escrow::release_via_cpi`] invocation may target. After this,
@@ -49761,7 +49894,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -66792,7 +66926,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -67024,9 +67159,10 @@ mod event_history_tests {
         // `ArbiterPanelMembersUpdated` (AV-283), 147 is
         // `CounterOfferAmended` (AV-285), 148 is
         // `DefaultJudgmentAmended` (AV-286), 149 is
-        // `AutoUnpauseAtAmended` (AV-287) and 150 is the
+        // `AutoUnpauseAtAmended` (AV-287), 150 is
+        // `DutchAuctionWindowAmended` (AV-288) and 151 is the
         // first still-unknown byte.
-        for bad in [150u8, 255] {
+        for bad in [151u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -79801,6 +79937,233 @@ mod amend_dutch_auction_reserve_bps_tests {
         assert_eq!(ev.amounts.fee, 0);
         // Re-affirming the same floor is a no-op: no new event.
         e.amend_dutch_auction_reserve_bps(ALICE, BOB, 9_000, NOW, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+}
+
+mod amend_dutch_auction_window_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const AMOUNT: u64 = 1_000_000;
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const START: u64 = 1_700_000_100;
+    const END: u64 = 1_700_003_700;
+    const NEW_START: u64 = 1_700_010_000;
+    const NEW_END: u64 = 1_700_013_600;
+    const RESERVE_BPS: u16 = 2_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_dutch_auction(START, END, RESERVE_BPS)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn delay_configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_dutch_auction(START, END, RESERVE_BPS)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn amend_changes_only_window() {
+        // Only the window moves: the floor, the state, and the
+        // encoded length are untouched — the auction region is
+        // already resident, so the revision rewrites it in place
+        // with no layout change.
+        let mut e = configured();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.amend_dutch_auction_window(ALICE, BOB, NEW_START, NEW_END, NOW)
+            .unwrap();
+        let auction = e.auction().expect("auction still configured");
+        assert_eq!(auction.start_at(), NEW_START, "window revised");
+        assert_eq!(auction.end_at(), NEW_END, "window revised");
+        assert_eq!(auction.reserve_bps(), RESERVE_BPS, "floor untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "auction region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_governs_next_claim_pricing() {
+        // The old window's midpoint prices 750_000 before the
+        // amendment; after moving the window, that same instant
+        // is outside the live window (the old window no longer
+        // exists), while the new window's midpoint prices the
+        // same linear 750_000 — and the taker's actual claim
+        // follows the new window.
+        let mut e = configured();
+        assert_eq!(
+            e.auction().unwrap().payout_cap(AMOUNT, START + 900).unwrap(),
+            750_000
+        );
+        e.amend_dutch_auction_window(ALICE, BOB, NEW_START, NEW_END, NOW)
+            .unwrap();
+        assert_eq!(
+            e.auction().unwrap().payout_cap(AMOUNT, START + 900),
+            Err(EscrowError::AuctionNotActive)
+        );
+        assert_eq!(
+            e.auction().unwrap().payout_cap(AMOUNT, NEW_START + 900).unwrap(),
+            750_000
+        );
+        assert_eq!(
+            e.claim(BOB, START + 900, None, BOB),
+            Err(EscrowError::AuctionNotActive)
+        );
+        let (payout, fee) = e.claim(BOB, NEW_START + 900, None, BOB).unwrap();
+        assert_eq!(fee, 0);
+        assert_eq!(payout, 750_000, "claim prices at the new window");
+        assert_eq!(e.released_amount(), 750_000);
+    }
+
+    #[test]
+    fn amend_rejects_unconfigured_open_invalid_authority_state_paused_and_delayed() {
+        // Fail-closed: an escrow with no auction can never acquire
+        // one after funding — amendment is revision, not install.
+        let mut plain = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        plain.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            plain.amend_dutch_auction_window(ALICE, BOB, NEW_START, NEW_END, NOW),
+            Err(EscrowError::InvalidAuctionParams)
+        );
+        assert!(plain.auction().is_none());
+        // Pre-open only, on the current window: at the open, live,
+        // and after the close the window is frozen for claims
+        // already priced.
+        let mut e = configured();
+        assert_eq!(
+            e.amend_dutch_auction_window(ALICE, BOB, NEW_START, NEW_END, START),
+            Err(EscrowError::AuctionNotActive)
+        );
+        assert_eq!(
+            e.amend_dutch_auction_window(ALICE, BOB, NEW_START, NEW_END, START + 900),
+            Err(EscrowError::AuctionNotActive)
+        );
+        assert_eq!(
+            e.amend_dutch_auction_window(ALICE, BOB, NEW_START, NEW_END, END + 1),
+            Err(EscrowError::AuctionNotActive)
+        );
+        assert_eq!(e.auction().unwrap().start_at(), START);
+        // Pre-open only, on the new window too: a new window that
+        // already opened (or closed) is refused, not installed.
+        assert_eq!(
+            e.amend_dutch_auction_window(ALICE, BOB, NOW - 100, NOW + 3_600, NOW),
+            Err(EscrowError::AuctionNotActive)
+        );
+        assert_eq!(
+            e.amend_dutch_auction_window(ALICE, BOB, NOW - 3_600, NOW - 100, NOW),
+            Err(EscrowError::AuctionNotActive)
+        );
+        assert_eq!(e.auction().unwrap().start_at(), START);
+        // The `DutchAuction::new` gate, unchanged: a zero-length
+        // (or inverted) new window is refused, original untouched.
+        assert_eq!(
+            e.amend_dutch_auction_window(ALICE, BOB, NEW_START, NEW_START, NOW),
+            Err(EscrowError::InvalidAuctionParams)
+        );
+        assert_eq!(
+            e.amend_dutch_auction_window(ALICE, BOB, NEW_END, NEW_START, NOW),
+            Err(EscrowError::InvalidAuctionParams)
+        );
+        assert_eq!(e.auction().unwrap().start_at(), START);
+        assert_eq!(e.auction().unwrap().end_at(), END);
+        // Dual signature: one party alone cannot move the window,
+        // and a stranger learns nothing.
+        assert_eq!(
+            e.amend_dutch_auction_window(ALICE, ALICE, NEW_START, NEW_END, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_dutch_auction_window(MALLORY, BOB, NEW_START, NEW_END, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.auction().unwrap().start_at(), START);
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_dutch_auction(START, END, RESERVE_BPS)
+            .unwrap();
+        assert_eq!(
+            bare.amend_dutch_auction_window(ALICE, BOB, NEW_START, NEW_END, NOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's revision on a paused escrow is `Paused`.
+        let mut paused = configured();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_dutch_auction_window(MALLORY, BOB, NEW_START, NEW_END, NOW),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.auction().unwrap().start_at(), START);
+        // The governance-delay routing gate: on a delay-opted-in
+        // escrow the direct call is refused, whatever the window.
+        let mut delayed = delay_configured();
+        assert_eq!(
+            delayed.amend_dutch_auction_window(ALICE, BOB, NEW_START, NEW_END, NOW),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(delayed.auction().unwrap().start_at(), START);
+    }
+
+    #[test]
+    fn amend_same_window_is_a_noop() {
+        // Re-affirming the current window succeeds but changes nothing
+        // observable; the event layer (tested below) emits nothing.
+        let mut e = configured();
+        e.amend_dutch_auction_window(ALICE, BOB, START, END, NOW)
+            .unwrap();
+        assert_eq!(e.auction().unwrap().start_at(), START);
+        assert_eq!(e.auction().unwrap().end_at(), END);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_indexed_emits_event_noop_and_failed_emit_nothing() {
+        let mut e = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_dutch_auction_window(MALLORY, BOB, NEW_START, NEW_END, NOW, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_dutch_auction_window(ALICE, BOB, NEW_START, NEW_END, NOW, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::DutchAuctionWindowAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same window is a no-op: no new event.
+        e.amend_dutch_auction_window(ALICE, BOB, NEW_START, NEW_END, NOW, NOW)
             .unwrap();
         assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
     }

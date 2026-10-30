@@ -612,6 +612,16 @@
 //!   exactly once at the new time and a cleared schedule never
 //!   fires. A failed revision emits nothing, and a no-op
 //!   re-affirmation of the current moment emits nothing either.
+//! - `amend_dutch_auction_window` emits
+//!   [`EscrowEventKind::DutchAuctionWindowAmended`] on every
+//!   successful revision that actually moves the window (AV-288)
+//!   — `from == to ==` the current state, all amounts zero;
+//!   only the window moves, so the reserve floor is untouched,
+//!   and claim prices through the live window at the next call,
+//!   so a claim after the amendment prices against the new window
+//!   while a claim already settled keeps the cap it settled under.
+//!   A failed revision emits nothing, and a no-op re-affirmation
+//!   of the current window emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -854,6 +864,7 @@
 //! | CounterOfferAmended (AV-285) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a settlement already made; only the offered amount and expiry change, so the escrow's amount, expiry, and state are untouched, and the initializer still answers via accept or reject — the accept path reads the live offer, so an acceptance after the amendment re-prices under the new terms while an acceptance already settled keeps the terms it settled under |
 //! | DefaultJudgmentAmended (AV-286) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a settlement already made; only the fallback terms change, so the escrow's amount and state are untouched, and the taker's confirmation resets — the trigger reads the live terms plus the live confirmation, so a dispute escalated after the amendment settles on the new split only once re-confirmed, while an in-flight dispute keeps its original fallback |
 //! | AutoUnpauseAtAmended (AV-287) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a recovery already fired; only the schedule changes, so the pause flag and the pause authority are untouched — the next clock-bearing transition reads the live schedule, so a revised moment fires exactly once at the new time and a cleared schedule never fires, while an already-fired recovery is never rewritten |
+//! | DutchAuctionWindowAmended (AV-288) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a claim already priced; only the window moves, so the reserve floor is untouched, and claim prices through the live window at the next call — `is_live` and the linear decay both read the new window — so a claim after the amendment prices against the new window while a claim already settled keeps the cap it settled under, and the `escalate` mutual exclusion follows the new window too |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2555,6 +2566,23 @@ pub enum EscrowEventKind {
     /// the vault, so the event needs no extra field. A no-op
     /// re-affirmation of the current moment emits nothing.
     AutoUnpauseAtAmended,
+    /// AV-288: the Dutch-auction window was amended by governed
+    /// post-funding amendment
+    /// ([`Escrow::amend_dutch_auction_window`](crate::Escrow::amend_dutch_auction_window)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::DutchAuctionReserveBpsAmended`]); all amounts are
+    /// zero — amending moves no funds and never restates a claim
+    /// already priced; only the window moves, so the reserve floor
+    /// is untouched — claim prices through the live window at the
+    /// next call (`is_live` and the linear decay both follow the
+    /// new window), so a claim after the amendment prices against
+    /// the new window while a claim already settled keeps the cap
+    /// it settled under, and the `escalate` mutual exclusion
+    /// follows the new window the same way. The new window is read
+    /// from the vault, so the event needs no extra field. A no-op
+    /// re-affirmation of the current window emits nothing.
+    DutchAuctionWindowAmended,
 }
 
 impl EscrowEventKind {
@@ -3022,6 +3050,10 @@ impl EscrowEventKind {
             // discriminants 0–148 stay stable for already-serialized
             // histories.
             149 => Self::AutoUnpauseAtAmended,
+            // AV-288: appended after AutoUnpauseAtAmended so
+            // discriminants 0–149 stay stable for already-serialized
+            // histories.
+            150 => Self::DutchAuctionWindowAmended,
             _ => return None,
         })
     }
@@ -3247,6 +3279,7 @@ impl EscrowEventKind {
             Self::CounterOfferAmended => "counter_offer_amended",
             Self::DefaultJudgmentAmended => "default_judgment_amended",
             Self::AutoUnpauseAtAmended => "auto_unpause_at_amended",
+            Self::DutchAuctionWindowAmended => "dutch_auction_window_amended",
         }
     }
 
@@ -3476,6 +3509,7 @@ impl EscrowEventKind {
             "counter_offer_amended" => Self::CounterOfferAmended,
             "default_judgment_amended" => Self::DefaultJudgmentAmended,
             "auto_unpause_at_amended" => Self::AutoUnpauseAtAmended,
+            "dutch_auction_window_amended" => Self::DutchAuctionWindowAmended,
             _ => return None,
         })
     }
@@ -7136,6 +7170,46 @@ impl IndexedEscrow {
             None,
             None,
         );
+        }
+        Ok(())
+    }
+
+    /// Revise a Dutch auction's window after funding (mirrors
+    /// [`Escrow::amend_dutch_auction_window`]). Emits
+    /// `DutchAuctionWindowAmended` only when the window actually
+    /// changes; `from == to ==` the current state. `now` is the
+    /// amendment time (pre-open on both windows); `at` is the
+    /// caller-supplied event timestamp.
+    pub fn amend_dutch_auction_window(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_start_at: u64,
+        new_end_at: u64,
+        now: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.auction().map(|a| (a.start_at(), a.end_at()));
+        self.inner
+            .amend_dutch_auction_window(initializer, taker, new_start_at, new_end_at, now)?;
+        let after = self.inner.auction().map(|a| (a.start_at(), a.end_at()));
+        // The inner call rejects bad input, strangers, and wrong states,
+        // so a changed window here always means real governance — and a
+        // same-window no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::DutchAuctionWindowAmended,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
         }
         Ok(())
     }
@@ -14756,7 +14830,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -14894,7 +14969,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -15466,7 +15542,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -15516,7 +15593,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -15563,7 +15641,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -15610,7 +15689,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -15657,7 +15737,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -15707,7 +15788,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -15757,7 +15839,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -15804,7 +15887,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -15851,7 +15935,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -15898,7 +15983,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -15945,7 +16031,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -15992,7 +16079,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -16039,7 +16127,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -16090,7 +16179,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -16140,7 +16230,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -16190,7 +16281,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -16240,7 +16332,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -16290,7 +16383,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -16341,7 +16435,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -16392,7 +16487,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -16443,7 +16539,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -16493,7 +16590,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]
@@ -16560,7 +16658,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
         assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
-        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), Some(EscrowEventKind::DutchAuctionWindowAmended)); // AV-288: 150 is DutchAuctionWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(151), None); // AV-288: 150 is DutchAuctionWindowAmended
     }
 
     #[test]

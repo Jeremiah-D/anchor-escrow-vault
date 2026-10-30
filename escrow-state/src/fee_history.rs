@@ -427,6 +427,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // so the window is untouched, while the next claim prices
         // through the live floor.
         | EscrowEventKind::DutchAuctionReserveBpsAmended
+        // AV-288: a revised auction window moves no funds and never
+        // restates a claim already priced — only the window moves,
+        // so the floor is untouched, while the next claim prices
+        // through the live window.
+        | EscrowEventKind::DutchAuctionWindowAmended
         // AV-278: an amended recovery threshold moves no funds and
         // never restates a settled request — only the threshold
         // changes, so the guardians, the count and the timelock
@@ -1349,6 +1354,11 @@ mod fee_history_tests {
         // so the window is untouched, while the next claim prices
         // through the live floor.
         | EscrowEventKind::DutchAuctionReserveBpsAmended
+                // AV-288: a revised auction window moves no funds and never
+                // restates a claim already priced — only the window moves,
+                // so the floor is untouched, while the next claim prices
+                // through the live window.
+        | EscrowEventKind::DutchAuctionWindowAmended
                 // AV-278: an amended recovery threshold moves no funds and
                 // never restates a settled request — only the threshold
                 // changes, so the guardians, the count and the timelock
