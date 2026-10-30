@@ -11943,6 +11943,82 @@ impl Escrow {
         Ok(())
     }
 
+    /// Rotate the live operator grant's delegate key (AV-301). Either
+    /// party may swap the operator identity in place — a compromised
+    /// hot wallet is cut off by one rotation, with no re-grant and no
+    /// new grant to configure. Only the delegate moves: the scopes,
+    /// the spend cap, the settled `spent` counter and the expiry
+    /// window are untouched. The rotation is an identity change, not
+    /// a re-authorization — reusing the
+    /// [`Escrow::delegate_authority`] re-grant path would reset
+    /// `spent` to `0` ("Overwriting with a new grant resets spent to
+    /// 0"), laundering the settled volume out of the cap, so this
+    /// method rewrites the delegate field in place and `spent` is
+    /// never cleared: the cap always binds the grant's cumulative
+    /// volume, never one operator's personal volume. The operator
+    /// paths ([`Escrow::fund`], [`Escrow::release`] and
+    /// [`Escrow::cancel`] / [`Escrow::cancel_expired`]) consult the
+    /// live delegate through [`Escrow::require_scoped_authority`] on
+    /// every call, so the new operator is effective from the next
+    /// operator call and the old operator loses power at once, with
+    /// no settled call ever re-judged. Check order mirrors
+    /// [`Escrow::amend_delegation_scopes`]: pause → authority →
+    /// state, then [`EscrowError::InvalidDelegation`] when there is
+    /// no grant to rotate or the new delegate is the zero key
+    /// (fail-closed — the original delegate stays). Rotating to the
+    /// current delegate is a no-op success (the capped re-grant
+    /// no-op precedent: the identical triple keeps the live `spent`).
+    ///
+    /// No new event: like `renew_delegation` and the cap and scope
+    /// revisions, the rotation emits nothing — the
+    /// [`IndexedEscrow`](crate::IndexedEscrow) wrapper needs no new
+    /// emission — and no layout change: the delegate already lives in
+    /// the AV-104 delegation region, so no field offset moves.
+    /// Orthogonal to `renew_delegation` (that is the expiry window,
+    /// this item is the operator identity), to
+    /// `amend_delegation_spend_cap` (that is the volume bound, this
+    /// item is the identity), to `amend_delegation_scopes` (that is
+    /// the scope bitmap, this item is the identity) and to AV-104
+    /// (that is the grant mechanism itself, this item is the identity
+    /// rotation).
+    pub fn rotate_delegation_delegate(
+        &mut self,
+        caller: [u8; 32],
+        new_delegate: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        if caller != self.initializer && caller != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let grant = match self.delegation {
+            Some(grant) => grant,
+            None => return Err(EscrowError::InvalidDelegation),
+        };
+        // Fail-closed on a grant to nowhere: the zero key must never
+        // land — the original delegate stays untouched.
+        if new_delegate == [0u8; 32] {
+            return Err(EscrowError::InvalidDelegation);
+        }
+        if grant.delegate() == new_delegate {
+            return Ok(());
+        }
+        // Identity change only: scopes, cap, spent and expiry ride
+        // along untouched — `spent` is never cleared, so the cap
+        // keeps binding the grant's cumulative volume.
+        self.delegation = Some(Delegation::new_full(
+            new_delegate,
+            grant.scopes(),
+            grant.spend_cap(),
+            grant.spent(),
+        ));
+        Ok(())
+    }
+
     /// Revoke the live operator grant (AV-104). Either party may revoke
     /// — the initializer can cut off a taker-appointed operator and
     /// vice versa, so a rogue operator has no protector. Check order

@@ -68,6 +68,18 @@
 //! and a widened scope grants it at once. Only the scopes move; the
 //! operator, the spend cap, `spent` and the expiry window are
 //! untouched.
+//!
+//! AV-301: the operator identity itself may be rotated in place
+//! ([`Escrow::rotate_delegation_delegate`](crate::Escrow::rotate_delegation_delegate)).
+//! Either party may swap the delegate key — a compromised hot wallet
+//! is cut off by one rotation — and the operator paths read the live
+//! delegate on every call, so the new operator is effective from the
+//! next operator call and the old operator loses power at once. Only
+//! the delegate moves; the scopes, the spend cap, `spent` and the
+//! expiry window are untouched. The rotation is an identity change,
+//! not a re-authorization: re-granting would reset `spent` to `0`,
+//! laundering the settled volume out of the cap, so the delegate
+//! field is rewritten in place and `spent` is never cleared.
 
 /// Scope bit: the operator may fund the escrow
 /// ([`Escrow::fund`](crate::Escrow::fund)).

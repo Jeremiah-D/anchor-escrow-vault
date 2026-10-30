@@ -151,6 +151,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `revoke_delegation(caller)` (AV-104)         | `Uninitialized`/`Funded` | — (no state change; clears the operator grant) | **either** party may revoke — the initializer can cut off a taker-appointed operator and vice versa; a stranger is `Unauthorized`; no live grant is `InvalidDelegation` (code 160); emits `DelegationRevoked` |
 | `amend_delegation_spend_cap(caller, new_cap)` (AV-295) | `Uninitialized`/`Funded` | — (no state change; rewrites `spend_cap` in place) | **either** party may revise (the same party power as granting and renewing — a stranger or the operator themselves is `Unauthorized`); a paused escrow fails fast (`Paused`); no live grant is `InvalidDelegation` (code 160); the new cap must be `0` (uncapped, the AV-208 storage meaning) or at least the live `spent` — a cap below the volume already settled is `InvalidDelegation` fail-closed, leaving the original cap untouched (no retroactive breach); revising to the current cap is a no-op (succeeds, writes nothing, emits no event, paralleling `rotate_arbiter`); only `spend_cap` changes — the operator, scopes, `spent` and expiry window are untouched, so the new bound governs from the next operator release (`record_operator_release` reads the live cap at every call, so a release after the amendment is judged against the new bound while a release already settled keeps the cap it settled under); orthogonal to `renew_delegation` (that is the expiry window, this item is the cap) and to AV-104 (that is the grant mechanism itself, this item is the cap revision); emits no event |
 | `amend_delegation_scopes(caller, new_scopes)` (AV-296) | `Uninitialized`/`Funded` | — (no state change; rewrites `scopes` in place) | **either** party may revise (the same party power as granting, renewing and revising the cap — a stranger or the operator themselves is `Unauthorized`); a paused escrow fails fast (`Paused`); no live grant is `InvalidDelegation` (code 160); the new bitmap must pass `validate_delegation_scopes` (non-empty, within `DELEGATION_SCOPE_MASK` — an empty bitmap or unknown bits are `InvalidDelegation` fail-closed, leaving the original bitmap untouched); revising to the current bitmap is a no-op (succeeds, writes nothing, emits no event, paralleling `rotate_arbiter`); only `scopes` changes — the operator, spend cap, `spent` and expiry window are untouched, so the new bitmap governs from the next operator call (`require_scoped_authority` reads the live bitmap on every `fund` / `release` / `cancel` call, so narrowing revokes a power at once while widening grants it at once, and a call already settled is never re-judged); orthogonal to `amend_delegation_spend_cap` (that is the volume bound, this item is the scope bitmap) and to AV-104 (that is the grant mechanism itself, this item is the scope revision); emits no event |
+| `rotate_delegation_delegate(caller, new_delegate)` (AV-301) | `Uninitialized`/`Funded` | — (no state change; rewrites `delegate` in place) | **either** party may rotate (the same party power as granting, renewing and revising the cap and scopes — a stranger or the operator themselves is `Unauthorized`); a paused escrow fails fast (`Paused`); no live grant is `InvalidDelegation` (code 160); the new delegate must be a non-zero key (a zero key is `InvalidDelegation` fail-closed, leaving the original delegate untouched); rotating to the current delegate is a no-op (succeeds, writes nothing, emits no event, paralleling the capped re-grant no-op); only `delegate` changes — the scopes, spend cap, `spent` and expiry window are untouched, and `spent` is never cleared (the rotation is an identity change, not a re-authorization — reusing the `delegate_authority` re-grant path would reset `spent` to `0` and launder the settled volume out of the cap, so the cap keeps binding the grant's cumulative volume under the new operator); the new operator is effective from the next operator call and the old operator loses power at once (`require_scoped_authority` reads the live delegate on every `fund` / `release` / `cancel` call, and a call already settled is never re-judged); orthogonal to `renew_delegation` (that is the expiry window, this item is the operator identity), to `amend_delegation_spend_cap` (that is the volume bound, this item is the identity), to `amend_delegation_scopes` (that is the scope bitmap, this item is the identity) and to AV-104 (that is the grant mechanism itself, this item is the identity rotation); emits no event |
 | `link_swap(caller, escrow_id_a, escrow_id_b, amount_a, amount_b)` (AV-105) | `Uninitialized` (both legs) | — (no state change; writes each vault's counterparty id) | **one of the two parties** (an AV-104 operator is `Unauthorized`); mirrored parties required (`InvalidSwapParties` code 161 — zero/duplicate counterparty id is the same code); leg amounts must equal the locked amounts (`InvalidSwapAmounts` code 162); already-linked is `SwapLinkActive` (code 163); on-chain requires *both* parties as signers; emits `SwapLinked` on each vault |
 | `release_swap(caller, escrow_id_a, escrow_id_b, amount_a, amount_b)` (AV-105) | `Funded` (both legs, cross-link matched) | `Funded` (partial) / `Released` (cumulative full), per leg | **party-only** — an AV-104 operator is `Unauthorized`; each leg runs under *its own* initializer (on-chain requires both parties as signers); two-phase atomic — either leg failing returns the single-side error with both escrows untouched and zero events; emits `Released` A→B |
 | `cancel_swap(caller, escrow_id_a, escrow_id_b)` (AV-105) | `Funded` (both legs, cross-link matched) | `Cancelled` (both legs) | caller must be the initializer of at least one leg (party-only — a stranger or AV-104 operator is `Unauthorized`; on-chain requires both parties as signers); two-phase atomic like `release_swap`; emits `Cancelled` A→B |
@@ -8152,3 +8153,39 @@ the scope bitmap) and to AV-104 (that is the grant mechanism itself,
 this item is the scope revision). Boundary: the Anchor instruction
 accepting a scope revision on chain is follow-up work — no such
 instruction is claimed. (Solana: delegation governance.)
+
+## Delegation operator rotation (AV-301)
+
+A grant's operator is no longer frozen at grant time.
+`rotate_delegation_delegate(caller, new_delegate)` swaps the live
+grant's delegate key in place: either party may cut off a
+compromised hot wallet with one rotation — no re-grant, no new grant
+to configure — and the operator paths read the live delegate on
+every call, so the new operator is effective from the next operator
+call and the old operator loses power at once, while a call already
+settled is never re-judged. The fail-closed gate is the new key
+itself: a zero key is `InvalidDelegation` (code 160) and leaves the
+original delegate untouched, and no live grant is
+`InvalidDelegation`. Only the delegate moves — the scopes, the spend
+cap, `spent` and the expiry window are untouched, and `spent` is
+never cleared. That last point is the whole item: a rotation is an
+identity change, not a re-authorization, and reusing the
+`delegate_authority` re-grant path would reset `spent` to `0`,
+laundering the settled volume out of the cap — so the delegate
+field is rewritten in place and the cap keeps binding the grant's
+cumulative volume, never one operator's personal volume. Rotating to
+the current delegate is a no-op success. Check order mirrors the
+scope revision (pause → party authority → `Uninitialized` /
+`Funded` state → config), a stranger or the operator themselves is
+`Unauthorized`, and no layout change: the delegate already lives in
+the AV-104 delegation region, so no field offset moves. No new
+event: like renewal and the cap and scope revisions, the rotation
+emits nothing — the `IndexedEscrow` wrapper needs no new emission.
+Orthogonal to `renew_delegation` (that is the expiry window, this
+item is the operator identity), to `amend_delegation_spend_cap`
+(that is the volume bound, this item is the identity), to
+`amend_delegation_scopes` (that is the scope bitmap, this item is
+the identity) and to AV-104 (that is the grant mechanism itself,
+this item is the identity rotation). Boundary: the Anchor
+instruction accepting a delegate rotation on chain is follow-up work
+— no such instruction is claimed. (Solana: delegation governance.)
