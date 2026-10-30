@@ -4623,6 +4623,13 @@ pub enum EscrowError {
     /// gate is left untouched. Never renumbered (see
     /// [`EscrowError::code`]).
     InvalidCollectionAllowlist,
+    /// AV-287: [`Escrow::amend_auto_unpause_at`] with a new
+    /// `Some(t)` at or before `now` — a schedule that is already
+    /// due on arrival would fire on the very next clock-bearing
+    /// transition, before anyone could read it. The live schedule
+    /// is left untouched. Never renumbered (see
+    /// [`EscrowError::code`]).
+    InvalidAutoUnpauseAt,
 }
 
 impl EscrowError {
@@ -5036,6 +5043,8 @@ impl EscrowError {
             EscrowError::InvalidKeeperBounty => 357,
             // AV-284: appended, never renumbered.
             EscrowError::InvalidCollectionAllowlist => 358,
+            // AV-287: appended, never renumbered.
+            EscrowError::InvalidAutoUnpauseAt => 359,
         }
     }
 
@@ -5431,6 +5440,8 @@ impl EscrowError {
             EscrowError::InvalidKeeperBounty,
             // AV-284: appended, never renumbered.
             EscrowError::InvalidCollectionAllowlist,
+            // AV-287: appended, never renumbered.
+            EscrowError::InvalidAutoUnpauseAt,
         ]
     }
 }
@@ -22347,6 +22358,124 @@ let fee = self.charge_protocol_fee(claimable)?;
         }
         self.paused = false;
         self.auto_unpause_at = None;
+        Ok(())
+    }
+
+    /// Revise the scheduled auto-recovery timestamp of a paused
+    /// escrow (AV-287 — Solana pause governance): only the bound
+    /// pause authority may call this, on an escrow that is paused
+    /// with a live schedule.
+    ///
+    /// Why: the recovery moment is fixed when the pause is engaged
+    /// ([`Escrow::pause`]), but the operational picture can move
+    /// while the pause is live — a fix that needs another day, or
+    /// a fix that lands early. Re-pausing is not an option (pausing
+    /// an already-paused escrow is `InvalidStateTransition`, and a
+    /// fresh pause would need an unpause first, dropping the
+    /// emergency freeze in between), so the schedule itself must be
+    /// revisable in place, without ever lifting the pause.
+    ///
+    /// Only `auto_unpause_at` moves: `paused` stays `true` and
+    /// `pause_authority` is untouched — the revision never lifts
+    /// the freeze, and it never hands the switch to a new key.
+    /// `Some(t)` arms a new recovery moment; an explicit `None`
+    /// clears the schedule, turning the pause manual — only
+    /// [`Escrow::unpause`] can release it from then on. The new
+    /// schedule governs from the next clock-bearing transition:
+    /// [`Escrow::try_auto_unpause`] reads the live schedule before
+    /// every clock-bearing transfer, so a revised moment fires
+    /// exactly once at the new time, and a cleared schedule never
+    /// fires.
+    ///
+    /// Check order is deliberate: authority first (mirroring
+    /// [`Escrow::pause`] / [`Escrow::unpause`] — an unbound
+    /// authority is `InvalidStateTransition`, a wrong key is
+    /// `Unauthorized`), then the pause state, then the schedule
+    /// state, then the new value — a failed revision leaves the
+    /// live schedule exactly as it was.
+    ///
+    /// The gates are fail-closed in both directions. A non-paused
+    /// escrow has nothing to revise (`InvalidStateTransition`), and
+    /// a manual pause — paused with no schedule — has no table to
+    /// revise (`InvalidStateTransition`): a schedule can only be
+    /// built by [`Escrow::pause`], never installed by revision. An
+    /// already-expired schedule (`now >= t`) is
+    /// `InvalidStateTransition`, not an auto-recovery: the matured
+    /// promise belongs to the next clock-bearing transition's
+    /// [`Escrow::try_auto_unpause`], and revising it would rewrite
+    /// a recovery that already came due — so the schedule is left
+    /// exactly as it was for that transition to consume. A new
+    /// `Some(t)` at or before `now` is
+    /// [`EscrowError::InvalidAutoUnpauseAt`] — a schedule that is
+    /// already due on arrival would fire on the very next
+    /// clock-bearing transition, before anyone could read it.
+    /// Re-affirming the current moment is a no-op that writes
+    /// nothing and emits nothing.
+    ///
+    /// The AV-158 governance-delay protocol does not apply: the
+    /// pause path is an emergency operation, and the delay gates
+    /// governance configuration changes only — `pause` /
+    /// `unpause` themselves are immediate, and so is this revision.
+    /// A delay-opted-in escrow revises its schedule directly.
+    ///
+    /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits
+    /// [`EscrowEventKind::AutoUnpauseAtAmended`](crate::EscrowEventKind::AutoUnpauseAtAmended).
+    ///
+    /// Orthogonal to [`Escrow::pause`] (which builds a pause plus a
+    /// schedule), to [`Escrow::unpause`] (which releases the pause
+    /// and consumes the schedule), and to AV-133
+    /// ([`Escrow::try_auto_unpause`], which fires a due schedule).
+    pub fn amend_auto_unpause_at(
+        &mut self,
+        authority: [u8; 32],
+        new_at: Option<u64>,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // Authority first, mirroring `pause` / `unpause`: without a
+        // bound authority the switch does not exist, and a wrong
+        // key learns nothing about the pause state.
+        let bound = match self.pause_authority {
+            Some(a) => a,
+            None => return Err(EscrowError::InvalidStateTransition),
+        };
+        if authority != bound {
+            return Err(EscrowError::Unauthorized);
+        }
+        // Pause-exclusive: only a live pause has a schedule to
+        // revise — and this revision never lifts the pause, so
+        // there is no `require_not_paused` gate here (unlike every
+        // other transition, which fails fast while paused).
+        if !self.paused {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        // Fail-closed: a manual pause carries no schedule, and a
+        // schedule can only be built by `pause` — never installed
+        // by revision.
+        let current = self
+            .auto_unpause_at
+            .ok_or(EscrowError::InvalidStateTransition)?;
+        // An expired schedule belongs to the next clock-bearing
+        // transition's `try_auto_unpause` — revising it would
+        // rewrite a recovery that already came due. The schedule
+        // is left exactly as it was for that transition to consume.
+        if now >= current {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        // A new moment must lie in the future — validated before
+        // any write, so a failed revision leaves the live schedule
+        // exactly as it was. `None` is always legal: it clears the
+        // schedule back to a manual pause.
+        if let Some(t) = new_at {
+            if t <= now {
+                return Err(EscrowError::InvalidAutoUnpauseAt);
+            }
+        }
+        // No-op: re-affirming the current moment writes nothing,
+        // so the event layer emits nothing for it.
+        if new_at == Some(current) {
+            return Ok(());
+        }
+        self.auto_unpause_at = new_at;
         Ok(())
     }
 
@@ -42074,6 +42203,12 @@ mod error_code_tests {
             358,
             "update_collection_allowlist with more than MAX_COLLECTION_ALLOWLIST distinct collections — the revision is refused and the original collection gate is untouched (AV-284)",
         ),
+        // AV-287: appended, never renumbered.
+        (
+            EscrowError::InvalidAutoUnpauseAt,
+            359,
+            "amend_auto_unpause_at with a new Some(t) at or before now — a schedule already due on arrival would fire on the next clock-bearing transition, so the revision is refused and the live schedule is untouched (AV-287)",
+        ),
     ];
 
     #[test]
@@ -49625,7 +49760,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -66655,7 +66791,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -66886,9 +67023,10 @@ mod event_history_tests {
         // `EventCapacityAmended` (AV-282), 146 is
         // `ArbiterPanelMembersUpdated` (AV-283), 147 is
         // `CounterOfferAmended` (AV-285), 148 is
-        // `DefaultJudgmentAmended` (AV-286) and 149 is the
+        // `DefaultJudgmentAmended` (AV-286), 149 is
+        // `AutoUnpauseAtAmended` (AV-287) and 150 is the
         // first still-unknown byte.
-        for bad in [149u8, 255] {
+        for bad in [150u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -70529,7 +70667,7 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
         assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
-        assert_eq!(EscrowError::all().len(), 250); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1; AV-284: +1
+        assert_eq!(EscrowError::all().len(), 251); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1; AV-284: +1; AV-287: +1 auto-unpause-at error
     }
 
     #[test]
@@ -81545,6 +81683,193 @@ mod amend_default_judgment_tests {
             e.default_judgment_confirmed(),
             "re-affirming identical terms resets nothing"
         );
+    }
+}
+
+mod amend_auto_unpause_at_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const FUND_AT: u64 = EXPIRES_AT - 3_600;
+    const NOW: u64 = 1_750_000_000;
+    const RECOVER_AT: u64 = 1_760_000_000;
+
+    /// Funded escrow paused with a live auto-recovery schedule.
+    fn paused() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e.pause(PAUSER, Some(RECOVER_AT)).unwrap();
+        assert!(e.is_paused(), "starts paused");
+        assert_eq!(e.auto_unpause_at(), Some(RECOVER_AT));
+        e
+    }
+
+    #[test]
+    fn amend_revises_only_schedule_and_new_moment_fires() {
+        let mut e = paused();
+        let new_at = 1_770_000_000;
+        e.amend_auto_unpause_at(PAUSER, Some(new_at), NOW).unwrap();
+        assert!(e.is_paused(), "pause never lifts on revision");
+        assert_eq!(e.pause_authority(), Some(PAUSER), "authority untouched");
+        assert_eq!(e.auto_unpause_at(), Some(new_at), "schedule replaced");
+        assert_eq!(e.state(), EscrowState::Funded, "state untouched");
+        // The old moment no longer fires; the new one does, exactly
+        // once, via the normal clock-bearing path.
+        assert!(!e.try_auto_unpause(RECOVER_AT), "old moment dead");
+        assert!(e.is_paused(), "still paused at the old moment");
+        assert!(e.try_auto_unpause(new_at), "new moment fires");
+        assert!(!e.is_paused(), "recovered at the new moment");
+        assert_eq!(e.auto_unpause_at(), None, "schedule consumed");
+    }
+
+    #[test]
+    fn amend_rejects_stranger() {
+        let mut e = paused();
+        assert_eq!(
+            e.amend_auto_unpause_at(MALLORY, Some(1_770_000_000), NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_auto_unpause_at(ALICE, Some(1_770_000_000), NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.auto_unpause_at(), Some(RECOVER_AT), "schedule untouched");
+        assert!(e.is_paused(), "still paused");
+    }
+
+    #[test]
+    fn amend_rejects_unbound_pause_authority() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(e.pause_authority(), None, "no authority bound");
+        assert_eq!(
+            e.amend_auto_unpause_at(PAUSER, Some(1_770_000_000), NOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_rejects_unpaused_escrow() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert!(!e.is_paused(), "never paused");
+        assert_eq!(
+            e.amend_auto_unpause_at(PAUSER, Some(1_770_000_000), NOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_rejects_manual_pause() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e.pause(PAUSER, None).unwrap();
+        assert!(e.is_paused(), "paused");
+        assert_eq!(e.auto_unpause_at(), None, "manual pause, no schedule");
+        assert_eq!(
+            e.amend_auto_unpause_at(PAUSER, Some(1_770_000_000), NOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.auto_unpause_at(),
+            None,
+            "no schedule installed by revision"
+        );
+        assert!(e.is_paused(), "still paused");
+    }
+
+    #[test]
+    fn amend_rejects_expired_schedule_without_consuming_it() {
+        let mut e = paused();
+        // At the scheduled moment the revision is refused — the
+        // matured promise belongs to the next clock-bearing
+        // transition, which still consumes it afterwards.
+        assert_eq!(
+            e.amend_auto_unpause_at(PAUSER, Some(1_770_000_000), RECOVER_AT),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.auto_unpause_at(),
+            Some(RECOVER_AT),
+            "expired schedule left for try_auto_unpause"
+        );
+        assert!(e.is_paused(), "still paused after refused revision");
+        assert!(
+            e.try_auto_unpause(RECOVER_AT),
+            "the matured schedule still fires afterwards"
+        );
+        assert!(!e.is_paused(), "recovered by the original schedule");
+    }
+
+    #[test]
+    fn amend_rejects_past_or_present_moment() {
+        let mut e = paused();
+        let err = e
+            .amend_auto_unpause_at(PAUSER, Some(NOW), NOW)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidAutoUnpauseAt);
+        assert_eq!(err.code(), 359);
+        let err = e
+            .amend_auto_unpause_at(PAUSER, Some(NOW - 1), NOW)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidAutoUnpauseAt);
+        assert_eq!(e.auto_unpause_at(), Some(RECOVER_AT), "schedule untouched");
+        assert!(e.is_paused(), "still paused");
+    }
+
+    #[test]
+    fn amend_clearing_schedule_turns_pause_manual() {
+        let mut e = paused();
+        e.amend_auto_unpause_at(PAUSER, None, NOW).unwrap();
+        assert!(e.is_paused(), "pause never lifts on clear");
+        assert_eq!(e.auto_unpause_at(), None, "schedule cleared");
+        assert_eq!(e.pause_authority(), Some(PAUSER), "authority untouched");
+        // A cleared schedule never fires, however far the clock runs.
+        assert!(!e.try_auto_unpause(1_900_000_000), "no schedule to fire");
+        assert!(e.is_paused(), "still paused without a schedule");
+        e.unpause(PAUSER).unwrap();
+        assert!(!e.is_paused(), "only unpause releases a manual pause");
+    }
+
+    #[test]
+    fn amend_noop_keeps_schedule() {
+        let mut e = paused();
+        e.amend_auto_unpause_at(PAUSER, Some(RECOVER_AT), NOW)
+            .unwrap();
+        assert_eq!(e.auto_unpause_at(), Some(RECOVER_AT));
+        assert!(e.is_paused(), "still paused");
+    }
+
+    #[test]
+    fn amend_ignores_governance_delay() {
+        // The pause path is an emergency operation: the AV-158 delay
+        // gates governance configuration changes only, so a
+        // delay-opted-in escrow revises its schedule directly.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e.pause(PAUSER, Some(RECOVER_AT)).unwrap();
+        e.amend_auto_unpause_at(PAUSER, Some(1_770_000_000), NOW)
+            .unwrap();
+        assert_eq!(e.auto_unpause_at(), Some(1_770_000_000));
+        assert!(e.is_paused(), "pause never lifts on revision");
     }
 }
 

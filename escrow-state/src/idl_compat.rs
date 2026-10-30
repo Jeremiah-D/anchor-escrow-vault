@@ -1498,7 +1498,7 @@ mod idl_compat_tests {
         // payment-channel errors; AV-200 adds 1 sealed-bid pricing
         // error; AV-201 adds 1 English-auction buyout error; AV-205
         // adds 1 per-call release cap error.
-        assert_eq!(spec.errors.len(), 250); // AV-209 adds 4 winner-payment errors; AV-212 adds 6 credential-gate errors; AV-214 adds 6 option-escrow errors; AV-215 adds 1 delegation-expiry error; AV-217 adds 3 settlement-rate errors; AV-218 adds 2 settlement-allowlist errors; AV-220 adds 1 partial-funding error; AV-266 adds 1 keeper-bounty error; AV-284 adds 1 collection-allowlist error.
+        assert_eq!(spec.errors.len(), 251); // AV-209 adds 4 winner-payment errors; AV-212 adds 6 credential-gate errors; AV-214 adds 6 option-escrow errors; AV-215 adds 1 delegation-expiry error; AV-217 adds 3 settlement-rate errors; AV-218 adds 2 settlement-allowlist errors; AV-220 adds 1 partial-funding error; AV-266 adds 1 keeper-bounty error; AV-284 adds 1 collection-allowlist error; AV-287 adds 1 auto-unpause-at error.
         // AV-178 adds the TieredQuorum + Tier named types; AV-195 adds
         // the SocialRecovery named type; AV-218 adds the
         // SettlementMintAllowlist named type.

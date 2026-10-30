@@ -601,6 +601,17 @@
 //!   original fallback. A failed revision emits nothing, and a
 //!   no-op re-affirmation of the identical terms emits nothing
 //!   either.
+//! - `amend_auto_unpause_at` emits
+//!   [`EscrowEventKind::AutoUnpauseAtAmended`] on every successful
+//!   revision that actually changes the recovery schedule (AV-287)
+//!   — `from == to ==` the current state (the pause stays engaged,
+//!   so this is a config change, not a lifecycle move), all amounts
+//!   zero; only the schedule changes, so the pause flag and the
+//!   pause authority are untouched — the next clock-bearing
+//!   transition reads the live schedule, so a revised moment fires
+//!   exactly once at the new time and a cleared schedule never
+//!   fires. A failed revision emits nothing, and a no-op
+//!   re-affirmation of the current moment emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -842,6 +853,7 @@
 //! | ArbiterPanelMembersUpdated (AV-283) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a vote already cast; only the roster changes, so the threshold, the blind mode and the reveal window are untouched, and the vote state is necessarily zero on a `Funded` escrow — the new roster governs from the next dispute, so a removed member is refused and a seated member votes, while no vote is ever re-attributed in flight (a reordering is a revision precisely because slot order is vote identity) |
 //! | CounterOfferAmended (AV-285) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a settlement already made; only the offered amount and expiry change, so the escrow's amount, expiry, and state are untouched, and the initializer still answers via accept or reject — the accept path reads the live offer, so an acceptance after the amendment re-prices under the new terms while an acceptance already settled keeps the terms it settled under |
 //! | DefaultJudgmentAmended (AV-286) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a settlement already made; only the fallback terms change, so the escrow's amount and state are untouched, and the taker's confirmation resets — the trigger reads the live terms plus the live confirmation, so a dispute escalated after the amendment settles on the new split only once re-confirmed, while an in-flight dispute keeps its original fallback |
+//! | AutoUnpauseAtAmended (AV-287) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a recovery already fired; only the schedule changes, so the pause flag and the pause authority are untouched — the next clock-bearing transition reads the live schedule, so a revised moment fires exactly once at the new time and a cleared schedule never fires, while an already-fired recovery is never rewritten |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2528,6 +2540,21 @@ pub enum EscrowEventKind {
     /// the event needs no extra field. A no-op re-affirmation of
     /// the identical terms emits nothing.
     DefaultJudgmentAmended,
+    /// AV-287: the scheduled auto-recovery timestamp of a paused
+    /// escrow was revised by pause-authority amendment
+    /// ([`Escrow::amend_auto_unpause_at`](crate::Escrow::amend_auto_unpause_at)).
+    /// `from == to ==` the current state (the pause stays engaged
+    /// — a config change, not a lifecycle move, like
+    /// [`EscrowEventKind::Paused`]); all amounts are zero —
+    /// amending moves no funds and never restates a recovery
+    /// already fired; only the schedule changes, so the pause flag
+    /// and the pause authority are untouched — the next
+    /// clock-bearing transition reads the live schedule, so a
+    /// revised moment fires exactly once at the new time and a
+    /// cleared schedule never fires. The new schedule is read from
+    /// the vault, so the event needs no extra field. A no-op
+    /// re-affirmation of the current moment emits nothing.
+    AutoUnpauseAtAmended,
 }
 
 impl EscrowEventKind {
@@ -2991,6 +3018,10 @@ impl EscrowEventKind {
             // discriminants 0–147 stay stable for already-serialized
             // histories.
             148 => Self::DefaultJudgmentAmended,
+            // AV-287: appended after DefaultJudgmentAmended so
+            // discriminants 0–148 stay stable for already-serialized
+            // histories.
+            149 => Self::AutoUnpauseAtAmended,
             _ => return None,
         })
     }
@@ -3215,6 +3246,7 @@ impl EscrowEventKind {
             Self::ArbiterPanelMembersUpdated => "arbiter_panel_members_updated",
             Self::CounterOfferAmended => "counter_offer_amended",
             Self::DefaultJudgmentAmended => "default_judgment_amended",
+            Self::AutoUnpauseAtAmended => "auto_unpause_at_amended",
         }
     }
 
@@ -3443,6 +3475,7 @@ impl EscrowEventKind {
             "arbiter_panel_members_updated" => Self::ArbiterPanelMembersUpdated,
             "counter_offer_amended" => Self::CounterOfferAmended,
             "default_judgment_amended" => Self::DefaultJudgmentAmended,
+            "auto_unpause_at_amended" => Self::AutoUnpauseAtAmended,
             _ => return None,
         })
     }
@@ -6627,6 +6660,51 @@ impl IndexedEscrow {
             None,
             Some(authority),
         );
+        Ok(())
+    }
+
+    /// Revise the scheduled auto-recovery timestamp (mirrors
+    /// [`Escrow::amend_auto_unpause_at`], AV-287).
+    ///
+    /// Emits `AutoUnpauseAtAmended` only when the schedule actually
+    /// changes (`from == to ==` the current state — the pause stays
+    /// engaged, so this is a config change, not a lifecycle move);
+    /// the new schedule is read from the vault. A failed revision
+    /// emits nothing, and a no-op re-affirmation of the current
+    /// moment emits nothing. The actor is the pause authority.
+    /// `at` doubles as the revision's `now` and the event
+    /// timestamp — the inner call deliberately does NOT fire a due
+    /// schedule (an expired schedule is refused, never consumed),
+    /// so no auto-unpause bookkeeping is needed here, unlike the
+    /// clock-bearing transitions.
+    pub fn amend_auto_unpause_at(
+        &mut self,
+        authority: [u8; 32],
+        new_at: Option<u64>,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.auto_unpause_at();
+        self.inner.amend_auto_unpause_at(authority, new_at, at)?;
+        let after = self.inner.auto_unpause_at();
+        // The inner call rejects bad input, strangers, wrong states,
+        // and schedule-less or expired pauses, so a changed schedule
+        // here always means a real revision — and a same-moment
+        // no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::AutoUnpauseAtAmended,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                Some(authority),
+            );
+        }
         Ok(())
     }
 
@@ -14677,7 +14755,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -14814,7 +14893,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15385,7 +15465,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15434,7 +15515,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15480,7 +15562,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15526,7 +15609,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15572,7 +15656,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15621,7 +15706,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15670,7 +15756,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15716,7 +15803,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15762,7 +15850,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15808,7 +15897,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15854,7 +15944,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15900,7 +15991,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15946,7 +16038,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -15996,7 +16089,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -16045,7 +16139,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -16094,7 +16189,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -16143,7 +16239,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -16192,7 +16289,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -16242,7 +16340,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -16292,7 +16391,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -16342,7 +16442,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -16391,7 +16492,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]
@@ -16457,7 +16559,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(146), Some(EscrowEventKind::ArbiterPanelMembersUpdated)); // AV-283: 146 is ArbiterPanelMembersUpdated
         assert_eq!(EscrowEventKind::from_discriminant(147), Some(EscrowEventKind::CounterOfferAmended)); // AV-285: 147 is CounterOfferAmended
         assert_eq!(EscrowEventKind::from_discriminant(148), Some(EscrowEventKind::DefaultJudgmentAmended)); // AV-286: 148 is DefaultJudgmentAmended
-        assert_eq!(EscrowEventKind::from_discriminant(149), None); // AV-286: 148 is DefaultJudgmentAmended
+        assert_eq!(EscrowEventKind::from_discriminant(149), Some(EscrowEventKind::AutoUnpauseAtAmended)); // AV-287: 149 is AutoUnpauseAtAmended
+        assert_eq!(EscrowEventKind::from_discriminant(150), None); // AV-287: 149 is AutoUnpauseAtAmended
     }
 
     #[test]

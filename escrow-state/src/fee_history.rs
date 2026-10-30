@@ -474,6 +474,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // are untouched, while the next trigger reads the live
         // terms plus the live confirmation.
         | EscrowEventKind::DefaultJudgmentAmended
+        // AV-287: a revised recovery schedule moves no funds and
+        // never restates a recovery already fired — only the
+        // schedule changes, so the pause flag and the pause
+        // authority are untouched, while the next clock-bearing
+        // transition reads the live schedule.
+        | EscrowEventKind::AutoUnpauseAtAmended
         // AV-158: delayed-governance lifecycle events move no funds.
         | EscrowEventKind::GovernanceProposed
         | EscrowEventKind::GovernanceExecuted
@@ -1390,6 +1396,12 @@ mod fee_history_tests {
                 // are untouched, while the next trigger reads the live
                 // terms plus the live confirmation.
                 | EscrowEventKind::DefaultJudgmentAmended
+                // AV-287: a revised recovery schedule moves no funds and
+                // never restates a recovery already fired — only the
+                // schedule changes, so the pause flag and the pause
+                // authority are untouched, while the next clock-bearing
+                // transition reads the live schedule.
+                | EscrowEventKind::AutoUnpauseAtAmended
                 // AV-158: delayed-governance lifecycle events move no funds.
                 | EscrowEventKind::GovernanceProposed
                 | EscrowEventKind::GovernanceExecuted

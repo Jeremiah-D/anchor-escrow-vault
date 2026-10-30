@@ -637,6 +637,6 @@ mod jury_sortition_tests {
         // AV-196 appends 6 jury-sortition errors after AV-195's
         // RecoveryTimelockNotElapsed (292); AV-197 appends 5
         // payment-channel errors after AV-196's JuryArbiterConflict (298).
-        assert_eq!(EscrowError::all().len(), 250); // AV-209: +4 winner-payment errors; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1; AV-284: +1
+        assert_eq!(EscrowError::all().len(), 251); // AV-209: +4 winner-payment errors; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1; AV-284: +1; AV-287: +1 auto-unpause-at error
     }
 }
