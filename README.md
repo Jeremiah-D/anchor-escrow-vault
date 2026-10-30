@@ -7888,6 +7888,37 @@ intervals are tracked and permanently excluded from accrual.
   (that is the per-second price, this item is the first-payout gate)
   and to `stream_cancel` / `pause` (those are lifecycle, this item is
   a parameter revision).
+- Duration renegotiation (AV-298): `amend_stream_duration_secs(initializer,
+  recipient, new_duration_secs, now)` moves the accrual window's end
+  (`end_ts = start_ts + duration_secs`) mid-flight, but only when
+  *both* parties sign — either party absent, or a stranger in either
+  slot, is `StreamUnauthorized` (code 305). The amount already earned
+  is checkpointed at `now` (exactly like `update_stream_rate`), so
+  `earned(now)` is identical immediately before and after the change:
+  lengthening lets accrual run longer, shortening caps it earlier, and
+  shortening below the seconds already accrued freezes the earned
+  amount — it never falls back, and nothing already withdrawn is
+  clawed back. The new duration reuses the `create_stream` gate (it
+  must be non-zero and at least the live `cliff_secs`, else
+  `InvalidStream` (code 304), the original duration untouched);
+  changing to the current duration is an idempotent no-op; terminal
+  streams are `StreamNotActive` (code 306); a change while paused is
+  legal and applies from resume. `total_funded` never moves:
+  lengthening creates no new funding obligation and shortening refunds
+  nothing already funded — any on-chain funding difference is the
+  caller's to settle, the state machine moves no funds. Emits the
+  `stream_duration_updated` audit event
+  (`PaymentStream::duration_update_audit_json`, hand-written JSON, no new
+  error codes — 304–308 unchanged). `earned()` / `stream_withdraw`
+  read the live duration on every call, so any consumer sees the new
+  window with no separate integration — same as the rate and cliff
+  changes, there is no stored/scanned stream state in `keeper.rs` or
+  `snapshot.rs` to pass through, and the Anchor IDL carries no
+  standalone-stream instructions. Orthogonal to `update_stream_rate`
+  (that is the per-second price, this item is the window length), to
+  `amend_stream_cliff_secs` (that is the first-payout gate, this item
+  is the window length), and to `stream_cancel` (that is lifecycle,
+  this item is a parameter revision).
 
 New error codes 304–308: `InvalidStream`, `StreamUnauthorized`,
 `StreamNotActive`, `StreamAlreadyPaused`, `StreamNotPaused`. Pure

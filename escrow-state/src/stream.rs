@@ -44,6 +44,23 @@
 //! (that is the per-second price, this item is the first-payout gate)
 //! and to `stream_cancel`/`pause` (those are lifecycle, this item is a
 //! parameter revision).
+//!
+//! AV-298: the stream *length* itself may be renegotiated mid-flight
+//! with `amend_stream_duration_secs` — dual-signed like the rate and
+//! the cliff, and checkpointed like the rate: the amount already
+//! earned under the old window is locked in at change time and never
+//! repriced or reduced, so `earned(now)` is identical immediately
+//! before and after the change. Only the accrual window's end moves
+//! (`end_ts = start_ts + duration_secs`): lengthening lets accrual
+//! run longer, shortening caps it earlier — but `total_funded` (set
+//! at creation) still caps everything, so lengthening creates no new
+//! funding obligation and shortening refunds nothing already funded;
+//! any on-chain funding difference is the caller's to settle, the
+//! state machine moves no funds. Orthogonal to `update_stream_rate`
+//! (that is the per-second price, this item is the window length),
+//! to `amend_stream_cliff_secs` (that is the first-payout gate, this
+//! item is the window length), and to `stream_cancel` (that is
+//! lifecycle, this item is a parameter revision).
 
 use crate::EscrowError;
 
@@ -445,6 +462,92 @@ impl PaymentStream {
         s.push_str(&old_cliff_secs.to_string());
         s.push_str(",\"new_cliff_secs\":");
         s.push_str(&new_cliff_secs.to_string());
+        s.push_str(",\"at\":");
+        s.push_str(&at.to_string());
+        s.push('}');
+        s
+    }
+
+    /// Renegotiates the stream length mid-flight — dual-signed: *both*
+    /// the initializer and the recipient must present, so neither side
+    /// can move the accrual window alone. Either party absent, or a
+    /// stranger in either slot, is [`EscrowError::StreamUnauthorized`]
+    /// (code 305).
+    ///
+    /// Only the window's end moves (`end_ts = start_ts +
+    /// duration_secs`): lengthening lets accrual run longer, shortening
+    /// caps it earlier. The amount already earned is checkpointed at
+    /// `now` (ungated — see [`Self::earned`]) and never repriced or
+    /// reduced, so `earned(now)` is identical immediately before and
+    /// after the change; shortening the window below the seconds
+    /// already accrued freezes the earned amount — it never falls
+    /// back, and nothing already withdrawn is clawed back. `earned`
+    /// after the change is `checkpoint_earned + rate × max(0,
+    /// accruing_seconds(now) − checkpoint_seconds)`, with
+    /// `accruing_seconds` capped at the *new* `end_ts`.
+    /// `total_funded` (set at creation) still caps everything:
+    /// lengthening creates no new funding obligation, shortening
+    /// refunds nothing already funded — any on-chain funding
+    /// difference is the caller's to settle, the state machine moves
+    /// no funds. Rate, start, cliff, withdrawn, and the checkpoint
+    /// pair are untouched apart from the freeze above.
+    ///
+    /// Check order is authority → state → config: a zero
+    /// `new_duration_secs` is [`EscrowError::InvalidStream`] (code
+    /// 304), as is a new duration shorter than the live `cliff_secs`
+    /// (the same bound [`Self::create_stream`] enforces — the cliff
+    /// must fit inside the window). A change to the current duration
+    /// is an idempotent no-op (no checkpoint churn). Allowed while
+    /// paused — accrual is frozen then, so the checkpoint is exact
+    /// and the new window applies from resume.
+    pub fn amend_stream_duration_secs(
+        &mut self,
+        initializer: [u8; 32],
+        recipient: [u8; 32],
+        new_duration_secs: u64,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // Authority first: dual signature — both parties must present.
+        if initializer != self.initializer || recipient != self.recipient {
+            return Err(EscrowError::StreamUnauthorized);
+        }
+        self.require_active()?;
+        if new_duration_secs == 0 || self.cliff_secs > new_duration_secs {
+            return Err(EscrowError::InvalidStream);
+        }
+        if new_duration_secs == self.duration_secs {
+            return Ok(());
+        }
+        // Checkpoint first, exactly like update_stream_rate: freeze
+        // the earned amount under the old window so shortening the
+        // window can never reduce it. Chain from the previous
+        // checkpoint — only the seconds since the last change accrue
+        // at the current rate.
+        let acc = self.accruing_seconds(now);
+        let ungated = (self.checkpoint_earned as u128)
+            .saturating_add(
+                (self.rate_per_sec as u128)
+                    .saturating_mul(acc.saturating_sub(self.checkpoint_seconds) as u128),
+            )
+            .min(self.total_funded as u128) as u64;
+        self.checkpoint_earned = ungated;
+        self.checkpoint_seconds = acc;
+        self.duration_secs = new_duration_secs;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a duration change (hand-written, no serde —
+    /// same convention as [`Self::cliff_update_audit_json`]):
+    /// `{"event":"stream_duration_updated","old_duration_secs":100,"new_duration_secs":200,"at":25}`.
+    pub fn duration_update_audit_json(
+        old_duration_secs: u64,
+        new_duration_secs: u64,
+        at: u64,
+    ) -> String {
+        let mut s = String::from("{\"event\":\"stream_duration_updated\",\"old_duration_secs\":");
+        s.push_str(&old_duration_secs.to_string());
+        s.push_str(",\"new_duration_secs\":");
+        s.push_str(&new_duration_secs.to_string());
         s.push_str(",\"at\":");
         s.push_str(&at.to_string());
         s.push('}');
