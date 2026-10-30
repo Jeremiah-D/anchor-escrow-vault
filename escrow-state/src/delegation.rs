@@ -58,6 +58,16 @@
 //! untouched, and the operator spend path reads the live cap on
 //! every release, so the new bound governs from the next operator
 //! release onward.
+//!
+//! AV-296: the scope bitmap itself may be revised in place
+//! ([`Escrow::amend_delegation_scopes`](crate::Escrow::amend_delegation_scopes)).
+//! Either party may narrow or widen the bitmap — but only to a bitmap
+//! [`validate_delegation_scopes`] accepts (non-empty, within
+//! [`DELEGATION_SCOPE_MASK`]) — and the operator paths read the live
+//! bitmap on every call, so a narrowed scope revokes a power at once
+//! and a widened scope grants it at once. Only the scopes move; the
+//! operator, the spend cap, `spent` and the expiry window are
+//! untouched.
 
 /// Scope bit: the operator may fund the escrow
 /// ([`Escrow::fund`](crate::Escrow::fund)).

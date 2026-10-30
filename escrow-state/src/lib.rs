@@ -11882,6 +11882,67 @@ impl Escrow {
         Ok(())
     }
 
+    /// Revise the live operator grant's scope bitmap (AV-296). Either
+    /// party may revise — the same party power as granting, renewing
+    /// and revising the cap — and the revision takes effect at the
+    /// next operator call: the operator paths
+    /// ([`Escrow::fund`], [`Escrow::release`] and
+    /// [`Escrow::cancel`] / [`Escrow::cancel_expired`]) consult the
+    /// live bitmap through [`Escrow::require_scoped_authority`] on
+    /// every call, so narrowing the scopes revokes a power at once
+    /// while widening grants it at once, with no settled call ever
+    /// re-judged. Only the scopes move: the operator, the spend cap,
+    /// the settled `spent` counter and the expiry window are
+    /// untouched. Check order mirrors
+    /// [`Escrow::amend_delegation_spend_cap`]: pause → authority →
+    /// state, then [`EscrowError::InvalidDelegation`] when there is no
+    /// grant to revise or the new bitmap fails
+    /// [`validate_delegation_scopes`] (empty, or bits outside
+    /// [`DELEGATION_SCOPE_MASK`] — fail-closed, the original bitmap
+    /// stays). Revising to the current bitmap is a no-op success.
+    ///
+    /// No new event: like `renew_delegation` and the cap revision,
+    /// the amendment emits nothing — the [`IndexedEscrow`](crate::IndexedEscrow)
+    /// wrapper needs no new emission. Orthogonal to
+    /// `amend_delegation_spend_cap` (that is the volume bound, this
+    /// item is the scope bitmap) and to AV-104 (that is the grant
+    /// mechanism itself, this item is the scope revision).
+    pub fn amend_delegation_scopes(
+        &mut self,
+        caller: [u8; 32],
+        new_scopes: u32,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        if caller != self.initializer && caller != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let grant = match self.delegation {
+            Some(grant) => grant,
+            None => return Err(EscrowError::InvalidDelegation),
+        };
+        // Fail-closed on a bad bitmap: an empty grant or a bit this
+        // version does not understand must never land — the original
+        // bitmap stays untouched.
+        if !validate_delegation_scopes(new_scopes) {
+            return Err(EscrowError::InvalidDelegation);
+        }
+        if grant.scopes() == new_scopes {
+            return Ok(());
+        }
+        self.delegation = Some(Delegation::new_full(
+            grant.delegate(),
+            new_scopes,
+            grant.spend_cap(),
+            grant.spent(),
+        ));
+        Ok(())
+    }
+
     /// Revoke the live operator grant (AV-104). Either party may revoke
     /// — the initializer can cut off a taker-appointed operator and
     /// vice versa, so a rogue operator has no protector. Check order
