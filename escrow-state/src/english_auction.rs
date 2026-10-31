@@ -11,6 +11,8 @@
 //! - **Reserve price**: the seller's hidden floor. If the highest bid
 //!   never reaches it, the sale fails and every bidder is refunded in
 //!   full — the seller never parts with the asset below the floor.
+//!   The seller may revise it before the first bid
+//!   (`amend_english_auction_reserve_price`, AV-306).
 //! - **Buy-it-now** (AV-201, opt-in): the seller may set a buyout
 //!   price; a live bid at or above it settles the auction immediately
 //!   at exactly that price, skipping the remaining window and any
@@ -101,7 +103,9 @@ pub struct BidReceipt {
 /// tail protection, and a seller's reserve price.
 ///
 /// Construct with [`EnglishAuction::new`]. The reserve price is set
-/// once and is never revealed to bidders by this module — the Anchor
+/// at construction and may be revised by the seller before the first
+/// bid ([`EnglishAuction::amend_english_auction_reserve_price`]);
+/// it is never revealed to bidders by this module — the Anchor
 /// program keeps it in the vault account's private fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnglishAuction {
@@ -212,6 +216,47 @@ impl EnglishAuction {
     /// The buy-it-now price (`0` = disabled).
     pub fn buyout_price(&self) -> u64 {
         self.buyout_price
+    }
+
+    /// Revise the seller's reserve price before the first bid (AV-306).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the floor is the seller's private price) and only
+    /// before the first bid: refused with
+    /// [`EscrowError::InvalidEnglishAuction`] (code 263) once any bid
+    /// has landed or the auction is terminal, the original floor
+    /// untouched — changing the reserve after bids exist would rewrite
+    /// terms bidders already accepted. Any `u64` is legal, including
+    /// `0` (which cancels the reserve, as at [`Self::new`]): there is
+    /// no value validation to reuse from `new` — the constructor
+    /// never validated `reserve_price` either.
+    ///
+    /// Only `reserve_price` changes: seller, `min_increment`,
+    /// windows, anti-sniping, buyout, `highest_bid`, `bid_count`,
+    /// and state are untouched. The new reserve governs from the next
+    /// [`Self::settle`], which reads the live value: a highest bid
+    /// below the new reserve is judged `ReserveNotMet`. Amending to
+    /// the current reserve is a no-op.
+    ///
+    /// Check order is authority → liveness, mirroring
+    /// [`Self::cancel`]: a stranger is refused even on a terminal
+    /// auction, and a lapsed auction refuses even the seller.
+    pub fn amend_english_auction_reserve_price(
+        &mut self,
+        caller: [u8; 32],
+        new_reserve_price: u64,
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != AuctionState::Bidding || self.bid_count > 0 {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        if new_reserve_price == self.reserve_price {
+            return Ok(());
+        }
+        self.reserve_price = new_reserve_price;
+        Ok(())
     }
 
     /// The recorded buy-it-now sale `(winner, price)` — `Some` only
@@ -495,6 +540,23 @@ impl EnglishAuction {
         s.push('}');
         s
     }
+
+    /// Audit-event JSON for a reserve-price revision (hand-written):
+    /// `{"event":"english_auction_reserve_price_amended",
+    /// "previous_reserve_price":<u64>,"reserve_price":<u64>}`.
+    /// English-auction audit events carry string event names, not
+    /// numeric event IDs, so no new event number is registered for
+    /// the revision — the event name is the identity.
+    pub fn reserve_price_audit_json(&self, previous_reserve_price: u64) -> String {
+        let mut s = String::from(
+            "{\"event\":\"english_auction_reserve_price_amended\",\"previous_reserve_price\":",
+        );
+        s.push_str(&previous_reserve_price.to_string());
+        s.push_str(",\"reserve_price\":");
+        s.push_str(&self.reserve_price.to_string());
+        s.push('}');
+        s
+    }
 }
 
 fn hex64(bytes: &[u8; 32]) -> String {
@@ -752,6 +814,158 @@ mod english_auction_tests {
         let err = b.cancel(key(0xAA), 200).unwrap_err();
         assert_eq!(err, EscrowError::EnglishAuctionNotCancellable);
         assert_eq!(b.state(), AuctionState::Bidding);
+    }
+
+    #[test]
+    fn amend_reserve_price_before_first_bid() {
+        let mut a = open_auction(); // reserve 150.
+        // Raise the floor.
+        a.amend_english_auction_reserve_price(key(0xAA), 200).unwrap();
+        assert_eq!(a.reserve_price(), 200);
+        // Lower it, and cancel it entirely with 0.
+        a.amend_english_auction_reserve_price(key(0xAA), 50).unwrap();
+        assert_eq!(a.reserve_price(), 50);
+        a.amend_english_auction_reserve_price(key(0xAA), 0).unwrap();
+        assert_eq!(a.reserve_price(), 0);
+        // Everything else is untouched.
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.min_increment(), 10);
+        assert_eq!(a.start_slot(), 100);
+        assert_eq!(a.end_slot(), 200);
+        assert_eq!(a.state(), AuctionState::Bidding);
+        assert_eq!(a.highest_bid(), 0);
+        assert_eq!(a.highest_bidder(), [0u8; 32]);
+        assert_eq!(a.bid_count(), 0);
+        assert_eq!(a.extension_count(), 0);
+        assert_eq!(a.buyout_price(), 0);
+        assert_eq!(a.buyout_sale(), None);
+    }
+
+    #[test]
+    fn amend_reserve_price_is_seller_only() {
+        let mut a = open_auction();
+        // A stranger is refused, even on a live auction.
+        let err = a
+            .amend_english_auction_reserve_price(key(9), 200)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(a.reserve_price(), 150);
+        // A bidder is refused too — authority is checked first.
+        a.place_bid(key(1), 50, 150).unwrap();
+        let err = a
+            .amend_english_auction_reserve_price(key(1), 200)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.reserve_price(), 150);
+    }
+
+    #[test]
+    fn amend_reserve_price_locks_after_first_bid() {
+        let mut a = open_auction();
+        a.place_bid(key(1), 100, 150).unwrap();
+        let err = a
+            .amend_english_auction_reserve_price(key(0xAA), 200)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(err.code(), 263);
+        assert_eq!(a.reserve_price(), 150);
+        // The bid still stands against the original floor.
+        let s = a.settle(200).unwrap();
+        assert!(matches!(s, AuctionSettlement::ReserveNotMet { .. }));
+    }
+
+    #[test]
+    fn amend_reserve_price_refused_in_terminal_states() {
+        // Settled via buyout.
+        let mut a = EnglishAuction::new(key(0xAA), 100, 200, 10, 150, 0, 0, 0)
+            .unwrap()
+            .with_buyout(300)
+            .unwrap();
+        a.place_bid(key(1), 300, 150).unwrap();
+        assert_eq!(a.state(), AuctionState::Settled);
+        let err = a
+            .amend_english_auction_reserve_price(key(0xAA), 200)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(a.reserve_price(), 150);
+        // NoSale after settling with no bids.
+        let mut b = open_auction();
+        b.settle(200).unwrap();
+        assert_eq!(b.state(), AuctionState::NoSale);
+        let err = b
+            .amend_english_auction_reserve_price(key(0xAA), 200)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(b.reserve_price(), 150);
+        // Cancelled.
+        let mut c = open_auction();
+        c.cancel(key(0xAA), 150).unwrap();
+        assert_eq!(c.state(), AuctionState::Cancelled);
+        let err = c
+            .amend_english_auction_reserve_price(key(0xAA), 200)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(c.reserve_price(), 150);
+        // Authority still wins on a terminal auction: a stranger is
+        // Unauthorized, not InvalidEnglishAuction.
+        let err = c
+            .amend_english_auction_reserve_price(key(9), 200)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_reserve_price_to_current_is_noop() {
+        let mut a = open_auction();
+        a.amend_english_auction_reserve_price(key(0xAA), 150)
+            .unwrap();
+        assert_eq!(a.reserve_price(), 150);
+        assert_eq!(a.state(), AuctionState::Bidding);
+    }
+
+    #[test]
+    fn reserve_price_audit_json_exact() {
+        let mut a = open_auction();
+        a.amend_english_auction_reserve_price(key(0xAA), 200).unwrap();
+        assert_eq!(
+            a.reserve_price_audit_json(150),
+            "{\"event\":\"english_auction_reserve_price_amended\",\"previous_reserve_price\":150,\"reserve_price\":200}"
+        );
+    }
+
+    #[test]
+    fn settle_honors_the_amended_reserve() {
+        // Raised above the highest bid: ReserveNotMet.
+        let mut a = open_auction(); // reserve 150.
+        a.amend_english_auction_reserve_price(key(0xAA), 200).unwrap();
+        a.place_bid(key(1), 180, 150).unwrap();
+        let s = a.settle(200).unwrap();
+        assert_eq!(
+            s,
+            AuctionSettlement::ReserveNotMet {
+                highest_bidder: key(1),
+                highest_bid: 180
+            }
+        );
+        // Lowered below the highest bid: Sold.
+        let mut b = open_auction();
+        b.amend_english_auction_reserve_price(key(0xAA), 100).unwrap();
+        b.place_bid(key(1), 120, 150).unwrap();
+        let s = b.settle(200).unwrap();
+        assert_eq!(
+            s,
+            AuctionSettlement::Sold {
+                winner: key(1),
+                winning_bid: 120
+            }
+        );
+        // Cancelled reserve (0): any bid sells.
+        let mut c = open_auction();
+        c.amend_english_auction_reserve_price(key(0xAA), 0).unwrap();
+        c.place_bid(key(1), 10, 150).unwrap();
+        let s = c.settle(200).unwrap();
+        assert!(matches!(s, AuctionSettlement::Sold { .. }));
     }
 
     #[test]

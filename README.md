@@ -7589,11 +7589,22 @@ whether the sale happens at all.
   of extensions, `MAX_SNIPE_EXTENSIONS` = 64, so a bidding war cannot
   postpone settlement forever). The bid receipt reports whether the
   bid extended the close and the new end slot.
-- **Reserve price**: the seller's floor, set once. If the highest bid
-  never reaches it, settlement returns `ReserveNotMet` and every
-  bidder is refunded in full; with no bids at all the outcome is
-  `NoBids`. The reserve is inclusive — a winning bid exactly at the
-  reserve sells.
+- **Reserve price**: the seller's floor, set at construction. If the
+  highest bid never reaches it, settlement returns `ReserveNotMet`
+  and every bidder is refunded in full; with no bids at all the
+  outcome is `NoBids`. The reserve is inclusive — a winning bid
+  exactly at the reserve sells.
+- **Reserve revision** (AV-306): before the first bid the seller may
+  revise the floor with `amend_english_auction_reserve_price` —
+  seller-only (`Unauthorized`, code 100), and refused with
+  `InvalidEnglishAuction` (code 263) once a bid has landed or the
+  auction is terminal, so terms bidders already accepted are never
+  rewritten. Any `u64` is legal, including `0` (cancels the reserve);
+  re-affirming the current floor is a no-op. Only `reserve_price`
+  changes; `settle` reads the live value, so a highest bid below the
+  new floor is judged `ReserveNotMet`. `reserve_price_audit_json`
+  records the previous and new floor (string event name
+  `english_auction_reserve_price_amended`, no new event code).
 - **Refunds are exact**: `place_bid` returns a `BidReceipt` naming the
   outbid leader and their amount, so the program refunds the full
   previous bid atomically; `settle` is permissionless after the close
