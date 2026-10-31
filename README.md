@@ -7605,6 +7605,20 @@ whether the sale happens at all.
   new floor is judged `ReserveNotMet`. `reserve_price_audit_json`
   records the previous and new floor (string event name
   `english_auction_reserve_price_amended`, no new event code).
+- **Minimum-increment revision** (AV-307): before the first bid the
+  seller may revise the minimum raise with
+  `amend_english_auction_min_increment` — seller-only
+  (`Unauthorized`, code 100), and refused with
+  `InvalidEnglishAuction` (code 263) once a bid has landed or the
+  auction is terminal, so terms bidders already accepted are never
+  rewritten. The new value must be greater than `0` (a zero
+  increment would let bids creep by nothing); re-affirming the
+  current increment is a no-op. Only `min_increment` changes;
+  `place_bid` reads the live value, so the opening bid must clear
+  the new increment and every later bid must beat the highest by
+  it. `min_increment_audit_json` records the previous and new
+  increment (string event name
+  `english_auction_min_increment_amended`, no new event code).
 - **Refunds are exact**: `place_bid` returns a `BidReceipt` naming the
   outbid leader and their amount, so the program refunds the full
   previous bid atomically; `settle` is permissionless after the close

@@ -12,7 +12,9 @@
 //!   never reaches it, the sale fails and every bidder is refunded in
 //!   full — the seller never parts with the asset below the floor.
 //!   The seller may revise it before the first bid
-//!   (`amend_english_auction_reserve_price`, AV-306).
+//!   (`amend_english_auction_reserve_price`, AV-306). The minimum
+//!   increment may likewise be revised before the first bid
+//!   (`amend_english_auction_min_increment`, AV-307).
 //! - **Buy-it-now** (AV-201, opt-in): the seller may set a buyout
 //!   price; a live bid at or above it settles the auction immediately
 //!   at exactly that price, skipping the remaining window and any
@@ -106,7 +108,9 @@ pub struct BidReceipt {
 /// at construction and may be revised by the seller before the first
 /// bid ([`EnglishAuction::amend_english_auction_reserve_price`]);
 /// it is never revealed to bidders by this module — the Anchor
-/// program keeps it in the vault account's private fields.
+/// program keeps it in the vault account's private fields. The
+/// minimum increment may likewise be revised before the first bid
+/// ([`EnglishAuction::amend_english_auction_min_increment`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnglishAuction {
     seller: [u8; 32],
@@ -256,6 +260,52 @@ impl EnglishAuction {
             return Ok(());
         }
         self.reserve_price = new_reserve_price;
+        Ok(())
+    }
+
+    /// Revise the minimum increment before the first bid (AV-307).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the raise is the seller's pricing term) and only
+    /// before the first bid: refused with
+    /// [`EscrowError::InvalidEnglishAuction`] (code 263) once any bid
+    /// has landed or the auction is terminal, the original increment
+    /// untouched — changing the raise after bids exist would rewrite
+    /// terms bidders already accepted. The new value must be greater
+    /// than `0` (a zero increment would let bids creep by nothing,
+    /// so the auction could never converge — refused with code 263);
+    /// any positive `u64` is legal.
+    ///
+    /// Only `min_increment` changes: seller, `reserve_price`,
+    /// windows, anti-sniping, buyout, `highest_bid`, `bid_count`,
+    /// and state are untouched. The new increment governs from the
+    /// next [`Self::place_bid`], which reads the live value: the
+    /// minimum legal bid is `highest_bid + min_increment`, so the
+    /// opening bid must itself clear the new increment. Amending to
+    /// the current increment is a no-op.
+    ///
+    /// Check order is authority → liveness → value, mirroring
+    /// [`Self::amend_english_auction_reserve_price`]: a stranger is
+    /// refused even on a terminal auction, and a lapsed auction
+    /// refuses even the seller.
+    pub fn amend_english_auction_min_increment(
+        &mut self,
+        caller: [u8; 32],
+        new_min_increment: u64,
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != AuctionState::Bidding || self.bid_count > 0 {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        if new_min_increment == 0 {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        if new_min_increment == self.min_increment {
+            return Ok(());
+        }
+        self.min_increment = new_min_increment;
         Ok(())
     }
 
@@ -554,6 +604,24 @@ impl EnglishAuction {
         s.push_str(&previous_reserve_price.to_string());
         s.push_str(",\"reserve_price\":");
         s.push_str(&self.reserve_price.to_string());
+        s.push('}');
+        s
+    }
+
+    /// Audit-event JSON for a minimum-increment revision
+    /// (hand-written):
+    /// `{"event":"english_auction_min_increment_amended",
+    /// "previous_min_increment":<u64>,"min_increment":<u64>}`.
+    /// English-auction audit events carry string event names, not
+    /// numeric event IDs, so no new event number is registered for
+    /// the revision — the event name is the identity.
+    pub fn min_increment_audit_json(&self, previous_min_increment: u64) -> String {
+        let mut s = String::from(
+            "{\"event\":\"english_auction_min_increment_amended\",\"previous_min_increment\":",
+        );
+        s.push_str(&previous_min_increment.to_string());
+        s.push_str(",\"min_increment\":");
+        s.push_str(&self.min_increment.to_string());
         s.push('}');
         s
     }
@@ -966,6 +1034,165 @@ mod english_auction_tests {
         c.place_bid(key(1), 10, 150).unwrap();
         let s = c.settle(200).unwrap();
         assert!(matches!(s, AuctionSettlement::Sold { .. }));
+    }
+
+    #[test]
+    fn amend_min_increment_before_first_bid() {
+        let mut a = open_auction(); // min increment 10.
+        // Raise the raise.
+        a.amend_english_auction_min_increment(key(0xAA), 25).unwrap();
+        assert_eq!(a.min_increment(), 25);
+        // Lower it.
+        a.amend_english_auction_min_increment(key(0xAA), 5).unwrap();
+        assert_eq!(a.min_increment(), 5);
+        // Everything else is untouched.
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.reserve_price(), 150);
+        assert_eq!(a.start_slot(), 100);
+        assert_eq!(a.end_slot(), 200);
+        assert_eq!(a.state(), AuctionState::Bidding);
+        assert_eq!(a.highest_bid(), 0);
+        assert_eq!(a.highest_bidder(), [0u8; 32]);
+        assert_eq!(a.bid_count(), 0);
+        assert_eq!(a.extension_count(), 0);
+        assert_eq!(a.buyout_price(), 0);
+        assert_eq!(a.buyout_sale(), None);
+    }
+
+    #[test]
+    fn amend_min_increment_is_seller_only() {
+        let mut a = open_auction();
+        // A stranger is refused, even on a live auction.
+        let err = a
+            .amend_english_auction_min_increment(key(9), 25)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(a.min_increment(), 10);
+        // A bidder is refused too — authority is checked first.
+        a.place_bid(key(1), 50, 150).unwrap();
+        let err = a
+            .amend_english_auction_min_increment(key(1), 25)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.min_increment(), 10);
+    }
+
+    #[test]
+    fn amend_min_increment_locks_after_first_bid() {
+        let mut a = open_auction();
+        a.place_bid(key(1), 100, 150).unwrap();
+        let err = a
+            .amend_english_auction_min_increment(key(0xAA), 25)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(err.code(), 263);
+        assert_eq!(a.min_increment(), 10);
+        // The bid still stands against the original increment: the
+        // next bid must clear highest + 10, not highest + 25.
+        let err = a.place_bid(key(2), 105, 150).unwrap_err();
+        assert_eq!(err, EscrowError::EnglishAuctionBidTooLow);
+        a.place_bid(key(2), 110, 150).unwrap();
+    }
+
+    #[test]
+    fn amend_min_increment_refused_in_terminal_states() {
+        // Settled via buyout.
+        let mut a = EnglishAuction::new(key(0xAA), 100, 200, 10, 150, 0, 0, 0)
+            .unwrap()
+            .with_buyout(300)
+            .unwrap();
+        a.place_bid(key(1), 300, 150).unwrap();
+        assert_eq!(a.state(), AuctionState::Settled);
+        let err = a
+            .amend_english_auction_min_increment(key(0xAA), 25)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(a.min_increment(), 10);
+        // NoSale after settling with no bids.
+        let mut b = open_auction();
+        b.settle(200).unwrap();
+        assert_eq!(b.state(), AuctionState::NoSale);
+        let err = b
+            .amend_english_auction_min_increment(key(0xAA), 25)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(b.min_increment(), 10);
+        // Cancelled.
+        let mut c = open_auction();
+        c.cancel(key(0xAA), 150).unwrap();
+        assert_eq!(c.state(), AuctionState::Cancelled);
+        let err = c
+            .amend_english_auction_min_increment(key(0xAA), 25)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(c.min_increment(), 10);
+        // Authority still wins on a terminal auction: a stranger is
+        // Unauthorized, not InvalidEnglishAuction.
+        let err = c
+            .amend_english_auction_min_increment(key(9), 25)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_min_increment_rejects_zero() {
+        let mut a = open_auction();
+        let err = a
+            .amend_english_auction_min_increment(key(0xAA), 0)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(err.code(), 263);
+        assert_eq!(a.min_increment(), 10);
+        // A zero increment is refused even before any other check
+        // that could pass — but authority still wins first.
+        let err = a
+            .amend_english_auction_min_increment(key(9), 0)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.min_increment(), 10);
+    }
+
+    #[test]
+    fn amend_min_increment_to_current_is_noop() {
+        let mut a = open_auction();
+        a.amend_english_auction_min_increment(key(0xAA), 10)
+            .unwrap();
+        assert_eq!(a.min_increment(), 10);
+        assert_eq!(a.state(), AuctionState::Bidding);
+    }
+
+    #[test]
+    fn min_increment_audit_json_exact() {
+        let mut a = open_auction();
+        a.amend_english_auction_min_increment(key(0xAA), 25).unwrap();
+        assert_eq!(
+            a.min_increment_audit_json(10),
+            "{\"event\":\"english_auction_min_increment_amended\",\"previous_min_increment\":10,\"min_increment\":25}"
+        );
+    }
+
+    #[test]
+    fn place_bid_honors_the_amended_increment() {
+        // Raised increment: the opening bid must clear 25, not 10.
+        let mut a = open_auction(); // min increment 10.
+        a.amend_english_auction_min_increment(key(0xAA), 25).unwrap();
+        let err = a.place_bid(key(1), 20, 150).unwrap_err();
+        assert_eq!(err, EscrowError::EnglishAuctionBidTooLow);
+        a.place_bid(key(1), 25, 150).unwrap();
+        // The next bid must clear highest + 25.
+        let err = a.place_bid(key(2), 40, 150).unwrap_err();
+        assert_eq!(err, EscrowError::EnglishAuctionBidTooLow);
+        a.place_bid(key(2), 50, 150).unwrap();
+        assert_eq!(a.highest_bid(), 50);
+        // Lowered increment: the opening bid need only clear 5.
+        let mut b = open_auction();
+        b.amend_english_auction_min_increment(key(0xAA), 5).unwrap();
+        b.place_bid(key(1), 5, 150).unwrap();
+        assert_eq!(b.highest_bid(), 5);
+        let err = b.place_bid(key(2), 9, 150).unwrap_err();
+        assert_eq!(err, EscrowError::EnglishAuctionBidTooLow);
+        b.place_bid(key(2), 10, 150).unwrap();
     }
 
     #[test]
