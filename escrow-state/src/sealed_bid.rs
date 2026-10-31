@@ -581,6 +581,78 @@ impl SealedBidAuction {
         s
     }
 
+    /// Revise the commit-start slot before the commit phase opens
+    /// (AV-304).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the window is the seller's public schedule) and
+    /// only before the commit window opens (`current_slot <
+    /// commit_start_slot`) on a live auction — refused with
+    /// [`EscrowError::SealedBidNotLive`] (code 273) once the commit
+    /// window has started or the auction is terminal, the original
+    /// start untouched. The new start reuses the [`Self::new`] window
+    /// gate (`new_commit_start_slot < reveal_start_slot`) and must
+    /// also be after `current_slot`, so a commit window remains after
+    /// the revision — otherwise [`EscrowError::InvalidSealedBid`]
+    /// (code 272).
+    ///
+    /// The gate guarantees no commitment can exist yet: `commit_bid`
+    /// requires `phase() == Commit`, which requires `current_slot >=
+    /// commit_start_slot`, so amending before the window opens cannot
+    /// rewrite a game any bidder has entered — commitments are made
+    /// against the announced window, and moving the start after the
+    /// window opened would rewrite it underneath them. Only
+    /// `commit_start_slot` changes: seller, `min_bid`,
+    /// `reveal_start_slot`, `end_slot`, pricing, slots, counts, and
+    /// state are untouched. The new start governs from the next
+    /// [`Self::phase`] evaluation, which reads the live slot.
+    /// Amending to the current start is a no-op.
+    ///
+    /// Check order is authority → liveness → value, mirroring
+    /// [`Self::amend_sealed_bid_reveal_start_slot`]: a stranger is
+    /// refused even on a terminal auction, and a lapsed auction
+    /// refuses even the seller.
+    pub fn amend_sealed_bid_commit_start_slot(
+        &mut self,
+        caller: [u8; 32],
+        new_commit_start_slot: u64,
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != SealedBidState::Active || current_slot >= self.commit_start_slot {
+            return Err(EscrowError::SealedBidNotLive);
+        }
+        if new_commit_start_slot == self.commit_start_slot {
+            return Ok(());
+        }
+        if new_commit_start_slot >= self.reveal_start_slot
+            || new_commit_start_slot <= current_slot
+        {
+            return Err(EscrowError::InvalidSealedBid);
+        }
+        self.commit_start_slot = new_commit_start_slot;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a commit-start-slot revision (hand-written,
+    /// no serde — same convention as [`Self::min_bid_audit_json`]):
+    /// `{"event":"sealed_bid_commit_start_slot_amended",
+    /// "previous_commit_start_slot":<u64>,"commit_start_slot":<u64>}`.
+    /// Sealed-bid audit events carry string event names, not numeric
+    /// event IDs, so no new event number is registered for the
+    /// revision — the event name is the identity.
+    pub fn commit_start_slot_audit_json(&self, previous_commit_start_slot: u64) -> String {
+        let mut s =
+            String::from("{\"event\":\"sealed_bid_commit_start_slot_amended\",\"previous_commit_start_slot\":");
+        s.push_str(&previous_commit_start_slot.to_string());
+        s.push_str(",\"commit_start_slot\":");
+        s.push_str(&self.commit_start_slot.to_string());
+        s.push('}');
+        s
+    }
+
     /// Audit-event JSON for a commitment (hand-written):
     /// `{"event":"sealed_bid_commit","bidder":"<64hex>","commitment":
     /// "<64hex>","reveal_start_slot":<u64>}`.
@@ -660,6 +732,11 @@ impl SealedBidAuction {
     /// The public minimum bid (`0` = no floor).
     pub fn min_bid(&self) -> u64 {
         self.min_bid
+    }
+
+    /// The slot the commit window opens at.
+    pub fn commit_start_slot(&self) -> u64 {
+        self.commit_start_slot
     }
 
     /// The slot the reveal window opens at.
@@ -1298,6 +1375,181 @@ mod sealed_bid_tests {
         assert_eq!(
             j,
             "{\"event\":\"sealed_bid_reveal_start_slot_amended\",\"previous_reveal_start_slot\":200,\"reveal_start_slot\":150}"
+        );
+    }
+
+    #[test]
+    fn amend_commit_start_slot_moves_the_window_both_ways() {
+        // Earlier: the commit opens at 50 instead of 100.
+        let mut a = open_auction(); // commit [100, 200), reveal [200, 300)
+        a.amend_sealed_bid_commit_start_slot(key(0xAA), 50, 40)
+            .unwrap();
+        assert_eq!(a.commit_start_slot(), 50);
+        assert_eq!(a.phase(49), SealedBidPhase::Closed);
+        assert_eq!(a.phase(50), SealedBidPhase::Commit);
+        // A commitment lands in the widened window and reveals at
+        // the unchanged start.
+        commit(&mut a, key(1), 50, nonce(1), 50);
+        a.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+
+        // Later: the commit window opens at 150 instead of 100.
+        // The revision must still land before the *live* start opens
+        // (current_slot 90 < 100), so the window has not started yet.
+        let mut b = open_auction();
+        b.amend_sealed_bid_commit_start_slot(key(0xAA), 150, 90)
+            .unwrap();
+        assert_eq!(b.commit_start_slot(), 150);
+        assert_eq!(b.phase(149), SealedBidPhase::Closed);
+        assert_eq!(b.phase(150), SealedBidPhase::Commit);
+        // A commitment at 100 now lands before the window opens.
+        let c = sealed_bid_commitment(&key(1), 50, &nonce(1));
+        assert_eq!(
+            b.commit_bid(key(1), c, 100).unwrap_err(),
+            EscrowError::SealedBidNotLive
+        );
+        commit(&mut b, key(1), 50, nonce(1), 150);
+        b.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        assert_eq!(
+            b.settle(300).unwrap(),
+            SealedBidSettlement::Sold {
+                winner: key(1),
+                winning_bid: 50
+            }
+        );
+    }
+
+    #[test]
+    fn amend_commit_start_slot_is_seller_only_and_pre_commit() {
+        let mut a = open_auction(); // seller key(0xAA), commit at 100
+        // A stranger or a bidder cannot move the seller's window.
+        assert_eq!(
+            a.amend_sealed_bid_commit_start_slot(key(9), 50, 40)
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(
+            a.amend_sealed_bid_commit_start_slot(key(1), 50, 40)
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(a.commit_start_slot(), 100);
+        // Once the commit window opens the start is locked.
+        let err = a
+            .amend_sealed_bid_commit_start_slot(key(0xAA), 50, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::SealedBidNotLive);
+        assert_eq!(err.code(), 273);
+        assert_eq!(a.commit_start_slot(), 100);
+        // A stranger is refused even on a lapsed auction (authority
+        // first, mirroring amend_sealed_bid_min_bid).
+        let err = a
+            .amend_sealed_bid_commit_start_slot(key(9), 50, 300)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        // Terminal auctions refuse even the seller.
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        a.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        a.settle(300).unwrap();
+        assert_eq!(a.state(), SealedBidState::Settled);
+        let err = a
+            .amend_sealed_bid_commit_start_slot(key(0xAA), 50, 40)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::SealedBidNotLive);
+        assert_eq!(a.commit_start_slot(), 100);
+        // A cancelled auction is terminal too.
+        let mut b = open_auction();
+        b.cancel(key(0xAA), 100).unwrap();
+        let err = b
+            .amend_sealed_bid_commit_start_slot(key(0xAA), 50, 40)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::SealedBidNotLive);
+    }
+
+    #[test]
+    fn amend_commit_start_slot_rejects_bad_windows() {
+        let mut a = open_auction(); // commit 100, reveal 200, end 300
+        // Too late: at or past the reveal start the commit window
+        // would be empty (the new() gate).
+        for bad in [200, 201] {
+            let err = a
+                .amend_sealed_bid_commit_start_slot(key(0xAA), bad, 50)
+                .unwrap_err();
+            assert_eq!(err, EscrowError::InvalidSealedBid);
+            assert_eq!(err.code(), 272);
+            assert_eq!(a.commit_start_slot(), 100);
+        }
+        // At or before the current slot no commit window would remain
+        // after the revision, even though the value sits inside the
+        // new() window.
+        for bad in [40, 50] {
+            let err = a
+                .amend_sealed_bid_commit_start_slot(key(0xAA), bad, 50)
+                .unwrap_err();
+            assert_eq!(err, EscrowError::InvalidSealedBid);
+            assert_eq!(a.commit_start_slot(), 100);
+        }
+        // Just after the current slot is fine.
+        a.amend_sealed_bid_commit_start_slot(key(0xAA), 51, 50)
+            .unwrap();
+        assert_eq!(a.commit_start_slot(), 51);
+    }
+
+    #[test]
+    fn amend_commit_start_slot_noop_on_same_value() {
+        let mut a = open_auction();
+        a.amend_sealed_bid_commit_start_slot(key(0xAA), 100, 50)
+            .unwrap();
+        assert_eq!(a.commit_start_slot(), 100);
+        assert_eq!(a.state(), SealedBidState::Active);
+        assert_eq!(a.phase(100), SealedBidPhase::Commit);
+    }
+
+    #[test]
+    fn amend_commit_start_slot_leaves_everything_else_untouched() {
+        let mut a = SealedBidAuction::new(key(0xAA), 100, 200, 300, 10)
+            .unwrap()
+            .with_vickrey()
+            .unwrap();
+        a.amend_sealed_bid_commit_start_slot(key(0xAA), 50, 40)
+            .unwrap();
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.min_bid(), 10);
+        assert_eq!(a.commit_start_slot(), 50);
+        assert_eq!(a.reveal_start_slot(), 200);
+        assert_eq!(a.pricing(), SealedBidPricing::Vickrey);
+        assert_eq!(a.commit_count(), 0);
+        assert_eq!(a.reveal_count(), 0);
+        assert_eq!(a.state(), SealedBidState::Active);
+        // The reveal window and end are unchanged: reveals still land
+        // at 200 and settlement still needs slot 300.
+        assert_eq!(a.phase(49), SealedBidPhase::Closed);
+        assert_eq!(a.phase(50), SealedBidPhase::Commit);
+        assert_eq!(a.phase(199), SealedBidPhase::Commit);
+        assert_eq!(a.phase(200), SealedBidPhase::Reveal);
+        assert_eq!(a.phase(300), SealedBidPhase::Closed);
+        commit(&mut a, key(1), 50, nonce(1), 50);
+        a.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        assert_eq!(
+            a.settle(300).unwrap(),
+            SealedBidSettlement::Sold {
+                winner: key(1),
+                winning_bid: 50
+            }
+        );
+    }
+
+    #[test]
+    fn amend_commit_start_slot_audit_json() {
+        let mut a = open_auction();
+        a.amend_sealed_bid_commit_start_slot(key(0xAA), 50, 40)
+            .unwrap();
+        let j = a.commit_start_slot_audit_json(100);
+        assert!(j.contains("\"event\":\"sealed_bid_commit_start_slot_amended\""));
+        assert!(j.contains("\"previous_commit_start_slot\":100"));
+        assert!(j.contains("\"commit_start_slot\":50"));
+        assert_eq!(
+            j,
+            "{\"event\":\"sealed_bid_commit_start_slot_amended\",\"previous_commit_start_slot\":100,\"commit_start_slot\":50}"
         );
     }
 
