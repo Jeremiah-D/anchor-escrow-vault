@@ -14,7 +14,9 @@
 //!   The seller may revise it before the first bid
 //!   (`amend_english_auction_reserve_price`, AV-306). The minimum
 //!   increment may likewise be revised before the first bid
-//!   (`amend_english_auction_min_increment`, AV-307).
+//!   (`amend_english_auction_min_increment`, AV-307). The
+//!   anti-sniping tail window may likewise be revised before the
+//!   first bid (`amend_english_auction_anti_snipe_window`, AV-308).
 //! - **Buy-it-now** (AV-201, opt-in): the seller may set a buyout
 //!   price; a live bid at or above it settles the auction immediately
 //!   at exactly that price, skipping the remaining window and any
@@ -110,7 +112,9 @@ pub struct BidReceipt {
 /// it is never revealed to bidders by this module — the Anchor
 /// program keeps it in the vault account's private fields. The
 /// minimum increment may likewise be revised before the first bid
-/// ([`EnglishAuction::amend_english_auction_min_increment`]).
+/// ([`EnglishAuction::amend_english_auction_min_increment`]). The
+/// anti-sniping tail window may likewise be revised before the first
+/// bid ([`EnglishAuction::amend_english_auction_anti_snipe_window`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnglishAuction {
     seller: [u8; 32],
@@ -309,6 +313,57 @@ impl EnglishAuction {
         Ok(())
     }
 
+    /// Revise the anti-sniping tail window before the first bid
+    /// (AV-308).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the tail window is the seller's auction term)
+    /// and only before the first bid: refused with
+    /// [`EscrowError::InvalidEnglishAuction`] (code 263) once any bid
+    /// has landed or the auction is terminal, the original window
+    /// untouched — changing the window after bids exist would rewrite
+    /// terms bidders already accepted. The new window reuses the
+    /// [`Self::new`] gate against the *live* extension and budget: a
+    /// nonzero window with a zero `anti_snipe_extension` or a zero
+    /// `max_extensions` never triggers, so that combination is
+    /// refused with code 263; `0` disables anti-sniping (as at
+    /// [`Self::new`]).
+    ///
+    /// Only `anti_snipe_window` changes: seller, `reserve_price`,
+    /// `min_increment`, windows, `anti_snipe_extension`,
+    /// `max_extensions`, buyout, `highest_bid`, `bid_count`,
+    /// `extension_count`, and state are untouched. The new window
+    /// governs from the next [`Self::place_bid`], which reads the
+    /// live value: a trailing bid is judged by the new window for
+    /// extension. Amending to the current window is a no-op.
+    ///
+    /// Check order is authority → liveness → value, mirroring
+    /// [`Self::amend_english_auction_min_increment`]: a stranger is
+    /// refused even on a terminal auction, and a lapsed auction
+    /// refuses even the seller.
+    pub fn amend_english_auction_anti_snipe_window(
+        &mut self,
+        caller: [u8; 32],
+        new_anti_snipe_window: u64,
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != AuctionState::Bidding || self.bid_count > 0 {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        if new_anti_snipe_window > 0
+            && (self.anti_snipe_extension == 0 || self.max_extensions == 0)
+        {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        if new_anti_snipe_window == self.anti_snipe_window {
+            return Ok(());
+        }
+        self.anti_snipe_window = new_anti_snipe_window;
+        Ok(())
+    }
+
     /// The recorded buy-it-now sale `(winner, price)` — `Some` only
     /// when the auction settled through the buyout path of
     /// [`EnglishAuction::place_bid`].
@@ -331,6 +386,13 @@ impl EnglishAuction {
     /// `min_increment`).
     pub fn min_increment(&self) -> u64 {
         self.min_increment
+    }
+
+    /// The anti-sniping tail window in slots (`0` = anti-sniping
+    /// disabled): a bid landing within this many slots of `end_slot`
+    /// pushes the close out (see [`EnglishAuction::place_bid`]).
+    pub fn anti_snipe_window(&self) -> u64 {
+        self.anti_snipe_window
     }
 
     /// The slot bidding opens.
@@ -622,6 +684,27 @@ impl EnglishAuction {
         s.push_str(&previous_min_increment.to_string());
         s.push_str(",\"min_increment\":");
         s.push_str(&self.min_increment.to_string());
+        s.push('}');
+        s
+    }
+
+    /// Audit-event JSON for an anti-sniping tail-window revision
+    /// (hand-written):
+    /// `{"event":"english_auction_anti_snipe_window_amended",
+    /// "previous_anti_snipe_window":<u64>,"anti_snipe_window":<u64>}`.
+    /// English-auction audit events carry string event names, not
+    /// numeric event IDs, so no new event number is registered for
+    /// the revision — the event name is the identity.
+    pub fn anti_snipe_window_audit_json(
+        &self,
+        previous_anti_snipe_window: u64,
+    ) -> String {
+        let mut s = String::from(
+            "{\"event\":\"english_auction_anti_snipe_window_amended\",\"previous_anti_snipe_window\":",
+        );
+        s.push_str(&previous_anti_snipe_window.to_string());
+        s.push_str(",\"anti_snipe_window\":");
+        s.push_str(&self.anti_snipe_window.to_string());
         s.push('}');
         s
     }
@@ -1193,6 +1276,217 @@ mod english_auction_tests {
         let err = b.place_bid(key(2), 9, 150).unwrap_err();
         assert_eq!(err, EscrowError::EnglishAuctionBidTooLow);
         b.place_bid(key(2), 10, 150).unwrap();
+    }
+
+    fn sniping_auction() -> EnglishAuction {
+        // Tail window 10 slots, extension 25 slots, budget 2.
+        EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 10, 25, 2).unwrap()
+    }
+
+    #[test]
+    fn amend_anti_snipe_window_before_first_bid() {
+        let mut a = sniping_auction(); // window 10.
+        // Widen the tail.
+        a.amend_english_auction_anti_snipe_window(key(0xAA), 20)
+            .unwrap();
+        assert_eq!(a.anti_snipe_window(), 20);
+        // Narrow it.
+        a.amend_english_auction_anti_snipe_window(key(0xAA), 5)
+            .unwrap();
+        assert_eq!(a.anti_snipe_window(), 5);
+        // Disable anti-sniping entirely with 0.
+        a.amend_english_auction_anti_snipe_window(key(0xAA), 0)
+            .unwrap();
+        assert_eq!(a.anti_snipe_window(), 0);
+        // Everything else is untouched.
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.reserve_price(), 0);
+        assert_eq!(a.min_increment(), 10);
+        assert_eq!(a.start_slot(), 100);
+        assert_eq!(a.end_slot(), 200);
+        assert_eq!(a.state(), AuctionState::Bidding);
+        assert_eq!(a.highest_bid(), 0);
+        assert_eq!(a.highest_bidder(), [0u8; 32]);
+        assert_eq!(a.bid_count(), 0);
+        assert_eq!(a.extension_count(), 0);
+        assert_eq!(a.buyout_price(), 0);
+        assert_eq!(a.buyout_sale(), None);
+    }
+
+    #[test]
+    fn amend_anti_snipe_window_is_seller_only() {
+        let mut a = sniping_auction();
+        // A stranger is refused, even on a live auction.
+        let err = a
+            .amend_english_auction_anti_snipe_window(key(9), 20)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(a.anti_snipe_window(), 10);
+        // A bidder is refused too — authority is checked first.
+        a.place_bid(key(1), 50, 150).unwrap();
+        let err = a
+            .amend_english_auction_anti_snipe_window(key(1), 20)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.anti_snipe_window(), 10);
+    }
+
+    #[test]
+    fn amend_anti_snipe_window_locks_after_first_bid() {
+        let mut a = sniping_auction();
+        // The opening bid lands in the tail and extends the close.
+        let r = a.place_bid(key(1), 100, 195).unwrap();
+        assert!(r.extended);
+        assert_eq!(a.end_slot(), 225);
+        let err = a
+            .amend_english_auction_anti_snipe_window(key(0xAA), 20)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(err.code(), 263);
+        assert_eq!(a.anti_snipe_window(), 10);
+        // The extension that already fired stands.
+        assert_eq!(a.end_slot(), 225);
+    }
+
+    #[test]
+    fn amend_anti_snipe_window_refused_in_terminal_states() {
+        // Settled via buyout.
+        let mut a = EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 10, 25, 2)
+            .unwrap()
+            .with_buyout(300)
+            .unwrap();
+        a.place_bid(key(1), 300, 150).unwrap();
+        assert_eq!(a.state(), AuctionState::Settled);
+        let err = a
+            .amend_english_auction_anti_snipe_window(key(0xAA), 20)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(a.anti_snipe_window(), 10);
+        // NoSale after settling with no bids.
+        let mut b = sniping_auction();
+        b.settle(200).unwrap();
+        assert_eq!(b.state(), AuctionState::NoSale);
+        let err = b
+            .amend_english_auction_anti_snipe_window(key(0xAA), 20)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(b.anti_snipe_window(), 10);
+        // Cancelled.
+        let mut c = sniping_auction();
+        c.cancel(key(0xAA), 150).unwrap();
+        assert_eq!(c.state(), AuctionState::Cancelled);
+        let err = c
+            .amend_english_auction_anti_snipe_window(key(0xAA), 20)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(c.anti_snipe_window(), 10);
+        // Authority still wins on a terminal auction: a stranger is
+        // Unauthorized, not InvalidEnglishAuction.
+        let err = c
+            .amend_english_auction_anti_snipe_window(key(9), 20)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_anti_snipe_window_rejects_degenerate_config() {
+        // Anti-sniping fully disabled: a nonzero window with no
+        // extension and no budget would never trigger.
+        let mut a = EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 0, 0, 0).unwrap();
+        let err = a
+            .amend_english_auction_anti_snipe_window(key(0xAA), 10)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(err.code(), 263);
+        assert_eq!(a.anti_snipe_window(), 0);
+        // Zero extension with a nonzero budget: still degenerate.
+        let mut b = EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 0, 0, 3).unwrap();
+        let err = b
+            .amend_english_auction_anti_snipe_window(key(0xAA), 10)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(b.anti_snipe_window(), 0);
+        // Zero budget with a nonzero extension: still degenerate.
+        let mut c = EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 0, 5, 0).unwrap();
+        let err = c
+            .amend_english_auction_anti_snipe_window(key(0xAA), 10)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(c.anti_snipe_window(), 0);
+        // A zero window with a live extension and budget re-enables
+        // cleanly: the new() gate is judged on the live values.
+        let mut d = EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 0, 5, 3).unwrap();
+        d.amend_english_auction_anti_snipe_window(key(0xAA), 10)
+            .unwrap();
+        assert_eq!(d.anti_snipe_window(), 10);
+        // Authority still wins first: a stranger asking for a
+        // degenerate window is Unauthorized, not InvalidEnglishAuction.
+        let err = a
+            .amend_english_auction_anti_snipe_window(key(9), 10)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.anti_snipe_window(), 0);
+    }
+
+    #[test]
+    fn amend_anti_snipe_window_to_current_is_noop() {
+        let mut a = sniping_auction();
+        a.amend_english_auction_anti_snipe_window(key(0xAA), 10)
+            .unwrap();
+        assert_eq!(a.anti_snipe_window(), 10);
+        assert_eq!(a.state(), AuctionState::Bidding);
+    }
+
+    #[test]
+    fn anti_snipe_window_audit_json_exact() {
+        let mut a = sniping_auction();
+        a.amend_english_auction_anti_snipe_window(key(0xAA), 20)
+            .unwrap();
+        assert_eq!(
+            a.anti_snipe_window_audit_json(10),
+            "{\"event\":\"english_auction_anti_snipe_window_amended\",\"previous_anti_snipe_window\":10,\"anti_snipe_window\":20}"
+        );
+    }
+
+    #[test]
+    fn place_bid_honors_the_amended_window() {
+        // Widened window: a bid at 185 is outside the original
+        // 10-slot tail (185 + 10 < 200) but inside the new 20-slot
+        // tail (185 + 20 >= 200) — it extends the close.
+        let mut a = sniping_auction(); // window 10.
+        a.amend_english_auction_anti_snipe_window(key(0xAA), 20)
+            .unwrap();
+        let r = a.place_bid(key(1), 100, 185).unwrap();
+        assert!(r.extended);
+        assert_eq!(r.end_slot, 225);
+        assert_eq!(a.end_slot(), 225);
+        assert_eq!(a.extension_count(), 1);
+        // Narrowed window: a bid at 194 is outside the new 5-slot
+        // tail (194 + 5 < 200) — no extension, though the original
+        // 10-slot tail would have extended it.
+        let mut b = sniping_auction();
+        b.amend_english_auction_anti_snipe_window(key(0xAA), 5)
+            .unwrap();
+        let r = b.place_bid(key(1), 100, 194).unwrap();
+        assert!(!r.extended);
+        assert_eq!(r.end_slot, 200);
+        // The narrowed tail still extends at its boundary (195 + 5
+        // == 200).
+        let mut c = sniping_auction();
+        c.amend_english_auction_anti_snipe_window(key(0xAA), 5)
+            .unwrap();
+        let r = c.place_bid(key(1), 100, 195).unwrap();
+        assert!(r.extended);
+        assert_eq!(r.end_slot, 225);
+        // Disabled window: even a bid at the last slot extends
+        // nothing.
+        let mut d = sniping_auction();
+        d.amend_english_auction_anti_snipe_window(key(0xAA), 0)
+            .unwrap();
+        let r = d.place_bid(key(1), 100, 195).unwrap();
+        assert!(!r.extended);
+        assert_eq!(r.end_slot, 200);
     }
 
     #[test]
