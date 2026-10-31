@@ -1762,7 +1762,7 @@ program error per variant):
 | `RentalNotActive` | 269 | `RentalEscrow::return_asset` (AV-190) on a rental already in a terminal state |
 | `RentalCancelNotAllowed` | 270 | `RentalEscrow::cancel` (AV-190) after `term_start_slot` or on a terminal rental |
 | `InvalidSealedBid` | 272 | `SealedBidAuction::new` (AV-192) with a zero seller key, `commit_start_slot >= reveal_start_slot`, or `reveal_start_slot >= end_slot`; also `commit_bid` with a zero bidder key or zero commitment |
-| `SealedBidNotLive` | 273 | Sealed-bid commit/reveal (AV-192) outside its phase or on a terminal auction |
+| `SealedBidNotLive` | 273 | Sealed-bid commit/reveal (AV-192) outside its phase or on a terminal auction; also `amend_sealed_bid_min_bid` (AV-302) once the reveal has started or on a terminal auction |
 | `SealedBidDuplicateCommit` | 274 | `SealedBidAuction::commit_bid` (AV-192) from a bidder that already committed |
 | `SealedBidRevealMismatch` | 275 | `SealedBidAuction::reveal_bid` (AV-192) whose `SHA-256(bid \|\| nonce \|\| bidder)` does not equal the stored commitment |
 | `SealedBidSettleTooEarly` | 276 | `SealedBidAuction::settle` (AV-192) at `current_slot < end_slot` |
@@ -2656,6 +2656,18 @@ last-second sniping on price.
   all the outcome is `NoBids`. One commitment per bidder (a second
   commitment is refused — replacing it would let a bidder narrow the
   field after seeing the commitment count), max 64 commitments.
+- **Minimum-bid revision** (AV-302): `amend_sealed_bid_min_bid()` lets
+  the seller move the public floor before the reveal window opens
+  (`current_slot < reveal_start_slot`) — including to `0`, which cancels
+  the floor. Commitments are hashes, so no bidder's position is
+  invalidated by the change; the new floor governs from the next
+  `settle` (reveals below it cannot win, and under Vickrey the price
+  is clamped up to the live floor). Seller-only (`Unauthorized` for
+  anyone else); refused with `SealedBidNotLive` once the reveal has
+  started or the auction is terminal; amending to the current floor is
+  a no-op. The revision is audited as `sealed_bid_min_bid_amended`
+  (hand-written JSON, same convention as the commit/reveal/settle
+  audit events — string event names, no numeric event ID).
 - **Cancel**: seller-only, before the first commitment and while the
   commit phase is still open; a lapsed or committed auction is settled,
   not cancelled.

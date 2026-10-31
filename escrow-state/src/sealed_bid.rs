@@ -450,6 +450,67 @@ impl SealedBidAuction {
         Ok(())
     }
 
+    /// Revise the seller's public minimum bid before the reveal
+    /// phase (AV-302).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the floor is the seller's public price) and only
+    /// before the reveal window opens (`current_slot <
+    /// reveal_start_slot`) on a live auction — refused with
+    /// [`EscrowError::SealedBidNotLive`] (code 273) once the reveal
+    /// has started or the auction is terminal, the original floor
+    /// untouched. The floor may move in either direction, including
+    /// to `0` (which cancels the floor, as at [`Self::new`]): any
+    /// `u64` is legal, so there is no value validation to reuse from
+    /// `new` — the constructor never validated `min_bid` either.
+    ///
+    /// The revision is safe even after commitments have landed:
+    /// commitments are hashes, so no bidder's position is invalidated
+    /// — a commitment binds a bid the seller has not seen yet, and
+    /// the floor is only read at [`Self::settle`]. Only `min_bid`
+    /// changes: seller, windows, pricing, slots, counts, and state
+    /// are untouched. The new floor governs from the next `settle`:
+    /// reveals below it cannot win (`ReserveNotMet`), and under
+    /// Vickrey the price is clamped up to the live floor. Amending to
+    /// the current floor is a no-op.
+    ///
+    /// Check order is authority → liveness, mirroring
+    /// [`Self::cancel`]: a stranger is refused even on a terminal
+    /// auction, and a lapsed auction refuses even the seller.
+    pub fn amend_sealed_bid_min_bid(
+        &mut self,
+        caller: [u8; 32],
+        new_min_bid: u64,
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != SealedBidState::Active || current_slot >= self.reveal_start_slot {
+            return Err(EscrowError::SealedBidNotLive);
+        }
+        if new_min_bid == self.min_bid {
+            return Ok(());
+        }
+        self.min_bid = new_min_bid;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a minimum-bid revision (hand-written, no
+    /// serde — same convention as [`Self::commit_audit_json`]):
+    /// `{"event":"sealed_bid_min_bid_amended","previous_min_bid":
+    /// <u64>,"min_bid":<u64>}`. Sealed-bid audit events carry string
+    /// event names, not numeric event IDs, so no new event number is
+    /// registered for the revision — the event name is the identity.
+    pub fn min_bid_audit_json(&self, previous_min_bid: u64) -> String {
+        let mut s = String::from("{\"event\":\"sealed_bid_min_bid_amended\",\"previous_min_bid\":");
+        s.push_str(&previous_min_bid.to_string());
+        s.push_str(",\"min_bid\":");
+        s.push_str(&self.min_bid.to_string());
+        s.push('}');
+        s
+    }
+
     /// Audit-event JSON for a commitment (hand-written):
     /// `{"event":"sealed_bid_commit","bidder":"<64hex>","commitment":
     /// "<64hex>","reveal_start_slot":<u64>}`.
@@ -834,6 +895,157 @@ mod sealed_bid_tests {
         let mut c = open_auction();
         c.cancel(key(0xAA), 100).unwrap();
         assert_eq!(c.state(), SealedBidState::Cancelled);
+    }
+
+    #[test]
+    fn amend_min_bid_is_seller_only_and_pre_reveal() {
+        let mut a = open_auction(); // seller key(0xAA), min_bid 10, reveal at 200
+        // A stranger or a bidder cannot move the seller's floor.
+        assert_eq!(
+            a.amend_sealed_bid_min_bid(key(9), 50, 100).unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(a.min_bid(), 10);
+        // Before the commit window opens the floor still moves: no
+        // bid is visible yet, so nothing is invalidated.
+        a.amend_sealed_bid_min_bid(key(0xAA), 20, 99).unwrap();
+        assert_eq!(a.min_bid(), 20);
+        // After commitments land but before the reveal, the seller
+        // may still move the floor — commitments are hashes.
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        a.amend_sealed_bid_min_bid(key(0xAA), 30, 150).unwrap();
+        assert_eq!(a.min_bid(), 30);
+        assert_eq!(a.commit_count(), 1);
+        // Once the reveal window opens the floor is locked.
+        let err = a.amend_sealed_bid_min_bid(key(0xAA), 40, 200).unwrap_err();
+        assert_eq!(err, EscrowError::SealedBidNotLive);
+        assert_eq!(err.code(), 273);
+        assert_eq!(a.min_bid(), 30);
+        // A stranger is refused even on a lapsed auction (authority
+        // first, mirroring cancel).
+        let err = a.amend_sealed_bid_min_bid(key(9), 40, 300).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        // Terminal auctions refuse even the seller.
+        a.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        a.settle(300).unwrap();
+        assert_eq!(a.state(), SealedBidState::Settled);
+        let err = a.amend_sealed_bid_min_bid(key(0xAA), 40, 300).unwrap_err();
+        assert_eq!(err, EscrowError::SealedBidNotLive);
+        assert_eq!(a.min_bid(), 30);
+        // A cancelled auction is terminal too.
+        let mut b = open_auction();
+        b.cancel(key(0xAA), 100).unwrap();
+        let err = b.amend_sealed_bid_min_bid(key(0xAA), 40, 100).unwrap_err();
+        assert_eq!(err, EscrowError::SealedBidNotLive);
+    }
+
+    #[test]
+    fn amend_min_bid_noop_on_same_value() {
+        let mut a = open_auction();
+        a.amend_sealed_bid_min_bid(key(0xAA), 10, 100).unwrap();
+        assert_eq!(a.min_bid(), 10);
+        assert_eq!(a.state(), SealedBidState::Active);
+    }
+
+    #[test]
+    fn amend_min_bid_governs_next_settle() {
+        // Raising the floor above the best bid turns a sale into a
+        // reserve-not-met.
+        let mut a = open_auction();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        commit(&mut a, key(2), 90, nonce(2), 120);
+        a.amend_sealed_bid_min_bid(key(0xAA), 100, 150).unwrap();
+        // The committed bids still reveal: the floor change does not
+        // invalidate any commitment.
+        a.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        a.reveal_bid(key(2), 90, nonce(2), 210).unwrap();
+        assert_eq!(
+            a.settle(300).unwrap(),
+            SealedBidSettlement::ReserveNotMet {
+                highest_bidder: key(2),
+                highest_bid: 90
+            }
+        );
+
+        // Lowering the floor lets a previously sub-floor bid win.
+        let mut b = SealedBidAuction::new(key(0xAA), 100, 200, 300, 100).unwrap();
+        commit(&mut b, key(1), 50, nonce(1), 100);
+        b.amend_sealed_bid_min_bid(key(0xAA), 10, 150).unwrap();
+        b.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        assert_eq!(
+            b.settle(300).unwrap(),
+            SealedBidSettlement::Sold {
+                winner: key(1),
+                winning_bid: 50
+            }
+        );
+
+        // Cancelling the floor (0) lets any revealed bid win.
+        let mut c = open_auction();
+        commit(&mut c, key(1), 5, nonce(1), 100);
+        c.amend_sealed_bid_min_bid(key(0xAA), 0, 150).unwrap();
+        assert_eq!(c.min_bid(), 0);
+        c.reveal_bid(key(1), 5, nonce(1), 200).unwrap();
+        assert_eq!(
+            c.settle(300).unwrap(),
+            SealedBidSettlement::Sold {
+                winner: key(1),
+                winning_bid: 5
+            }
+        );
+
+        // Under Vickrey the price clamps up to the *live* floor: the
+        // second-highest bid is 50, the amended floor is 60.
+        let mut d = SealedBidAuction::new(key(0xAA), 100, 200, 300, 10)
+            .unwrap()
+            .with_vickrey()
+            .unwrap();
+        commit(&mut d, key(1), 50, nonce(1), 100);
+        commit(&mut d, key(2), 90, nonce(2), 120);
+        d.amend_sealed_bid_min_bid(key(0xAA), 60, 150).unwrap();
+        d.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        d.reveal_bid(key(2), 90, nonce(2), 210).unwrap();
+        assert_eq!(
+            d.settle(300).unwrap(),
+            SealedBidSettlement::Sold {
+                winner: key(2),
+                winning_bid: 60
+            }
+        );
+    }
+
+    #[test]
+    fn amend_min_bid_leaves_everything_else_untouched() {
+        let mut a = SealedBidAuction::new(key(0xAA), 100, 200, 300, 10)
+            .unwrap()
+            .with_vickrey()
+            .unwrap();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        a.amend_sealed_bid_min_bid(key(0xAA), 25, 150).unwrap();
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.min_bid(), 25);
+        assert_eq!(a.pricing(), SealedBidPricing::Vickrey);
+        assert_eq!(a.commit_count(), 1);
+        assert_eq!(a.reveal_count(), 0);
+        assert_eq!(a.state(), SealedBidState::Active);
+        // The reveal window is unchanged: reveals still land at 200.
+        a.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        assert_eq!(a.phase(150), SealedBidPhase::Commit);
+        assert_eq!(a.phase(200), SealedBidPhase::Reveal);
+    }
+
+    #[test]
+    fn amend_min_bid_audit_json() {
+        let mut a = open_auction();
+        a.amend_sealed_bid_min_bid(key(0xAA), 25, 100).unwrap();
+        let j = a.min_bid_audit_json(10);
+        assert!(j.contains("\"event\":\"sealed_bid_min_bid_amended\""));
+        assert!(j.contains("\"previous_min_bid\":10"));
+        assert!(j.contains("\"min_bid\":25"));
+        assert_eq!(
+            j,
+            "{\"event\":\"sealed_bid_min_bid_amended\",\"previous_min_bid\":10,\"min_bid\":25}"
+        );
     }
 
     #[test]
