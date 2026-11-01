@@ -7648,6 +7648,23 @@ whether the sale happens at all.
   extension. `anti_snipe_extension_audit_json` records the previous
   and new extension (string event name
   `english_auction_anti_snipe_extension_amended`, no new event code).
+- **Anti-snipe extension-budget revision** (AV-310): before the first
+  bid the seller may revise how many times a tail bid may push the
+  close out with `amend_english_auction_max_extensions` — seller-only
+  (`Unauthorized`, code 100), and refused with
+  `InvalidEnglishAuction` (code 263) once a bid has landed or the
+  auction is terminal, so terms bidders already accepted are never
+  rewritten. The new budget reuses the `new` gate against the live
+  window (at most `MAX_SNIPE_EXTENSIONS` = 64, and a live nonzero
+  window needs a nonzero budget); with the window at `0`
+  anti-sniping is off and any budget up to the cap is inert, so it
+  is accepted as-is, and re-affirming the current budget is a
+  no-op. Only `max_extensions` changes; `place_bid` reads the live
+  value, so a trailing bid extends the close only while
+  `extension_count` is under the new budget.
+  `max_extensions_audit_json` records the previous and new budget
+  (string event name `english_auction_max_extensions_amended`, no
+  new event code).
 - **Refunds are exact**: `place_bid` returns a `BidReceipt` naming the
   outbid leader and their amount, so the program refunds the full
   previous bid atomically; `settle` is permissionless after the close

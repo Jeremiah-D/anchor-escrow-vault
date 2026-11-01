@@ -19,7 +19,10 @@
 //!   first bid (`amend_english_auction_anti_snipe_window`, AV-308).
 //!   The anti-sniping extension — how far a tail bid pushes the
 //!   close out — may likewise be revised before the first bid
-//!   (`amend_english_auction_anti_snipe_extension`, AV-309).
+//!   (`amend_english_auction_anti_snipe_extension`, AV-309). The
+//!   anti-sniping extension budget — how many times a tail bid may
+//!   push the close out — may likewise be revised before the first
+//!   bid (`amend_english_auction_max_extensions`, AV-310).
 //! - **Buy-it-now** (AV-201, opt-in): the seller may set a buyout
 //!   price; a live bid at or above it settles the auction immediately
 //!   at exactly that price, skipping the remaining window and any
@@ -121,6 +124,9 @@ pub struct BidReceipt {
 /// The anti-sniping extension may likewise be revised before the
 /// first bid
 /// ([`EnglishAuction::amend_english_auction_anti_snipe_extension`]).
+/// The anti-sniping extension budget may likewise be revised before
+/// the first bid
+/// ([`EnglishAuction::amend_english_auction_max_extensions`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnglishAuction {
     seller: [u8; 32],
@@ -420,6 +426,59 @@ impl EnglishAuction {
         Ok(())
     }
 
+    /// Revise the anti-sniping extension budget before the first bid
+    /// (AV-310).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the extension budget is the seller's auction
+    /// term) and only before the first bid: refused with
+    /// [`EscrowError::InvalidEnglishAuction`] (code 263) once any bid
+    /// has landed or the auction is terminal, the original budget
+    /// untouched — changing the budget after bids exist would rewrite
+    /// terms bidders already accepted. The new budget reuses the
+    /// [`Self::new`] gate against the *live* window: it must not
+    /// exceed [`MAX_SNIPE_EXTENSIONS`], and a live nonzero window
+    /// with a zero budget never triggers, so that combination is
+    /// refused with code 263; when the live window is `0`
+    /// anti-sniping is off and any budget is inert, so `0` (and any
+    /// value up to the cap) is accepted as-is.
+    ///
+    /// Only `max_extensions` changes: seller, `reserve_price`,
+    /// `min_increment`, windows, `anti_snipe_extension`, buyout,
+    /// `highest_bid`, `bid_count`, `extension_count`, and state are
+    /// untouched. The new budget governs from the next
+    /// [`Self::place_bid`], which reads the live value: a trailing
+    /// bid extends the close only while `extension_count` is under
+    /// the new budget. Amending to the current budget is a no-op.
+    ///
+    /// Check order is authority → liveness → value, mirroring
+    /// [`Self::amend_english_auction_anti_snipe_extension`]: a
+    /// stranger is refused even on a terminal auction, and a lapsed
+    /// auction refuses even the seller.
+    pub fn amend_english_auction_max_extensions(
+        &mut self,
+        caller: [u8; 32],
+        new_max_extensions: u16,
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != AuctionState::Bidding || self.bid_count > 0 {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        if new_max_extensions > MAX_SNIPE_EXTENSIONS {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        if self.anti_snipe_window > 0 && new_max_extensions == 0 {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        if new_max_extensions == self.max_extensions {
+            return Ok(());
+        }
+        self.max_extensions = new_max_extensions;
+        Ok(())
+    }
+
     /// The recorded buy-it-now sale `(winner, price)` — `Some` only
     /// when the auction settled through the buyout path of
     /// [`EnglishAuction::place_bid`].
@@ -449,6 +508,13 @@ impl EnglishAuction {
     /// pushes the close out (see [`EnglishAuction::place_bid`]).
     pub fn anti_snipe_window(&self) -> u64 {
         self.anti_snipe_window
+    }
+
+    /// The maximum number of anti-sniping extensions (`0` with a
+    /// zero tail window disables anti-sniping; capped at
+    /// [`MAX_SNIPE_EXTENSIONS`]).
+    pub fn max_extensions(&self) -> u16 {
+        self.max_extensions
     }
 
     /// The slot bidding opens.
@@ -783,6 +849,27 @@ impl EnglishAuction {
         s.push_str(&previous_anti_snipe_extension.to_string());
         s.push_str(",\"anti_snipe_extension\":");
         s.push_str(&self.anti_snipe_extension.to_string());
+        s.push('}');
+        s
+    }
+
+    /// Audit-event JSON for an anti-sniping extension-budget
+    /// revision (hand-written):
+    /// `{"event":"english_auction_max_extensions_amended",
+    /// "previous_max_extensions":<u16>,"max_extensions":<u16>}`.
+    /// English-auction audit events carry string event names, not
+    /// numeric event IDs, so no new event number is registered for
+    /// the revision — the event name is the identity.
+    pub fn max_extensions_audit_json(
+        &self,
+        previous_max_extensions: u16,
+    ) -> String {
+        let mut s = String::from(
+            "{\"event\":\"english_auction_max_extensions_amended\",\"previous_max_extensions\":",
+        );
+        s.push_str(&previous_max_extensions.to_string());
+        s.push_str(",\"max_extensions\":");
+        s.push_str(&self.max_extensions.to_string());
         s.push('}');
         s
     }
@@ -1801,6 +1888,241 @@ mod english_auction_tests {
             EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 0, 5, 3).unwrap();
         c.amend_english_auction_anti_snipe_extension(key(0xAA), 0)
             .unwrap();
+        let r = c.place_bid(key(1), 100, 195).unwrap();
+        assert!(!r.extended);
+        assert_eq!(r.end_slot, 200);
+    }
+
+    #[test]
+    fn amend_max_extensions_before_first_bid() {
+        let mut a = sniping_auction(); // budget 2.
+        // Raise the budget.
+        a.amend_english_auction_max_extensions(key(0xAA), 5)
+            .unwrap();
+        assert_eq!(a.max_extensions(), 5);
+        // Lower it.
+        a.amend_english_auction_max_extensions(key(0xAA), 1)
+            .unwrap();
+        assert_eq!(a.max_extensions(), 1);
+        // Everything else is untouched.
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.reserve_price(), 0);
+        assert_eq!(a.min_increment(), 10);
+        assert_eq!(a.anti_snipe_window(), 10);
+        assert_eq!(a.start_slot(), 100);
+        assert_eq!(a.end_slot(), 200);
+        assert_eq!(a.state(), AuctionState::Bidding);
+        assert_eq!(a.highest_bid(), 0);
+        assert_eq!(a.highest_bidder(), [0u8; 32]);
+        assert_eq!(a.bid_count(), 0);
+        assert_eq!(a.extension_count(), 0);
+        assert_eq!(a.buyout_price(), 0);
+        assert_eq!(a.buyout_sale(), None);
+        // A zero budget is refused while the tail window is live —
+        // it is covered in amend_max_extensions_rejects_degenerate_config.
+    }
+
+    #[test]
+    fn amend_max_extensions_is_seller_only() {
+        let mut a = sniping_auction();
+        // A stranger is refused, even on a live auction.
+        let err = a
+            .amend_english_auction_max_extensions(key(9), 5)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(a.max_extensions(), 2);
+        // A bidder is refused too — authority is checked first.
+        a.place_bid(key(1), 50, 150).unwrap();
+        let err = a
+            .amend_english_auction_max_extensions(key(1), 5)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.max_extensions(), 2);
+    }
+
+    #[test]
+    fn amend_max_extensions_locks_after_first_bid() {
+        let mut a = sniping_auction();
+        // The opening bid lands in the tail and extends the close.
+        let r = a.place_bid(key(1), 100, 195).unwrap();
+        assert!(r.extended);
+        assert_eq!(a.end_slot(), 225);
+        assert_eq!(a.extension_count(), 1);
+        let err = a
+            .amend_english_auction_max_extensions(key(0xAA), 5)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(err.code(), 263);
+        assert_eq!(a.max_extensions(), 2);
+        // The original budget still governs: the next tail bid burns
+        // the last extension, and the one after it extends nothing.
+        let r = a.place_bid(key(2), 120, 220).unwrap();
+        assert!(r.extended);
+        assert_eq!(a.end_slot(), 250);
+        assert_eq!(a.extension_count(), 2);
+        let r = a.place_bid(key(3), 140, 245).unwrap();
+        assert!(!r.extended);
+        assert_eq!(a.end_slot(), 250);
+    }
+
+    #[test]
+    fn amend_max_extensions_refused_in_terminal_states() {
+        // Settled via buyout.
+        let mut a = EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 10, 25, 2)
+            .unwrap()
+            .with_buyout(300)
+            .unwrap();
+        a.place_bid(key(1), 300, 150).unwrap();
+        assert_eq!(a.state(), AuctionState::Settled);
+        let err = a
+            .amend_english_auction_max_extensions(key(0xAA), 5)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(a.max_extensions(), 2);
+        // NoSale after settling with no bids.
+        let mut b = sniping_auction();
+        b.settle(200).unwrap();
+        assert_eq!(b.state(), AuctionState::NoSale);
+        let err = b
+            .amend_english_auction_max_extensions(key(0xAA), 5)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(b.max_extensions(), 2);
+        // Cancelled.
+        let mut c = sniping_auction();
+        c.cancel(key(0xAA), 150).unwrap();
+        assert_eq!(c.state(), AuctionState::Cancelled);
+        let err = c
+            .amend_english_auction_max_extensions(key(0xAA), 5)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(c.max_extensions(), 2);
+        // Authority still wins on a terminal auction: a stranger is
+        // Unauthorized, not InvalidEnglishAuction.
+        let err = c
+            .amend_english_auction_max_extensions(key(9), 5)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_max_extensions_rejects_degenerate_config() {
+        // A live tail window with a zero budget never triggers.
+        let mut a = sniping_auction(); // window 10, budget 2.
+        let err = a
+            .amend_english_auction_max_extensions(key(0xAA), 0)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(err.code(), 263);
+        assert_eq!(
+            a.max_extensions_audit_json(2),
+            "{\"event\":\"english_auction_max_extensions_amended\",\"previous_max_extensions\":2,\"max_extensions\":2}"
+        );
+        // Above the hard cap.
+        let err = a
+            .amend_english_auction_max_extensions(key(0xAA), MAX_SNIPE_EXTENSIONS + 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(a.max_extensions(), 2);
+        // Exactly at the cap is accepted.
+        a.amend_english_auction_max_extensions(key(0xAA), MAX_SNIPE_EXTENSIONS)
+            .unwrap();
+        assert_eq!(a.max_extensions(), MAX_SNIPE_EXTENSIONS);
+        // With the window off, zeroing the budget is allowed — it is
+        // inert until a window is set.
+        let mut b =
+            EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 0, 5, 3).unwrap();
+        b.amend_english_auction_max_extensions(key(0xAA), 0)
+            .unwrap();
+        assert_eq!(
+            b.max_extensions_audit_json(3),
+            "{\"event\":\"english_auction_max_extensions_amended\",\"previous_max_extensions\":3,\"max_extensions\":0}"
+        );
+        // Anti-sniping fully disabled (window 0, extension 0,
+        // budget 0): any budget up to the cap is accepted as inert.
+        let mut c =
+            EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 0, 0, 0).unwrap();
+        c.amend_english_auction_max_extensions(key(0xAA), 5)
+            .unwrap();
+        assert_eq!(
+            c.max_extensions_audit_json(0),
+            "{\"event\":\"english_auction_max_extensions_amended\",\"previous_max_extensions\":0,\"max_extensions\":5}"
+        );
+        // Authority still wins first: a stranger asking for a
+        // degenerate budget is Unauthorized, not InvalidEnglishAuction.
+        let err = a
+            .amend_english_auction_max_extensions(key(9), 0)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.max_extensions(), MAX_SNIPE_EXTENSIONS);
+    }
+
+    #[test]
+    fn amend_max_extensions_to_current_is_noop() {
+        let mut a = sniping_auction();
+        a.amend_english_auction_max_extensions(key(0xAA), 2)
+            .unwrap();
+        assert_eq!(a.max_extensions(), 2);
+        assert_eq!(
+            a.max_extensions_audit_json(2),
+            "{\"event\":\"english_auction_max_extensions_amended\",\"previous_max_extensions\":2,\"max_extensions\":2}"
+        );
+        assert_eq!(a.state(), AuctionState::Bidding);
+    }
+
+    #[test]
+    fn max_extensions_audit_json_exact() {
+        let mut a = sniping_auction();
+        a.amend_english_auction_max_extensions(key(0xAA), 5)
+            .unwrap();
+        assert_eq!(
+            a.max_extensions_audit_json(2),
+            "{\"event\":\"english_auction_max_extensions_amended\",\"previous_max_extensions\":2,\"max_extensions\":5}"
+        );
+    }
+
+    #[test]
+    fn place_bid_honors_the_amended_budget() {
+        // Raised budget: a third tail bid still extends the close —
+        // the original budget of 2 would have stopped at two.
+        let mut a = sniping_auction(); // budget 2.
+        a.amend_english_auction_max_extensions(key(0xAA), 3)
+            .unwrap();
+        let r = a.place_bid(key(1), 100, 195).unwrap();
+        assert!(r.extended);
+        assert_eq!(r.end_slot, 225);
+        let r = a.place_bid(key(2), 120, 220).unwrap();
+        assert!(r.extended);
+        assert_eq!(r.end_slot, 250);
+        let r = a.place_bid(key(3), 140, 245).unwrap();
+        assert!(r.extended);
+        assert_eq!(r.end_slot, 275);
+        assert_eq!(a.extension_count(), 3);
+        // The raised budget is spent now: the next tail bid extends
+        // nothing.
+        let r = a.place_bid(key(4), 160, 270).unwrap();
+        assert!(!r.extended);
+        assert_eq!(a.end_slot(), 275);
+        // Lowered budget: the second tail bid already extends
+        // nothing — the original budget of 2 would have extended it.
+        let mut b = sniping_auction();
+        b.amend_english_auction_max_extensions(key(0xAA), 1)
+            .unwrap();
+        let r = b.place_bid(key(1), 100, 195).unwrap();
+        assert!(r.extended);
+        assert_eq!(r.end_slot, 225);
+        assert_eq!(b.extension_count(), 1);
+        let r = b.place_bid(key(2), 120, 220).unwrap();
+        assert!(!r.extended);
+        assert_eq!(r.end_slot, 225);
+        // Zeroed budget with the window off: a tail bid extends
+        // nothing (the window, not the budget, gates it here).
+        let mut c =
+            EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 0, 5, 3).unwrap();
+        c.amend_english_auction_max_extensions(key(0xAA), 0)
+            .unwrap();
+        assert_eq!(c.max_extensions(), 0);
         let r = c.place_bid(key(1), 100, 195).unwrap();
         assert!(!r.extended);
         assert_eq!(r.end_slot, 200);
