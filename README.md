@@ -7665,6 +7665,21 @@ whether the sale happens at all.
   `max_extensions_audit_json` records the previous and new budget
   (string event name `english_auction_max_extensions_amended`, no
   new event code).
+- **Closing-slot revision** (AV-311): before the first bid the seller
+  may revise the closing slot with `amend_english_auction_end_slot`
+  — seller-only (`Unauthorized`, code 100), and refused with
+  `InvalidEnglishAuction` (code 263) once a bid has landed or the
+  auction is terminal, so terms bidders already accepted are never
+  rewritten. The new close reuses the `new` gate against the live
+  start slot (it must be strictly after `start_slot`); the method
+  takes no `current_slot`, so a new close already in the past is
+  accepted as-is — its effect is an early close, with later bids
+  refused and `settle` able to finalize. Re-affirming the current
+  close is a no-op. Only `end_slot` changes; `place_bid` reads the
+  live value, so a trailing bid is judged against the new close for
+  extension and pushes it out by the live extension.
+  `end_slot_audit_json` records the previous and new close (string
+  event name `english_auction_end_slot_amended`, no new event code).
 - **Refunds are exact**: `place_bid` returns a `BidReceipt` naming the
   outbid leader and their amount, so the program refunds the full
   previous bid atomically; `settle` is permissionless after the close
