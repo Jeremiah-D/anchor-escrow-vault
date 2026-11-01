@@ -79,9 +79,11 @@ pub enum SealedBidPhase {
 /// incentive (a bidder's best strategy is to reveal their true value,
 /// since the price they pay is set by someone else's bid).
 ///
-/// The mode is fixed before the first commitment lands (see
-/// [`SealedBidAuction::with_vickrey`]) — changing the pricing rule
-/// after bidders have committed would rewrite the game they entered.
+/// The mode is fixed before the first commitment lands — switch it
+/// with [`SealedBidAuction::with_vickrey`] at construction or
+/// [`SealedBidAuction::amend_sealed_bid_pricing`] after construction.
+/// Changing the pricing rule after bidders have committed would
+/// rewrite the game they entered.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SealedBidPricing {
     /// Winner pays their own bid.
@@ -184,7 +186,8 @@ pub struct SealedBidAuction {
     reveal_start_slot: u64,
     end_slot: u64,
     /// The pricing rule `settle` applies — fixed before the first
-    /// commitment (see [`SealedBidAuction::with_vickrey`]).
+    /// commitment (see [`SealedBidAuction::with_vickrey`] and
+    /// [`SealedBidAuction::amend_sealed_bid_pricing`]).
     pricing: SealedBidPricing,
     slots: [SealedBidSlot; MAX_SEALED_BIDS],
     commit_count: u32,
@@ -236,7 +239,10 @@ impl SealedBidAuction {
     /// first commitment has landed or the auction is terminal —
     /// bidders committed under first-price rules and the rule may not
     /// be rewritten underneath them. Calling it twice is a harmless
-    /// no-op (the mode is already Vickrey).
+    /// no-op (the mode is already Vickrey). To revise the rule after
+    /// construction — including switching back to first-price — use
+    /// [`Self::amend_sealed_bid_pricing`], which enforces the same
+    /// pre-commit gate.
     pub fn with_vickrey(mut self) -> Result<Self, EscrowError> {
         if self.state != SealedBidState::Active || self.commit_count > 0 {
             return Err(EscrowError::SealedBidPricingLocked);
@@ -508,6 +514,77 @@ impl SealedBidAuction {
         s.push_str(",\"min_bid\":");
         s.push_str(&self.min_bid.to_string());
         s.push('}');
+        s
+    }
+
+    /// Revise the sealed-bid pricing rule before the first commitment
+    /// lands (AV-313).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the pricing rule is the seller's public game)
+    /// and only before the first commitment lands (`state == Active`
+    /// and `commit_count == 0`) — refused with
+    /// [`EscrowError::SealedBidPricingLocked`] (code 313) once a
+    /// commitment has landed or the auction is terminal, the original
+    /// rule untouched. This is the post-construction counterpart of
+    /// [`Self::with_vickrey`]: that builder only switches FirstPrice
+    /// → Vickrey, and only while the construction chain is still
+    /// open, so it offers no way back and no way to revise the rule
+    /// after construction — this method supplies both, in either
+    /// direction, for any [`SealedBidPricing`] variant.
+    ///
+    /// The revision is safe even after the commit window has opened:
+    /// no commitment has landed yet, so no bidder has entered the
+    /// game under the old rule — and commitments are hashes anyway,
+    /// so a later commitment binds a bid the seller has not seen.
+    /// Only `pricing` changes: seller, `min_bid`, the three windows,
+    /// slots, counts, and state are untouched. The new rule governs
+    /// from the next [`Self::settle`], which reads the live value:
+    /// FirstPrice pays the winner's own bid, Vickrey pays the
+    /// second-highest revealed bid clamped up to the live `min_bid`.
+    /// Amending to the current rule is a no-op.
+    ///
+    /// Check order is authority → liveness, mirroring
+    /// [`Self::amend_sealed_bid_min_bid`]: a stranger is refused
+    /// even on a terminal auction, and a locked auction refuses even
+    /// the seller.
+    pub fn amend_sealed_bid_pricing(
+        &mut self,
+        caller: [u8; 32],
+        new_pricing: SealedBidPricing,
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != SealedBidState::Active || self.commit_count > 0 {
+            return Err(EscrowError::SealedBidPricingLocked);
+        }
+        if new_pricing == self.pricing {
+            return Ok(());
+        }
+        self.pricing = new_pricing;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a pricing-rule revision (hand-written, no
+    /// serde — same convention as [`Self::min_bid_audit_json`]):
+    /// `{"event":"sealed_bid_pricing_amended","previous":
+    /// "first_price|vickrey","pricing":"first_price|vickrey"}`.
+    /// Sealed-bid audit events carry string event names, not numeric
+    /// event IDs, so no new event number is registered for the
+    /// revision — the event name is the identity.
+    pub fn pricing_audit_json(&self, previous_pricing: SealedBidPricing) -> String {
+        let mut s = String::from("{\"event\":\"sealed_bid_pricing_amended\",\"previous\":\"");
+        s.push_str(match previous_pricing {
+            SealedBidPricing::FirstPrice => "first_price",
+            SealedBidPricing::Vickrey => "vickrey",
+        });
+        s.push_str("\",\"pricing\":\"");
+        s.push_str(match self.pricing {
+            SealedBidPricing::FirstPrice => "first_price",
+            SealedBidPricing::Vickrey => "vickrey",
+        });
+        s.push_str("\"}");
         s
     }
 
@@ -1269,6 +1346,208 @@ mod sealed_bid_tests {
         assert_eq!(
             j,
             "{\"event\":\"sealed_bid_min_bid_amended\",\"previous_min_bid\":10,\"min_bid\":25}"
+        );
+    }
+
+    #[test]
+    fn amend_sealed_bid_pricing_switches_both_ways() {
+        let mut a = open_auction(); // FirstPrice by default
+        assert_eq!(a.pricing(), SealedBidPricing::FirstPrice);
+        // FirstPrice -> Vickrey after construction — the builder
+        // chain is closed by then, so only this method can do it.
+        a.amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::Vickrey)
+            .unwrap();
+        assert_eq!(a.pricing(), SealedBidPricing::Vickrey);
+        // ... and back again — with_vickrey is one-way, this is not.
+        a.amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::FirstPrice)
+            .unwrap();
+        assert_eq!(a.pricing(), SealedBidPricing::FirstPrice);
+        // The switch still works once the commit window has opened,
+        // as long as no commitment has landed.
+        a.amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::Vickrey)
+            .unwrap();
+        assert_eq!(a.pricing(), SealedBidPricing::Vickrey);
+        assert_eq!(a.state(), SealedBidState::Active);
+        assert_eq!(a.commit_count(), 0);
+    }
+
+    #[test]
+    fn amend_sealed_bid_pricing_is_seller_only_and_pre_commit() {
+        let mut a = open_auction(); // seller key(0xAA), FirstPrice
+        // A stranger or a bidder cannot rewrite the seller's game.
+        assert_eq!(
+            a.amend_sealed_bid_pricing(key(9), SealedBidPricing::Vickrey)
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(
+            a.amend_sealed_bid_pricing(key(1), SealedBidPricing::Vickrey)
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(a.pricing(), SealedBidPricing::FirstPrice);
+        // Once the first commitment lands the rule is locked — the
+        // same SealedBidPricingLocked gate as with_vickrey.
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        let err = a
+            .amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::Vickrey)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::SealedBidPricingLocked);
+        assert_eq!(err.code(), 313);
+        assert_eq!(a.pricing(), SealedBidPricing::FirstPrice);
+        // A stranger is refused even on a terminal auction
+        // (authority first, mirroring amend_sealed_bid_min_bid).
+        a.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        a.settle(300).unwrap();
+        assert_eq!(a.state(), SealedBidState::Settled);
+        let err = a
+            .amend_sealed_bid_pricing(key(9), SealedBidPricing::Vickrey)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        // A terminal auction refuses even the seller.
+        let err = a
+            .amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::Vickrey)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::SealedBidPricingLocked);
+        assert_eq!(a.pricing(), SealedBidPricing::FirstPrice);
+        // A cancelled auction is terminal too.
+        let mut b = open_auction();
+        b.cancel(key(0xAA), 100).unwrap();
+        let err = b
+            .amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::Vickrey)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::SealedBidPricingLocked);
+    }
+
+    #[test]
+    fn amend_sealed_bid_pricing_noop_on_same_value() {
+        let mut a = open_auction();
+        a.amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::FirstPrice)
+            .unwrap();
+        assert_eq!(a.pricing(), SealedBidPricing::FirstPrice);
+        assert_eq!(a.state(), SealedBidState::Active);
+        let mut b = SealedBidAuction::new(key(0xAA), 100, 200, 300, 10)
+            .unwrap()
+            .with_vickrey()
+            .unwrap();
+        b.amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::Vickrey)
+            .unwrap();
+        assert_eq!(b.pricing(), SealedBidPricing::Vickrey);
+    }
+
+    #[test]
+    fn amend_sealed_bid_pricing_governs_next_settle() {
+        // Switch to Vickrey after construction: the winner pays the
+        // second-highest revealed bid, not their own.
+        let mut a = open_auction();
+        a.amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::Vickrey)
+            .unwrap();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        commit(&mut a, key(2), 90, nonce(2), 120);
+        a.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        a.reveal_bid(key(2), 90, nonce(2), 210).unwrap();
+        assert_eq!(
+            a.settle(300).unwrap(),
+            SealedBidSettlement::Sold {
+                winner: key(2),
+                winning_bid: 50
+            }
+        );
+
+        // Switch back to FirstPrice before any commitment: the
+        // winner pays their own bid again.
+        let mut b = SealedBidAuction::new(key(0xAA), 100, 200, 300, 10)
+            .unwrap()
+            .with_vickrey()
+            .unwrap();
+        b.amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::FirstPrice)
+            .unwrap();
+        commit(&mut b, key(1), 50, nonce(1), 100);
+        commit(&mut b, key(2), 90, nonce(2), 120);
+        b.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        b.reveal_bid(key(2), 90, nonce(2), 210).unwrap();
+        assert_eq!(
+            b.settle(300).unwrap(),
+            SealedBidSettlement::Sold {
+                winner: key(2),
+                winning_bid: 90
+            }
+        );
+
+        // Under Vickrey the price is clamped up to the *live* floor:
+        // the second-highest bid is 50, the floor is 60.
+        let mut c = open_auction(); // min_bid = 10
+        c.amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::Vickrey)
+            .unwrap();
+        c.amend_sealed_bid_min_bid(key(0xAA), 60, 100).unwrap();
+        commit(&mut c, key(1), 50, nonce(1), 100);
+        commit(&mut c, key(2), 90, nonce(2), 120);
+        c.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        c.reveal_bid(key(2), 90, nonce(2), 210).unwrap();
+        assert_eq!(
+            c.settle(300).unwrap(),
+            SealedBidSettlement::Sold {
+                winner: key(2),
+                winning_bid: 60
+            }
+        );
+    }
+
+    #[test]
+    fn amend_sealed_bid_pricing_leaves_everything_else_untouched() {
+        let mut a = SealedBidAuction::new(key(0xAA), 100, 200, 300, 10)
+            .unwrap()
+            .with_vickrey()
+            .unwrap();
+        a.amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::FirstPrice)
+            .unwrap();
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.min_bid(), 10);
+        assert_eq!(a.commit_start_slot(), 100);
+        assert_eq!(a.reveal_start_slot(), 200);
+        assert_eq!(a.end_slot(), 300);
+        assert_eq!(a.pricing(), SealedBidPricing::FirstPrice);
+        assert_eq!(a.commit_count(), 0);
+        assert_eq!(a.reveal_count(), 0);
+        assert_eq!(a.state(), SealedBidState::Active);
+        // The windows are unchanged: commits still open at 100,
+        // reveals at 200, settlement at 300.
+        assert_eq!(a.phase(99), SealedBidPhase::Closed);
+        assert_eq!(a.phase(100), SealedBidPhase::Commit);
+        assert_eq!(a.phase(200), SealedBidPhase::Reveal);
+        assert_eq!(a.phase(300), SealedBidPhase::Closed);
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        a.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        assert_eq!(
+            a.settle(300).unwrap(),
+            SealedBidSettlement::Sold {
+                winner: key(1),
+                winning_bid: 50
+            }
+        );
+    }
+
+    #[test]
+    fn amend_sealed_bid_pricing_audit_json() {
+        let mut a = open_auction();
+        a.amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::Vickrey)
+            .unwrap();
+        let j = a.pricing_audit_json(SealedBidPricing::FirstPrice);
+        assert!(j.contains("\"event\":\"sealed_bid_pricing_amended\""));
+        assert!(j.contains("\"previous\":\"first_price\""));
+        assert!(j.contains("\"pricing\":\"vickrey\""));
+        assert_eq!(
+            j,
+            "{\"event\":\"sealed_bid_pricing_amended\",\"previous\":\"first_price\",\"pricing\":\"vickrey\"}"
+        );
+        // ... and back: the audit names both directions.
+        a.amend_sealed_bid_pricing(key(0xAA), SealedBidPricing::FirstPrice)
+            .unwrap();
+        let j = a.pricing_audit_json(SealedBidPricing::Vickrey);
+        assert_eq!(
+            j,
+            "{\"event\":\"sealed_bid_pricing_amended\",\"previous\":\"vickrey\",\"pricing\":\"first_price\"}"
         );
     }
 

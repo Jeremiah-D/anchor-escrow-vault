@@ -2727,6 +2727,27 @@ last-second sniping on price.
   313) — rewriting the rules after bidders entered would be a
   bait-and-switch. `Sold.winning_bid` is the price *paid*, and the
   settlement audit JSON records `"pricing":"first_price|vickrey"`.
+- **Pricing-rule revision** (AV-313): `amend_sealed_bid_pricing()`
+  lets the seller revise the pricing rule after construction, in
+  either direction — `with_vickrey()` is a one-way builder that only
+  switches FirstPrice → Vickrey while the construction chain is still
+  open, so it offers no way back and no post-construction entry point.
+  Any `SealedBidPricing` variant is legal (no value gate to reuse:
+  `new()` defaults to FirstPrice and `with_vickrey()` proves Vickrey
+  legal). Seller-only (`Unauthorized` for anyone else); refused with
+  `SealedBidPricingLocked` (code 313) once the first commitment has
+  landed or the auction is terminal — the same gate as
+  `with_vickrey` — so no bidder's entered game is rewritten. The
+  switch still works after the commit window has opened, as long as
+  no commitment has landed (the method takes no `current_slot`).
+  Only `pricing` changes — seller, `min_bid`, the three windows,
+  slots, counts, and state are untouched; amending to the current
+  rule is a no-op. The new rule governs from the next `settle`
+  (`settle` reads the live value: FirstPrice pays the winner's own
+  bid, Vickrey pays the second-highest revealed bid clamped up to
+  the live `min_bid`). Audited as `sealed_bid_pricing_amended`
+  (hand-written JSON, `"previous"|"pricing"` as
+  `"first_price"|"vickrey"` strings, no numeric event ID).
 
 New error codes (never renumbered): `InvalidSealedBid` (272),
 `SealedBidNotLive` (273), `SealedBidDuplicateCommit` (274),
