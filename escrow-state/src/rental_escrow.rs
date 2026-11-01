@@ -404,6 +404,78 @@ impl RentalEscrow {
         Ok(())
     }
 
+    /// Revise the rent amount on an `Active` rental (AV-314 —
+    /// Solana rental governance): both parties authorize the change
+    /// (the rent is a bilateral economic term — a unilateral
+    /// rewrite would let one side reprice the other's custody cost
+    /// alone). Check order is authority → state → window → value,
+    /// mirroring AV-292's `extend_term_end`, so a stranger learns
+    /// nothing about the rental's state from the error alone.
+    ///
+    /// Why: the rent is fixed at construction
+    /// ([`RentalEscrow::new`]), but the parties may renegotiate the
+    /// price before the term starts — a rent that cannot be revised
+    /// would force a fresh rental (and a fresh custody transfer)
+    /// for a legitimate new price. Only an `Active` rental may
+    /// revise, and only before the term starts: once the term has
+    /// begun the rent corresponds to use already consumed (and
+    /// possibly already prepaid), and repricing it would only
+    /// rebase the late-fee computation on consumed use. Before the
+    /// start there is no consumed use and no accrued fee, so a
+    /// renegotiated rent is a clean re-price.
+    ///
+    /// The new rent reuses the [`RentalEscrow::new`] gate exactly:
+    /// a zero rent fails closed with
+    /// [`EscrowError::InvalidRentalTerms`] (code 268), leaving the
+    /// current rent untouched, because the new value is validated
+    /// before any write. Re-affirming the current rent is a no-op
+    /// that writes nothing. Only `rent_amount` changes — the owner,
+    /// renter, asset, term slots, `slots_per_day`, late fee, and
+    /// state are untouched — and [`RentalEscrow::late_fee_due`] /
+    /// [`RentalEscrow::return_asset`] read the live rent, so the new
+    /// rent governs from the next billing (both the per-day fee and
+    /// the cap scale with it); a return already executed is
+    /// unaffected. There is no event layer on `RentalEscrow`, so no
+    /// event is emitted for the revision or its no-op. No new error
+    /// code: the refusals reuse `Unauthorized` (100),
+    /// `RentalNotActive` (269), and `InvalidRentalTerms` (268).
+    /// Orthogonal to [`RentalEscrow::new`] (that installs the rent
+    /// at build time, this revises it while `Active` and
+    /// pre-term), to AV-190 (that is the rental mechanism itself,
+    /// this is its rent revision), to AV-291 (that revises the
+    /// late-fee terms, this revises the rent), and to AV-292 (that
+    /// extends the term window, this revises the rent).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller pair that is not exactly owner + renter,
+    /// ([`EscrowError::RentalNotActive`], code 269) once the rental
+    /// is in a terminal state, and
+    /// ([`EscrowError::InvalidRentalTerms`], code 268) once
+    /// `term_start_slot` has arrived or when the new rent is zero —
+    /// either way the current rent is untouched.
+    pub fn amend_rent_amount(
+        &mut self,
+        owner: [u8; 32],
+        renter: [u8; 32],
+        new_rent_amount: u64,
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if owner != self.owner || renter != self.renter {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != RentalState::Active {
+            return Err(EscrowError::RentalNotActive);
+        }
+        if current_slot >= self.term_start_slot {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        if new_rent_amount == 0 {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        self.rent_amount = new_rent_amount;
+        Ok(())
+    }
+
     /// Audit-event JSON for a return (hand-written):
     /// `{"event":"rental_returned","asset":"<64hex>","late_fee":<u64>,
     /// "overdue_days":<u64>,"late":<bool>}`.
@@ -947,6 +1019,160 @@ mod rental_escrow_tests {
         let err = r3.extend_term_end(key(0xAA), key(0xBB), 300, 50).unwrap_err();
         assert_eq!(err, EscrowError::RentalNotActive);
         assert_eq!(r3.term_end_slot(), 200);
+    }
+
+    #[test]
+    fn amend_rent_amount_revises_the_live_rent() {
+        // AV-314: dual-signed re-price before the term starts
+        // reprices future billings only.
+        let mut r = open_rental();
+        assert_eq!(r.late_fee_due(300), 10_000);
+        r.amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 50)
+            .unwrap();
+        assert_eq!(r.rent_amount(), 2_000_000);
+        // The live rent prices the same overdue slot: 1%/day of the
+        // new rent now.
+        assert_eq!(r.late_fee_due(300), 20_000);
+        // Nothing else moved.
+        assert_eq!(r.owner(), key(0xAA));
+        assert_eq!(r.renter(), key(0xBB));
+        assert_eq!(r.asset_id(), key(0xCC));
+        assert_eq!(r.term_start_slot(), 100);
+        assert_eq!(r.term_end_slot(), 200);
+        assert_eq!(r.state(), RentalState::Active);
+        assert_eq!(r.late_fee(), terms());
+        // The amended rent governs the return settlement.
+        let receipt = r.return_asset(300).unwrap();
+        assert_eq!(receipt.late_fee_due, 20_000);
+        assert_eq!(r.state(), RentalState::ReturnedLate);
+    }
+
+    #[test]
+    fn amend_rent_amount_governs_later_overdue_returns_and_cap() {
+        // AV-314: both the per-day fee and the cap scale with the
+        // new rent — the cap is 20% of the *revised* rent.
+        let mut r = open_rental();
+        // Under the old rent the 30-day fee would cap at 200_000.
+        assert_eq!(r.late_fee_due(3200), 200_000);
+        r.amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 50)
+            .unwrap();
+        // 30 days uncapped at 20_000/day = 600_000, capped at 20%
+        // of 2_000_000 = 400_000.
+        assert_eq!(r.late_fee_due(3200), 400_000);
+        let receipt = r.return_asset(3200).unwrap();
+        assert_eq!(receipt.overdue_days, 30);
+        assert_eq!(receipt.late_fee_due, 400_000);
+        assert_eq!(r.state(), RentalState::ReturnedLate);
+    }
+
+    #[test]
+    fn amend_rent_amount_is_dual_signed() {
+        // AV-314: a stranger, or either party alone, is refused and
+        // the rent is untouched.
+        let mut r = open_rental();
+        let err = r
+            .amend_rent_amount(key(9), key(0xBB), 2_000_000, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = r
+            .amend_rent_amount(key(0xAA), key(9), 2_000_000, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = r
+            .amend_rent_amount(key(9), key(9), 2_000_000, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(r.rent_amount(), 1_000_000);
+        // Authority is checked before state: a stranger on a
+        // terminal rental still gets Unauthorized, not
+        // RentalNotActive.
+        let mut r2 = open_rental();
+        r2.return_asset(150).unwrap();
+        let err = r2
+            .amend_rent_amount(key(9), key(0xBB), 2_000_000, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_rent_amount_rejects_terminal_rentals() {
+        // AV-314: Returned / ReturnedLate / Cancelled are terminal.
+        let mut r = open_rental();
+        r.return_asset(150).unwrap();
+        let err = r
+            .amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(err.code(), 269);
+        assert_eq!(r.rent_amount(), 1_000_000);
+
+        let mut r2 = open_rental();
+        r2.return_asset(300).unwrap();
+        assert_eq!(r2.state(), RentalState::ReturnedLate);
+        let err = r2
+            .amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+
+        let mut r3 = open_rental();
+        r3.cancel(key(0xAA), 50).unwrap();
+        let err = r3
+            .amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(r3.rent_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn amend_rent_amount_only_before_term_start() {
+        // AV-314: once the term starts the rent is frozen — the
+        // rent corresponds to use already consumed.
+        let mut r = open_rental();
+        // Exactly at the term start: too late.
+        let err = r
+            .amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.rent_amount(), 1_000_000);
+        // Mid-term: too late.
+        let err = r
+            .amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 150)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.rent_amount(), 1_000_000);
+        // One slot before the term starts: still renegotiable.
+        r.amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 99)
+            .unwrap();
+        assert_eq!(r.rent_amount(), 2_000_000);
+    }
+
+    #[test]
+    fn amend_rent_amount_reuses_the_construction_gate() {
+        // AV-314: a zero rent fails closed with the original rent
+        // untouched.
+        let mut r = open_rental();
+        let err = r
+            .amend_rent_amount(key(0xAA), key(0xBB), 0, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.rent_amount(), 1_000_000);
+        // The boundary itself is legal: a rent of 1 passes.
+        r.amend_rent_amount(key(0xAA), key(0xBB), 1, 50).unwrap();
+        assert_eq!(r.rent_amount(), 1);
+    }
+
+    #[test]
+    fn amend_rent_amount_identical_value_is_a_noop() {
+        // AV-314: re-affirming the current rent writes nothing.
+        let mut r = open_rental();
+        r.amend_rent_amount(key(0xAA), key(0xBB), 1_000_000, 50)
+            .unwrap();
+        assert_eq!(r.rent_amount(), 1_000_000);
+        assert_eq!(r.state(), RentalState::Active);
+        assert_eq!(r.late_fee_due(300), 10_000);
     }
 
     #[test]

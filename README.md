@@ -7792,6 +7792,25 @@ expires, custody returns to the owner automatically.
   `is_overdue` / `late_fee_due` / `return_asset` read the live
   window, so the new window governs from the revision. No event is
   emitted — `RentalEscrow` has no event layer.
+- **Revising the rent (AV-314)**: `amend_rent_amount` revises the
+  rent on an `Active` rental, authorized by owner + renter together
+  — the rent is a bilateral economic term, so a unilateral rewrite
+  would let one side reprice the other's custody cost alone. Only
+  before the term starts: once the term has begun the rent
+  corresponds to use already consumed (and possibly already
+  prepaid), so repricing it would only rebase the late-fee
+  computation on consumed use; before the start there is no
+  consumed use and no accrued fee, so a renegotiated rent is a
+  clean re-price. The new rent reuses the construction gate (a zero
+  rent fails closed with `InvalidRentalTerms`, code 268, and the
+  current rent is untouched); re-affirming the current rent is a
+  no-op. Only `rent_amount` changes, and `late_fee_due` /
+  `return_asset` read the live rent, so the new rent governs from
+  the next billing — both the per-day fee and the cap scale with
+  it — while a return already executed is never restated. No event
+  is emitted — `RentalEscrow` has no event layer — and no new error
+  code: the refusals reuse `Unauthorized` (100), `RentalNotActive`
+  (269), and `InvalidRentalTerms` (268).
 
 New error codes (never renumbered): `InvalidRentalTerms` (268),
 `RentalNotActive` (269), `RentalCancelNotAllowed` (270). Pure logic:
