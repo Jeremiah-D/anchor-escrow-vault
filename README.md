@@ -7680,6 +7680,22 @@ whether the sale happens at all.
   extension and pushes it out by the live extension.
   `end_slot_audit_json` records the previous and new close (string
   event name `english_auction_end_slot_amended`, no new event code).
+- **Opening-slot revision** (AV-312): before the first bid the seller
+  may revise the opening slot with `amend_english_auction_start_slot`
+  — seller-only (`Unauthorized`, code 100), and refused with
+  `InvalidEnglishAuction` (code 263) once a bid has landed or the
+  auction is terminal, so terms bidders already accepted are never
+  rewritten. The new open reuses the `new` gate against the live
+  end slot (it must be strictly before `end_slot`); the method
+  takes no `current_slot`, so a new open already in the past is
+  accepted as-is — its effect is an immediate open, with later bids
+  admitted. Re-affirming the current open is a no-op. Only
+  `start_slot` changes; `place_bid` reads the live value through
+  `is_live`, so a bid before the new open is refused and a bid at
+  or after it lands, while the anti-sniping tail stays anchored at
+  `end_slot`. `start_slot_audit_json` records the previous and new
+  open (string event name `english_auction_start_slot_amended`, no
+  new event code).
 - **Refunds are exact**: `place_bid` returns a `BidReceipt` naming the
   outbid leader and their amount, so the program refunds the full
   previous bid atomically; `settle` is permissionless after the close

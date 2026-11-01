@@ -24,7 +24,9 @@
 //!   push the close out — may likewise be revised before the first
 //!   bid (`amend_english_auction_max_extensions`, AV-310). The
 //!   closing slot itself may likewise be revised before the first bid
-//!   (`amend_english_auction_end_slot`, AV-311).
+//!   (`amend_english_auction_end_slot`, AV-311). The opening slot
+//!   itself may likewise be revised before the first bid
+//!   (`amend_english_auction_start_slot`, AV-312).
 //! - **Buy-it-now** (AV-201, opt-in): the seller may set a buyout
 //!   price; a live bid at or above it settles the auction immediately
 //!   at exactly that price, skipping the remaining window and any
@@ -131,6 +133,8 @@ pub struct BidReceipt {
 /// ([`EnglishAuction::amend_english_auction_max_extensions`]).
 /// The closing slot may likewise be revised before the first bid
 /// ([`EnglishAuction::amend_english_auction_end_slot`]).
+/// The opening slot may likewise be revised before the first bid
+/// ([`EnglishAuction::amend_english_auction_start_slot`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnglishAuction {
     seller: [u8; 32],
@@ -533,6 +537,59 @@ impl EnglishAuction {
             return Ok(());
         }
         self.end_slot = new_end_slot;
+        Ok(())
+    }
+
+    /// Revise the opening slot before the first bid (AV-312).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the open is the seller's auction term) and
+    /// only before the first bid: refused with
+    /// [`EscrowError::InvalidEnglishAuction`] (code 263) once any bid
+    /// has landed or the auction is terminal, the original open
+    /// untouched — changing the open after bids exist would rewrite
+    /// terms bidders already accepted. The new open reuses the
+    /// [`Self::new`] gate against the *live* end slot: it must be
+    /// strictly before `end_slot` (an empty or inverted bidding
+    /// window is refused with code 263). This method takes no
+    /// `current_slot`, so a new open already in the past is
+    /// accepted as-is — its effect is an immediate open: later
+    /// [`Self::place_bid`] calls read the live value and admit bids.
+    ///
+    /// Only `start_slot` changes: seller, `reserve_price`,
+    /// `min_increment`, `end_slot`, windows, `anti_snipe_extension`,
+    /// `max_extensions`, buyout, `highest_bid`, `bid_count`,
+    /// `extension_count`, and state are untouched — before the first
+    /// bid `extension_count` is always `0`, so no in-flight
+    /// extension count is disturbed. The new open governs from the
+    /// next [`Self::place_bid`], which reads the live value through
+    /// [`Self::is_live`]: a bid before the new open is refused, a
+    /// bid at or after it lands. The anti-sniping tail is anchored
+    /// at `end_slot`, so moving the open never moves the tail.
+    /// Amending to the current open is a no-op.
+    ///
+    /// Check order is authority → liveness → value, mirroring
+    /// [`Self::amend_english_auction_end_slot`]: a stranger is
+    /// refused even on a terminal auction, and a lapsed auction
+    /// refuses even the seller.
+    pub fn amend_english_auction_start_slot(
+        &mut self,
+        caller: [u8; 32],
+        new_start_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != AuctionState::Bidding || self.bid_count > 0 {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        if new_start_slot >= self.end_slot {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        if new_start_slot == self.start_slot {
+            return Ok(());
+        }
+        self.start_slot = new_start_slot;
         Ok(())
     }
 
@@ -944,6 +1001,23 @@ impl EnglishAuction {
         s.push_str(&previous_end_slot.to_string());
         s.push_str(",\"end_slot\":");
         s.push_str(&self.end_slot.to_string());
+        s.push('}');
+        s
+    }
+
+    /// Audit-event JSON for an opening-slot revision (hand-written):
+    /// `{"event":"english_auction_start_slot_amended",
+    /// "previous_start_slot":<u64>,"start_slot":<u64>}`.
+    /// English-auction audit events carry string event names, not
+    /// numeric event IDs, so no new event number is registered for
+    /// the revision — the event name is the identity.
+    pub fn start_slot_audit_json(&self, previous_start_slot: u64) -> String {
+        let mut s = String::from(
+            "{\"event\":\"english_auction_start_slot_amended\",\"previous_start_slot\":",
+        );
+        s.push_str(&previous_start_slot.to_string());
+        s.push_str(",\"start_slot\":");
+        s.push_str(&self.start_slot.to_string());
         s.push('}');
         s
     }
@@ -2407,6 +2481,207 @@ mod english_auction_tests {
         assert_eq!(err, EscrowError::EnglishAuctionNotLive);
         let s = c.settle(120).unwrap();
         assert_eq!(s, AuctionSettlement::NoBids);
+    }
+
+    #[test]
+    fn amend_start_slot_before_first_bid() {
+        let mut a = open_auction(); // [100, 200).
+        // Push the open out.
+        a.amend_english_auction_start_slot(key(0xAA), 150).unwrap();
+        assert_eq!(a.start_slot(), 150);
+        // Pull it in.
+        a.amend_english_auction_start_slot(key(0xAA), 50).unwrap();
+        assert_eq!(a.start_slot(), 50);
+        // Everything else is untouched.
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.reserve_price(), 150);
+        assert_eq!(a.min_increment(), 10);
+        assert_eq!(a.end_slot(), 200);
+        assert_eq!(a.anti_snipe_window(), 0);
+        assert_eq!(a.max_extensions(), 0);
+        assert_eq!(
+            a.start_slot_audit_json(100),
+            "{\"event\":\"english_auction_start_slot_amended\",\"previous_start_slot\":100,\"start_slot\":50}"
+        );
+        assert_eq!(a.state(), AuctionState::Bidding);
+        assert_eq!(a.highest_bid(), 0);
+        assert_eq!(a.highest_bidder(), [0u8; 32]);
+        assert_eq!(a.bid_count(), 0);
+        assert_eq!(a.extension_count(), 0);
+        assert_eq!(a.buyout_price(), 0);
+        assert_eq!(a.buyout_sale(), None);
+    }
+
+    #[test]
+    fn amend_start_slot_is_seller_only() {
+        let mut a = open_auction();
+        // A stranger is refused, even on a live auction.
+        let err = a
+            .amend_english_auction_start_slot(key(9), 150)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(a.start_slot(), 100);
+        // A bidder is refused too — authority is checked first.
+        a.place_bid(key(1), 50, 150).unwrap();
+        let err = a
+            .amend_english_auction_start_slot(key(1), 150)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.start_slot(), 100);
+    }
+
+    #[test]
+    fn amend_start_slot_locks_after_first_bid() {
+        let mut a = open_auction();
+        a.place_bid(key(1), 200, 150).unwrap();
+        let err = a
+            .amend_english_auction_start_slot(key(0xAA), 150)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(err.code(), 263);
+        assert_eq!(a.start_slot(), 100);
+        // The bid still stands against the original open.
+        let s = a.settle(200).unwrap();
+        assert_eq!(
+            s,
+            AuctionSettlement::Sold {
+                winner: key(1),
+                winning_bid: 200
+            }
+        );
+    }
+
+    #[test]
+    fn amend_start_slot_refused_in_terminal_states() {
+        // Settled via buyout.
+        let mut a = EnglishAuction::new(key(0xAA), 100, 200, 10, 150, 0, 0, 0)
+            .unwrap()
+            .with_buyout(300)
+            .unwrap();
+        a.place_bid(key(1), 300, 150).unwrap();
+        assert_eq!(a.state(), AuctionState::Settled);
+        let err = a
+            .amend_english_auction_start_slot(key(0xAA), 150)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(a.start_slot(), 100);
+        // NoSale after settling with no bids.
+        let mut b = open_auction();
+        b.settle(200).unwrap();
+        assert_eq!(b.state(), AuctionState::NoSale);
+        let err = b
+            .amend_english_auction_start_slot(key(0xAA), 150)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(b.start_slot(), 100);
+        // Cancelled.
+        let mut c = open_auction();
+        c.cancel(key(0xAA), 150).unwrap();
+        assert_eq!(c.state(), AuctionState::Cancelled);
+        let err = c
+            .amend_english_auction_start_slot(key(0xAA), 150)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(c.start_slot(), 100);
+        // Authority still wins on a terminal auction: a stranger is
+        // Unauthorized, not InvalidEnglishAuction.
+        let err = c
+            .amend_english_auction_start_slot(key(9), 150)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_start_slot_rejects_empty_window() {
+        let mut a = open_auction(); // start 100, end 200.
+        // An open at the close is an empty window — the new() gate.
+        let err = a
+            .amend_english_auction_start_slot(key(0xAA), 200)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(err.code(), 263);
+        assert_eq!(a.start_slot(), 100);
+        // An open past the close is inverted — same refusal.
+        let err = a
+            .amend_english_auction_start_slot(key(0xAA), 250)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(a.start_slot(), 100);
+        // One slot before the close is the tightest legal window.
+        a.amend_english_auction_start_slot(key(0xAA), 199).unwrap();
+        assert_eq!(a.start_slot(), 199);
+        // Authority still wins first: a stranger asking for an
+        // empty window is Unauthorized, not InvalidEnglishAuction.
+        let err = a
+            .amend_english_auction_start_slot(key(9), 200)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.start_slot(), 199);
+    }
+
+    #[test]
+    fn amend_start_slot_to_current_is_noop() {
+        let mut a = open_auction();
+        a.amend_english_auction_start_slot(key(0xAA), 100).unwrap();
+        assert_eq!(a.start_slot(), 100);
+        assert_eq!(
+            a.start_slot_audit_json(100),
+            "{\"event\":\"english_auction_start_slot_amended\",\"previous_start_slot\":100,\"start_slot\":100}"
+        );
+        assert_eq!(a.state(), AuctionState::Bidding);
+    }
+
+    #[test]
+    fn start_slot_audit_json_exact() {
+        let mut a = open_auction();
+        a.amend_english_auction_start_slot(key(0xAA), 150).unwrap();
+        assert_eq!(
+            a.start_slot_audit_json(100),
+            "{\"event\":\"english_auction_start_slot_amended\",\"previous_start_slot\":100,\"start_slot\":150}"
+        );
+    }
+
+    #[test]
+    fn place_bid_honors_the_amended_start_slot() {
+        // Delayed open: a bid at 100 is before the new open of 150,
+        // so it is refused; a bid at the new open lands.
+        let mut a = open_auction(); // [100, 200).
+        a.amend_english_auction_start_slot(key(0xAA), 150).unwrap();
+        let err = a.place_bid(key(1), 10, 100).unwrap_err();
+        assert_eq!(err, EscrowError::EnglishAuctionNotLive);
+        let r = a.place_bid(key(1), 10, 150).unwrap();
+        assert_eq!(r.end_slot, 200);
+        let s = a.settle(200).unwrap();
+        assert_eq!(
+            s,
+            AuctionSettlement::ReserveNotMet {
+                highest_bidder: key(1),
+                highest_bid: 10
+            }
+        );
+        // Early open: a bid at 75 lands against the new open of 50
+        // — it would have been too early against the original 100.
+        let mut b = open_auction();
+        b.amend_english_auction_start_slot(key(0xAA), 50).unwrap();
+        let r = b.place_bid(key(1), 10, 75).unwrap();
+        assert_eq!(r.end_slot, 200);
+        // A new open already in the past is accepted — it acts as
+        // an immediate open: a bid at the current slot lands.
+        let mut c = open_auction();
+        c.amend_english_auction_start_slot(key(0xAA), 50).unwrap();
+        assert_eq!(c.start_slot(), 50);
+        let r = c.place_bid(key(1), 10, 150).unwrap();
+        assert_eq!(r.end_slot, 200);
+        // Moving the open never moves the anti-sniping tail, which
+        // is anchored at end_slot: a bid at 195 inside the tail of
+        // the 200 close still extends it.
+        let mut d = sniping_auction(); // end 200, window 10.
+        d.amend_english_auction_start_slot(key(0xAA), 150).unwrap();
+        let r = d.place_bid(key(1), 100, 195).unwrap();
+        assert!(r.extended);
+        assert_eq!(r.end_slot, 225);
+        assert_eq!(d.extension_count(), 1);
     }
 
     #[test]
