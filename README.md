@@ -6907,6 +6907,19 @@ this module *detects dead operators and reassigns their work*.
 - **The recovery**: a fresh heartbeat from a claimed keeper revokes
   the claim (`ClaimRevoked` audit) — the original keeper is back, so
   the standby stands down. No split-brain.
+- **The live revision (AV-316)**: `amend_config(new_config)` revises
+  the detector's thresholds without touching the roster: the new
+  config is validated first (zero interval or zero max-missed fails
+  with `InvalidHeartbeatConfig`, code 231, and the old config stands),
+  amending to the config already in force is a no-op returning
+  `false`, and any other valid config replaces the whole package and
+  returns `true`. Only the config moves — keepers, claims, and the
+  audit ring are untouched, and no audit event is recorded (the audit
+  ring only records keeper liveness events). The new thresholds govern
+  the next `scan` (every verdict reads the live config), but widening
+  them does not revive a keeper already latched unhealthy — `scan`
+  only latches healthy → unhealthy, and recovery still needs a fresh
+  heartbeat. `config()` reads the thresholds currently in force.
 
 Honest scope: the registry is off-chain fleet state, not an on-chain
 account — the caller feeds `current_slot` / `now` (the crate has no

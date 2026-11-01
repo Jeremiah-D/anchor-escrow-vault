@@ -23,7 +23,9 @@
 //!   keeper; [`HeartbeatRegistry::heartbeat`] verifies and folds a
 //!   signed heartbeat; [`HeartbeatRegistry::scan`] is the missed-beat
 //!   detector (marks keepers unhealthy); [`HeartbeatRegistry::claim`]
-//!   lets a standby claim an unhealthy keeper's escrow set.
+//!   lets a standby claim an unhealthy keeper's escrow set;
+//!   [`HeartbeatRegistry::amend_config`] revises the detector's
+//!   thresholds live, without touching the roster.
 //! - [`HeartbeatAuditEntry`]: the structured audit — `HeartbeatMissed`
 //!   on the unhealthy transition (edge-triggered), `TakeoverClaimed`
 //!   on a successful claim, `ClaimConflict` when two standbys race for
@@ -275,6 +277,38 @@ impl HeartbeatRegistry {
             keepers: Vec::new(),
             audit: VecDeque::with_capacity(MAX_KEEPER_AUDIT_ENTRIES),
         })
+    }
+
+    /// Revise the missed-beat detector's thresholds live (AV-316).
+    /// The new config is validated first — an invalid config leaves
+    /// the current one exactly as it was
+    /// ([`EscrowError::InvalidHeartbeatConfig`]). Amending to the
+    /// config already in force is a no-op returning `Ok(false)`:
+    /// nothing moves and no audit event fires. Any other valid
+    /// config replaces the whole package and returns `Ok(true)`.
+    ///
+    /// Only the config moves: the keeper roster, the audit ring, and
+    /// any takeover claims are untouched. The new thresholds govern
+    /// the next [`HeartbeatRegistry::scan`] — every missed-beat
+    /// verdict reads the live config — but widening the thresholds
+    /// does not revive a keeper already latched unhealthy: `scan`
+    /// only latches healthy → unhealthy, and recovery still needs a
+    /// fresh heartbeat (see [`HeartbeatRegistry::heartbeat`]).
+    /// No audit event is recorded for a config revision:
+    /// [`HeartbeatAuditEntry`] only records keeper liveness events,
+    /// so the revision is pinned by tests, not by the audit ring.
+    pub fn amend_config(&mut self, new_config: HeartbeatConfig) -> Result<bool, EscrowError> {
+        new_config.validate()?;
+        if self.config == new_config {
+            return Ok(false);
+        }
+        self.config = new_config;
+        Ok(true)
+    }
+
+    /// The detector config currently in force.
+    pub fn config(&self) -> HeartbeatConfig {
+        self.config
     }
 
     /// Enroll a keeper. Re-enrolling the same key is an idempotent
@@ -529,6 +563,14 @@ mod keeper_heartbeat_tests {
         };
         let sig = hb.sign(key);
         (hb, sig)
+    }
+
+    fn heartbeat_all_at(r: &mut HeartbeatRegistry, slot: u64) {
+        for seed in [KEEPER_A_SEED, KEEPER_B_SEED, KEEPER_C_SEED] {
+            let k = SigningKey::from_seed(seed);
+            let (hb, sig) = heartbeat_for(&k, slot, KeeperLastAction::Idle);
+            r.heartbeat(&hb, &sig).unwrap();
+        }
     }
 
     #[test]
@@ -869,5 +911,173 @@ mod keeper_heartbeat_tests {
         assert_eq!(EscrowError::KeeperHealthy.code(), 234);
         assert_eq!(EscrowError::ClaimConflict.code(), 235);
         assert_eq!(EscrowError::InvalidClaim.code(), 236);
+    }
+
+    #[test]
+    fn amend_rejects_zero_interval_and_keeps_original() {
+        let (mut r, pa, pb, pc) = registry();
+        heartbeat_all_at(&mut r, 100);
+        let bad = HeartbeatConfig {
+            expected_interval_slots: 0,
+            max_missed_beats: 3,
+            stale_slot_threshold: 100,
+        };
+        assert_eq!(
+            r.amend_config(bad),
+            Err(EscrowError::InvalidHeartbeatConfig)
+        );
+        // The original config is untouched: at slot 131 every keeper
+        // missed 31 / 10 = 3 beats, the old trip threshold.
+        assert_eq!(r.config(), config());
+        assert_eq!(r.scan(131, 9_999), vec![pa, pb, pc]);
+    }
+
+    #[test]
+    fn amend_rejects_zero_max_missed_and_keeps_original() {
+        let (mut r, pa, pb, pc) = registry();
+        heartbeat_all_at(&mut r, 100);
+        let bad = HeartbeatConfig {
+            expected_interval_slots: 10,
+            max_missed_beats: 0,
+            stale_slot_threshold: 100,
+        };
+        assert_eq!(
+            r.amend_config(bad),
+            Err(EscrowError::InvalidHeartbeatConfig)
+        );
+        assert_eq!(r.config(), config());
+        assert_eq!(r.scan(131, 9_999), vec![pa, pb, pc]);
+    }
+
+    #[test]
+    fn amend_same_config_is_noop() {
+        let (mut r, pa, pb, pc) = registry();
+        heartbeat_all_at(&mut r, 100);
+        assert_eq!(r.amend_config(config()), Ok(false));
+        assert_eq!(r.config(), config());
+        assert!(r.audit().is_empty());
+        // The detector is exactly as it was: the old thresholds
+        // still trip at slot 131.
+        assert_eq!(r.scan(131, 9_999), vec![pa, pb, pc]);
+    }
+
+    #[test]
+    fn amend_widening_interval_rescues_edge_keeper() {
+        let (mut r, pa, pb, pc) = registry();
+        heartbeat_all_at(&mut r, 100);
+        // Widen the expected interval 10 -> 20: at slot 131 each
+        // keeper missed 31 / 20 = 1 beat, not 31 / 10 = 3.
+        let wide = HeartbeatConfig {
+            expected_interval_slots: 20,
+            max_missed_beats: 3,
+            stale_slot_threshold: 100,
+        };
+        assert_eq!(r.amend_config(wide), Ok(true));
+        assert_eq!(r.config(), wide);
+        assert!(r.scan(131, 9_999).is_empty());
+        assert!(!r.is_unhealthy(&pa));
+        assert!(!r.is_unhealthy(&pb));
+        assert!(!r.is_unhealthy(&pc));
+    }
+
+    #[test]
+    fn amend_tightening_max_missed_marks_earlier() {
+        let (mut r, pa, pb, pc) = registry();
+        heartbeat_all_at(&mut r, 100);
+        // At slot 115 each keeper missed 15 / 10 = 1 beat — healthy
+        // under max_missed_beats 3.
+        assert!(r.scan(115, 1).is_empty());
+        // Tighten to 1: the same single missed beat now trips.
+        let tight = HeartbeatConfig {
+            expected_interval_slots: 10,
+            max_missed_beats: 1,
+            stale_slot_threshold: 100,
+        };
+        assert_eq!(r.amend_config(tight), Ok(true));
+        assert_eq!(r.scan(115, 2), vec![pa, pb, pc]);
+    }
+
+    #[test]
+    fn amend_widening_stale_threshold_rescues_long_interval_keeper() {
+        let cfg = HeartbeatConfig {
+            expected_interval_slots: 1_000,
+            max_missed_beats: 100,
+            stale_slot_threshold: 50,
+        };
+        let ka = SigningKey::from_seed(KEEPER_A_SEED);
+        let mut r = HeartbeatRegistry::new(cfg).unwrap();
+        r.register(ka.public_key()).unwrap();
+        let (hb, sig) = heartbeat_for(&ka, 1_000, KeeperLastAction::Idle);
+        r.heartbeat(&hb, &sig).unwrap();
+        // Elapsed 51: missed = 0 beats, but staleness 51 > 50 trips
+        // the old config. Widen the stale threshold to 100 first:
+        // the same scan stays healthy.
+        let wide = HeartbeatConfig {
+            expected_interval_slots: 1_000,
+            max_missed_beats: 100,
+            stale_slot_threshold: 100,
+        };
+        assert_eq!(r.amend_config(wide), Ok(true));
+        assert!(r.scan(1_051, 1).is_empty());
+        assert!(!r.is_unhealthy(&ka.public_key()));
+        // Control: without the amendment the same scan trips.
+        let mut r2 = HeartbeatRegistry::new(cfg).unwrap();
+        r2.register(ka.public_key()).unwrap();
+        let (hb2, sig2) = heartbeat_for(&ka, 1_000, KeeperLastAction::Idle);
+        r2.heartbeat(&hb2, &sig2).unwrap();
+        assert_eq!(r2.scan(1_051, 1), vec![ka.public_key()]);
+    }
+
+    #[test]
+    fn amend_does_not_revive_already_unhealthy_keeper() {
+        let (mut r, pa, _, _) = registry();
+        heartbeat_all_at(&mut r, 100);
+        assert_eq!(r.scan(131, 9_999).len(), 3);
+        assert!(r.is_unhealthy(&pa));
+        // Widen every threshold far past the edge: the latched
+        // keeper stays unhealthy — scan only latches healthy ->
+        // unhealthy, it never unlatches.
+        let wide = HeartbeatConfig {
+            expected_interval_slots: 1_000,
+            max_missed_beats: 100,
+            stale_slot_threshold: 10_000,
+        };
+        assert_eq!(r.amend_config(wide), Ok(true));
+        assert!(r.scan(200, 10_000).is_empty());
+        assert!(r.is_unhealthy(&pa));
+        // Only a fresh heartbeat clears the latch.
+        let ka = SigningKey::from_seed(KEEPER_A_SEED);
+        let (hb, sig) = heartbeat_for(&ka, 201, KeeperLastAction::Idle);
+        r.heartbeat(&hb, &sig).unwrap();
+        assert!(!r.is_unhealthy(&pa));
+    }
+
+    #[test]
+    fn amend_leaves_keepers_claims_and_audit_untouched() {
+        let (mut r, _, pb, pc) = registry();
+        let kc = SigningKey::from_seed(KEEPER_C_SEED);
+        // C never heartbeated (last_slot 0): unhealthy at slot 1000
+        // — B claims C's set.
+        let escrows = [[0xE1; 32]];
+        r.claim(pb, pc, &escrows, 42, 1_000).unwrap();
+        assert_eq!(r.claimed_by(&pc), Some(pb));
+        let audit_before = r.audit();
+        let wide = HeartbeatConfig {
+            expected_interval_slots: 20,
+            max_missed_beats: 5,
+            stale_slot_threshold: 200,
+        };
+        assert_eq!(r.amend_config(wide), Ok(true));
+        // The roster, the claim, and the audit ring are exactly as
+        // they were — only the config moved.
+        assert_eq!(r.claimed_by(&pc), Some(pb));
+        assert_eq!(r.claimed_escrows(&pc).unwrap(), &escrows);
+        assert_eq!(r.audit(), audit_before);
+        // And the keepers' liveness records survived: C recovers
+        // with a fresh heartbeat, revoking the claim exactly as
+        // before the amendment.
+        let (hb, sig) = heartbeat_for(&kc, 1_001, KeeperLastAction::Idle);
+        r.heartbeat(&hb, &sig).unwrap();
+        assert_eq!(r.claimed_by(&pc), None);
     }
 }
