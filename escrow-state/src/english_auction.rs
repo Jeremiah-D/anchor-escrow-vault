@@ -17,6 +17,9 @@
 //!   (`amend_english_auction_min_increment`, AV-307). The
 //!   anti-sniping tail window may likewise be revised before the
 //!   first bid (`amend_english_auction_anti_snipe_window`, AV-308).
+//!   The anti-sniping extension — how far a tail bid pushes the
+//!   close out — may likewise be revised before the first bid
+//!   (`amend_english_auction_anti_snipe_extension`, AV-309).
 //! - **Buy-it-now** (AV-201, opt-in): the seller may set a buyout
 //!   price; a live bid at or above it settles the auction immediately
 //!   at exactly that price, skipping the remaining window and any
@@ -115,6 +118,9 @@ pub struct BidReceipt {
 /// ([`EnglishAuction::amend_english_auction_min_increment`]). The
 /// anti-sniping tail window may likewise be revised before the first
 /// bid ([`EnglishAuction::amend_english_auction_anti_snipe_window`]).
+/// The anti-sniping extension may likewise be revised before the
+/// first bid
+/// ([`EnglishAuction::amend_english_auction_anti_snipe_extension`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnglishAuction {
     seller: [u8; 32],
@@ -361,6 +367,56 @@ impl EnglishAuction {
             return Ok(());
         }
         self.anti_snipe_window = new_anti_snipe_window;
+        Ok(())
+    }
+
+    /// Revise the anti-sniping extension before the first bid
+    /// (AV-309).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the extension is the seller's auction term)
+    /// and only before the first bid: refused with
+    /// [`EscrowError::InvalidEnglishAuction`] (code 263) once any bid
+    /// has landed or the auction is terminal, the original extension
+    /// untouched — changing the extension after bids exist would
+    /// rewrite terms bidders already accepted. The new extension
+    /// reuses the [`Self::new`] gate against the *live* window: a
+    /// live nonzero window with a zero extension never triggers, so
+    /// that combination is refused with code 263; when the live
+    /// window is `0` anti-sniping is off and any extension value is
+    /// inert, so it is accepted as-is (the extension only matters
+    /// once a window is set).
+    ///
+    /// Only `anti_snipe_extension` changes: seller, `reserve_price`,
+    /// `min_increment`, windows, `max_extensions`, buyout,
+    /// `highest_bid`, `bid_count`, `extension_count`, and state are
+    /// untouched. The new extension governs from the next
+    /// [`Self::place_bid`], which reads the live value: a trailing
+    /// bid pushes the close out by the new extension. Amending to
+    /// the current extension is a no-op.
+    ///
+    /// Check order is authority → liveness → value, mirroring
+    /// [`Self::amend_english_auction_anti_snipe_window`]: a stranger
+    /// is refused even on a terminal auction, and a lapsed auction
+    /// refuses even the seller.
+    pub fn amend_english_auction_anti_snipe_extension(
+        &mut self,
+        caller: [u8; 32],
+        new_anti_snipe_extension: u64,
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != AuctionState::Bidding || self.bid_count > 0 {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        if self.anti_snipe_window > 0 && new_anti_snipe_extension == 0 {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        if new_anti_snipe_extension == self.anti_snipe_extension {
+            return Ok(());
+        }
+        self.anti_snipe_extension = new_anti_snipe_extension;
         Ok(())
     }
 
@@ -705,6 +761,28 @@ impl EnglishAuction {
         s.push_str(&previous_anti_snipe_window.to_string());
         s.push_str(",\"anti_snipe_window\":");
         s.push_str(&self.anti_snipe_window.to_string());
+        s.push('}');
+        s
+    }
+
+    /// Audit-event JSON for an anti-sniping extension revision
+    /// (hand-written):
+    /// `{"event":"english_auction_anti_snipe_extension_amended",
+    /// "previous_anti_snipe_extension":<u64>,
+    /// "anti_snipe_extension":<u64>}`.
+    /// English-auction audit events carry string event names, not
+    /// numeric event IDs, so no new event number is registered for
+    /// the revision — the event name is the identity.
+    pub fn anti_snipe_extension_audit_json(
+        &self,
+        previous_anti_snipe_extension: u64,
+    ) -> String {
+        let mut s = String::from(
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":",
+        );
+        s.push_str(&previous_anti_snipe_extension.to_string());
+        s.push_str(",\"anti_snipe_extension\":");
+        s.push_str(&self.anti_snipe_extension.to_string());
         s.push('}');
         s
     }
@@ -1485,6 +1563,245 @@ mod english_auction_tests {
         d.amend_english_auction_anti_snipe_window(key(0xAA), 0)
             .unwrap();
         let r = d.place_bid(key(1), 100, 195).unwrap();
+        assert!(!r.extended);
+        assert_eq!(r.end_slot, 200);
+    }
+
+    #[test]
+    fn amend_anti_snipe_extension_before_first_bid() {
+        let mut a = sniping_auction(); // extension 25.
+        // Lengthen the push-out.
+        a.amend_english_auction_anti_snipe_extension(key(0xAA), 40)
+            .unwrap();
+        assert_eq!(
+            a.anti_snipe_extension_audit_json(25),
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":25,\"anti_snipe_extension\":40}"
+        );
+        // Shorten it.
+        a.amend_english_auction_anti_snipe_extension(key(0xAA), 15)
+            .unwrap();
+        assert_eq!(
+            a.anti_snipe_extension_audit_json(40),
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":40,\"anti_snipe_extension\":15}"
+        );
+        // Everything else is untouched.
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.reserve_price(), 0);
+        assert_eq!(a.min_increment(), 10);
+        assert_eq!(a.anti_snipe_window(), 10);
+        assert_eq!(a.start_slot(), 100);
+        assert_eq!(a.end_slot(), 200);
+        assert_eq!(a.state(), AuctionState::Bidding);
+        assert_eq!(a.highest_bid(), 0);
+        assert_eq!(a.highest_bidder(), [0u8; 32]);
+        assert_eq!(a.bid_count(), 0);
+        assert_eq!(a.extension_count(), 0);
+        assert_eq!(a.buyout_price(), 0);
+        assert_eq!(a.buyout_sale(), None);
+    }
+
+    #[test]
+    fn amend_anti_snipe_extension_is_seller_only() {
+        let mut a = sniping_auction();
+        // A stranger is refused, even on a live auction.
+        let err = a
+            .amend_english_auction_anti_snipe_extension(key(9), 40)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(
+            a.anti_snipe_extension_audit_json(25),
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":25,\"anti_snipe_extension\":25}"
+        );
+        // A bidder is refused too — authority is checked first — and
+        // the refused value never takes effect: the next tail bid
+        // still pushes the close out by the original 25.
+        a.place_bid(key(1), 50, 150).unwrap();
+        let err = a
+            .amend_english_auction_anti_snipe_extension(key(1), 40)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let r = a.place_bid(key(2), 100, 195).unwrap();
+        assert!(r.extended);
+        assert_eq!(r.end_slot, 225);
+    }
+
+    #[test]
+    fn amend_anti_snipe_extension_locks_after_first_bid() {
+        let mut a = sniping_auction();
+        // The opening bid lands in the tail and extends the close.
+        let r = a.place_bid(key(1), 100, 195).unwrap();
+        assert!(r.extended);
+        assert_eq!(a.end_slot(), 225);
+        let err = a
+            .amend_english_auction_anti_snipe_extension(key(0xAA), 40)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(err.code(), 263);
+        // The extension that already fired stands, and the next tail
+        // bid still pushes out by the original 25.
+        assert_eq!(a.end_slot(), 225);
+        let r = a.place_bid(key(2), 120, 220).unwrap();
+        assert!(r.extended);
+        assert_eq!(r.end_slot, 250);
+        assert_eq!(a.extension_count(), 2);
+    }
+
+    #[test]
+    fn amend_anti_snipe_extension_refused_in_terminal_states() {
+        // Settled via buyout.
+        let mut a = EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 10, 25, 2)
+            .unwrap()
+            .with_buyout(300)
+            .unwrap();
+        a.place_bid(key(1), 300, 150).unwrap();
+        assert_eq!(a.state(), AuctionState::Settled);
+        let err = a
+            .amend_english_auction_anti_snipe_extension(key(0xAA), 40)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(
+            a.anti_snipe_extension_audit_json(25),
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":25,\"anti_snipe_extension\":25}"
+        );
+        // NoSale after settling with no bids.
+        let mut b = sniping_auction();
+        b.settle(200).unwrap();
+        assert_eq!(b.state(), AuctionState::NoSale);
+        let err = b
+            .amend_english_auction_anti_snipe_extension(key(0xAA), 40)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(
+            b.anti_snipe_extension_audit_json(25),
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":25,\"anti_snipe_extension\":25}"
+        );
+        // Cancelled.
+        let mut c = sniping_auction();
+        c.cancel(key(0xAA), 150).unwrap();
+        assert_eq!(c.state(), AuctionState::Cancelled);
+        let err = c
+            .amend_english_auction_anti_snipe_extension(key(0xAA), 40)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(
+            c.anti_snipe_extension_audit_json(25),
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":25,\"anti_snipe_extension\":25}"
+        );
+        // Authority still wins on a terminal auction: a stranger is
+        // Unauthorized, not InvalidEnglishAuction.
+        let err = c
+            .amend_english_auction_anti_snipe_extension(key(9), 40)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_anti_snipe_extension_rejects_degenerate_config() {
+        // A live tail window with a zero extension never triggers.
+        let mut a = sniping_auction(); // window 10, extension 25.
+        let err = a
+            .amend_english_auction_anti_snipe_extension(key(0xAA), 0)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(err.code(), 263);
+        assert_eq!(
+            a.anti_snipe_extension_audit_json(25),
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":25,\"anti_snipe_extension\":25}"
+        );
+        // With the window off, any extension is inert: zeroing it is
+        // allowed, and so is raising it — it only matters once a
+        // window is set.
+        let mut b =
+            EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 0, 5, 3).unwrap();
+        b.amend_english_auction_anti_snipe_extension(key(0xAA), 0)
+            .unwrap();
+        assert_eq!(
+            b.anti_snipe_extension_audit_json(5),
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":5,\"anti_snipe_extension\":0}"
+        );
+        b.amend_english_auction_anti_snipe_extension(key(0xAA), 100)
+            .unwrap();
+        assert_eq!(
+            b.anti_snipe_extension_audit_json(0),
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":0,\"anti_snipe_extension\":100}"
+        );
+        // Anti-sniping fully disabled (window 0, extension 0,
+        // budget 0): any extension is accepted as inert.
+        let mut c =
+            EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 0, 0, 0).unwrap();
+        c.amend_english_auction_anti_snipe_extension(key(0xAA), 7)
+            .unwrap();
+        assert_eq!(
+            c.anti_snipe_extension_audit_json(0),
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":0,\"anti_snipe_extension\":7}"
+        );
+        // Authority still wins first: a stranger asking for a
+        // degenerate extension is Unauthorized, not InvalidEnglishAuction.
+        let err = a
+            .amend_english_auction_anti_snipe_extension(key(9), 0)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(
+            a.anti_snipe_extension_audit_json(25),
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":25,\"anti_snipe_extension\":25}"
+        );
+    }
+
+    #[test]
+    fn amend_anti_snipe_extension_to_current_is_noop() {
+        let mut a = sniping_auction();
+        a.amend_english_auction_anti_snipe_extension(key(0xAA), 25)
+            .unwrap();
+        assert_eq!(
+            a.anti_snipe_extension_audit_json(25),
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":25,\"anti_snipe_extension\":25}"
+        );
+        assert_eq!(a.state(), AuctionState::Bidding);
+    }
+
+    #[test]
+    fn anti_snipe_extension_audit_json_exact() {
+        let mut a = sniping_auction();
+        a.amend_english_auction_anti_snipe_extension(key(0xAA), 40)
+            .unwrap();
+        assert_eq!(
+            a.anti_snipe_extension_audit_json(25),
+            "{\"event\":\"english_auction_anti_snipe_extension_amended\",\"previous_anti_snipe_extension\":25,\"anti_snipe_extension\":40}"
+        );
+    }
+
+    #[test]
+    fn place_bid_honors_the_amended_extension() {
+        // Lengthened extension: a tail bid pushes the close out by
+        // 40, not 25 — and the next tail bid by 40 again.
+        let mut a = sniping_auction(); // extension 25.
+        a.amend_english_auction_anti_snipe_extension(key(0xAA), 40)
+            .unwrap();
+        let r = a.place_bid(key(1), 100, 195).unwrap();
+        assert!(r.extended);
+        assert_eq!(r.end_slot, 240);
+        assert_eq!(a.end_slot(), 240);
+        assert_eq!(a.extension_count(), 1);
+        let r = a.place_bid(key(2), 120, 235).unwrap();
+        assert!(r.extended);
+        assert_eq!(r.end_slot, 280);
+        assert_eq!(a.extension_count(), 2);
+        // Shortened extension: a tail bid pushes the close out by
+        // only 10.
+        let mut b = sniping_auction();
+        b.amend_english_auction_anti_snipe_extension(key(0xAA), 10)
+            .unwrap();
+        let r = b.place_bid(key(1), 100, 195).unwrap();
+        assert!(r.extended);
+        assert_eq!(r.end_slot, 210);
+        // Zeroed extension with the window off: a tail bid extends
+        // nothing (the window, not the extension, gates it).
+        let mut c =
+            EnglishAuction::new(key(0xAA), 100, 200, 10, 0, 0, 5, 3).unwrap();
+        c.amend_english_auction_anti_snipe_extension(key(0xAA), 0)
+            .unwrap();
+        let r = c.place_bid(key(1), 100, 195).unwrap();
         assert!(!r.extended);
         assert_eq!(r.end_slot, 200);
     }

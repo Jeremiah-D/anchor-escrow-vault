@@ -7633,6 +7633,21 @@ whether the sale happens at all.
   the new window for extension. `anti_snipe_window_audit_json`
   records the previous and new window (string event name
   `english_auction_anti_snipe_window_amended`, no new event code).
+- **Anti-snipe extension revision** (AV-309): before the first bid the
+  seller may revise how far a tail bid pushes the close out with
+  `amend_english_auction_anti_snipe_extension` — seller-only
+  (`Unauthorized`, code 100), and refused with
+  `InvalidEnglishAuction` (code 263) once a bid has landed or the
+  auction is terminal, so terms bidders already accepted are never
+  rewritten. The new extension reuses the `new` gate against the live
+  window (a live nonzero window needs a nonzero extension); with the
+  window at `0` anti-sniping is off and any extension is inert, so
+  it is accepted as-is, and re-affirming the current extension is a
+  no-op. Only `anti_snipe_extension` changes; `place_bid` reads the
+  live value, so a trailing bid pushes the close out by the new
+  extension. `anti_snipe_extension_audit_json` records the previous
+  and new extension (string event name
+  `english_auction_anti_snipe_extension_amended`, no new event code).
 - **Refunds are exact**: `place_bid` returns a `BidReceipt` naming the
   outbid leader and their amount, so the program refunds the full
   previous bid atomically; `settle` is permissionless after the close
