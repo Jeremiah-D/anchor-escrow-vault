@@ -8013,6 +8013,27 @@ New error codes 299–303: `InvalidChannelConfig`,
 `dispute` after expiry are `InvalidChannelState` (code 300) — the
 window state, not a new error, decides which call is legal.
 
+**Challenge-period amendment (AV-315):**
+`amend_challenge_period(party_a, party_b, new_challenge_period)`
+revises the unilateral-close dispute window in place. The window is a
+bilateral term, so only both parties together may move it — the two
+callers must be exactly the stored `party_a` and `party_b` (in order),
+anything else is `Unauthorized` (code 100), following the
+dual-signature convention of the payment-stream rate revision
+(AV-204). Check order is authority → state, with no value gate: any
+`u64` is legal, including 0 (instant unilateral finalization, the
+same domain `open` accepts). Only `Unfunded` and `Open` channels may
+be revised; a `UnilateralClosePending` or `Closed` channel fails with
+`InvalidChannelState` (code 300) and the stored period is untouched —
+`close_unilateral` already computed `challenge_until` from the old
+value, so amending mid-pending would rewrite the counterparty's live
+response window. Only `challenge_period` changes; amending to the
+current value is a no-op. The new value governs the next
+`close_unilateral` / `dispute` (both read the live value); a window
+already open keeps the period it was opened with. No new error codes,
+no vault layout change, no Anchor instruction surface. (Solana:
+payment-channel governance.)
+
 ## Payment streams (AV-198)
 
 `escrow-state/src/stream.rs` — a Sablier-style per-second payment

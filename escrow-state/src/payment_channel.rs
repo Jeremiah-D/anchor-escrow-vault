@@ -387,6 +387,68 @@ impl PaymentChannel {
         Ok((self.balance_a, self.balance_b))
     }
 
+    /// Revise the unilateral-close dispute window in place (AV-315).
+    ///
+    /// The challenge period is a *bilateral* dispute window — it
+    /// decides how long either side has to refute a unilateral close
+    /// — so only both parties together may move it: the two callers
+    /// must be exactly the stored `party_a` and `party_b`
+    /// (in order), anything else is [`EscrowError::Unauthorized`]
+    /// (code 100), following the dual-signature convention of
+    /// [`PaymentStream::update_stream_rate`].
+    ///
+    /// Check order is authority → state, with no value gate: any
+    /// `u64` is a legal window, including 0 (the same domain
+    /// [`PaymentChannel::open`] accepts — 0 is instant unilateral
+    /// finalization). A `u64::MAX` window is likewise accepted here;
+    /// the overflow is still caught where the window is *used* — the
+    /// next [`PaymentChannel::close_unilateral`] or
+    /// [`PaymentChannel::dispute`] computes `now + challenge_period`
+    /// with `checked_add` and fails with
+    /// [`EscrowError::InvalidChannelConfig`] (code 299) — so no new
+    /// error code is needed.
+    ///
+    /// Only `Unfunded` and `Open` channels may be revised. A
+    /// `UnilateralClosePending` or `Closed` channel fails with
+    /// [`EscrowError::InvalidChannelState`] (code 300) and the stored
+    /// period is untouched: `close_unilateral` already computed
+    /// `challenge_until` from the old value, and `dispute` restarts
+    /// the window from the live value, so amending mid-pending would
+    /// rewrite the counterparty's live response window.
+    ///
+    /// Only `challenge_period` changes — parties, total, balances,
+    /// nonce, state, and `challenge_until` are untouched. Amending to
+    /// the current period is a no-op. The new value takes effect
+    /// from the next `close_unilateral` / `dispute`, both of which
+    /// read the live value; a window already open keeps the period
+    /// it was opened with. There is no audit-event JSON layer in
+    /// this module (the whole `PaymentChannel` module has none), so
+    /// the revision is pinned by tests, like the other channel
+    /// transitions. No vault layout change and no Anchor instruction
+    /// surface (`program.rs` has no payment-channel instructions).
+    /// Orthogonal to AV-197 (the channel mechanism itself), AV-204
+    /// (the payment-stream rate revision), and AV-314 (the rental
+    /// rent revision).
+    pub fn amend_challenge_period(
+        &mut self,
+        party_a: [u8; 32],
+        party_b: [u8; 32],
+        new_challenge_period: u64,
+    ) -> Result<(), EscrowError> {
+        // Authority first: dual signature — both parties must present.
+        if party_a != self.party_a || party_b != self.party_b {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != ChannelState::Unfunded && self.state != ChannelState::Open {
+            return Err(EscrowError::InvalidChannelState);
+        }
+        if self.challenge_period == new_challenge_period {
+            return Ok(());
+        }
+        self.challenge_period = new_challenge_period;
+        Ok(())
+    }
+
     /// The final `(party_a, party_b)` split — `Some` only once
     /// [`ChannelState::Closed`].
     pub fn settlement(&self) -> Option<(u64, u64)> {
@@ -854,5 +916,159 @@ mod payment_channel_tests {
             Err(EscrowError::InvalidChannelConfig)
         );
         assert_eq!(ch.state(), ChannelState::Open);
+    }
+
+    #[test]
+    fn amend_challenge_period_revises_unfunded_and_open_channels() {
+        let a = alice().public_key();
+        let b = bob().public_key();
+        let mut ch = channel();
+        assert_eq!(ch.challenge_period(), CHALLENGE_PERIOD);
+        // Unfunded: the window is just a stored number until funding.
+        ch.amend_challenge_period(a, b, 7_200).unwrap();
+        assert_eq!(ch.challenge_period(), 7_200);
+        assert_eq!(ch.state(), ChannelState::Unfunded);
+        ch.fund(600_000).unwrap();
+        // Open: revise again — only the period moves.
+        ch.amend_challenge_period(a, b, 1_800).unwrap();
+        assert_eq!(ch.challenge_period(), 1_800);
+        assert_eq!(ch.state(), ChannelState::Open);
+        assert_eq!(ch.party_a(), &a);
+        assert_eq!(ch.party_b(), &b);
+        assert_eq!(ch.total(), TOTAL);
+        assert_eq!(ch.balances(), (600_000, 400_000));
+        assert_eq!(ch.nonce(), 0);
+        assert_eq!(ch.challenge_until(), 0);
+        assert_eq!(ch.settlement(), None);
+    }
+
+    #[test]
+    fn amend_challenge_period_is_dual_signed() {
+        let a = alice().public_key();
+        let b = bob().public_key();
+        let m = mallory().public_key();
+        let mut ch = open_channel();
+        // Stranger in either seat.
+        assert_eq!(
+            ch.amend_challenge_period(m, b, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            ch.amend_challenge_period(a, m, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            ch.amend_challenge_period(m, m, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        // Both parties present but swapped: the seats are ordered.
+        assert_eq!(
+            ch.amend_challenge_period(b, a, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        // Authority-first: refused before any state is examined, and
+        // the stored period is untouched by every refusal.
+        assert_eq!(ch.challenge_period(), CHALLENGE_PERIOD);
+        assert_eq!(ch.state(), ChannelState::Open);
+    }
+
+    #[test]
+    fn amend_challenge_period_refused_while_close_pending() {
+        let mut ch = open_channel();
+        let v1 = cosign(&ch, &update(1, 250_000, 750_000));
+        let alice_key = alice().public_key();
+        ch.close_unilateral(&alice_key, &v1, 1_000_000).unwrap();
+        assert_eq!(ch.challenge_until(), 1_000_000 + CHALLENGE_PERIOD);
+        // Both parties agree, but the window is already live: the
+        // counterparty's response window must not move mid-dispute.
+        assert_eq!(
+            ch.amend_challenge_period(alice_key, bob().public_key(), 7_200),
+            Err(EscrowError::InvalidChannelState)
+        );
+        assert_eq!(ch.challenge_period(), CHALLENGE_PERIOD);
+        assert_eq!(ch.challenge_until(), 1_000_000 + CHALLENGE_PERIOD);
+        assert_eq!(ch.state(), ChannelState::UnilateralClosePending);
+    }
+
+    #[test]
+    fn amend_challenge_period_refused_once_closed() {
+        let mut ch = open_channel();
+        let signed = cosign(&ch, &update(1, 300_000, 700_000));
+        ch.close_cooperative(&signed).unwrap();
+        assert_eq!(ch.state(), ChannelState::Closed);
+        assert_eq!(
+            ch.amend_challenge_period(alice().public_key(), bob().public_key(), 7_200),
+            Err(EscrowError::InvalidChannelState)
+        );
+        assert_eq!(ch.challenge_period(), CHALLENGE_PERIOD);
+    }
+
+    #[test]
+    fn amend_challenge_period_governs_next_unilateral_close() {
+        let mut ch = open_channel();
+        ch.amend_challenge_period(alice().public_key(), bob().public_key(), 7_200)
+            .unwrap();
+        let signed = cosign(&ch, &update(1, 250_000, 750_000));
+        let alice_key = alice().public_key();
+        ch.close_unilateral(&alice_key, &signed, 1_000_000).unwrap();
+        // The new window opens at now + the amended period.
+        assert_eq!(ch.challenge_until(), 1_000_000 + 7_200);
+        // Finalize is refused until the new window elapses.
+        assert_eq!(
+            ch.finalize(1_000_000 + CHALLENGE_PERIOD),
+            Err(EscrowError::InvalidChannelState)
+        );
+        let settlement = ch.finalize(1_000_000 + 7_200).unwrap();
+        assert_eq!(settlement, (250_000, 750_000));
+    }
+
+    #[test]
+    fn amend_challenge_period_governs_dispute_restart() {
+        let mut ch = open_channel();
+        ch.amend_challenge_period(alice().public_key(), bob().public_key(), 7_200)
+            .unwrap();
+        let v1 = cosign(&ch, &update(1, 250_000, 750_000));
+        let alice_key = alice().public_key();
+        ch.close_unilateral(&alice_key, &v1, 1_000_000).unwrap();
+        assert_eq!(ch.challenge_until(), 1_000_000 + 7_200);
+        // Bob disputes with the newer state: the restarted window
+        // also uses the amended period, not the original one.
+        let v2 = cosign(&ch, &update(2, 800_000, 200_000));
+        let bob_key = bob().public_key();
+        ch.dispute(&bob_key, &v2, 1_000_500).unwrap();
+        assert_eq!(ch.challenge_until(), 1_000_500 + 7_200);
+        assert_eq!(
+            ch.finalize(1_000_500 + CHALLENGE_PERIOD),
+            Err(EscrowError::InvalidChannelState)
+        );
+        let settlement = ch.finalize(1_000_500 + 7_200).unwrap();
+        assert_eq!(settlement, (800_000, 200_000));
+    }
+
+    #[test]
+    fn amend_challenge_period_zero_is_legal() {
+        let mut ch = open_channel();
+        // 0 is in open()'s domain — instant unilateral finalization.
+        ch.amend_challenge_period(alice().public_key(), bob().public_key(), 0)
+            .unwrap();
+        assert_eq!(ch.challenge_period(), 0);
+        let signed = cosign(&ch, &update(1, 250_000, 750_000));
+        let alice_key = alice().public_key();
+        ch.close_unilateral(&alice_key, &signed, 1_000_000).unwrap();
+        assert_eq!(ch.challenge_until(), 1_000_000);
+        // The window is already over at the close time.
+        let settlement = ch.finalize(1_000_000).unwrap();
+        assert_eq!(settlement, (250_000, 750_000));
+    }
+
+    #[test]
+    fn amend_challenge_period_same_value_is_noop() {
+        let mut ch = open_channel();
+        let before = ch;
+        ch.amend_challenge_period(alice().public_key(), bob().public_key(), CHALLENGE_PERIOD)
+            .unwrap();
+        // PaymentChannel is Copy: the whole channel is bit-identical.
+        assert_eq!(ch, before);
+        assert_eq!(ch.challenge_period(), CHALLENGE_PERIOD);
     }
 }
