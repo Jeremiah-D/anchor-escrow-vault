@@ -5316,6 +5316,19 @@ never assert on-chain hook execution — only that the declared
 binding and the plan agree. Indexers see the binding in the state
 snapshot (`"transfer_hook"` as 64-char hex or `null`).
 
+After funding, the bound program can rotate via
+`rotate_transfer_hook(initializer, taker, new_hook)` (AV-318):
+pause first, then unconditional dual signature (either party alone
+is `Unauthorized`), `Funded` only. Only an escrow with a hook
+already bound may rotate — an unbound escrow is refused with
+`InvalidTransferHook`, so rotation never installs a hook the
+taker never funded under — and the zero program id is refused
+the same way. Rotating to the current hook is a no-op success
+that emits nothing; a real change emits `TransferHookRotated`
+(discriminant 155) and governs from the next CPI plan build (a
+plan naming the old hook then fails with `SettlementMismatch`),
+while plain `release` is unaffected.
+
 ## Streaming fee on funded time (AV-100)
 
 A flat bps fee prices the *size* of a payout; the streaming fee

@@ -669,6 +669,17 @@
 //!   mint settles, and plain `release` is unaffected. A failed
 //!   revision emits nothing, and a no-op re-affirmation of the
 //!   current mint emits nothing either.
+//! - `rotate_transfer_hook` emits
+//!   [`EscrowEventKind::TransferHookRotated`] on every
+//!   successful rotation that actually changes the bound hook
+//!   (AV-318) — `from == to ==` the current state, all amounts
+//!   zero; only the hook binding moves, so the mint, the
+//!   allowlist, and any settled payout are untouched, and the
+//!   next CPI plan build reads the live hook, so a plan naming
+//!   the new hook builds while a plan naming the old hook fails
+//!   with `SettlementMismatch`, and plain `release` is
+//!   unaffected. A failed rotation emits nothing, and a no-op
+//!   re-affirmation of the current hook emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -916,6 +927,7 @@
 //! | VestingCurveAmended (AV-290) | 0 | 0 | 0 | 0 — amending moves no funds and never restates an amount already claimed; only the unlock shape moves, so the linear schedule table, the cliff, and the locked amount are untouched, and the next `claim` prices through the live curve — a claim after the amendment unlocks under the new shape while an amount already claimed keeps the shape it settled under |
 //! | PayoutSplitSharesAmended (AV-293) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a release already settled; only the share amounts move, so the recipient set and order, the locked amount, and the state are untouched, and the next `release_payout_split` prorates over the live shares — a release after the amendment pays the new split while a release already settled keeps the shares it settled under |
 //! | SettlementMintAmended (AV-317) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a release already settled; only the settlement denomination moves, so the funded mint, the allowlist, and the funded-unit counters are untouched, and the next `release_with_settlement_rate` reads the live mint before rate verification — a quote for the old mint fails at once while a quote for the new mint settles, and plain `release` is unaffected |
+//! | TransferHookRotated (AV-318) | 0 | 0 | 0 | 0 — rotating moves no funds and never restates a release already settled; only the hook binding moves, so the mint, the allowlist, and any settled payout are untouched, and the next CPI plan build reads the live hook — a plan naming the new hook builds while a plan naming the old hook fails with `SettlementMismatch`, and plain `release` is unaffected |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2683,6 +2695,16 @@ pub enum EscrowEventKind {
     /// field. A no-op re-affirmation of the current mint emits
     /// nothing.
     SettlementMintAmended,
+    /// Rotate the bound Token-2022 transfer-hook program after
+    /// funding (AV-318): only the hook binding moves, so the
+    /// mint, the allowlist, and any settled payout are untouched
+    /// — the next CPI plan build reads the live hook, so a plan
+    /// naming the new hook builds while a plan naming the old
+    /// hook fails with `SettlementMismatch`, and plain `release`
+    /// is unaffected. The new hook is read from the vault, so
+    /// the event needs no extra field. A no-op re-affirmation
+    /// of the current hook emits nothing.
+    TransferHookRotated,
 }
 
 impl EscrowEventKind {
@@ -3170,6 +3192,10 @@ impl EscrowEventKind {
             // discriminants 0–153 stay stable for already-serialized
             // histories.
             154 => Self::SettlementMintAmended,
+            // AV-318: appended after SettlementMintAmended so
+            // discriminants 0–154 stay stable for already-serialized
+            // histories.
+            155 => Self::TransferHookRotated,
             _ => return None,
         })
     }
@@ -3400,6 +3426,7 @@ impl EscrowEventKind {
             Self::VestingCurveAmended => "vesting_curve_amended",
             Self::PayoutSplitSharesAmended => "payout_split_shares_amended",
             Self::SettlementMintAmended => "settlement_mint_amended",
+            Self::TransferHookRotated => "transfer_hook_rotated",
         }
     }
 
@@ -3634,6 +3661,7 @@ impl EscrowEventKind {
             "vesting_curve_amended" => Self::VestingCurveAmended,
             "payout_split_shares_amended" => Self::PayoutSplitSharesAmended,
             "settlement_mint_amended" => Self::SettlementMintAmended,
+            "transfer_hook_rotated" => Self::TransferHookRotated,
             _ => return None,
         })
     }
@@ -7712,6 +7740,45 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
             EscrowEventKind::ArbiterRotated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Rotate the bound Token-2022 transfer-hook program after
+    /// funding (mirrors [`Escrow::rotate_transfer_hook`]).
+    /// Emits `TransferHookRotated` only when the hook actually
+    /// changes; `from == to ==` the current state (a config
+    /// change, not a lifecycle move — like `QuorumUpdated`). `at`
+    /// is the caller-supplied event timestamp.
+    pub fn rotate_transfer_hook(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_hook: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.transfer_hook();
+        self.inner
+            .rotate_transfer_hook(initializer, taker, new_hook)?;
+        let after = self.inner.transfer_hook();
+        // The inner call rejects a stranger pair, wrong states, the
+        // zero address, and the no-hook case, so a changed hook
+        // here always means real governance — and a same-hook no-op
+        // stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::TransferHookRotated,
             state,
             state,
             EventAmounts::none(),
@@ -15247,7 +15314,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -15390,7 +15458,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -15967,7 +16036,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16022,7 +16092,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16074,7 +16145,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16126,7 +16198,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16178,7 +16251,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16233,7 +16307,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16288,7 +16363,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16340,7 +16416,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16392,7 +16469,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16444,7 +16522,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16496,7 +16575,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16548,7 +16628,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16600,7 +16681,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16656,7 +16738,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16711,7 +16794,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16766,7 +16850,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16821,7 +16906,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16876,7 +16962,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16932,7 +17019,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -16988,7 +17076,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -17044,7 +17133,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -17099,7 +17189,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -17171,7 +17262,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]

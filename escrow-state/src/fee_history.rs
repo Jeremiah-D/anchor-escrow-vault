@@ -455,6 +455,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // the funded-unit counters are untouched, while the next
         // settled release reads the live mint before rate verification.
         | EscrowEventKind::SettlementMintAmended
+        // AV-318: a rotated transfer-hook program moves no funds and
+        // never restates a release already settled — only the hook
+        // binding moves, so the mint, the allowlist, and any settled
+        // payout are untouched, while the next CPI plan build reads
+        // the live hook.
+        | EscrowEventKind::TransferHookRotated
         // AV-278: an amended recovery threshold moves no funds and
         // never restates a settled request — only the threshold
         // changes, so the guardians, the count and the timelock
@@ -1405,6 +1411,12 @@ mod fee_history_tests {
         // the funded-unit counters are untouched, while the next
         // settled release reads the live mint before rate verification.
         | EscrowEventKind::SettlementMintAmended
+                // AV-318: a rotated transfer-hook program moves no funds and
+                // never restates a release already settled — only the hook
+                // binding moves, so the mint, the allowlist, and any settled
+                // payout are untouched, while the next CPI plan build reads
+                // the live hook.
+                | EscrowEventKind::TransferHookRotated
                 // AV-278: an amended recovery threshold moves no funds and
                 // never restates a settled request — only the threshold
                 // changes, so the guardians, the count and the timelock

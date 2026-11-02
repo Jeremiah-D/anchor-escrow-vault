@@ -19073,6 +19073,89 @@ let fee = self.charge_protocol_fee(claimable)?;
         self.transfer_hook
     }
 
+    /// Rotate the bound Token-2022 transfer-hook program after
+    /// funding (AV-318 — Solana transfer-hook governance): the
+    /// post-funding counterpart to [`Escrow::with_transfer_hook`]
+    /// (`Uninitialized`-only initial binding). A deal's hook program
+    /// may need to move mid-deal — the hook is redeployed, its key
+    /// is compromised, or the venue migrates — without cancelling
+    /// and re-locking the escrow.
+    ///
+    /// Governance mirrors [`Escrow::rotate_milestone_verifier`]:
+    /// pause first (AV-46), then unconditional dual signature —
+    /// both the *current* initializer and the *current* taker must
+    /// authorize, one party alone (or a stranger pair) is
+    /// [`EscrowError::Unauthorized`] — then the `Funded`-only state
+    /// gate ([`EscrowError::InvalidStateTransition`]). Only an
+    /// escrow with a hook already bound may rotate it: an unbound
+    /// escrow is refused with [`EscrowError::InvalidTransferHook`]
+    /// (fail-closed — rotation never creates a hook; post-funding
+    /// installation would add hook execution the taker never funded
+    /// under, so it is not a rotation, it is a new deal). The new
+    /// hook reuses the [`Escrow::with_transfer_hook`] value gate
+    /// (the zero address is [`EscrowError::InvalidTransferHook`]) —
+    /// and a rejected hook leaves the original binding exactly as
+    /// it was, since the new value is validated before any write.
+    /// Only `transfer_hook` changes: the mint, the allowlist, and
+    /// any settled payout are untouched, and plain `release` is
+    /// unaffected (no hook context on the SPL path). The new hook
+    /// governs from the next CPI plan build: the builders
+    /// ([`cpi::payout_plan`] and siblings) read the live binding
+    /// when the plan is built, so a plan naming the new hook builds
+    /// while a plan naming the old hook fails with
+    /// `SettlementMismatch` — a plan already built keeps the hook
+    /// it was built under, and no plan can silently drop or swap
+    /// the hook. Rotating to the current hook is a no-op: it
+    /// succeeds and writes nothing, so the event layer emits
+    /// nothing for it (paralleling `rotate_arbiter` — unlike
+    /// `rotate_milestone_verifier`, which refuses the same value).
+    /// The 33-byte `Option` region is already resident, so the
+    /// rotation rewrites it in place with no layout change. No new
+    /// error code is needed. Pure logic only: like
+    /// `rotate_milestone_verifier` and `rotate_credential_issuer`
+    /// there is no Anchor instruction surface for this rotation.
+    /// Emits `TransferHookRotated` on the event layer, except for
+    /// the no-op re-affirmation.
+    pub fn rotate_transfer_hook(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_hook: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the *current*
+        // initializer and the *current* taker must authorize.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow with a hook already bound may
+        // rotate it — rotation never creates a hook. Checked before
+        // the value gate so an unbound escrow never acquires a hook
+        // through this path, whatever the proposed program.
+        let current = self
+            .transfer_hook
+            .ok_or(EscrowError::InvalidTransferHook)?;
+        // The value gate lives in `with_transfer_hook`: the zero
+        // address is not a hook program (the stored zero always
+        // means "no hook bound"), and a rejected hook leaves the
+        // original binding exactly as it was.
+        if new_hook == [0u8; 32] {
+            return Err(EscrowError::InvalidTransferHook);
+        }
+        // No-op: re-affirming the current hook writes nothing, so
+        // the event layer emits nothing for it.
+        if new_hook == current {
+            return Ok(());
+        }
+        self.transfer_hook = Some(new_hook);
+        Ok(())
+    }
+
     /// Opt in to a streaming fee on funded time (AV-100).
     /// Builder-style: only valid on an `Uninitialized` escrow, so the
     /// rate is fixed before any funds move — mirroring
@@ -50694,7 +50777,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
     }
 
     #[test]
@@ -67900,7 +67984,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
-        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -68137,9 +68222,10 @@ mod event_history_tests {
         // `SubscriptionPeriodSecsAmended` (AV-289), 152 is
         // `VestingCurveAmended` (AV-290), 153 is
         // `PayoutSplitSharesAmended` (AV-293), 154 is
-        // `SettlementMintAmended` (AV-317) and 155 is the
+        // `SettlementMintAmended` (AV-317), 155 is
+        // `TransferHookRotated` (AV-318) and 156 is the
         // first still-unknown byte.
-        for bad in [155u8, 255] {
+        for bad in [156u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -81089,6 +81175,314 @@ mod amend_settlement_mint_tests {
         assert_eq!(e.event_count(), before + 2);
         let ev = e.events().last().copied().expect("event pushed");
         assert_eq!(ev.kind, EscrowEventKind::SettlementMintAmended);
+    }
+}
+
+mod rotate_transfer_hook_tests {
+    use super::*;
+    use crate::cpi::{payout_plan, CpiError, PayoutAddrs, PayoutKind, TransferHookPlan};
+    use crate::events::IndexedEscrow;
+
+    const H1: [u8; 32] = [0x77; 32];
+    const H2: [u8; 32] = [0x78; 32];
+    const H3: [u8; 32] = [0x79; 32];
+    const MINT: [u8; 32] = [0xD0; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn init_key() -> SigningKey {
+        SigningKey::from_seed([0x11; 32])
+    }
+
+    fn taker_key() -> SigningKey {
+        SigningKey::from_seed([0x22; 32])
+    }
+
+    fn initializer() -> [u8; 32] {
+        init_key().public_key()
+    }
+
+    fn taker() -> [u8; 32] {
+        taker_key().public_key()
+    }
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_transfer_hook(H1)
+            .unwrap();
+        e.fund(initializer(), NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn hook_plan(hook: [u8; 32]) -> TransferHookPlan {
+        TransferHookPlan {
+            program: hook,
+            extra_accounts: vec![
+                AccountMeta {
+                    pubkey: [0x14; 32],
+                    is_signer: false,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: [0x15; 32],
+                    is_signer: false,
+                    is_writable: false,
+                },
+            ],
+        }
+    }
+
+    fn hook_payout_addrs(hook: [u8; 32]) -> PayoutAddrs {
+        PayoutAddrs {
+            source: [0x0B; 32],
+            vault_authority: [0x0A; 32],
+            taker: taker(),
+            taker_leg: [0x0C; 32],
+            fee_leg: [0x09; 32],
+            transfer_hook: Some(hook_plan(hook)),
+            token_program: None,
+        }
+    }
+
+    #[test]
+    fn rotate_moves_hook_only() {
+        // Only the hook binding moves: the mint, the state, and
+        // the encoded length are untouched — the 33-byte Option
+        // region is already resident, so the revision rewrites it
+        // in place with no layout change.
+        let mut e = configured();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.rotate_transfer_hook(initializer(), taker(), H2).unwrap();
+        assert_eq!(e.transfer_hook(), Some(H2), "hook rotated");
+        assert_eq!(e.mint(), Some(MINT), "funded mint untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "hook region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn rotate_rejects_stranger_and_single_party() {
+        // Unconditional dual signature: one party alone, a
+        // stranger, or the parties swapped is Unauthorized.
+        let mut e = configured();
+        assert_eq!(
+            e.rotate_transfer_hook(MALLORY, taker(), H2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.rotate_transfer_hook(initializer(), initializer(), H2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.rotate_transfer_hook(taker(), initializer(), H2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.transfer_hook(), Some(H1), "hook untouched");
+    }
+
+    #[test]
+    fn rotate_rejects_non_funded_state() {
+        // Funded-only: the Uninitialized builder owns the initial
+        // binding, and a terminal escrow has no future CPI plan
+        // left to re-hook.
+        let mut bare = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_transfer_hook(H1)
+            .unwrap();
+        assert_eq!(
+            bare.rotate_transfer_hook(initializer(), taker(), H2),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.transfer_hook(), Some(H1));
+        let mut released = configured();
+        released
+            .release(initializer(), NOW, 1_000_000, Some(MINT), taker())
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.rotate_transfer_hook(initializer(), taker(), H2),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(released.transfer_hook(), Some(H1));
+    }
+
+    #[test]
+    fn rotate_rejects_unbound_escrow() {
+        // Fail-closed: rotation never creates a hook — only an
+        // escrow with a hook already bound may rotate it. The
+        // bound gate fires before the value gate, so even a zero
+        // hook on an unbound escrow reports InvalidTransferHook.
+        let mut plain = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap();
+        plain.fund(initializer(), NOW).unwrap();
+        assert_eq!(
+            plain.rotate_transfer_hook(initializer(), taker(), H2),
+            Err(EscrowError::InvalidTransferHook)
+        );
+        assert_eq!(
+            plain.rotate_transfer_hook(initializer(), taker(), [0u8; 32]),
+            Err(EscrowError::InvalidTransferHook)
+        );
+        assert_eq!(plain.transfer_hook(), None);
+    }
+
+    #[test]
+    fn rotate_rejects_zero_address_and_preserves_original() {
+        // The `with_transfer_hook` value gate, unchanged: the
+        // zero address is not a hook program, and a failed
+        // rotation never writes.
+        let mut e = configured();
+        assert_eq!(
+            e.rotate_transfer_hook(initializer(), taker(), [0u8; 32]),
+            Err(EscrowError::InvalidTransferHook)
+        );
+        assert_eq!(e.transfer_hook(), Some(H1), "original hook untouched");
+    }
+
+    #[test]
+    fn rotate_same_hook_is_noop() {
+        // Re-affirming the current hook succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing — paralleling `rotate_arbiter`, unlike
+        // `rotate_milestone_verifier`, which refuses the same
+        // value.
+        let mut e = configured();
+        e.rotate_transfer_hook(initializer(), taker(), H1).unwrap();
+        assert_eq!(e.transfer_hook(), Some(H1));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn rotate_new_hook_plan_builds_old_hook_plan_fails() {
+        // The CPI builders read the live binding at plan-build
+        // time: a plan naming the new hook builds and annotates
+        // it, while a plan naming the old hook fails with
+        // SettlementMismatch — a swapped hook is never built.
+        let mut e = configured();
+        e.rotate_transfer_hook(initializer(), taker(), H2).unwrap();
+        let (payout, fee) = e
+            .release(initializer(), NOW, 1_000_000, Some(MINT), taker())
+            .unwrap();
+        let plan = payout_plan(
+            PayoutKind::Release,
+            &e,
+            &hook_payout_addrs(H2),
+            payout,
+            fee,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.transfer_hook_program, Some(H2));
+        assert_eq!(plan.transfer_hook_accounts.len(), 2);
+        assert_eq!(
+            payout_plan(
+                PayoutKind::Release,
+                &e,
+                &hook_payout_addrs(H1),
+                payout,
+                fee,
+                None
+            ),
+            Err(CpiError::SettlementMismatch)
+        );
+    }
+
+    #[test]
+    fn rotate_plain_release_unaffected() {
+        // Rotating the hook changes nothing for the plain path:
+        // it keeps settling in funded units, unconverted, with
+        // no hook context.
+        let mut e = configured();
+        e.rotate_transfer_hook(initializer(), taker(), H2).unwrap();
+        assert_eq!(
+            e.release(initializer(), NOW, 1_000_000, Some(MINT), taker())
+                .unwrap(),
+            (1_000_000, 0)
+        );
+        assert_eq!(e.released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn rotate_rejects_when_paused() {
+        // The pause guard fires before the authority and state
+        // gates: even a stranger's rotation on a paused escrow is
+        // `Paused`, and a dual-signed rotation is refused too.
+        let mut e = configured();
+        e.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            e.rotate_transfer_hook(MALLORY, taker(), H2),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            e.rotate_transfer_hook(initializer(), taker(), H2),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(e.transfer_hook(), Some(H1), "hook untouched");
+    }
+
+    #[test]
+    fn rotate_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-318: a dual-signed rotation emits TransferHookRotated
+        // (discriminant 155, appended last) with zero amounts — a
+        // config change, not a settlement — and the rotated hook is
+        // read from the vault. A refused rotation emits nothing,
+        // and a no-op re-affirmation emits nothing either.
+        assert_eq!(EscrowEventKind::TransferHookRotated.discriminant(), 155);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(155),
+            Some(EscrowEventKind::TransferHookRotated)
+        );
+        assert_eq!(
+            EscrowEventKind::TransferHookRotated.name(),
+            "transfer_hook_rotated"
+        );
+        assert_eq!(
+            EscrowEventKind::from_name("transfer_hook_rotated"),
+            Some(EscrowEventKind::TransferHookRotated)
+        );
+        let mut e = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = e.event_count();
+        assert_eq!(
+            e.rotate_transfer_hook(MALLORY, taker(), H2, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.rotate_transfer_hook(initializer(), taker(), H2, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::TransferHookRotated);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same hook is a no-op: no new event.
+        e.rotate_transfer_hook(initializer(), taker(), H2, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        // A second real change emits again.
+        e.rotate_transfer_hook(initializer(), taker(), H3, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 2);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::TransferHookRotated);
     }
 }
 
