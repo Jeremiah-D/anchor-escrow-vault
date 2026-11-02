@@ -481,6 +481,13 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // state are untouched, while the next funding reads the
         // live window.
         | EscrowEventKind::FundingStartAmended
+        // AV-322: a rotated English-auction seller moves no funds and
+        // never restates a bid already placed — only the seller
+        // moves, so the reserve, the minimum increment, the windows,
+        // anti-sniping, the buyout price, the highest bid, the bid
+        // count, and the state are untouched, while the next amend /
+        // cancel / settle reads the live seller.
+        | EscrowEventKind::EnglishAuctionSellerAmended
         // AV-278: an amended recovery threshold moves no funds and
         // never restates a settled request — only the threshold
         // changes, so the guardians, the count and the timelock
@@ -1457,6 +1464,13 @@ mod fee_history_tests {
                 // state are untouched, while the next funding reads the
                 // live window.
                 | EscrowEventKind::FundingStartAmended
+                // AV-322: a rotated English-auction seller moves no funds
+                // and never restates a bid already placed — only the seller
+                // moves, so the reserve, the minimum increment, the windows,
+                // anti-sniping, the buyout price, the highest bid, the bid
+                // count, and the state are untouched, while the next amend /
+                // cancel / settle reads the live seller.
+                | EscrowEventKind::EnglishAuctionSellerAmended
                 // AV-278: an amended recovery threshold moves no funds and
                 // never restates a settled request — only the threshold
                 // changes, so the guardians, the count and the timelock

@@ -28,7 +28,9 @@
 //!   itself may likewise be revised before the first bid
 //!   (`amend_english_auction_start_slot`, AV-312). The buy-it-now
 //!   price may likewise be revised before the first bid
-//!   (`amend_english_auction_buyout_price`, AV-320).
+//!   (`amend_english_auction_buyout_price`, AV-320). The seller key
+//!   itself may likewise be rotated before the first bid
+//!   (`amend_english_auction_seller`, AV-322).
 //! - **Buy-it-now** (AV-201, opt-in): the seller may set a buyout
 //!   price; a live bid at or above it settles the auction immediately
 //!   at exactly that price, skipping the remaining window and any
@@ -661,6 +663,61 @@ impl EnglishAuction {
             return Err(EscrowError::InvalidEnglishAuction);
         }
         self.buyout_price = new_buyout_price;
+        Ok(())
+    }
+
+    /// Rotate the seller before the first bid (AV-322).
+    ///
+    /// Only the current seller may rotate ([`EscrowError::Unauthorized`],
+    /// code 100, for anyone else — the seller key is the auction's
+    /// authority root) and only before the first bid: refused with
+    /// [`EscrowError::InvalidEnglishAuction`] (code 263) once any bid
+    /// has landed or the auction is terminal — rotating after bids
+    /// exist would rewrite the counterparty bidders already accepted,
+    /// and the settle payout goes to the live seller. The new seller
+    /// reuses the [`Self::new`] gate: the zero key is refused with
+    /// code 263 and the original seller stands. No slot gate: with
+    /// zero bids no bidder has entered, so the window may already be
+    /// open.
+    ///
+    /// Only `seller` changes: `reserve_price`, `min_increment`, the
+    /// windows, anti-sniping, `buyout_price`, `highest_bid`,
+    /// `bid_count`, `extension_count`, and state are untouched. The
+    /// new seller is the sole authority from the next call: every
+    /// `amend_*`, [`Self::cancel`], and the settle payout read the
+    /// live seller. Rotating to the current seller is a no-op.
+    ///
+    /// Check order is authority → liveness → no-op → value,
+    /// mirroring [`Self::amend_english_auction_buyout_price`]. A
+    /// stranger is refused even on a terminal auction, and a lapsed
+    /// auction refuses even the seller.
+    ///
+    /// Pure logic: this method changes state only. The rotation is
+    /// recorded for the indexer as
+    /// [`EscrowEventKind::EnglishAuctionSellerAmended`](crate::EscrowEventKind::EnglishAuctionSellerAmended)
+    /// (discriminant 159, all amounts zero — a config change, not a
+    /// settlement); a failed rotation and a no-op re-affirmation
+    /// record nothing. There is no Anchor instruction surface in
+    /// this round — the program drives this method and emits the
+    /// event — and no new error code: the gates reuse 100/263.
+    pub fn amend_english_auction_seller(
+        &mut self,
+        caller: [u8; 32],
+        new_seller: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != AuctionState::Bidding || self.bid_count > 0 {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        if new_seller == self.seller {
+            return Ok(());
+        }
+        if new_seller == [0u8; 32] {
+            return Err(EscrowError::InvalidEnglishAuction);
+        }
+        self.seller = new_seller;
         Ok(())
     }
 
@@ -2860,6 +2917,166 @@ mod english_auction_tests {
             .amend_english_auction_buyout_price(key(9), 400)
             .unwrap_err();
         assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_seller_before_first_bid() {
+        let mut a = open_auction().with_buyout(300).unwrap();
+        a.amend_english_auction_seller(key(0xAA), key(0xBB))
+            .unwrap();
+        assert_eq!(a.seller(), key(0xBB));
+        // Everything else is untouched.
+        assert_eq!(a.reserve_price(), 150);
+        assert_eq!(a.min_increment(), 10);
+        assert_eq!(a.buyout_price(), 300);
+        assert_eq!(a.start_slot(), 100);
+        assert_eq!(a.end_slot(), 200);
+        assert_eq!(a.state(), AuctionState::Bidding);
+        assert_eq!(a.highest_bid(), 0);
+        assert_eq!(a.bid_count(), 0);
+        assert_eq!(a.extension_count(), 0);
+        // The new seller governs from the next call: a bid still
+        // lands against the live terms, and settle pays the live
+        // seller's auction.
+        let r = a.place_bid(key(1), 100, 150).unwrap();
+        assert_eq!(r.end_slot, 200);
+        assert!(!r.buyout);
+    }
+
+    #[test]
+    fn amend_seller_is_current_seller_only() {
+        let mut a = open_auction();
+        // A stranger is refused, even on a live auction.
+        let err = a
+            .amend_english_auction_seller(key(9), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(a.seller(), key(0xAA));
+        // A bidder is refused too — authority is checked first.
+        a.place_bid(key(1), 50, 150).unwrap();
+        let err = a
+            .amend_english_auction_seller(key(1), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.seller(), key(0xAA));
+    }
+
+    #[test]
+    fn amend_seller_locks_after_first_bid() {
+        let mut a = open_auction();
+        a.place_bid(key(1), 100, 150).unwrap();
+        let err = a
+            .amend_english_auction_seller(key(0xAA), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(err.code(), 263);
+        assert_eq!(a.seller(), key(0xAA));
+        // The bid still stands: settle keeps the original seller's
+        // auction intact.
+        let s = a.settle(200).unwrap();
+        assert!(matches!(s, AuctionSettlement::ReserveNotMet { .. }));
+    }
+
+    #[test]
+    fn amend_seller_refused_in_terminal_states() {
+        // Settled via buyout.
+        let mut a = EnglishAuction::new(key(0xAA), 100, 200, 10, 150, 0, 0, 0)
+            .unwrap()
+            .with_buyout(300)
+            .unwrap();
+        a.place_bid(key(1), 300, 150).unwrap();
+        assert_eq!(a.state(), AuctionState::Settled);
+        let err = a
+            .amend_english_auction_seller(key(0xAA), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(a.seller(), key(0xAA));
+        // NoSale after settling with no bids.
+        let mut b = open_auction();
+        b.settle(200).unwrap();
+        assert_eq!(b.state(), AuctionState::NoSale);
+        let err = b
+            .amend_english_auction_seller(key(0xAA), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(b.seller(), key(0xAA));
+        // Cancelled.
+        let mut c = open_auction();
+        c.cancel(key(0xAA), 150).unwrap();
+        assert_eq!(c.state(), AuctionState::Cancelled);
+        let err = c
+            .amend_english_auction_seller(key(0xAA), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(c.seller(), key(0xAA));
+        // Authority still wins on a terminal auction: a stranger is
+        // Unauthorized, not InvalidEnglishAuction.
+        let err = c
+            .amend_english_auction_seller(key(9), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_seller_rejects_zero_seller() {
+        let mut a = open_auction().with_buyout(300).unwrap();
+        let err = a
+            .amend_english_auction_seller(key(0xAA), [0u8; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidEnglishAuction);
+        assert_eq!(err.code(), 263);
+        assert_eq!(a.seller(), key(0xAA));
+        // The original seller still governs.
+        a.amend_english_auction_reserve_price(key(0xAA), 120)
+            .unwrap();
+        assert_eq!(a.reserve_price(), 120);
+    }
+
+    #[test]
+    fn amend_seller_same_value_is_noop() {
+        let mut a = open_auction().with_buyout(300).unwrap();
+        // Re-affirming the current seller succeeds and changes
+        // nothing — the pure-logic method emits no event, so there
+        // is no event to assert here; the state pin is the seller.
+        a.amend_english_auction_seller(key(0xAA), key(0xAA))
+            .unwrap();
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.buyout_price(), 300);
+        assert_eq!(a.state(), AuctionState::Bidding);
+    }
+
+    #[test]
+    fn amend_seller_old_seller_loses_authority() {
+        let mut a = open_auction().with_buyout(300).unwrap();
+        a.amend_english_auction_seller(key(0xAA), key(0xBB))
+            .unwrap();
+        // The old seller can no longer amend or cancel.
+        let err = a
+            .amend_english_auction_reserve_price(key(0xAA), 120)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        let err = a.cancel(key(0xAA), 150).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.state(), AuctionState::Bidding);
+        assert_eq!(a.reserve_price(), 150);
+    }
+
+    #[test]
+    fn amend_seller_new_seller_can_govern() {
+        let mut a = open_auction().with_buyout(300).unwrap();
+        a.amend_english_auction_seller(key(0xAA), key(0xBB))
+            .unwrap();
+        // The new seller can amend the terms and cancel.
+        a.amend_english_auction_reserve_price(key(0xBB), 120)
+            .unwrap();
+        assert_eq!(a.reserve_price(), 120);
+        a.amend_english_auction_buyout_price(key(0xBB), 400)
+            .unwrap();
+        assert_eq!(a.buyout_price(), 400);
+        a.cancel(key(0xBB), 150).unwrap();
+        assert_eq!(a.state(), AuctionState::Cancelled);
     }
 
     #[test]

@@ -7800,6 +7800,22 @@ whether the sale happens at all.
   all amounts zero); a failed revision and a no-op re-affirmation
   record nothing. Pure logic, no new error code, no Anchor
   instruction surface in this round.
+- **Seller rotation** (AV-322): before the first bid the current seller
+  may rotate the seller key with `amend_english_auction_seller` —
+  seller-only (`Unauthorized`, code 100), and refused with
+  `InvalidEnglishAuction` (code 263) once a bid has landed or the
+  auction is terminal, so the counterparty bidders already accepted
+  is never rewritten. The new seller reuses the construction gate
+  (the zero key is refused with code 263); no slot gate, since with
+  zero bids no bidder has entered. Re-affirming the current seller
+  is a no-op. Only `seller` changes; every `amend_*`, `cancel`, and
+  the settle payout read the live seller, so the old seller loses
+  all authority at once and the new seller governs from the next
+  call. The rotation is recorded as
+  `EnglishAuctionSellerAmended` (discriminant 159, all amounts
+  zero); a failed rotation and a no-op re-affirmation record
+  nothing. Pure logic, no new error code, no Anchor instruction
+  surface in this round.
 
 New error codes (never renumbered): `InvalidEnglishAuction` (263),
 `EnglishAuctionBidTooLow` (264), `EnglishAuctionNotLive` (265),
