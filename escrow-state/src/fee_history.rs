@@ -461,6 +461,13 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // payout are untouched, while the next CPI plan build reads
         // the live hook.
         | EscrowEventKind::TransferHookRotated
+        // AV-319: a revised blind-panel reveal window moves no funds
+        // and never restates a reveal already settled — only the
+        // window moves, so the members, the threshold, the
+        // commitments, the commit times, the revealed flags, and
+        // the votes are untouched, while the next reveal reads the
+        // live window.
+        | EscrowEventKind::BlindPanelRevealWindowAmended
         // AV-278: an amended recovery threshold moves no funds and
         // never restates a settled request — only the threshold
         // changes, so the guardians, the count and the timelock
@@ -1417,6 +1424,13 @@ mod fee_history_tests {
                 // payout are untouched, while the next CPI plan build reads
                 // the live hook.
                 | EscrowEventKind::TransferHookRotated
+                // AV-319: a revised blind-panel reveal window moves no funds
+                // and never restates a reveal already settled — only the
+                // window moves, so the members, the threshold, the
+                // commitments, the commit times, the revealed flags, and
+                // the votes are untouched, while the next reveal reads the
+                // live window.
+                | EscrowEventKind::BlindPanelRevealWindowAmended
                 // AV-278: an amended recovery threshold moves no funds and
                 // never restates a settled request — only the threshold
                 // changes, so the guardians, the count and the timelock

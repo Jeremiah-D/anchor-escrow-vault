@@ -28200,6 +28200,98 @@ let fee = self.charge_protocol_fee(taker_amount)?;
         )
     }
 
+    /// Revise the blind panel's reveal window after funding (AV-319):
+    /// the post-funding counterpart to [`Escrow::with_blind_panel`]
+    /// (`Uninitialized`-only initial configuration).
+    ///
+    /// Why: the right reveal window is not always obvious at setup —
+    /// a window that proved too tight strands slow members (every
+    /// reveal lands `BlindRevealWindowClosed`) or too loose lets a
+    /// dispute drag — and the parties should be able to retune it
+    /// without cancelling and re-locking the escrow.
+    ///
+    /// Governance mirrors [`Escrow::rotate_transfer_hook`]:
+    /// pause first (AV-46), then unconditional dual signature —
+    /// both the *current* initializer and the *current* taker must
+    /// authorize, one party alone (or a stranger pair) is
+    /// [`EscrowError::Unauthorized`] — then the `Funded`-only state
+    /// gate ([`EscrowError::InvalidStateTransition`]). Only an
+    /// escrow with a blind panel already configured may revise its
+    /// window: an escrow with no panel, or a plain (non-blind)
+    /// panel, is refused with [`EscrowError::InvalidArbiterPanel`]
+    /// (fail-closed — revision never installs a blind panel, and
+    /// never turns a plain panel blind; post-funding installation
+    /// would add commit-reveal voting the taker never funded under,
+    /// so it is not a revision, it is a new deal). The new window
+    /// reuses the [`Escrow::with_blind_panel`] value gate (a zero
+    /// window is [`EscrowError::InvalidArbiterPanel`]) — and a
+    /// rejected window leaves the original window exactly as it
+    /// was, since the new value is validated before any write.
+    /// Only `reveal_window_secs` changes: the members, the
+    /// threshold, the commitments, the commit times, the revealed
+    /// flags, and the votes are untouched. The new window governs
+    /// from the next commit-reveal round:
+    /// [`Escrow::reveal_judgment`] reads the live window when the
+    /// reveal lands, so a reveal after a commit under the new
+    /// window is judged against the new deadline — and because the
+    /// revision is `Funded`-only, no commitment can be in flight
+    /// at revision time (commits only happen in `Disputed`), so no
+    /// live deadline is ever restated. Revising to the current
+    /// window is a no-op: it succeeds and writes nothing, so the
+    /// event layer emits nothing for it (paralleling
+    /// `rotate_arbiter` — unlike `rotate_milestone_verifier`,
+    /// which refuses the same value). The 8-byte
+    /// `reveal_window_secs` field is already resident, so the
+    /// revision rewrites it in place with no layout change. No new
+    /// error code is needed. Pure logic only: like
+    /// `rotate_transfer_hook` there is no Anchor instruction surface
+    /// for this revision. Emits `BlindPanelRevealWindowAmended` on
+    /// the event layer, except for the no-op re-affirmation.
+    pub fn amend_blind_panel_reveal_window(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        reveal_window_secs: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the *current*
+        // initializer and the *current* taker must authorize.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow with a blind panel already
+        // configured may revise its window — revision never
+        // installs a blind panel, and never turns a plain panel
+        // blind. Checked before the value gate so an unconfigured
+        // escrow never acquires blind voting through this path,
+        // whatever the proposed window.
+        let mut panel = self
+            .arbiter_panel
+            .ok_or(EscrowError::InvalidArbiterPanel)?;
+        if !panel.blind {
+            return Err(EscrowError::InvalidArbiterPanel);
+        }
+        // The value gate lives in `with_blind_panel`: a zero
+        // window would make every reveal instantly late, and a
+        // rejected window leaves the original exactly as it was.
+        if reveal_window_secs == 0 {
+            return Err(EscrowError::InvalidArbiterPanel);
+        }
+        // No-op: re-affirming the current window writes nothing,
+        // so the event layer emits nothing for it.
+        if reveal_window_secs == panel.reveal_window_secs {
+            return Ok(());
+        }
+        panel.reveal_window_secs = reveal_window_secs;
+        self.arbiter_panel = Some(panel);
+        Ok(())
+    }
+
     /// Update the arbiter panel's judgment threshold by dual-signed
     /// governance (AV-69 — Solana governance): the initializer AND the
     /// taker jointly retune the M-of-N threshold of the opt-in panel
@@ -50778,7 +50870,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -67985,7 +68078,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -68223,9 +68317,10 @@ mod event_history_tests {
         // `VestingCurveAmended` (AV-290), 153 is
         // `PayoutSplitSharesAmended` (AV-293), 154 is
         // `SettlementMintAmended` (AV-317), 155 is
-        // `TransferHookRotated` (AV-318) and 156 is the
+        // `TransferHookRotated` (AV-318), 156 is
+        // `BlindPanelRevealWindowAmended` (AV-319) and 157 is the
         // first still-unknown byte.
-        for bad in [156u8, 255] {
+        for bad in [157u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -81483,6 +81578,310 @@ mod rotate_transfer_hook_tests {
         assert_eq!(e.event_count(), before + 2);
         let ev = e.events().last().copied().expect("event pushed");
         assert_eq!(ev.kind, EscrowEventKind::TransferHookRotated);
+    }
+}
+
+mod amend_blind_panel_reveal_window_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const M1: [u8; 32] = [0xC1; 32];
+    const M2: [u8; 32] = [0xC2; 32];
+    const M3: [u8; 32] = [0xC3; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+    const WINDOW: u64 = 86_400;
+    const NEW_WINDOW: u64 = 172_800;
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_blind_panel(&[M1, M2, M3], 2, WINDOW)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn window_of(e: &Escrow) -> u64 {
+        e.arbiter_panel()
+            .expect("panel configured")
+            .reveal_window_secs
+    }
+
+    fn commit_of(taker_amount: u64, salt: [u8; 32]) -> [u8; 32] {
+        crate::blind_commitment(taker_amount, None, salt)
+    }
+
+    fn disputed(e: &mut Escrow) {
+        e.escalate(ALICE, NOW, 1_000_000, None, None, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn amend_moves_window_only() {
+        // Only `reveal_window_secs` moves: the roster, the
+        // threshold, the blind flag, the vote state, and the
+        // encoded length are untouched — the 8-byte window field
+        // is already resident, so the revision rewrites it in
+        // place with no layout change.
+        let mut e = configured();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let panel_before = e.arbiter_panel().unwrap();
+        e.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW)
+            .unwrap();
+        let panel = e.arbiter_panel().unwrap();
+        assert_eq!(panel.reveal_window_secs, NEW_WINDOW, "window revised");
+        assert_eq!(panel.members, panel_before.members, "roster untouched");
+        assert_eq!(panel.threshold, panel_before.threshold);
+        assert_eq!(panel.n, panel_before.n);
+        assert!(panel.blind, "still blind");
+        assert_eq!(panel.commitments, panel_before.commitments);
+        assert_eq!(panel.committed_at, panel_before.committed_at);
+        assert_eq!(
+            panel.commit_disputed_at,
+            panel_before.commit_disputed_at
+        );
+        assert_eq!(panel.revealed, panel_before.revealed);
+        assert_eq!(panel.voted, panel_before.voted);
+        assert_eq!(panel.votes, panel_before.votes);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "window rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_rejects_stranger_and_single_party() {
+        // Unconditional dual signature: one party alone, a
+        // stranger, or the parties swapped is Unauthorized.
+        let mut e = configured();
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(MALLORY, BOB, NEW_WINDOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(ALICE, ALICE, NEW_WINDOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(BOB, ALICE, NEW_WINDOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(window_of(&e), WINDOW, "window untouched");
+    }
+
+    #[test]
+    fn amend_rejects_non_funded_state() {
+        // Funded-only: the Uninitialized builder owns the initial
+        // window, and a terminal escrow has no future reveal left
+        // to retune.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_blind_panel(&[M1, M2, M3], 2, WINDOW)
+            .unwrap();
+        assert_eq!(
+            bare.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(window_of(&bare), WINDOW);
+        let mut released = configured();
+        released.release(ALICE, NOW, 1_000_000, None, BOB).unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(window_of(&released), WINDOW);
+    }
+
+    #[test]
+    fn amend_rejects_unconfigured_panel() {
+        // Fail-closed: revision never installs a blind panel — an
+        // escrow with no panel at all is refused, and the panel
+        // gate fires before the value gate, so even a zero window
+        // on an unconfigured escrow reports InvalidArbiterPanel.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        plain.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            plain.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(
+            plain.amend_blind_panel_reveal_window(ALICE, BOB, 0),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert!(plain.arbiter_panel().is_none());
+    }
+
+    #[test]
+    fn amend_rejects_plain_panel() {
+        // Fail-closed the other way: a plain (non-blind) panel is
+        // refused too — revision never turns a plain panel blind.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        let panel = e.arbiter_panel().unwrap();
+        assert!(!panel.blind, "still plain");
+        assert_eq!(panel.reveal_window_secs, 0, "no window installed");
+    }
+
+    #[test]
+    fn amend_rejects_zero_window_and_preserves_original() {
+        // The `with_blind_panel` value gate, unchanged: a zero
+        // window would make every reveal instantly late, and a
+        // failed revision never writes.
+        let mut e = configured();
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(ALICE, BOB, 0),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(window_of(&e), WINDOW, "original window untouched");
+    }
+
+    #[test]
+    fn amend_same_window_is_noop() {
+        // Re-affirming the current window succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing — paralleling `rotate_arbiter`, unlike
+        // `rotate_milestone_verifier`, which refuses the same
+        // value.
+        let mut e = configured();
+        e.amend_blind_panel_reveal_window(ALICE, BOB, WINDOW)
+            .unwrap();
+        assert_eq!(window_of(&e), WINDOW);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_new_window_governs_next_reveal() {
+        // The reveal reads the live window: after the revision a
+        // commit revealed past the old deadline but inside the new
+        // one settles, while an unrevised escrow with the old
+        // window refuses the same reveal with
+        // BlindRevealWindowClosed.
+        let mut revised = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_blind_panel(&[M1], 1, 100)
+            .unwrap();
+        revised.fund(ALICE, NOW).unwrap();
+        revised
+            .amend_blind_panel_reveal_window(ALICE, BOB, 10_000)
+            .unwrap();
+        let mut kept = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_blind_panel(&[M1], 1, 100)
+            .unwrap();
+        kept.fund(ALICE, NOW).unwrap();
+        disputed(&mut revised);
+        disputed(&mut kept);
+        let salt = [0x11; 32];
+        revised
+            .submit_judgment_commit(M1, commit_of(600_000, salt), NOW)
+            .unwrap();
+        kept.submit_judgment_commit(M1, commit_of(600_000, salt), NOW)
+            .unwrap();
+        // NOW + 1_000 is past the old 100-second window but inside
+        // the revised 10_000-second window.
+        let settled = revised
+            .reveal_judgment(M1, 600_000, None, salt, NOW + 1_000, NOW + 1_000, None, BOB)
+            .unwrap()
+            .expect("reveal inside the new window settles");
+        assert_eq!(revised.state(), EscrowState::Settled);
+        assert!(settled.0 > 0);
+        assert_eq!(
+            kept.reveal_judgment(M1, 600_000, None, salt, NOW + 1_000, NOW + 1_000, None, BOB),
+            Err(EscrowError::BlindRevealWindowClosed)
+        );
+        assert_eq!(kept.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn amend_rejects_when_paused() {
+        // The pause guard fires before the authority and state
+        // gates: even a stranger's revision on a paused escrow is
+        // `Paused`, and a dual-signed revision is refused too.
+        let mut e = configured();
+        e.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(MALLORY, BOB, NEW_WINDOW),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(window_of(&e), WINDOW, "window untouched");
+    }
+
+    #[test]
+    fn amend_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-319: a dual-signed revision emits
+        // BlindPanelRevealWindowAmended (discriminant 156,
+        // appended last) with zero amounts — a config change, not
+        // a settlement — and the revised window is read from the
+        // vault. A refused revision emits nothing, and a no-op
+        // re-affirmation emits nothing either.
+        assert_eq!(
+            EscrowEventKind::BlindPanelRevealWindowAmended.discriminant(),
+            156
+        );
+        assert_eq!(
+            EscrowEventKind::from_discriminant(156),
+            Some(EscrowEventKind::BlindPanelRevealWindowAmended)
+        );
+        assert_eq!(
+            EscrowEventKind::BlindPanelRevealWindowAmended.name(),
+            "blind_panel_reveal_window_amended"
+        );
+        assert_eq!(
+            EscrowEventKind::from_name("blind_panel_reveal_window_amended"),
+            Some(EscrowEventKind::BlindPanelRevealWindowAmended)
+        );
+        let mut e = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(MALLORY, BOB, NEW_WINDOW, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::BlindPanelRevealWindowAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same window is a no-op: no new event.
+        e.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        // A second real change emits again.
+        e.amend_blind_panel_reveal_window(ALICE, BOB, WINDOW, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 2);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::BlindPanelRevealWindowAmended);
     }
 }
 

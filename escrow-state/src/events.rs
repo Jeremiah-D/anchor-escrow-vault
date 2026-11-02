@@ -680,6 +680,18 @@
 //!   with `SettlementMismatch`, and plain `release` is
 //!   unaffected. A failed rotation emits nothing, and a no-op
 //!   re-affirmation of the current hook emits nothing either.
+//! - `amend_blind_panel_reveal_window` emits
+//!   [`EscrowEventKind::BlindPanelRevealWindowAmended`] on every
+//!   successful revision that actually changes the reveal window
+//!   (AV-319) — `from == to ==` the current state, all amounts
+//!   zero; only `reveal_window_secs` moves, so the members, the
+//!   threshold, the commitments, the commit times, the revealed
+//!   flags, and the votes are untouched, and the next reveal
+//!   reads the live window, so a reveal after a commit under the
+//!   new window is judged against the new deadline while a reveal
+//!   under the old window is refused once it lapses. A failed
+//!   revision emits nothing, and a no-op re-affirmation of the
+//!   current window emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -928,6 +940,7 @@
 //! | PayoutSplitSharesAmended (AV-293) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a release already settled; only the share amounts move, so the recipient set and order, the locked amount, and the state are untouched, and the next `release_payout_split` prorates over the live shares — a release after the amendment pays the new split while a release already settled keeps the shares it settled under |
 //! | SettlementMintAmended (AV-317) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a release already settled; only the settlement denomination moves, so the funded mint, the allowlist, and the funded-unit counters are untouched, and the next `release_with_settlement_rate` reads the live mint before rate verification — a quote for the old mint fails at once while a quote for the new mint settles, and plain `release` is unaffected |
 //! | TransferHookRotated (AV-318) | 0 | 0 | 0 | 0 — rotating moves no funds and never restates a release already settled; only the hook binding moves, so the mint, the allowlist, and any settled payout are untouched, and the next CPI plan build reads the live hook — a plan naming the new hook builds while a plan naming the old hook fails with `SettlementMismatch`, and plain `release` is unaffected |
+//! | BlindPanelRevealWindowAmended (AV-319) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a reveal already settled; only `reveal_window_secs` moves, so the members, the threshold, the commitments, the commit times, the revealed flags, and the votes are untouched, and the next reveal reads the live window — a reveal after a commit under the new window is judged against the new deadline while a reveal under the old window is refused once it lapses |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2705,6 +2718,17 @@ pub enum EscrowEventKind {
     /// the event needs no extra field. A no-op re-affirmation
     /// of the current hook emits nothing.
     TransferHookRotated,
+    /// Revise the blind panel's reveal window after funding
+    /// (AV-319): only `reveal_window_secs` moves, so the members,
+    /// the threshold, the commitments, the commit times, the
+    /// revealed flags, and the votes are untouched — the next
+    /// reveal reads the live window, so a reveal after a commit
+    /// under the new window is judged against the new deadline
+    /// while a reveal under the old window is refused once it
+    /// lapses. The new window is read from the vault, so the
+    /// event needs no extra field. A no-op re-affirmation of
+    /// the current window emits nothing.
+    BlindPanelRevealWindowAmended,
 }
 
 impl EscrowEventKind {
@@ -3196,6 +3220,10 @@ impl EscrowEventKind {
             // discriminants 0–154 stay stable for already-serialized
             // histories.
             155 => Self::TransferHookRotated,
+            // AV-319: appended after TransferHookRotated so
+            // discriminants 0–155 stay stable for already-serialized
+            // histories.
+            156 => Self::BlindPanelRevealWindowAmended,
             _ => return None,
         })
     }
@@ -3427,6 +3455,7 @@ impl EscrowEventKind {
             Self::PayoutSplitSharesAmended => "payout_split_shares_amended",
             Self::SettlementMintAmended => "settlement_mint_amended",
             Self::TransferHookRotated => "transfer_hook_rotated",
+            Self::BlindPanelRevealWindowAmended => "blind_panel_reveal_window_amended",
         }
     }
 
@@ -3662,6 +3691,7 @@ impl EscrowEventKind {
             "payout_split_shares_amended" => Self::PayoutSplitSharesAmended,
             "settlement_mint_amended" => Self::SettlementMintAmended,
             "transfer_hook_rotated" => Self::TransferHookRotated,
+            "blind_panel_reveal_window_amended" => Self::BlindPanelRevealWindowAmended,
             _ => return None,
         })
     }
@@ -7779,6 +7809,51 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
             EscrowEventKind::TransferHookRotated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Revise the blind panel's reveal window after funding
+    /// (mirrors [`Escrow::amend_blind_panel_reveal_window`]).
+    /// Emits `BlindPanelRevealWindowAmended` only when the window
+    /// actually changes; `from == to ==` the current state (a config
+    /// change, not a lifecycle move — like `QuorumUpdated`). `at`
+    /// is the caller-supplied event timestamp.
+    pub fn amend_blind_panel_reveal_window(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        reveal_window_secs: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self
+            .inner
+            .arbiter_panel()
+            .map(|p| p.reveal_window_secs);
+        self.inner
+            .amend_blind_panel_reveal_window(initializer, taker, reveal_window_secs)?;
+        let after = self
+            .inner
+            .arbiter_panel()
+            .map(|p| p.reveal_window_secs);
+        // The inner call rejects a stranger pair, wrong states, the
+        // unconfigured/plain-panel case, and the zero window, so a
+        // changed window here always means real governance — and a
+        // same-window no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::BlindPanelRevealWindowAmended,
             state,
             state,
             EventAmounts::none(),
@@ -15315,7 +15390,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -15459,7 +15535,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16037,7 +16114,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16093,7 +16171,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16146,7 +16225,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16199,7 +16279,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16252,7 +16333,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16308,7 +16390,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16364,7 +16447,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16417,7 +16501,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16470,7 +16555,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16523,7 +16609,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16576,7 +16663,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16629,7 +16717,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16682,7 +16771,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16739,7 +16829,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16795,7 +16886,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16851,7 +16943,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16907,7 +17000,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -16963,7 +17057,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -17020,7 +17115,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -17077,7 +17173,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -17134,7 +17231,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -17190,7 +17288,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]
@@ -17263,7 +17362,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
-        assert_eq!(EscrowEventKind::from_discriminant(156), None); // AV-318: 155 is TransferHookRotated
+        assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
     }
 
     #[test]

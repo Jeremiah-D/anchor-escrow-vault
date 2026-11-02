@@ -834,6 +834,26 @@ timestamps + 8 dispute snapshots + revealed bitmask, 401 bytes) is
 appended to the `arbiter_panel` region, which grows 595 → 995
 bytes; see "Account space & rent" for the new vault totals.
 
+After funding, the blind panel's reveal window can be retuned via
+`amend_blind_panel_reveal_window(initializer, taker,
+reveal_window_secs)` (AV-319): pause first, then unconditional dual
+signature (either party alone is `Unauthorized`), `Funded` only. Only
+an escrow with a blind panel already configured may revise — an
+escrow with no panel, or a plain panel, is refused with
+`InvalidArbiterPanel`, so revision never installs a blind panel or
+turns a plain panel blind — and a zero window is refused the same
+way, leaving the original window untouched. Revising to the current
+window is a no-op success that emits nothing; a real change emits
+`BlindPanelRevealWindowAmended` (discriminant 156) and governs from
+the next commit-reveal round (the reveal reads the live window, so a
+reveal after a commit under the new window is judged against the new
+deadline, while a reveal under the old window is refused once it
+lapses). Only `reveal_window_secs` changes — the members, the
+threshold, the commitments, the commit times, the revealed flags, and
+the votes are untouched — and since the revision is `Funded`-only, no
+commitment can be in flight, so no live deadline is ever restated.
+(Solana: blind-panel governance.)
+
 **Evidence-disclosure deadline (AV-68).** Arbitration stalls when the
 escalating party never produces the evidence their claim rests on —
 the arbiter (or panel) is left ruling on assertions, and the
