@@ -475,6 +475,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // the bid count, and the state are untouched, while the
         // next bid reads the live price.
         | EscrowEventKind::EnglishAuctionBuyoutPriceAmended
+        // AV-321: a revised funding start window moves no funds and
+        // never restates a funding already made — only the window
+        // moves, so `expires_at`, `funded_total`, `amount`, and the
+        // state are untouched, while the next funding reads the
+        // live window.
+        | EscrowEventKind::FundingStartAmended
         // AV-278: an amended recovery threshold moves no funds and
         // never restates a settled request — only the threshold
         // changes, so the guardians, the count and the timelock
@@ -1445,6 +1451,12 @@ mod fee_history_tests {
                 // the bid count, and the state are untouched, while the
                 // next bid reads the live price.
                 | EscrowEventKind::EnglishAuctionBuyoutPriceAmended
+                // AV-321: a revised funding start window moves no funds and
+                // never restates a funding already made — only the window
+                // moves, so `expires_at`, `funded_total`, `amount`, and the
+                // state are untouched, while the next funding reads the
+                // live window.
+                | EscrowEventKind::FundingStartAmended
                 // AV-278: an amended recovery threshold moves no funds and
                 // never restates a settled request — only the threshold
                 // changes, so the guardians, the count and the timelock

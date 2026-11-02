@@ -707,6 +707,16 @@
 //!   [`EnglishAuction`](crate::EnglishAuction) method itself emits
 //!   nothing — there is no indexed-auction wrapper in this crate,
 //!   and no new Anchor instruction surface in this round.
+//! - `amend_funding_start` records
+//!   [`EscrowEventKind::FundingStartAmended`] on every successful
+//!   revision that actually changes the funding start window
+//!   (AV-321) — all amounts zero; only `funding_start` moves, so
+//!   `expires_at`, `funded_total`, `amount`, and state are
+//!   untouched, and the next `fund` / `fund_with_slot` reads the
+//!   live window, so an early funding under the new window is
+//!   refused at once while a funding at or after it succeeds. A
+//!   failed revision records nothing, and a no-op re-affirmation
+//!   of the current window records nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -957,6 +967,7 @@
 //! | TransferHookRotated (AV-318) | 0 | 0 | 0 | 0 — rotating moves no funds and never restates a release already settled; only the hook binding moves, so the mint, the allowlist, and any settled payout are untouched, and the next CPI plan build reads the live hook — a plan naming the new hook builds while a plan naming the old hook fails with `SettlementMismatch`, and plain `release` is unaffected |
 //! | BlindPanelRevealWindowAmended (AV-319) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a reveal already settled; only `reveal_window_secs` moves, so the members, the threshold, the commitments, the commit times, the revealed flags, and the votes are untouched, and the next reveal reads the live window — a reveal after a commit under the new window is judged against the new deadline while a reveal under the old window is refused once it lapses |
 //! | EnglishAuctionBuyoutPriceAmended (AV-320) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a buyout already settled; only `buyout_price` moves, so the seller, the reserve, the minimum increment, the windows, anti-sniping, `highest_bid`, `bid_count`, and state are untouched, and the next `place_bid` reads the live price — a bid at or above the new price settles immediately at exactly it while a bid under it is an ordinary bid |
+//! | FundingStartAmended (AV-321) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a funding already made; only `funding_start` moves, so `expires_at`, `funded_total`, `amount`, and state are untouched, and the next `fund` / `fund_with_slot` reads the live window — an early funding under the new window is refused at once while a funding at or after it succeeds |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2755,6 +2766,15 @@ pub enum EscrowEventKind {
     /// is read from the auction, so the event needs no extra field.
     /// A no-op re-affirmation of the current price emits nothing.
     EnglishAuctionBuyoutPriceAmended,
+    /// Revise the funding start window before funding (AV-321):
+    /// only `funding_start` moves, so `expires_at`, `funded_total`,
+    /// `amount`, and state are untouched — the next `fund` /
+    /// `fund_with_slot` reads the live window, so an early funding
+    /// under the new window is refused at once while a funding at
+    /// or after it succeeds. The new window is read from the vault,
+    /// so the event needs no extra field. A no-op re-affirmation
+    /// of the current window emits nothing.
+    FundingStartAmended,
 }
 
 impl EscrowEventKind {
@@ -3254,6 +3274,10 @@ impl EscrowEventKind {
             // discriminants 0–156 stay stable for already-serialized
             // histories.
             157 => Self::EnglishAuctionBuyoutPriceAmended,
+            // AV-321: appended after EnglishAuctionBuyoutPriceAmended so
+            // discriminants 0–157 stay stable for already-serialized
+            // histories.
+            158 => Self::FundingStartAmended,
             _ => return None,
         })
     }
@@ -3487,6 +3511,7 @@ impl EscrowEventKind {
             Self::TransferHookRotated => "transfer_hook_rotated",
             Self::BlindPanelRevealWindowAmended => "blind_panel_reveal_window_amended",
             Self::EnglishAuctionBuyoutPriceAmended => "english_auction_buyout_price_amended",
+            Self::FundingStartAmended => "funding_start_amended",
         }
     }
 
@@ -3724,6 +3749,7 @@ impl EscrowEventKind {
             "transfer_hook_rotated" => Self::TransferHookRotated,
             "blind_panel_reveal_window_amended" => Self::BlindPanelRevealWindowAmended,
             "english_auction_buyout_price_amended" => Self::EnglishAuctionBuyoutPriceAmended,
+            "funding_start_amended" => Self::FundingStartAmended,
             _ => return None,
         })
     }
@@ -8921,6 +8947,47 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
                 EscrowEventKind::SettlementMintAmended,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// Revise the funding start window before funding (mirrors
+    /// [`Escrow::amend_funding_start`]). Emits `FundingStartAmended`
+    /// only when the window actually changes; `from == to ==` the
+    /// current state (a config change, not a lifecycle move — like
+    /// `SettlementMintAmended`). `at` is the caller-supplied event
+    /// timestamp. The amended window is read from the vault, so the
+    /// event needs no extra field. A failed revision emits nothing:
+    /// the core call returns before any event is pushed.
+    pub fn amend_funding_start(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_start_at: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.funding_start();
+        self.inner
+            .amend_funding_start(initializer, taker, new_start_at)?;
+        let after = self.inner.funding_start();
+        // The inner call rejects strangers, wrong states, funded
+        // escrows, and the tranche / installment deposit paths, so a
+        // changed window here always means real governance — and a
+        // same-window no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::FundingStartAmended,
                 state,
                 state,
                 EventAmounts::none(),
@@ -15424,7 +15491,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -15570,7 +15638,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16150,7 +16219,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16208,7 +16278,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16263,7 +16334,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16318,7 +16390,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16373,7 +16446,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16431,7 +16505,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16489,7 +16564,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16544,7 +16620,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16599,7 +16676,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16654,7 +16732,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16709,7 +16788,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16764,7 +16844,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16819,7 +16900,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16878,7 +16960,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16936,7 +17019,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -16994,7 +17078,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -17052,7 +17137,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -17110,7 +17196,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -17169,7 +17256,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -17228,7 +17316,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -17287,7 +17376,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -17345,7 +17435,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -17420,7 +17511,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]

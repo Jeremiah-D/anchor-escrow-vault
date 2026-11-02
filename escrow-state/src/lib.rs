@@ -14526,6 +14526,121 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(self)
     }
 
+    /// Revise the funding start window before funding (AV-321 — Solana
+    /// / payment settlement: the funding calendar's opening time may
+    /// need to move — a sale's announced open slips, or opens early —
+    /// without cancelling and re-locking the escrow). The pre-funding
+    /// counterpart to [`Escrow::with_funding_start`] (`Uninitialized`-only
+    /// initial attachment, AV-228).
+    ///
+    /// Governance mirrors [`Escrow::amend_settlement_mint`]: *both*
+    /// parties must sign — one party alone cannot unilaterally move the
+    /// other's funding window — on an escrow that is `Uninitialized`
+    /// or `Activated`, and on a delay-opted-in escrow the window moves
+    /// only through the AV-158 propose/execute protocol. Check order is
+    /// pause, then authority, then the governance-delay routing gate,
+    /// then state, then the funded-total gate, then the deposit-path
+    /// gates — the AV-46 / AV-49 convention. The state gate alone is
+    /// not clean: [`Escrow::fund_partial`] accumulates installments
+    /// while still `Uninitialized` (it flips to `Funded` only when the
+    /// installments sum to `amount`), so an escrow that already took
+    /// installment money would pass a pure state gate — the
+    /// `funded_total == 0` gate is the second, independent bar, and
+    /// both must hold (a window already consumed by real funds is
+    /// never rewritten). A funding-plan escrow is refused with
+    /// [`EscrowError::InvalidFundingPlan`] and a partial-funding
+    /// escrow with [`EscrowError::InvalidPartialFunding`]: the window
+    /// never gates `fund_tranche` / `fund_partial`, so revising it
+    /// there would rewrite a dead configuration — fail-closed instead.
+    /// The new value reuses the [`Escrow::with_funding_start`] gate:
+    /// there is none — any `u64` is accepted, `0` clears the window
+    /// (no window, funding ungated, as at construction), and no
+    /// relation to `expires_at` is checked (a window opening after
+    /// the deadline simply never funds, it does not extend anything).
+    /// Only `funding_start` changes: `expires_at`, `funded_total`,
+    /// `amount`, and state are untouched. The new window governs from
+    /// the next [`Escrow::fund`] / [`Escrow::fund_with_slot`]: those
+    /// read the live value, so an early funding under the new window
+    /// is refused with `FundingNotStarted` at once while a funding
+    /// at or after it succeeds. Revising to the current window is a
+    /// no-op: it succeeds and writes nothing, so the event layer
+    /// emits nothing for it (paralleling `rotate_arbiter`).
+    /// Orthogonal to AV-228 (that is the window mechanism itself, this
+    /// item is the pre-funding revision), to AV-59 (that moves the
+    /// deadline, this item fixes the start), to AV-27 (that gates
+    /// release time, this item gates funding time), and to AV-270
+    /// (that is the installment budget, this item is the funding
+    /// window). Emits `FundingStartAmended` on the event layer,
+    /// except for the no-op re-affirmation.
+    pub fn amend_funding_start(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_start_at: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-158: the direct entry always takes `via_delayed = false`
+        // — on a delay-opted-in escrow the window moves only through
+        // the propose/execute protocol. Thin by design: one window
+        // implementation, zero gate drift (see `update_quorum_impl`).
+        self.amend_funding_start_impl(initializer, taker, new_start_at, false)
+    }
+
+    /// The funding-start engine behind [`Escrow::amend_funding_start`]
+    /// (AV-321). Same guard chain as the direct call; `via_delayed`
+    /// is `true` only when the AV-158 two-step protocol drives the
+    /// call after the delay elapsed.
+    fn amend_funding_start_impl(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_start_at: u64,
+        via_delayed: bool,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Both parties must sign: either key alone (or a stranger)
+        // is Unauthorized. Independent `==` checks (not `||`): the
+        // degenerate initializer == taker self-escrow authorizes with
+        // one key passed twice, like AV-12's activation.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        // AV-158: the governance-delay routing gate — on a
+        // delay-opted-in escrow the window moves only through the
+        // two-step propose/execute protocol, never a direct call
+        // (see `update_quorum_impl` for the placement rationale).
+        if !via_delayed && self.governance_delay_secs != 0 {
+            return Err(EscrowError::GovernanceActionNotProposed);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Activated => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // The state gate alone is not clean: `fund_partial` holds
+        // `Uninitialized` while installments accumulate, so an
+        // escrow that already took money would pass it — the
+        // funded-total gate is the second, independent bar.
+        if self.funded_total != 0 {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        // The window never gates the tranche / installment deposit
+        // paths, so revising it on an escrow that owns one of those
+        // paths would rewrite a dead configuration — fail-closed.
+        if self.funding_plan.is_some() {
+            return Err(EscrowError::InvalidFundingPlan);
+        }
+        if self.partial_funding {
+            return Err(EscrowError::InvalidPartialFunding);
+        }
+        // No-op: re-affirming the current window writes nothing, so
+        // the event layer emits nothing for it.
+        if new_start_at == self.funding_start {
+            return Ok(());
+        }
+        self.funding_start = new_start_at;
+        Ok(())
+    }
+
     /// Opt into the late-milestone penalty rate (AV-206): 0–10_000
     /// bps, [`EscrowError::InvalidPenalty`] above that (the AV-24
     /// rule — a rate can never exceed 100%). `Uninitialized`-only,
@@ -50872,7 +50987,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
     }
 
     #[test]
@@ -68081,7 +68197,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
+        assert_eq!(EscrowEventKind::from_discriminant(159), None); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -68321,9 +68438,10 @@ mod event_history_tests {
         // `SettlementMintAmended` (AV-317), 155 is
         // `TransferHookRotated` (AV-318), 156 is
         // `BlindPanelRevealWindowAmended` (AV-319), 157 is
-        // `EnglishAuctionBuyoutPriceAmended` (AV-320) and 158 is the
+        // `EnglishAuctionBuyoutPriceAmended` (AV-320), 158 is
+        // `FundingStartAmended` (AV-321) and 159 is the
         // first still-unknown byte.
-        for bad in [158u8, 255] {
+        for bad in [159u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -81273,6 +81391,355 @@ mod amend_settlement_mint_tests {
         assert_eq!(e.event_count(), before + 2);
         let ev = e.events().last().copied().expect("event pushed");
         assert_eq!(ev.kind, EscrowEventKind::SettlementMintAmended);
+    }
+}
+
+mod amend_funding_start_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+    const WINDOW_OPEN: u64 = 1_700_000_500;
+    const WINDOW_LATER: u64 = 1_700_001_000;
+
+    fn init_key() -> SigningKey {
+        SigningKey::from_seed([0x11; 32])
+    }
+
+    fn taker_key() -> SigningKey {
+        SigningKey::from_seed([0x22; 32])
+    }
+
+    fn initializer() -> [u8; 32] {
+        init_key().public_key()
+    }
+
+    fn taker() -> [u8; 32] {
+        taker_key().public_key()
+    }
+
+    /// Unfunded, `Uninitialized`, window attached, pause authority set.
+    fn windowed() -> Escrow {
+        Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_funding_start(WINDOW_OPEN)
+            .unwrap()
+    }
+
+    /// Funded at the window's opening second.
+    fn funded_windowed() -> Escrow {
+        let mut e = windowed();
+        e.fund(initializer(), WINDOW_OPEN).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    /// Dual-signed escrow, both parties activated, window attached.
+    fn activated_windowed() -> Escrow {
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_funding_start(WINDOW_OPEN)
+            .unwrap();
+        e.activate(initializer()).unwrap();
+        e.activate(taker()).unwrap();
+        assert_eq!(e.state(), EscrowState::Activated);
+        e
+    }
+
+    #[test]
+    fn amend_moves_window_only() {
+        // Only the window moves: the deadline, the funded total, the
+        // amount, the state, and the encoded length are untouched —
+        // the window is a resident 8-byte field, rewritten in place
+        // with no layout change.
+        let mut e = windowed();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.amend_funding_start(initializer(), taker(), WINDOW_LATER)
+            .unwrap();
+        assert_eq!(e.funding_start(), WINDOW_LATER, "window revised");
+        assert_eq!(e.expires_at(), EXPIRES_AT, "deadline untouched");
+        assert_eq!(e.funded_total(), 0, "nothing funded yet");
+        assert_eq!(e.amount(), 1_000_000, "amount untouched");
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "window rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_rejects_stranger_and_single_party() {
+        // Unconditional dual signature: one party alone, a stranger,
+        // or the parties swapped is Unauthorized — paralleling
+        // `amend_settlement_mint`.
+        let mut e = windowed();
+        assert_eq!(
+            e.amend_funding_start(MALLORY, taker(), WINDOW_LATER),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_funding_start(initializer(), initializer(), WINDOW_LATER),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_funding_start(taker(), initializer(), WINDOW_LATER),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.funding_start(), WINDOW_OPEN, "window untouched");
+    }
+
+    #[test]
+    fn amend_rejects_funded_and_terminal() {
+        // Funded-only exclusion: once funds are in, the window has
+        // been consumed — and a terminal escrow has no future funding
+        // left to gate.
+        let mut funded = funded_windowed();
+        assert_eq!(
+            funded.amend_funding_start(initializer(), taker(), WINDOW_LATER),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(funded.funding_start(), WINDOW_OPEN);
+        let mut released = funded_windowed();
+        released
+            .release(initializer(), WINDOW_OPEN, 1_000_000, None, taker())
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_funding_start(initializer(), taker(), WINDOW_LATER),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(released.funding_start(), WINDOW_OPEN);
+    }
+
+    #[test]
+    fn amend_rejects_partial_funded_uninitialized() {
+        // The state gate alone is not clean: installments accumulate
+        // while the escrow is still `Uninitialized`, so the
+        // funded-total gate is the second, independent bar — an
+        // escrow that already took installment money refuses the
+        // revision even though its state still reads `Uninitialized`.
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_partial_funding()
+            .unwrap()
+            .with_funding_start(WINDOW_OPEN)
+            .unwrap();
+        e.fund_partial(initializer(), 400_000, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.funded_total(), 400_000);
+        let err = e
+            .amend_funding_start(initializer(), taker(), WINDOW_LATER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        assert_eq!(err.code(), 101);
+        assert_eq!(e.funding_start(), WINDOW_OPEN, "window untouched");
+        assert_eq!(e.funded_total(), 400_000, "installments untouched");
+    }
+
+    #[test]
+    fn amend_rejects_funding_plan_escrow() {
+        // The window never gates `fund_tranche`, so revising it on a
+        // funding-plan escrow would rewrite a dead configuration —
+        // fail-closed with the plan error.
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_funding_start(WINDOW_OPEN)
+            .unwrap();
+        e.with_funding_plan(1_000_000, 4).unwrap();
+        let err = e
+            .amend_funding_start(initializer(), taker(), WINDOW_LATER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidFundingPlan);
+        assert_eq!(err.code(), 173);
+        assert_eq!(e.funding_start(), WINDOW_OPEN, "window untouched");
+    }
+
+    #[test]
+    fn amend_rejects_partial_funding_escrow() {
+        // Same fail-closed rule for the installment path: the window
+        // never gates `fund_partial`, so a partial-funding escrow
+        // refuses the revision even before the first installment.
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_partial_funding()
+            .unwrap()
+            .with_funding_start(WINDOW_OPEN)
+            .unwrap();
+        let err = e
+            .amend_funding_start(initializer(), taker(), WINDOW_LATER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidPartialFunding);
+        assert_eq!(err.code(), 351);
+        assert_eq!(e.funding_start(), WINDOW_OPEN, "window untouched");
+    }
+
+    #[test]
+    fn amend_zero_clears_window() {
+        // `0` clears the window (no window, funding ungated, as at
+        // construction): a funding before the old opening second
+        // succeeds once the window is gone.
+        let mut e = windowed();
+        e.amend_funding_start(initializer(), taker(), 0).unwrap();
+        assert_eq!(e.funding_start(), 0);
+        e.fund(initializer(), NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        // And a cleared window can be set again.
+        let mut f = windowed();
+        f.amend_funding_start(initializer(), taker(), 0).unwrap();
+        f.amend_funding_start(initializer(), taker(), WINDOW_LATER)
+            .unwrap();
+        assert_eq!(f.funding_start(), WINDOW_LATER);
+    }
+
+    #[test]
+    fn amend_same_window_is_noop() {
+        // Re-affirming the current window succeeds but changes nothing
+        // observable; the event layer (tested below) emits nothing.
+        let mut e = windowed();
+        e.amend_funding_start(initializer(), taker(), WINDOW_OPEN)
+            .unwrap();
+        assert_eq!(e.funding_start(), WINDOW_OPEN);
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+    }
+
+    #[test]
+    fn amend_new_window_gates_next_fund() {
+        // The funding path reads the live window: a funding under the
+        // new window is refused at once, while a funding at the new
+        // opening second succeeds.
+        let mut e = windowed();
+        e.amend_funding_start(initializer(), taker(), WINDOW_LATER)
+            .unwrap();
+        let err = e.fund(initializer(), WINDOW_OPEN).unwrap_err();
+        assert_eq!(err, EscrowError::FundingNotStarted);
+        assert_eq!(err.code(), 356);
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.funded_total(), 0, "refused funding moves nothing");
+        e.fund(initializer(), WINDOW_LATER).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_allowed_from_activated() {
+        // The dual-signature funding state is the second arm of the
+        // state gate: a dual-signed escrow may revise its window
+        // after both parties activated, and the revised window gates
+        // the funding that follows.
+        let mut e = activated_windowed();
+        e.amend_funding_start(initializer(), taker(), WINDOW_LATER)
+            .unwrap();
+        assert_eq!(e.funding_start(), WINDOW_LATER);
+        assert_eq!(e.state(), EscrowState::Activated);
+        let err = e.fund(initializer(), WINDOW_OPEN).unwrap_err();
+        assert_eq!(err, EscrowError::FundingNotStarted);
+        e.fund(initializer(), WINDOW_LATER).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_refuses_direct_call_on_delay_opted_in() {
+        // AV-158 routing: on a delay-opted-in escrow the direct call
+        // is refused — the window moves only through the
+        // propose/execute protocol, never a direct call.
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_funding_start(WINDOW_OPEN)
+            .unwrap();
+        let err = e
+            .amend_funding_start(initializer(), taker(), WINDOW_LATER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::GovernanceActionNotProposed);
+        assert_eq!(err.code(), 219);
+        assert_eq!(e.funding_start(), WINDOW_OPEN);
+    }
+
+    #[test]
+    fn amend_rejects_when_paused() {
+        // The pause guard fires before the authority and state
+        // gates: even a stranger's revision on a paused escrow is
+        // `Paused`, and a dual-signed revision is refused too.
+        let mut e = windowed();
+        e.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            e.amend_funding_start(MALLORY, taker(), WINDOW_LATER),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            e.amend_funding_start(initializer(), taker(), WINDOW_LATER),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(e.funding_start(), WINDOW_OPEN, "window untouched");
+    }
+
+    #[test]
+    fn amend_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-321: a dual-signed revision emits FundingStartAmended
+        // (discriminant 158, appended last) with zero amounts — a
+        // config change, not a settlement — and the amended window is
+        // read from the vault. A refused revision emits nothing, and
+        // a no-op re-affirmation emits nothing either.
+        assert_eq!(EscrowEventKind::FundingStartAmended.discriminant(), 158);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(158),
+            Some(EscrowEventKind::FundingStartAmended)
+        );
+        assert_eq!(
+            EscrowEventKind::FundingStartAmended.name(),
+            "funding_start_amended"
+        );
+        assert_eq!(
+            EscrowEventKind::from_name("funding_start_amended"),
+            Some(EscrowEventKind::FundingStartAmended)
+        );
+        let mut e = IndexedEscrow::wrap([0xE0; 32], windowed());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_funding_start(MALLORY, taker(), WINDOW_LATER, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_funding_start(initializer(), taker(), WINDOW_LATER, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::FundingStartAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Uninitialized, EscrowState::Uninitialized)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same window is a no-op: no new event.
+        e.amend_funding_start(initializer(), taker(), WINDOW_LATER, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        // A second real change emits again.
+        e.amend_funding_start(initializer(), taker(), 0, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 2);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::FundingStartAmended);
     }
 }
 
