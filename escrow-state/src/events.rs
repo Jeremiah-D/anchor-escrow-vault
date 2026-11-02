@@ -692,6 +692,21 @@
 //!   under the old window is refused once it lapses. A failed
 //!   revision emits nothing, and a no-op re-affirmation of the
 //!   current window emits nothing either.
+//! - `amend_english_auction_buyout_price` records
+//!   [`EscrowEventKind::EnglishAuctionBuyoutPriceAmended`] on every
+//!   successful revision that actually changes the buyout price
+//!   (AV-320) — all amounts zero; only `buyout_price` moves, so the
+//!   seller, the reserve, the minimum increment, the windows,
+//!   anti-sniping, `highest_bid`, `bid_count`, and state are
+//!   untouched, and the next `place_bid` reads the live price, so a
+//!   bid at or above the new price settles immediately at exactly
+//!   it while a bid under it is an ordinary bid. A failed revision
+//!   records nothing, and a no-op re-affirmation of the current
+//!   price records nothing either. The kind is defined here for
+//!   the Anchor program and the indexer; the pure-logic
+//!   [`EnglishAuction`](crate::EnglishAuction) method itself emits
+//!   nothing — there is no indexed-auction wrapper in this crate,
+//!   and no new Anchor instruction surface in this round.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -941,6 +956,7 @@
 //! | SettlementMintAmended (AV-317) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a release already settled; only the settlement denomination moves, so the funded mint, the allowlist, and the funded-unit counters are untouched, and the next `release_with_settlement_rate` reads the live mint before rate verification — a quote for the old mint fails at once while a quote for the new mint settles, and plain `release` is unaffected |
 //! | TransferHookRotated (AV-318) | 0 | 0 | 0 | 0 — rotating moves no funds and never restates a release already settled; only the hook binding moves, so the mint, the allowlist, and any settled payout are untouched, and the next CPI plan build reads the live hook — a plan naming the new hook builds while a plan naming the old hook fails with `SettlementMismatch`, and plain `release` is unaffected |
 //! | BlindPanelRevealWindowAmended (AV-319) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a reveal already settled; only `reveal_window_secs` moves, so the members, the threshold, the commitments, the commit times, the revealed flags, and the votes are untouched, and the next reveal reads the live window — a reveal after a commit under the new window is judged against the new deadline while a reveal under the old window is refused once it lapses |
+//! | EnglishAuctionBuyoutPriceAmended (AV-320) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a buyout already settled; only `buyout_price` moves, so the seller, the reserve, the minimum increment, the windows, anti-sniping, `highest_bid`, `bid_count`, and state are untouched, and the next `place_bid` reads the live price — a bid at or above the new price settles immediately at exactly it while a bid under it is an ordinary bid |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2729,6 +2745,16 @@ pub enum EscrowEventKind {
     /// event needs no extra field. A no-op re-affirmation of
     /// the current window emits nothing.
     BlindPanelRevealWindowAmended,
+    /// Revise the English auction's buy-it-now price before the
+    /// first bid (AV-320): only `buyout_price` moves, so the
+    /// seller, the reserve, the minimum increment, the windows,
+    /// anti-sniping, `highest_bid`, `bid_count`, and state are
+    /// untouched — the next `place_bid` reads the live price, so a
+    /// bid at or above the new price settles immediately at exactly
+    /// it while a bid under it is an ordinary bid. The new price
+    /// is read from the auction, so the event needs no extra field.
+    /// A no-op re-affirmation of the current price emits nothing.
+    EnglishAuctionBuyoutPriceAmended,
 }
 
 impl EscrowEventKind {
@@ -3224,6 +3250,10 @@ impl EscrowEventKind {
             // discriminants 0–155 stay stable for already-serialized
             // histories.
             156 => Self::BlindPanelRevealWindowAmended,
+            // AV-320: appended after BlindPanelRevealWindowAmended so
+            // discriminants 0–156 stay stable for already-serialized
+            // histories.
+            157 => Self::EnglishAuctionBuyoutPriceAmended,
             _ => return None,
         })
     }
@@ -3456,6 +3486,7 @@ impl EscrowEventKind {
             Self::SettlementMintAmended => "settlement_mint_amended",
             Self::TransferHookRotated => "transfer_hook_rotated",
             Self::BlindPanelRevealWindowAmended => "blind_panel_reveal_window_amended",
+            Self::EnglishAuctionBuyoutPriceAmended => "english_auction_buyout_price_amended",
         }
     }
 
@@ -3692,6 +3723,7 @@ impl EscrowEventKind {
             "settlement_mint_amended" => Self::SettlementMintAmended,
             "transfer_hook_rotated" => Self::TransferHookRotated,
             "blind_panel_reveal_window_amended" => Self::BlindPanelRevealWindowAmended,
+            "english_auction_buyout_price_amended" => Self::EnglishAuctionBuyoutPriceAmended,
             _ => return None,
         })
     }
@@ -15391,7 +15423,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -15536,7 +15569,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16115,7 +16149,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16172,7 +16207,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16226,7 +16262,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16280,7 +16317,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16334,7 +16372,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16391,7 +16430,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16448,7 +16488,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16502,7 +16543,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16556,7 +16598,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16610,7 +16653,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16664,7 +16708,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16718,7 +16763,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16772,7 +16818,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16830,7 +16877,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16887,7 +16935,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -16944,7 +16993,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -17001,7 +17051,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -17058,7 +17109,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -17116,7 +17168,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -17174,7 +17227,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -17232,7 +17286,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -17289,7 +17344,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -17363,7 +17419,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]

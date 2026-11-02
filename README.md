@@ -7780,6 +7780,23 @@ whether the sale happens at all.
   both are refused; the price locks before the first bid
   (`EnglishAuctionBuyoutLocked`, code 314). `buyout_audit_json`
   records the winner, price, and refunded leader.
+- **Buyout-price revision** (AV-320): before the first bid the seller
+  may revise the buyout price with
+  `amend_english_auction_buyout_price` — seller-only
+  (`Unauthorized`, code 100), and refused with
+  `InvalidEnglishAuction` (code 263) once a bid has landed or the
+  auction is terminal, so the instant-settlement trigger bidders
+  already accepted is never rewritten. The new price reuses the
+  `with_buyout` gates against the live floors (at least
+  `min_increment`, and at least a nonzero `reserve_price`); `0`
+  clears the buyout (disabled, as at construction), and re-affirming
+  the current price is a no-op. Only `buyout_price` changes;
+  `place_bid` reads the live value, so a bid at or above the new
+  price settles immediately at exactly that price. The revision is
+  recorded as `EnglishAuctionBuyoutPriceAmended` (discriminant 157,
+  all amounts zero); a failed revision and a no-op re-affirmation
+  record nothing. Pure logic, no new error code, no Anchor
+  instruction surface in this round.
 
 New error codes (never renumbered): `InvalidEnglishAuction` (263),
 `EnglishAuctionBidTooLow` (264), `EnglishAuctionNotLive` (265),

@@ -426,6 +426,13 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // the votes are untouched, while the next reveal reads the
         // live window.
         | EscrowEventKind::BlindPanelRevealWindowAmended
+        // AV-320: a revised English-auction buyout price moves no
+        // funds and never restates a buyout already settled — only
+        // the price moves, so the seller, the reserve, the minimum
+        // increment, the windows, anti-sniping, the highest bid,
+        // the bid count, and the state are untouched, while the
+        // next bid reads the live price.
+        | EscrowEventKind::EnglishAuctionBuyoutPriceAmended
         // AV-278: an amended recovery threshold moves no funds and
         // never restates a settled request — only the threshold
         // changes, so the guardians, the count and the timelock
@@ -1385,6 +1392,13 @@ mod event_sourcing_tests {
                 // the votes are untouched, while the next reveal reads the
                 // live window.
                 | EscrowEventKind::BlindPanelRevealWindowAmended
+                // AV-320: a revised English-auction buyout price moves no
+                // funds and never restates a buyout already settled — only
+                // the price moves, so the seller, the reserve, the minimum
+                // increment, the windows, anti-sniping, the highest bid,
+                // the bid count, and the state are untouched, while the
+                // next bid reads the live price.
+                | EscrowEventKind::EnglishAuctionBuyoutPriceAmended
                 // AV-278: an amended recovery threshold moves no funds and
                 // never restates a settled request — only the threshold
                 // changes, so the guardians, the count and the timelock

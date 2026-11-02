@@ -50871,7 +50871,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
     }
 
     #[test]
@@ -68079,7 +68080,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(155), Some(EscrowEventKind::TransferHookRotated)); // AV-318: 155 is TransferHookRotated
         assert_eq!(EscrowEventKind::from_discriminant(156), Some(EscrowEventKind::BlindPanelRevealWindowAmended)); // AV-319: 156 is BlindPanelRevealWindowAmended
-        assert_eq!(EscrowEventKind::from_discriminant(157), None); // AV-319: 156 is BlindPanelRevealWindowAmended
+        assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(158), None); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -68318,9 +68320,10 @@ mod event_history_tests {
         // `PayoutSplitSharesAmended` (AV-293), 154 is
         // `SettlementMintAmended` (AV-317), 155 is
         // `TransferHookRotated` (AV-318), 156 is
-        // `BlindPanelRevealWindowAmended` (AV-319) and 157 is the
+        // `BlindPanelRevealWindowAmended` (AV-319), 157 is
+        // `EnglishAuctionBuyoutPriceAmended` (AV-320) and 158 is the
         // first still-unknown byte.
-        for bad in [157u8, 255] {
+        for bad in [158u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
