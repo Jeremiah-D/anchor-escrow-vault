@@ -407,6 +407,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // and the state are untouched, while the next split release
         // prorates over the live shares.
         | EscrowEventKind::PayoutSplitSharesAmended
+        // AV-317: a revised settlement mint moves no funds and never
+        // restates a release already settled — only the settlement
+        // denomination moves, so the funded mint, the allowlist, and
+        // the funded-unit counters are untouched, while the next
+        // settled release reads the live mint before rate verification.
+        | EscrowEventKind::SettlementMintAmended
         // AV-278: an amended recovery threshold moves no funds and
         // never restates a settled request — only the threshold
         // changes, so the guardians, the count and the timelock
@@ -1347,6 +1353,12 @@ mod event_sourcing_tests {
         // and the state are untouched, while the next split release
         // prorates over the live shares.
         | EscrowEventKind::PayoutSplitSharesAmended
+        // AV-317: a revised settlement mint moves no funds and never
+        // restates a release already settled — only the settlement
+        // denomination moves, so the funded mint, the allowlist, and
+        // the funded-unit counters are untouched, while the next
+        // settled release reads the live mint before rate verification.
+        | EscrowEventKind::SettlementMintAmended
                 // AV-278: an amended recovery threshold moves no funds and
                 // never restates a settled request — only the threshold
                 // changes, so the guardians, the count and the timelock

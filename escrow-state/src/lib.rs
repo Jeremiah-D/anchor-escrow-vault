@@ -13794,6 +13794,125 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(())
     }
 
+    /// Revise the bound settlement mint after funding (AV-317 — Solana
+    /// settlement-currency governance): the post-funding counterpart to
+    /// [`Escrow::with_settlement_mint`] (`Uninitialized`-only initial
+    /// binding). A deal's payout denomination may need to change
+    /// mid-deal — the agreed stablecoin may depeg, delist, or lose
+    /// its venue — without cancelling and re-locking the escrow.
+    ///
+    /// Governance mirrors [`Escrow::update_tiered_quorum`]: *both*
+    /// parties must sign — one party alone cannot unilaterally
+    /// redenominate the other's share — on an escrow that is
+    /// `Funded`, and on a delay-opted-in escrow the mint moves only
+    /// through the AV-158 propose/execute protocol. Check order is
+    /// pause, then authority, then the governance-delay routing
+    /// gate, then state, then the bound-only gate, then the value
+    /// gate — the AV-46 / AV-49 convention. Only an escrow with a
+    /// settlement mint already bound may revise: an unbound escrow
+    /// is refused with [`EscrowError::SettlementMintNotBound`]
+    /// (fail-closed — post-funding installation would add a
+    /// denomination the taker never funded under, so it is not an
+    /// amendment, it is a new deal). The new mint reuses the
+    /// [`Escrow::with_settlement_mint`] gate (the zero address is
+    /// [`EscrowError::InvalidMint`]) — and a rejected mint leaves
+    /// the original mint exactly as it was, since the new value is
+    /// validated before any write. Only `settlement_mint` changes:
+    /// the funded mint, the allowlist, any settled release already
+    /// made, and the funded-unit counters are untouched, and plain
+    /// `release` is unaffected (no conversion, no settlement mint
+    /// to gate). The new mint governs from the next
+    /// [`Escrow::release_with_settlement_rate`]: that path reads
+    /// the live mint before rate verification, so a quote for the
+    /// old mint fails with `SettlementRateInvalid` at once while a
+    /// quote for the new mint settles — an old quote can never
+    /// misprice a settlement in the new mint — while a release
+    /// already settled keeps the mint it settled under, since a
+    /// settled release is consumed. The live allowlist is not
+    /// consulted here (the release-time gate stays the single
+    /// enforcement point, as on the builder — a mint outside the
+    /// list simply means no settled release can pass until the list
+    /// is revised again, AV-276). Revising to the current mint is
+    /// a no-op: it succeeds and writes nothing, so the event layer
+    /// emits nothing for it (paralleling `rotate_arbiter`).
+    /// Orthogonal to [`Escrow::with_settlement_mint`] (that is the
+    /// initial binding, this item is the post-funding revision), to
+    /// AV-217 (that is the settlement-conversion mechanism itself,
+    /// this item is the bound mint's revision), to AV-276 (that is
+    /// the allowlist, this item is the bound mint), and to AV-16
+    /// (that is the funded-mint binding, this item is the
+    /// settlement mint). Emits `SettlementMintAmended` on the event
+    /// layer, except for the no-op re-affirmation.
+    pub fn amend_settlement_mint(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_settle_mint: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-158: the direct entry always takes `via_delayed = false`
+        // — on a delay-opted-in escrow the mint moves only through
+        // the propose/execute protocol. Thin by design: one mint
+        // implementation, zero gate drift (see `update_quorum_impl`).
+        self.amend_settlement_mint_impl(initializer, taker, new_settle_mint, false)
+    }
+
+    /// The settlement-mint engine behind
+    /// [`Escrow::amend_settlement_mint`] (AV-317). Same guard chain
+    /// as the direct call; `via_delayed` is `true` only when the
+    /// AV-158 two-step protocol drives the call after the delay
+    /// elapsed.
+    fn amend_settlement_mint_impl(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_settle_mint: [u8; 32],
+        via_delayed: bool,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Both parties must sign: either key alone (or a stranger)
+        // is Unauthorized. Independent `==` checks (not `||`): the
+        // degenerate initializer == taker self-escrow authorizes with
+        // one key passed twice, like AV-12's activation.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        // AV-158: the governance-delay routing gate — on a
+        // delay-opted-in escrow the mint moves only through the
+        // two-step propose/execute protocol, never a direct call
+        // (see `update_quorum_impl` for the placement rationale).
+        if !via_delayed && self.governance_delay_secs != 0 {
+            return Err(EscrowError::GovernanceActionNotProposed);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow with a settlement mint already
+        // bound may amend it — post-funding installation would add
+        // a denomination the taker never funded under. Checked
+        // before the value gate so an unbound escrow never acquires
+        // a settlement mint through this path, whatever the proposed
+        // mint.
+        let current = self
+            .settlement_mint()
+            .ok_or(EscrowError::SettlementMintNotBound)?;
+        // The value gate lives in `with_settlement_mint`: the zero
+        // address is not a mint (the stored zero always means "no
+        // settlement mint bound"), and a rejected mint leaves the
+        // original mint exactly as it was.
+        if new_settle_mint == [0u8; 32] {
+            return Err(EscrowError::InvalidMint);
+        }
+        // No-op: re-affirming the current mint writes nothing, so
+        // the event layer emits nothing for it.
+        if new_settle_mint == current {
+            return Ok(());
+        }
+        self.settlement_mint = new_settle_mint;
+        Ok(())
+    }
+
     /// Opt in to partial funding (AV-220 — Solana / payment
     /// fintech: installment deposits toward the declared amount).
     /// Builder-style: only valid on an `Uninitialized` escrow, like
@@ -50574,7 +50693,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
     }
 
     #[test]
@@ -67779,7 +67899,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(151), Some(EscrowEventKind::SubscriptionPeriodSecsAmended)); // AV-289: 151 is SubscriptionPeriodSecsAmended
         assert_eq!(EscrowEventKind::from_discriminant(152), Some(EscrowEventKind::VestingCurveAmended)); // AV-290: 152 is VestingCurveAmended
         assert_eq!(EscrowEventKind::from_discriminant(153), Some(EscrowEventKind::PayoutSplitSharesAmended)); // AV-293: 153 is PayoutSplitSharesAmended
-        assert_eq!(EscrowEventKind::from_discriminant(154), None); // AV-293: 153 is PayoutSplitSharesAmended
+        assert_eq!(EscrowEventKind::from_discriminant(154), Some(EscrowEventKind::SettlementMintAmended)); // AV-317: 154 is SettlementMintAmended
+        assert_eq!(EscrowEventKind::from_discriminant(155), None); // AV-317: 154 is SettlementMintAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -68015,9 +68136,10 @@ mod event_history_tests {
         // `DutchAuctionWindowAmended` (AV-288), 151 is
         // `SubscriptionPeriodSecsAmended` (AV-289), 152 is
         // `VestingCurveAmended` (AV-290), 153 is
-        // `PayoutSplitSharesAmended` (AV-293) and 154 is the
+        // `PayoutSplitSharesAmended` (AV-293), 154 is
+        // `SettlementMintAmended` (AV-317) and 155 is the
         // first still-unknown byte.
-        for bad in [154u8, 255] {
+        for bad in [155u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -80619,6 +80741,354 @@ mod update_settlement_mint_allowlist_tests {
         assert_eq!(e.event_count(), before + 2);
         let ev = e.events().last().copied().expect("event pushed");
         assert_eq!(ev.kind, EscrowEventKind::SettlementMintAllowlistUpdated);
+    }
+}
+
+mod amend_settlement_mint_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const M1: [u8; 32] = [0x11; 32];
+    const M2: [u8; 32] = [0x22; 32];
+    const M3: [u8; 32] = [0x33; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn init_key() -> SigningKey {
+        SigningKey::from_seed([0x11; 32])
+    }
+
+    fn taker_key() -> SigningKey {
+        SigningKey::from_seed([0x22; 32])
+    }
+
+    fn initializer() -> [u8; 32] {
+        init_key().public_key()
+    }
+
+    fn taker() -> [u8; 32] {
+        taker_key().public_key()
+    }
+
+    /// A dual-signed quote over the given terms.
+    fn quote(
+        settle: [u8; 32],
+        numerator: u64,
+        denominator: u64,
+        expires_at: u64,
+    ) -> SettlementRateAttestation {
+        let mut attestation = SettlementRateAttestation {
+            settle_mint: settle,
+            numerator,
+            denominator,
+            expires_at,
+            initializer_signature: [0u8; 64],
+            taker_signature: [0u8; 64],
+        };
+        let message = settlement_rate_message(&attestation);
+        attestation.initializer_signature = init_key().sign(&message);
+        attestation.taker_signature = taker_key().sign(&message);
+        attestation
+    }
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_settlement_mint(M1)
+            .unwrap()
+            .with_settlement_mint_allowlist(&[M1, M2])
+            .unwrap();
+        e.fund(initializer(), NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn amend_moves_bound_mint_only() {
+        // Only the settlement mint moves: the funded mint, the
+        // allowlist, the state, and the encoded length are
+        // untouched — the mint region is already resident, so the
+        // revision rewrites it in place with no layout change.
+        let mut e = configured();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.amend_settlement_mint(initializer(), taker(), M2).unwrap();
+        assert_eq!(e.settlement_mint(), Some(M2), "mint revised");
+        assert_eq!(e.mint(), None, "funded mint untouched");
+        assert_eq!(
+            e.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1, M2],
+            "allowlist untouched"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "mint region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_rejects_stranger_and_single_party() {
+        // Unconditional dual signature: one party alone, a
+        // stranger, or the parties swapped is Unauthorized —
+        // paralleling `amend_protocol_fee`.
+        let mut e = configured();
+        assert_eq!(
+            e.amend_settlement_mint(MALLORY, taker(), M2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_settlement_mint(initializer(), initializer(), M2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_settlement_mint(taker(), initializer(), M2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.settlement_mint(), Some(M1), "mint untouched");
+    }
+
+    #[test]
+    fn amend_rejects_non_funded_state() {
+        // Funded-only: the Uninitialized builder owns the initial
+        // binding, and a terminal escrow has no future settled
+        // release left to redenominate.
+        let mut bare = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_settlement_mint(M1)
+            .unwrap();
+        assert_eq!(
+            bare.amend_settlement_mint(initializer(), taker(), M2),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.settlement_mint(), Some(M1));
+        let mut released = configured();
+        released
+            .release(initializer(), NOW, 1_000_000, None, taker())
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_settlement_mint(initializer(), taker(), M2),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(released.settlement_mint(), Some(M1));
+    }
+
+    #[test]
+    fn amend_rejects_unbound_escrow() {
+        // Fail-closed: only an escrow with a settlement mint
+        // already bound may revise — post-funding installation
+        // would add a denomination the taker never funded under.
+        // The bound gate fires before the value gate, so even a
+        // zero mint on an unbound escrow reports NotBound.
+        let mut plain = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        plain.fund(initializer(), NOW).unwrap();
+        assert_eq!(
+            plain.amend_settlement_mint(initializer(), taker(), M2),
+            Err(EscrowError::SettlementMintNotBound)
+        );
+        assert_eq!(
+            plain.amend_settlement_mint(initializer(), taker(), [0u8; 32]),
+            Err(EscrowError::SettlementMintNotBound)
+        );
+        assert_eq!(plain.settlement_mint(), None);
+    }
+
+    #[test]
+    fn amend_rejects_zero_address_and_preserves_original() {
+        // The `with_settlement_mint` value gate, unchanged: the
+        // zero address is not a mint (the stored zero always means
+        // "no settlement mint bound"), and a failed revision never
+        // writes.
+        let mut e = configured();
+        assert_eq!(
+            e.amend_settlement_mint(initializer(), taker(), [0u8; 32]),
+            Err(EscrowError::InvalidMint)
+        );
+        assert_eq!(e.settlement_mint(), Some(M1), "original mint untouched");
+    }
+
+    #[test]
+    fn amend_same_mint_is_noop() {
+        // Re-affirming the current mint succeeds but changes nothing
+        // observable; the event layer (tested below) emits nothing.
+        let mut e = configured();
+        e.amend_settlement_mint(initializer(), taker(), M1)
+            .unwrap();
+        assert_eq!(e.settlement_mint(), Some(M1));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_old_quote_fails_new_quote_settles() {
+        // The settled-release path reads the live mint before rate
+        // verification: a quote for the old mint fails at once, so
+        // an old quote can never misprice a settlement in the new
+        // mint, while a quote for the new mint settles.
+        let mut e = configured();
+        e.amend_settlement_mint(initializer(), taker(), M2).unwrap();
+        let old = quote(M1, 2, 1, 2_000_000_000);
+        assert_eq!(
+            e.release_with_settlement_rate(initializer(), NOW, 1_000, None, taker(), &old),
+            Err(EscrowError::SettlementRateInvalid)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        let new = quote(M2, 2, 1, 2_000_000_000);
+        let settled = e
+            .release_with_settlement_rate(initializer(), NOW, 1_000, None, taker(), &new)
+            .unwrap();
+        assert_eq!(settled.payout, 2_000);
+        assert_eq!(settled.fee, 0);
+        assert_eq!(settled.penalty, 0);
+        assert_eq!(settled.settle_mint, M2);
+    }
+
+    #[test]
+    fn amend_settled_release_snapshot_not_restated() {
+        // A release already settled keeps the mint it settled
+        // under: the settled legs are a snapshot, and the
+        // amendment only governs the next release.
+        let mut e = configured();
+        let first = e
+            .release_with_settlement_rate(
+                initializer(),
+                NOW,
+                400_000,
+                None,
+                taker(),
+                &quote(M1, 2, 1, 2_000_000_000),
+            )
+            .unwrap();
+        assert_eq!(first.payout, 800_000);
+        assert_eq!(first.settle_mint, M1);
+        e.amend_settlement_mint(initializer(), taker(), M2).unwrap();
+        let second = e
+            .release_with_settlement_rate(
+                initializer(),
+                NOW,
+                600_000,
+                None,
+                taker(),
+                &quote(M2, 1, 1, 2_000_000_000),
+            )
+            .unwrap();
+        assert_eq!(second.payout, 600_000);
+        assert_eq!(second.settle_mint, M2);
+        // The first snapshot is untouched by the amendment.
+        assert_eq!(first.payout, 800_000);
+        assert_eq!(first.settle_mint, M1);
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_plain_release_unaffected() {
+        // Binding — or re-binding — a settlement mint changes
+        // nothing for the plain path: it keeps settling in funded
+        // units, unconverted.
+        let mut e = configured();
+        e.amend_settlement_mint(initializer(), taker(), M2).unwrap();
+        assert_eq!(
+            e.release(initializer(), NOW, 1_000_000, None, taker())
+                .unwrap(),
+            (1_000_000, 0)
+        );
+        assert_eq!(e.released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn amend_refuses_direct_call_on_delay_opted_in() {
+        // AV-158 routing: on a delay-opted-in escrow the direct call
+        // is refused — the mint moves only through the
+        // propose/execute protocol, never a direct call.
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_settlement_mint(M1)
+            .unwrap();
+        e.fund(initializer(), NOW).unwrap();
+        assert_eq!(
+            e.amend_settlement_mint(initializer(), taker(), M2),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(e.settlement_mint(), Some(M1));
+    }
+
+    #[test]
+    fn amend_rejects_when_paused() {
+        // The pause guard fires before the authority and state
+        // gates: even a stranger's revision on a paused escrow is
+        // `Paused`, and a dual-signed revision is refused too.
+        let mut e = configured();
+        e.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            e.amend_settlement_mint(MALLORY, taker(), M2),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            e.amend_settlement_mint(initializer(), taker(), M2),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(e.settlement_mint(), Some(M1), "mint untouched");
+    }
+
+    #[test]
+    fn amend_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-317: a dual-signed revision emits SettlementMintAmended
+        // (discriminant 154, appended last) with zero amounts — a
+        // config change, not a settlement — and the amended mint is
+        // read from the vault. A refused revision emits nothing, and
+        // a no-op re-affirmation emits nothing either.
+        assert_eq!(EscrowEventKind::SettlementMintAmended.discriminant(), 154);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(154),
+            Some(EscrowEventKind::SettlementMintAmended)
+        );
+        assert_eq!(
+            EscrowEventKind::SettlementMintAmended.name(),
+            "settlement_mint_amended"
+        );
+        assert_eq!(
+            EscrowEventKind::from_name("settlement_mint_amended"),
+            Some(EscrowEventKind::SettlementMintAmended)
+        );
+        let mut e = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_settlement_mint(MALLORY, taker(), M2, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_settlement_mint(initializer(), taker(), M2, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::SettlementMintAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same mint is a no-op: no new event.
+        e.amend_settlement_mint(initializer(), taker(), M2, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        // A second real change emits again.
+        e.amend_settlement_mint(initializer(), taker(), M3, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 2);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::SettlementMintAmended);
     }
 }
 
