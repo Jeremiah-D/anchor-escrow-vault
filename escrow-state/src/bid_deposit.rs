@@ -272,6 +272,63 @@ impl BidDepositAuction {
         }
     }
 
+    /// Revise the flat per-bidder deposit amount before the first
+    /// registration lands (AV-324).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the seller key is the book's authority, the
+    /// same gate as [`Self::forfeit`]) and only while no bidder has
+    /// registered (`deposit_count == 0`): a registered bidder locked
+    /// their deposit at the old amount via [`DepositReceipt`], so
+    /// the terms must not be rewritten under them. Refused with
+    /// [`EscrowError::BidDepositAlreadySettled`] (code 284) once the
+    /// book is settled, and with
+    /// [`EscrowError::InvalidBidDeposit`] (code 282) once a deposit
+    /// is registered.
+    ///
+    /// Check order is authority → settled → registration → value,
+    /// mirroring [`Self::forfeit`]: a stranger is refused even on a
+    /// settled book, and a settled book refuses even the seller. A
+    /// zero new amount reuses the [`Self::new`] gate
+    /// ([`EscrowError::InvalidBidDeposit`], code 282), the original
+    /// amount untouched. Revising to the current amount is a no-op.
+    ///
+    /// Only `deposit_amount` changes: `auction`, `kind`, `seller`,
+    /// entries, count, and settled are untouched. The next
+    /// [`Self::register`] locks the new amount; receipts already
+    /// issued keep the amount they locked under — there are none yet
+    /// by construction, since the gate is `deposit_count == 0`.
+    ///
+    /// Pure logic: this method changes state only. The revision is
+    /// recorded for the indexer as
+    /// [`Self::deposit_amount_audit_json`] (a string event name, no
+    /// numeric event ID — the deposit audit convention); a failed
+    /// revision and a no-op re-affirmation record nothing. No Vault
+    /// layout change, no new error code: the gates reuse 100/282/284.
+    pub fn amend_bid_deposit_amount(
+        &mut self,
+        authority: [u8; 32],
+        new_deposit_amount: u64,
+    ) -> Result<(), EscrowError> {
+        if authority != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.settled {
+            return Err(EscrowError::BidDepositAlreadySettled);
+        }
+        if self.count > 0 {
+            return Err(EscrowError::InvalidBidDeposit);
+        }
+        if new_deposit_amount == self.deposit_amount {
+            return Ok(());
+        }
+        if new_deposit_amount == 0 {
+            return Err(EscrowError::InvalidBidDeposit);
+        }
+        self.deposit_amount = new_deposit_amount;
+        Ok(())
+    }
+
     /// The current state of one bidder's deposit.
     ///
     /// Refused ([`EscrowError::BidDepositNotRegistered`], code 283)
@@ -443,6 +500,22 @@ impl BidDepositAuction {
         s.push_str(&report.refunded.to_string());
         s.push_str(",\"forfeited\":");
         s.push_str(&report.forfeited.to_string());
+        s.push('}');
+        s
+    }
+
+    /// Audit-event JSON for a deposit-amount revision (hand-written):
+    /// `{"event":"bid_deposit_amount_amended","auction":"<64hex>",
+    /// "previous_deposit_amount":<u64>,"deposit_amount":<u64>}`.
+    /// Emitted only on an actual change — a no-op re-affirmation
+    /// records nothing.
+    pub fn deposit_amount_audit_json(&self, previous_deposit_amount: u64) -> String {
+        let mut s = String::from("{\"event\":\"bid_deposit_amount_amended\",\"auction\":\"");
+        s.push_str(&hex64(&self.auction));
+        s.push_str("\",\"previous_deposit_amount\":");
+        s.push_str(&previous_deposit_amount.to_string());
+        s.push_str(",\"deposit_amount\":");
+        s.push_str(&self.deposit_amount.to_string());
         s.push('}');
         s
     }
@@ -748,6 +821,130 @@ mod bid_deposit_tests {
         assert!(j.contains("\"applied\":1000"));
         assert!(j.contains("\"refunded\":1"));
         assert!(j.contains("\"forfeited\":0"));
+    }
+
+    #[test]
+    fn amend_deposit_amount_is_seller_only() {
+        let mut b = open_book();
+        // A stranger is refused, even on an empty book.
+        let err = b.amend_bid_deposit_amount(key(9), 2500).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(b.deposit_amount(), 1000);
+        // A bidder is refused too — authority is checked first,
+        // before the post-registration gate.
+        b.register(key(1)).unwrap();
+        let err = b.amend_bid_deposit_amount(key(1), 2500).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(b.deposit_amount(), 1000);
+    }
+
+    #[test]
+    fn amend_deposit_amount_refused_after_settlement() {
+        let mut b = open_book();
+        b.register(key(1)).unwrap();
+        b.settle(Some(key(1))).unwrap();
+        assert!(b.is_settled());
+        let err = b.amend_bid_deposit_amount(key(0xAA), 2500).unwrap_err();
+        assert_eq!(err, EscrowError::BidDepositAlreadySettled);
+        assert_eq!(err.code(), 284);
+        assert_eq!(b.deposit_amount(), 1000);
+        // Authority still wins on a settled book: a stranger is
+        // Unauthorized, not AlreadySettled.
+        let err = b.amend_bid_deposit_amount(key(9), 2500).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_deposit_amount_locks_after_first_registration() {
+        let mut b = open_book();
+        let r = b.register(key(1)).unwrap();
+        assert_eq!(r.amount, 1000);
+        let err = b.amend_bid_deposit_amount(key(0xAA), 2500).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidBidDeposit);
+        assert_eq!(err.code(), 282);
+        assert_eq!(b.deposit_amount(), 1000);
+        // The registered bidder's terms stand: settlement still
+        // applies the original amount.
+        let s = b.settle(Some(key(1))).unwrap();
+        assert_eq!(s.applied, 1000);
+        assert_conservation(&b);
+    }
+
+    #[test]
+    fn amend_deposit_amount_rejects_zero() {
+        let mut b = open_book();
+        let err = b.amend_bid_deposit_amount(key(0xAA), 0).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidBidDeposit);
+        assert_eq!(err.code(), 282);
+        assert_eq!(b.deposit_amount(), 1000);
+        // The original amount still governs — a later valid revision
+        // works.
+        b.amend_bid_deposit_amount(key(0xAA), 2500).unwrap();
+        assert_eq!(b.deposit_amount(), 2500);
+    }
+
+    #[test]
+    fn amend_deposit_amount_same_value_is_noop() {
+        let mut b = open_book();
+        // Re-affirming the current amount succeeds and changes
+        // nothing — the pure-logic method emits no event, so there
+        // is no event to assert here; the state pin is the amount.
+        b.amend_bid_deposit_amount(key(0xAA), 1000).unwrap();
+        assert_eq!(b.deposit_amount(), 1000);
+        assert_eq!(b.deposit_count(), 0);
+        assert!(!b.is_settled());
+        assert_eq!(b.seller(), key(0xAA));
+    }
+
+    #[test]
+    fn amend_deposit_amount_revises_before_first_registration() {
+        let mut b = open_book();
+        b.amend_bid_deposit_amount(key(0xAA), 2500).unwrap();
+        assert_eq!(b.deposit_amount(), 2500);
+        // Only the amount changes.
+        assert_eq!(b.auction(), key(0xA0));
+        assert_eq!(b.kind(), AuctionKind::English);
+        assert_eq!(b.seller(), key(0xAA));
+        assert_eq!(b.deposit_count(), 0);
+        assert!(!b.is_settled());
+        assert_conservation(&b);
+        // The revision is repeatable while nobody has registered.
+        b.amend_bid_deposit_amount(key(0xAA), 750).unwrap();
+        assert_eq!(b.deposit_amount(), 750);
+    }
+
+    #[test]
+    fn register_after_revision_locks_new_amount() {
+        let mut b = open_book();
+        b.amend_bid_deposit_amount(key(0xAA), 2500).unwrap();
+        let r = b.register(key(1)).unwrap();
+        // The receipt locks the new amount — the old amount is no
+        // longer accepted anywhere on this book.
+        assert_eq!(r.amount, 2500);
+        assert_ne!(r.amount, 1000);
+        b.register(key(2)).unwrap();
+        assert_conservation(&b);
+        let (locked, applied, refunded, forfeited) = b.total_custody();
+        assert_eq!(locked, 5000);
+        assert_eq!((applied, refunded, forfeited), (0, 0, 0));
+        let s = b.settle(Some(key(1))).unwrap();
+        assert_eq!(s.applied, 2500);
+        assert_eq!(s.refunded, 1);
+    }
+
+    #[test]
+    fn amend_deposit_amount_audit_json() {
+        let mut b = open_book();
+        b.amend_bid_deposit_amount(key(0xAA), 2500).unwrap();
+        let j = b.deposit_amount_audit_json(1000);
+        assert_eq!(
+            j,
+            format!(
+                "{{\"event\":\"bid_deposit_amount_amended\",\"auction\":\"{}\",\"previous_deposit_amount\":1000,\"deposit_amount\":2500}}",
+                "a0".repeat(32)
+            )
+        );
     }
 
     #[test]

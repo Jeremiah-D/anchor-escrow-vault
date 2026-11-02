@@ -1795,9 +1795,9 @@ program error per variant):
 | `InvalidOracleAccount` | 279 | `PythPriceFeed::from_account_data` (AV-193) with a short account, header mismatch, or exponent outside `[-18, 0]` |
 | `OraclePriceStale` | 280 | Oracle publish timestamp (AV-193) missing, in the future, or older than `max_age_secs` |
 | `OraclePriceUnreliable` | 281 | Non-trading aggregate status, non-positive price, confidence wider than `max_conf_bps`, normalization failure, or unmet Switchboard oracle-result quorum (AV-193) |
-| `InvalidBidDeposit` | 282 | `BidDepositAuction::new` (AV-194) with a zero auction id / zero seller key / zero deposit amount; also `register` with a zero bidder key or a duplicate registration, `settle`/`settle_sealed` on the wrong auction kind, a settle whose winner's deposit is no longer locked, `settle_sealed` whose winner never revealed, or a forfeit of an already-terminal deposit |
+| `InvalidBidDeposit` | 282 | `BidDepositAuction::new` (AV-194) with a zero auction id / zero seller key / zero deposit amount; also `register` with a zero bidder key or a duplicate registration, `settle`/`settle_sealed` on the wrong auction kind, a settle whose winner's deposit is no longer locked, `settle_sealed` whose winner never revealed, or a forfeit of an already-terminal deposit; also `amend_bid_deposit_amount` (AV-324) with a zero new amount or once a deposit is registered |
 | `BidDepositNotRegistered` | 283 | Bid-deposit (AV-194) operation naming a bidder that never registered a deposit |
-| `BidDepositAlreadySettled` | 284 | Bid-deposit (AV-194) register / reveal / forfeit / settle after the book was settled |
+| `BidDepositAlreadySettled` | 284 | Bid-deposit (AV-194) register / reveal / forfeit / settle / `amend_bid_deposit_amount` (AV-324) after the book was settled |
 | `BidDepositBookFull` | 285 | `BidDepositAuction::register` (AV-194) past `MAX_BID_DEPOSITS` (64) deposits |
 
 **Amount conservation** is pinned by a model-based fuzz test: 24
@@ -2848,6 +2848,15 @@ closes; pre-settlement seller forfeits stand; a custody invariant
 holds at every step — `locked + applied + refunded + forfeited` always
 equals `deposit_count * deposit_amount`, funds are only reclassified,
 never created or destroyed.
+
+Deposit amount revision (AV-324): `amend_bid_deposit_amount()` lets
+the seller revise the flat deposit before the first registration
+(`deposit_count == 0`) — seller-only, refused after settlement or
+once a bidder has registered, so no bidder's locked terms are
+rewritten; a zero amount reuses the `new()` gate and re-affirming
+the current amount is a no-op. Audited as
+`bid_deposit_amount_amended` (hand-written JSON, string event name,
+no numeric event ID).
 
 New error codes (never renumbered): `InvalidBidDeposit` (282),
 `BidDepositNotRegistered` (283), `BidDepositAlreadySettled` (284),
