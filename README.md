@@ -1785,8 +1785,8 @@ program error per variant):
 | `InvalidRentalTerms` | 268 | `RentalEscrow::new` (AV-190) with a zero owner/renter key, owner == renter, a zero rent amount, `term_end_slot <= term_start_slot`, a zero `slots_per_day`, or a late-fee rate/cap above 10_000 bps |
 | `RentalNotActive` | 269 | `RentalEscrow::return_asset` (AV-190) on a rental already in a terminal state |
 | `RentalCancelNotAllowed` | 270 | `RentalEscrow::cancel` (AV-190) after `term_start_slot` or on a terminal rental |
-| `InvalidSealedBid` | 272 | `SealedBidAuction::new` (AV-192) with a zero seller key, `commit_start_slot >= reveal_start_slot`, or `reveal_start_slot >= end_slot`; also `commit_bid` with a zero bidder key or zero commitment; also `amend_sealed_bid_reveal_start_slot` (AV-303) outside the `new()` window or at/before `current_slot`; also `amend_sealed_bid_commit_start_slot` (AV-304) outside the `new()` window or at/before `current_slot`; also `amend_sealed_bid_end_slot` (AV-305) at/before `reveal_start_slot` |
-| `SealedBidNotLive` | 273 | Sealed-bid commit/reveal (AV-192) outside its phase or on a terminal auction; also `amend_sealed_bid_min_bid` (AV-302) and `amend_sealed_bid_reveal_start_slot` (AV-303) once the reveal has started or on a terminal auction; also `amend_sealed_bid_commit_start_slot` (AV-304) once the commit window has opened or on a terminal auction; also `amend_sealed_bid_end_slot` (AV-305) once the reveal has started or on a terminal auction |
+| `InvalidSealedBid` | 272 | `SealedBidAuction::new` (AV-192) with a zero seller key, `commit_start_slot >= reveal_start_slot`, or `reveal_start_slot >= end_slot`; also `commit_bid` with a zero bidder key or zero commitment; also `amend_sealed_bid_reveal_start_slot` (AV-303) outside the `new()` window or at/before `current_slot`; also `amend_sealed_bid_commit_start_slot` (AV-304) outside the `new()` window or at/before `current_slot`; also `amend_sealed_bid_end_slot` (AV-305) at/before `reveal_start_slot`; also `amend_sealed_bid_seller` (AV-323) with a zero new seller |
+| `SealedBidNotLive` | 273 | Sealed-bid commit/reveal (AV-192) outside its phase or on a terminal auction; also `amend_sealed_bid_min_bid` (AV-302) and `amend_sealed_bid_reveal_start_slot` (AV-303) once the reveal has started or on a terminal auction; also `amend_sealed_bid_commit_start_slot` (AV-304) once the commit window has opened or on a terminal auction; also `amend_sealed_bid_end_slot` (AV-305) once the reveal has started or on a terminal auction; also `amend_sealed_bid_seller` (AV-323) once the first commitment has landed or on a terminal auction |
 | `SealedBidDuplicateCommit` | 274 | `SealedBidAuction::commit_bid` (AV-192) from a bidder that already committed |
 | `SealedBidRevealMismatch` | 275 | `SealedBidAuction::reveal_bid` (AV-192) whose `SHA-256(bid \|\| nonce \|\| bidder)` does not equal the stored commitment |
 | `SealedBidSettleTooEarly` | 276 | `SealedBidAuction::settle` (AV-192) at `current_slot < end_slot` |
@@ -2692,6 +2692,20 @@ last-second sniping on price.
   a no-op. The revision is audited as `sealed_bid_min_bid_amended`
   (hand-written JSON, same convention as the commit/reveal/settle
   audit events — string event names, no numeric event ID).
+- **Seller rotation** (AV-323): `amend_sealed_bid_seller()` lets
+  the current seller rotate the seller key before the first
+  commitment lands (`state == Active` and `commit_count == 0`) —
+  no slot gate, since with zero commitments no bidder has entered
+  and commitments are hashes the seller has not seen. Only `seller`
+  changes — `min_bid`, the three windows, pricing, slots, counts,
+  and state are untouched; the new seller is the sole authority
+  from the next call (every `amend_*`, `cancel`, and the settle
+  payout read the live seller). Seller-only (`Unauthorized` for
+  anyone else); refused with `SealedBidNotLive` once a commitment
+  has landed or the auction is terminal; a zero new seller reuses
+  the `new()` gate (`InvalidSealedBid`); rotating to the current
+  seller is a no-op. Audited as `sealed_bid_seller_amended`
+  (hand-written JSON, string event name, no numeric event ID).
 - **Reveal-start revision** (AV-303): `amend_sealed_bid_reveal_start_slot()`
   lets the seller move the reveal window's opening slot before the
   reveal starts (`current_slot < reveal_start_slot`) — earlier

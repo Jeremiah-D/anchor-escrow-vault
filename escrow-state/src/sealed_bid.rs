@@ -517,6 +517,77 @@ impl SealedBidAuction {
         s
     }
 
+    /// Rotate the seller key before the first commitment lands
+    /// (AV-323).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the seller key is the auction's authority) and
+    /// only while the auction is live and no commitment has landed
+    /// (`state == Active` and `commit_count == 0`) — refused with
+    /// [`EscrowError::SealedBidNotLive`] (code 273) once a commitment
+    /// has landed or the auction is terminal, the original seller
+    /// untouched. No slot gate: with zero commitments no bidder has
+    /// entered, so the window may already be open — commitments are
+    /// hashes and the seller has not seen any bid yet, so nothing
+    /// entered is rewritten.
+    ///
+    /// Only `seller` changes: `min_bid`, the three windows, pricing,
+    /// slots, counts, and state are untouched. The new seller is the
+    /// sole authority from the next call: every `amend_*`,
+    /// [`Self::cancel`], and the settle payout read the live seller.
+    /// Rotating to the current seller is a no-op.
+    ///
+    /// Check order is authority → liveness → no-op → value,
+    /// mirroring [`Self::amend_sealed_bid_min_bid`]: a stranger is
+    /// refused even on a terminal auction, and a lapsed auction
+    /// refuses even the seller. A zero new seller reuses the
+    /// [`Self::new`] gate ([`EscrowError::InvalidSealedBid`], code
+    /// 272), the original seller untouched.
+    ///
+    /// Pure logic: this method changes state only. The rotation is
+    /// recorded for the indexer as [`Self::seller_audit_json`] (a
+    /// string event name, no numeric event ID — the sealed-bid audit
+    /// convention); a failed rotation and a no-op re-affirmation
+    /// record nothing. There is no Anchor instruction surface in
+    /// this round — the program drives this method and emits the
+    /// event — and no new error code: the gates reuse 100/272/273.
+    pub fn amend_sealed_bid_seller(
+        &mut self,
+        caller: [u8; 32],
+        new_seller: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != SealedBidState::Active || self.commit_count > 0 {
+            return Err(EscrowError::SealedBidNotLive);
+        }
+        if new_seller == self.seller {
+            return Ok(());
+        }
+        if new_seller == [0u8; 32] {
+            return Err(EscrowError::InvalidSealedBid);
+        }
+        self.seller = new_seller;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a seller rotation (hand-written, no
+    /// serde — same convention as [`Self::min_bid_audit_json`]):
+    /// `{"event":"sealed_bid_seller_amended","previous_seller":
+    /// "<64hex>","seller":"<64hex>"}`. Sealed-bid audit events
+    /// carry string event names, not numeric event IDs, so no new
+    /// event number is registered for the rotation — the event name
+    /// is the identity.
+    pub fn seller_audit_json(&self, previous_seller: [u8; 32]) -> String {
+        let mut s = String::from("{\"event\":\"sealed_bid_seller_amended\",\"previous_seller\":\"");
+        s.push_str(&hex64(&previous_seller));
+        s.push_str("\",\"seller\":\"");
+        s.push_str(&hex64(&self.seller));
+        s.push_str("\"}");
+        s
+    }
+
     /// Revise the sealed-bid pricing rule before the first commitment
     /// lands (AV-313).
     ///
@@ -1346,6 +1417,186 @@ mod sealed_bid_tests {
         assert_eq!(
             j,
             "{\"event\":\"sealed_bid_min_bid_amended\",\"previous_min_bid\":10,\"min_bid\":25}"
+        );
+    }
+
+    #[test]
+    fn amend_seller_before_first_commit() {
+        let mut a = open_auction(); // seller key(0xAA), min_bid 10
+        a.amend_sealed_bid_seller(key(0xAA), key(0xBB)).unwrap();
+        assert_eq!(a.seller(), key(0xBB));
+        // Everything else is untouched.
+        assert_eq!(a.min_bid(), 10);
+        assert_eq!(a.commit_start_slot(), 100);
+        assert_eq!(a.reveal_start_slot(), 200);
+        assert_eq!(a.end_slot(), 300);
+        assert_eq!(a.pricing(), SealedBidPricing::FirstPrice);
+        assert_eq!(a.commit_count(), 0);
+        assert_eq!(a.reveal_count(), 0);
+        assert_eq!(a.state(), SealedBidState::Active);
+        // The rotation works even mid-window (no slot gate: zero
+        // commitments, so no bidder has entered) and the auction
+        // still runs to a sale under the new seller.
+        commit(&mut a, key(1), 50, nonce(1), 150);
+        a.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        assert_eq!(
+            a.settle(300).unwrap(),
+            SealedBidSettlement::Sold {
+                winner: key(1),
+                winning_bid: 50
+            }
+        );
+    }
+
+    #[test]
+    fn amend_seller_is_current_seller_only() {
+        let mut a = open_auction();
+        // A stranger is refused, even on a live auction.
+        let err = a
+            .amend_sealed_bid_seller(key(9), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(a.seller(), key(0xAA));
+        // A bidder is refused too — authority is checked first,
+        // before the post-commit liveness gate.
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        let err = a
+            .amend_sealed_bid_seller(key(1), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.seller(), key(0xAA));
+    }
+
+    #[test]
+    fn amend_seller_locks_after_first_commit() {
+        let mut a = open_auction();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        let err = a
+            .amend_sealed_bid_seller(key(0xAA), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::SealedBidNotLive);
+        assert_eq!(err.code(), 273);
+        assert_eq!(a.seller(), key(0xAA));
+        // The commitment still stands: reveal and settle run under
+        // the original seller.
+        a.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        assert_eq!(
+            a.settle(300).unwrap(),
+            SealedBidSettlement::Sold {
+                winner: key(1),
+                winning_bid: 50
+            }
+        );
+    }
+
+    #[test]
+    fn amend_seller_refused_in_terminal_states() {
+        // Settled.
+        let mut a = open_auction();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        a.reveal_bid(key(1), 50, nonce(1), 200).unwrap();
+        a.settle(300).unwrap();
+        assert_eq!(a.state(), SealedBidState::Settled);
+        let err = a
+            .amend_sealed_bid_seller(key(0xAA), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::SealedBidNotLive);
+        assert_eq!(a.seller(), key(0xAA));
+        // NoSale after settling with no bids.
+        let mut b = open_auction();
+        b.settle(300).unwrap();
+        assert_eq!(b.state(), SealedBidState::NoSale);
+        let err = b
+            .amend_sealed_bid_seller(key(0xAA), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::SealedBidNotLive);
+        assert_eq!(b.seller(), key(0xAA));
+        // Cancelled.
+        let mut c = open_auction();
+        c.cancel(key(0xAA), 100).unwrap();
+        assert_eq!(c.state(), SealedBidState::Cancelled);
+        let err = c
+            .amend_sealed_bid_seller(key(0xAA), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::SealedBidNotLive);
+        assert_eq!(c.seller(), key(0xAA));
+        // Authority still wins on a terminal auction: a stranger is
+        // Unauthorized, not SealedBidNotLive.
+        let err = c
+            .amend_sealed_bid_seller(key(9), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_seller_rejects_zero_seller() {
+        let mut a = open_auction();
+        let err = a
+            .amend_sealed_bid_seller(key(0xAA), [0u8; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidSealedBid);
+        assert_eq!(err.code(), 272);
+        assert_eq!(a.seller(), key(0xAA));
+        // The original seller still governs.
+        a.amend_sealed_bid_min_bid(key(0xAA), 20, 100).unwrap();
+        assert_eq!(a.min_bid(), 20);
+    }
+
+    #[test]
+    fn amend_seller_same_value_is_noop() {
+        let mut a = open_auction();
+        // Re-affirming the current seller succeeds and changes
+        // nothing — the pure-logic method emits no event, so there
+        // is no event to assert here; the state pin is the seller.
+        a.amend_sealed_bid_seller(key(0xAA), key(0xAA)).unwrap();
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.min_bid(), 10);
+        assert_eq!(a.state(), SealedBidState::Active);
+    }
+
+    #[test]
+    fn amend_seller_old_seller_loses_authority() {
+        let mut a = open_auction();
+        a.amend_sealed_bid_seller(key(0xAA), key(0xBB)).unwrap();
+        // The old seller can no longer amend or cancel.
+        let err = a
+            .amend_sealed_bid_min_bid(key(0xAA), 20, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        let err = a.cancel(key(0xAA), 100).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.state(), SealedBidState::Active);
+        assert_eq!(a.min_bid(), 10);
+    }
+
+    #[test]
+    fn amend_seller_new_seller_can_govern() {
+        let mut a = open_auction();
+        a.amend_sealed_bid_seller(key(0xAA), key(0xBB)).unwrap();
+        // The new seller can amend the terms and cancel.
+        a.amend_sealed_bid_min_bid(key(0xBB), 20, 100).unwrap();
+        assert_eq!(a.min_bid(), 20);
+        a.cancel(key(0xBB), 100).unwrap();
+        assert_eq!(a.state(), SealedBidState::Cancelled);
+    }
+
+    #[test]
+    fn amend_seller_audit_json() {
+        let mut a = open_auction();
+        a.amend_sealed_bid_seller(key(0xAA), key(0xBB)).unwrap();
+        let j = a.seller_audit_json(key(0xAA));
+        assert!(j.contains("\"event\":\"sealed_bid_seller_amended\""));
+        assert!(j.contains("\"previous_seller\":\""));
+        assert!(j.contains("\"seller\":\""));
+        assert_eq!(
+            j,
+            format!(
+                "{{\"event\":\"sealed_bid_seller_amended\",\"previous_seller\":\"{}\",\"seller\":\"{}\"}}",
+                "aa".repeat(32),
+                "bb".repeat(32)
+            )
         );
     }
 
