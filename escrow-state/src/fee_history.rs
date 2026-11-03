@@ -365,6 +365,10 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // pays min(new per_crank, pool) from the live amount,
         // while a crank already settled keeps its amount.
         | EscrowEventKind::KeeperBountyPerCrankAmended
+        // AV-328: a topped-up keeper-bounty pool carries no fee
+        // leg — the top-up rides `payout`, not `fee`, and the
+        // pool is funder inflow outside the principal.
+        | EscrowEventKind::KeeperBountyPoolToppedUp
         // AV-267: a revised flat slash deadline moves no funds
         // and never restates a settled penalty — the slash path
         // reads the live deadline at the next eligibility check,
@@ -1348,6 +1352,10 @@ mod fee_history_tests {
         // pays min(new per_crank, pool) from the live amount,
         // while a crank already settled keeps its amount.
         | EscrowEventKind::KeeperBountyPerCrankAmended
+        // AV-328: a topped-up keeper-bounty pool carries no fee
+        // leg — the top-up rides `payout`, not `fee`, and the
+        // pool is funder inflow outside the principal.
+        | EscrowEventKind::KeeperBountyPoolToppedUp
         // AV-267: a revised flat slash deadline moves no funds
         // and never restates a settled penalty — the slash path
         // reads the live deadline at the next eligibility check,

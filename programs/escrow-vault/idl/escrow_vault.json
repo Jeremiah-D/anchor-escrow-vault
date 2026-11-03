@@ -1036,6 +1036,14 @@
       ]
     },
     {
+      "name": "top_up_keeper_bounty",
+      "discriminator": [107, 59, 235, 162, 146, 128, 59, 102],
+      "accounts": [],
+      "args": [
+        {"name": "additional", "type": "u64"}
+      ]
+    },
+    {
       "name": "initialize_funding_plan",
       "discriminator": [163, 209, 171, 116, 156, 37, 54, 133],
       "accounts": [],

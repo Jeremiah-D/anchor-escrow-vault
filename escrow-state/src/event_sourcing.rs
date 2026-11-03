@@ -323,6 +323,15 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // pays min(new per_crank, pool) from the live amount,
         // while a crank already settled keeps its amount.
         | EscrowEventKind::KeeperBountyPerCrankAmended
+        // AV-328: a topped-up keeper-bounty pool moves no
+        // fold-tracked funds — the pool is initializer/funder
+        // inflow outside the principal (the AV-103 appeal-bond
+        // precedent, symmetric with the KeeperBountyPaid no-op),
+        // so the fold never books it; only the pool counter
+        // moves, while the next crank pays min(per_crank, pool)
+        // from the live pool and a crank already settled keeps
+        // the amount it settled under.
+        | EscrowEventKind::KeeperBountyPoolToppedUp
         // AV-267: a revised flat slash deadline moves no funds
         // and never restates a settled penalty — the slash path
         // reads the live deadline at the next eligibility check,
@@ -1302,6 +1311,15 @@ mod event_sourcing_tests {
         // pays min(new per_crank, pool) from the live amount,
         // while a crank already settled keeps its amount.
         | EscrowEventKind::KeeperBountyPerCrankAmended
+        // AV-328: a topped-up keeper-bounty pool moves no
+        // fold-tracked funds — the pool is funder inflow outside
+        // the principal (the AV-103 appeal-bond precedent,
+        // symmetric with the KeeperBountyPaid no-op), so the
+        // fold never books it; only the pool counter moves,
+        // while the next crank pays min(per_crank, pool) from
+        // the live pool and a crank already settled keeps the
+        // amount it settled under.
+        | EscrowEventKind::KeeperBountyPoolToppedUp
         // AV-267: a revised flat slash deadline moves no funds
         // and never restates a settled penalty — the slash path
         // reads the live deadline at the next eligibility check,

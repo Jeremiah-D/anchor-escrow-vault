@@ -21438,6 +21438,80 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Top up the keeper-bounty pool after funding (AV-328):
+    /// the post-funding counterpart to the pool leg of
+    /// [`Escrow::with_keeper_bounty`] (`Uninitialized`-only
+    /// initial configuration). The pool is a consumable balance
+    /// — [`Escrow::amend_keeper_bounty_per_crank`] revises the
+    /// per-crank amount but never tops the pool up, so once the
+    /// pool is exhausted the bounty pays `0` and the keeper
+    /// falls back to the unpaid AV-48 behavior; this is the
+    /// refill path the AV-266 entry itself names as missing.
+    /// Permissionless, paralleling [`Escrow::crank_expired`]
+    /// ("no authority check: the crank is permissionless") and
+    /// [`Escrow::fund`]'s no-threshold deposit: topping up is a
+    /// donation by whoever funds it — nobody is harmed by it —
+    /// so `funder` is recorded only as the event actor by the
+    /// event layer (and as the transfer source by the Anchor
+    /// instruction), never as a gate. Pause first (AV-46),
+    /// `Funded`-only ([`EscrowError::InvalidStateTransition`],
+    /// code 101). Fail-closed: only an escrow with a non-zero
+    /// per-crank amount may be topped up — a `per_crank == 0`
+    /// escrow pays `0` forever, so a top-up would strand
+    /// lamports in an inert pool ([`EscrowError::InvalidKeeperBounty`],
+    /// code 357); a zero `additional` is the same error, the
+    /// pool untouched. The addition is `saturating_add`, so a
+    /// top-up past `u64::MAX` pins the pool at the ceiling
+    /// instead of wrapping. Only `keeper_bounty_pool` changes —
+    /// `keeper_bounty_per_crank`, `amount`, `released`, and
+    /// bounty already paid are untouched (the pool is AV-103
+    /// principal-external inflow, it never enters the amount
+    /// conservation identity). The new pool governs from the
+    /// next `crank_expired`: [`Escrow::keeper_bounty_payable`]
+    /// reads the live pool at payment time, so a topped-up pool
+    /// pays again at once, while a crank already settled keeps
+    /// the amount it settled under. Top-up moves lamports into
+    /// the vault (the Anchor instruction transfers them from
+    /// the funder), so no AV-36 reentrancy lock is needed at the
+    /// logic layer, which only rewrites the counter — the
+    /// `amend_keeper_bounty_per_crank` precedent. Emits
+    /// `KeeperBountyPoolToppedUp` on the event layer, with the
+    /// topped-up amount in the payout field. Orthogonal to
+    /// AV-124 (that is the bounty mechanism itself, this item
+    /// is its pool refill), to AV-266 (that is the per-crank
+    /// amount, this item is the pool balance — AV-266
+    /// explicitly does not top the pool up), to AV-48 (that is
+    /// `crank_expired` itself, this item is the bounty it pays
+    /// from), and to AV-103 (that is the appeal bond, this item
+    /// is the keeper-bounty pool).
+    pub fn top_up_keeper_bounty(
+        &mut self,
+        funder: [u8; 32],
+        additional: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        // The funder is permissionless (see the doc comment), so
+        // there is deliberately no authority check here.
+        let _ = funder;
+        self.require_not_paused()?;
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow with a live per-crank
+        // amount may be topped up — a zero per-crank escrow can
+        // never pay a bounty, so topping its pool up would strand
+        // lamports in an inert pool.
+        if self.keeper_bounty_per_crank == 0 {
+            return Err(EscrowError::InvalidKeeperBounty);
+        }
+        if additional == 0 {
+            return Err(EscrowError::InvalidKeeperBounty);
+        }
+        self.keeper_bounty_pool = self.keeper_bounty_pool.saturating_add(additional);
+        Ok(())
+    }
+
     /// Revise the flat slash deadline after funding (AV-267):
     /// the post-funding counterpart to the deadline leg of
     /// [`Escrow::with_slash_terms`] (`Uninitialized`-only initial
@@ -38030,6 +38104,23 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "lamports <- param; caller <- accounts.caller (signer) — permissionless: the initializer, the taker, the keeper bot or a stranger may all top up (the state machine takes the caller only as the event actor; no authority check); any state except Closed (InvalidStateTransition on a closed vault — there is no account left to keep rent-exempt); deliberately NOT pause-gated (pausing freezes fund movement, not operational hygiene) and no reentrancy guard (no escrow funds move, exactly one counter is touched); the state byte is untouched and the amount conservation identity is untouched — a top-up is pure lamport bookkeeping on the vault account; emits the RentToppedUp indexer event (from == to == the current state; the topped-up lamports ride the event's `rent_reclaimed` amount field); `at` <- clock sysvar on the Anchor layer (never an instruction param)",
         },
         InstructionSpec {
+            // AV-328: the permissionless keeper-bounty pool top-up.
+            // IDL: discriminator =
+            // sha256("global:top_up_keeper_bounty")[..8] =
+            // [107, 59, 235, 162, 146, 128, 59, 102] — the Anchor
+            // instruction discriminator for the
+            // top_up_keeper_bounty handler (pinned by the
+            // discriminator test below).
+            name: "top_up_keeper_bounty",
+            params: &[(
+                "additional",
+                "u64",
+                "instruction param; the lamports to add to the keeper-bounty pool — must be positive (InvalidKeeperBounty, code 357, on zero); saturating_adds into the vault's `keeper_bounty_pool` counter",
+            )],
+            method: "Escrow::top_up_keeper_bounty",
+            input_mapping: "additional <- param; funder <- accounts.funder (signer) — permissionless: the initializer, the taker, the keeper bot or a stranger may all top up (the state machine takes the funder only as the event actor; no authority check — topping up is a donation, nobody is harmed by it); Funded only (InvalidStateTransition otherwise) and pause-gated (Paused); only an escrow with a live per-crank amount may be topped up (InvalidKeeperBounty, code 357, on a zero per-crank amount — topping an inert pool would strand lamports); the real build transfers `additional` lamports from the funder's wallet into the vault account, so the pool counter and the vault balance move together; the state byte is untouched and the amount conservation identity is untouched — the pool is principal-external inflow (the AV-103 appeal-bond precedent); the next crank_expired pays min(per_crank, pool) from the live pool; emits the KeeperBountyPoolToppedUp indexer event (from == to == the current state; the topped-up amount rides the event's `payout` amount field); `at` <- clock sysvar on the Anchor layer (never an instruction param)",
+        },
+        InstructionSpec {
             // AV-111: the tranched-funding opt-in. IDL:
             // discriminator = sha256("global:initialize_funding_plan")[..8] =
             // [163, 209, 171, 116, 156, 37, 54, 133] — the Anchor
@@ -38761,6 +38852,11 @@ pub(crate) mod anchor_idl_tests {
             // vault's lamport balance in any non-Closed state; pure
             // counter bookkeeping, no state change.
             "Escrow::top_up_rent",
+            // AV-328: permissionless keeper-bounty pool top-up —
+            // anyone refills the pool on a Funded escrow with a
+            // live per-crank amount; pure counter bookkeeping
+            // (saturating add), no state change.
+            "Escrow::top_up_keeper_bounty",
             // AV-111: the tranched-funding pair — the opt-in builder
             // (Uninitialized only) and the per-tranche deposit.
             "Escrow::with_funding_plan",
@@ -39020,6 +39116,10 @@ pub(crate) mod anchor_idl_tests {
                 // (u64) — the only input besides the permissionless
                 // caller signer.
                 &"top_up_rent",
+                // AV-328: the keeper-bounty pool top-up carries the
+                // additional amount (u64) — the only input besides
+                // the permissionless funder signer.
+                &"top_up_keeper_bounty",
                 // AV-111: the funding-plan opt-in carries the target
                 // (u64) + the tranche budget (u8); each tranche
                 // carries its deposit amount (u64).
@@ -41139,6 +41239,11 @@ pub(crate) mod anchor_idl_tests {
         // into the `rent_topped_up_total` tail counter (any state but
         // Closed); the counter is zeroed by `initialize`.
         ("top_up_rent", "lamports", "rent_topped_up_total"),
+        // AV-328: the keeper-bounty pool top-up saturating-adds its
+        // `additional` param into the `keeper_bounty_pool` tail
+        // counter (Funded only, live per-crank amount); the counter
+        // is zeroed by `initialize` and debited by `crank_expired`.
+        ("top_up_keeper_bounty", "additional", "keeper_bounty_pool"),
         // AV-111: the funding-plan opt-in writes the `funding_plan`
         // tail region in place (Uninitialized only); each tranche
         // accumulates into the `funded_total` tail counter.
@@ -50497,6 +50602,26 @@ mod topup_rent_tests {
     }
 
     #[test]
+    fn top_up_keeper_bounty_instruction_spec_pinned() {
+        // The INSTRUCTIONS table carries the new instruction with the
+        // additional param, and the discriminator is pinned so a sha256
+        // regression is caught here, not on-chain.
+        let spec = crate::anchor_idl_tests::INSTRUCTIONS
+            .iter()
+            .find(|s| s.method == "Escrow::top_up_keeper_bounty")
+            .expect("INSTRUCTIONS covers top_up_keeper_bounty");
+        assert_eq!(spec.name, "top_up_keeper_bounty");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "additional");
+        assert_eq!(spec.params[0].1, "u64");
+        assert_eq!(
+            crate::discriminator::instruction_discriminator("top_up_keeper_bounty"),
+            [107, 59, 235, 162, 146, 128, 59, 102],
+            "sha256(\"global:top_up_keeper_bounty\")[..8]"
+        );
+    }
+
+    #[test]
     fn funding_instruction_specs_pinned() {
         // The INSTRUCTIONS table carries the tranched-funding pair,
         // and both discriminators are pinned so a sha256 regression
@@ -50989,7 +51114,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -68200,7 +68326,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -68442,9 +68569,10 @@ mod event_history_tests {
         // `BlindPanelRevealWindowAmended` (AV-319), 157 is
         // `EnglishAuctionBuyoutPriceAmended` (AV-320), 158 is
         // `FundingStartAmended` (AV-321), 159 is
-        // `EnglishAuctionSellerAmended` (AV-322) and 160 is the
+        // `EnglishAuctionSellerAmended` (AV-322), 160 is
+        // `KeeperBountyPoolToppedUp` (AV-328) and 161 is the
         // first still-unknown byte.
-        for bad in [160u8, 255] {
+        for bad in [161u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -79303,6 +79431,161 @@ mod amend_keeper_bounty_per_crank_tests {
             before + 1,
             "no-op emits nothing"
         );
+    }
+}
+
+// ---------- AV-328: top up the keeper-bounty pool after funding ----------
+mod top_up_keeper_bounty_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_750_000_000;
+
+    fn bounty_escrow(pool: u64, per_crank: u64) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_keeper_bounty(pool, per_crank)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn any_funder_may_top_up_and_only_the_pool_moves() {
+        // Permissionless: a stranger funds the pool — the
+        // funder is a donor, never a gate.
+        let mut e = bounty_escrow(50_000, 10_000);
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.top_up_keeper_bounty(MALLORY, 30_000).unwrap();
+        assert_eq!(e.keeper_bounty_pool(), 80_000);
+        assert_eq!(e.keeper_bounty_per_crank(), 10_000);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "pool region rewritten in place, no layout change"
+        );
+        // Either party may top up too.
+        e.top_up_keeper_bounty(ALICE, 5_000).unwrap();
+        assert_eq!(e.keeper_bounty_pool(), 85_000);
+        e.top_up_keeper_bounty(BOB, 5_000).unwrap();
+        assert_eq!(e.keeper_bounty_pool(), 90_000);
+    }
+
+    #[test]
+    fn top_up_raises_payable_and_next_crank_pays_from_new_pool() {
+        // An exhausted pool pays zero; the top-up revives the
+        // bounty at once, and the next crank pays from the new
+        // pool.
+        let mut e = bounty_escrow(0, 10_000);
+        assert_eq!(e.keeper_bounty_payable(), 0);
+        e.top_up_keeper_bounty(MALLORY, 25_000).unwrap();
+        assert_eq!(e.keeper_bounty_payable(), 10_000);
+        let (_, _, _, bounty) = e.crank_expired(MALLORY, EXPIRES_AT + 1, None).unwrap();
+        assert_eq!(bounty, 10_000, "the crank pays the per-crank amount");
+        assert_eq!(e.keeper_bounty_pool(), 15_000, "pool debited by exactly the payout");
+        // A partially-drained pool tops up the same way.
+        let mut e = bounty_escrow(50_000, 10_000);
+        let (_, _, _, bounty) = e.crank_expired(MALLORY, EXPIRES_AT + 1, None).unwrap();
+        assert_eq!(bounty, 10_000);
+        assert_eq!(e.keeper_bounty_pool(), 40_000);
+        // (Cranked escrows are terminal, so the second top-up
+        // below runs on a fresh escrow.)
+        let mut e = bounty_escrow(7_000, 10_000);
+        e.top_up_keeper_bounty(MALLORY, 100_000).unwrap();
+        assert_eq!(e.keeper_bounty_payable(), 10_000, "min(per_crank, pool) caps at per_crank");
+        let (_, _, _, bounty) = e.crank_expired(MALLORY, EXPIRES_AT + 1, None).unwrap();
+        assert_eq!(bounty, 10_000);
+        assert_eq!(e.keeper_bounty_pool(), 97_000);
+    }
+
+    #[test]
+    fn top_up_saturates_at_u64_max() {
+        let mut e = bounty_escrow(u64::MAX - 5, 10_000);
+        e.top_up_keeper_bounty(MALLORY, 100).unwrap();
+        assert_eq!(e.keeper_bounty_pool(), u64::MAX, "saturating, never wraps");
+        assert_eq!(e.keeper_bounty_per_crank(), 10_000);
+    }
+
+    #[test]
+    fn top_up_rejects_zero_amount_and_unconfigured_and_non_funded_and_paused() {
+        // Zero additional is refused and the pool does not move.
+        let mut e = bounty_escrow(50_000, 10_000);
+        assert_eq!(
+            e.top_up_keeper_bounty(MALLORY, 0),
+            Err(EscrowError::InvalidKeeperBounty)
+        );
+        assert_eq!(e.keeper_bounty_pool(), 50_000);
+        assert_eq!(EscrowError::InvalidKeeperBounty.code(), 357);
+        // Fail-closed: a never-configured escrow can never
+        // acquire a bounty pool after funding.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            plain.top_up_keeper_bounty(MALLORY, 10_000),
+            Err(EscrowError::InvalidKeeperBounty)
+        );
+        assert_eq!(plain.keeper_bounty_pool(), 0);
+        // A pool with a deliberately-zero per-crank amount is the
+        // same shape: payouts disabled at setup means the pool
+        // is inert, so topping it up would strand lamports.
+        let mut disabled = bounty_escrow(50_000, 0);
+        assert_eq!(
+            disabled.top_up_keeper_bounty(MALLORY, 10_000),
+            Err(EscrowError::InvalidKeeperBounty)
+        );
+        assert_eq!(disabled.keeper_bounty_pool(), 50_000);
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_keeper_bounty(50_000, 10_000)
+            .unwrap();
+        assert_eq!(
+            bare.top_up_keeper_bounty(MALLORY, 10_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.keeper_bounty_pool(), 50_000);
+        // The pause guard fires before the state and bounty
+        // gates: even a stranger's top-up on a paused escrow is
+        // `Paused`.
+        let mut paused = bounty_escrow(50_000, 10_000);
+        paused.pause([0xDD; 32], None).unwrap();
+        assert_eq!(
+            paused.top_up_keeper_bounty(MALLORY, 10_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.keeper_bounty_pool(), 50_000);
+    }
+
+    #[test]
+    fn top_up_keeper_bounty_indexed_emits_event_and_failed_emits_nothing() {
+        use crate::events::IndexedEscrow;
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], NOW)
+            .unwrap()
+            .with_keeper_bounty(50_000, 10_000)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.top_up_keeper_bounty(MALLORY, 0, NOW),
+            Err(EscrowError::InvalidKeeperBounty)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.top_up_keeper_bounty(MALLORY, 30_000, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::KeeperBountyPoolToppedUp);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 30_000, "the top-up rides the payout field");
+        assert_eq!(ev.amounts.fee, 0);
+        assert_eq!(ev.amounts.refund, 0);
+        assert_eq!(e.inner().keeper_bounty_pool(), 80_000);
     }
 }
 

@@ -128,6 +128,10 @@ pub const INSTRUCTION_CU_TABLE: &[(&str, u64, usize)] = &[
     // write that moves no escrow funds — cheaper than the
     // fund-moving unwinds, ranked with the cheap config writes.
     ("top_up_rent", 8_000, 16),
+    // AV-328: additional:u64 → 8 + 8; a permissionless single-counter
+    // write (saturating pool add) — the lamport transfer itself is
+    // a plain system transfer, so it ranks with top_up_rent.
+    ("top_up_keeper_bounty", 8_000, 16),
     // AV-111: tranche_amount:u64 → 8 + 8; a deposit inflow with the
     // full guard chain (pause, reentrancy, FUND-scoped authority,
     // plan presence, state, tranche budget, overfund cap) plus
@@ -411,6 +415,7 @@ mod cu_estimate_tests {
             ("pool_payout", 18_000),
             ("claim_deadman", 10_000),
             ("top_up_rent", 8_000),
+            ("top_up_keeper_bounty", 8_000),
             ("fund_tranche", 12_000),
             ("initialize_release_cooling", 8_000),
             ("announce_release", 8_000),

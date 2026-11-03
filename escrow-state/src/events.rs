@@ -371,6 +371,18 @@
 //!   amount it settled under. A failed revision emits nothing,
 //!   and a no-op re-affirmation of the current amount emits
 //!   nothing either.
+//! - `top_up_keeper_bounty` emits
+//!   [`EscrowEventKind::KeeperBountyPoolToppedUp`] on every
+//!   successful top-up (AV-328) — `from == to ==` the current
+//!   state, the topped-up amount rides `payout` (the AV-124
+//!   `KeeperBountyPaid` precedent); only the pool moves, so
+//!   `per_crank`, `amount`, `released`, and bounty already paid
+//!   are untouched, and the next `crank_expired` pays
+//!   `min(per_crank, pool)` from the live pool, while a crank
+//!   already settled keeps the amount it settled under. A failed
+//!   top-up emits nothing, and there is no no-op case — a zero
+//!   top-up is rejected by the state machine, so a successful
+//!   call always emits.
 //! - `amend_slash_deadline` emits
 //!   [`EscrowEventKind::SlashDeadlineAmended`] on every
 //!   successful revision that actually changes the deadline
@@ -984,6 +996,7 @@
 //! | EnglishAuctionBuyoutPriceAmended (AV-320) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a buyout already settled; only `buyout_price` moves, so the seller, the reserve, the minimum increment, the windows, anti-sniping, `highest_bid`, `bid_count`, and state are untouched, and the next `place_bid` reads the live price — a bid at or above the new price settles immediately at exactly it while a bid under it is an ordinary bid |
 //! | FundingStartAmended (AV-321) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a funding already made; only `funding_start` moves, so `expires_at`, `funded_total`, `amount`, and state are untouched, and the next `fund` / `fund_with_slot` reads the live window — an early funding under the new window is refused at once while a funding at or after it succeeds |
 //! | EnglishAuctionSellerAmended (AV-322) | 0 | 0 | 0 | 0 — rotating moves no funds and never restates a bid already placed; only `seller` moves, so `reserve_price`, `min_increment`, the windows, anti-sniping, `buyout_price`, `highest_bid`, `bid_count`, and state are untouched, and the next `amend_*` / `cancel` / settle reads the live seller — the old seller is refused at once while the new seller governs |
+//! | KeeperBountyPoolToppedUp (AV-328) | the topped-up amount (`additional`) | 0 | 0 | 0 — topping up moves lamports into the pool from outside the principal (the AV-103 appeal-bond precedent), so the fold books nothing and the amount conservation identity is untouched; only `keeper_bounty_pool` moves, so `per_crank`, `amount`, `released`, and bounty already paid are untouched, and the next `crank_expired` pays `min(per_crank, pool)` from the live pool while a crank already settled keeps the amount it settled under |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2801,6 +2814,26 @@ pub enum EscrowEventKind {
     /// event needs no extra field. A no-op re-affirmation of the
     /// current seller emits nothing.
     EnglishAuctionSellerAmended,
+    /// AV-328: the keeper-bounty pool was topped up by a
+    /// permissionless funder
+    /// ([`Escrow::top_up_keeper_bounty`](crate::Escrow::top_up_keeper_bounty)).
+    /// `from == to ==` the current state (a pool refill, not a
+    /// lifecycle move — like
+    /// [`EscrowEventKind::RentToppedUp`]); the topped-up amount
+    /// rides `payout` (the AV-124 `KeeperBountyPaid` precedent —
+    /// the funder is neither party, so it is neither a taker
+    /// payout nor an initializer refund, and the direction is
+    /// read from the event kind). Only `keeper_bounty_pool`
+    /// moves, so `per_crank`, `amount`, `released`, and bounty
+    /// already paid are untouched, and the next
+    /// [`Escrow::crank_expired`](crate::Escrow::crank_expired)
+    /// pays `min(per_crank, pool)` from the live pool, while a
+    /// crank already settled keeps the amount it settled under,
+    /// the crank being terminal. The new pool balance is read
+    /// from the vault, so the event needs no extra field. There
+    /// is no no-op case: a zero top-up is rejected by the state
+    /// machine, so a successful call always emits.
+    KeeperBountyPoolToppedUp,
 }
 
 impl EscrowEventKind {
@@ -3308,6 +3341,10 @@ impl EscrowEventKind {
             // discriminants 0–158 stay stable for already-serialized
             // histories.
             159 => Self::EnglishAuctionSellerAmended,
+            // AV-328: appended after EnglishAuctionSellerAmended so
+            // discriminants 0–159 stay stable for already-serialized
+            // histories.
+            160 => Self::KeeperBountyPoolToppedUp,
             _ => return None,
         })
     }
@@ -3513,6 +3550,7 @@ impl EscrowEventKind {
             Self::CredentialIssuerRotated => "credential_issuer_rotated",
             Self::DeadmanInactivityAmended => "deadman_inactivity_amended",
             Self::KeeperBountyPerCrankAmended => "keeper_bounty_per_crank_amended",
+            Self::KeeperBountyPoolToppedUp => "keeper_bounty_pool_topped_up",
             Self::SlashDeadlineAmended => "slash_deadline_amended",
             Self::AmountBoundsAmended => "amount_bounds_amended",
             Self::MilestoneLatePenaltyBpsAmended => "milestone_late_penalty_bps_amended",
@@ -3752,6 +3790,7 @@ impl EscrowEventKind {
             "credential_issuer_rotated" => Self::CredentialIssuerRotated,
             "deadman_inactivity_amended" => Self::DeadmanInactivityAmended,
             "keeper_bounty_per_crank_amended" => Self::KeeperBountyPerCrankAmended,
+            "keeper_bounty_pool_topped_up" => Self::KeeperBountyPoolToppedUp,
             "slash_deadline_amended" => Self::SlashDeadlineAmended,
             "amount_bounds_amended" => Self::AmountBoundsAmended,
             "milestone_late_penalty_bps_amended" => Self::MilestoneLatePenaltyBpsAmended,
@@ -10398,6 +10437,46 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Top up the keeper-bounty pool after funding (mirrors
+    /// [`Escrow::top_up_keeper_bounty`]). Emits
+    /// `KeeperBountyPoolToppedUp` with `from == to ==` the
+    /// current state (a pool refill, not a lifecycle move — like
+    /// `RentToppedUp`); the topped-up amount rides `payout`
+    /// (the AV-124 `KeeperBountyPaid` precedent — the funder is
+    /// neither party, so it is neither a taker payout nor an
+    /// initializer refund, and the direction is read from the
+    /// event kind). Only the pool moves, so the next
+    /// `crank_expired` pays `min(per_crank, pool)` from the live
+    /// pool, while a crank already settled keeps the amount it
+    /// settled under. The new pool balance is read from the
+    /// vault, so the event needs no extra field beyond the
+    /// amount. A failed top-up emits nothing, and there is no
+    /// no-op case: a zero top-up is rejected by the state
+    /// machine, so a successful call always emits. The funder
+    /// is the permissionless caller — the event's actor.
+    pub fn top_up_keeper_bounty(
+        &mut self,
+        funder: [u8; 32],
+        additional: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        self.inner.top_up_keeper_bounty(funder, additional)?;
+        self.push_event(
+            EscrowEventKind::KeeperBountyPoolToppedUp,
+            from,
+            self.inner.state(),
+            EventAmounts::keeper_bounty(additional),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(funder),
+        );
+        Ok(())
+    }
+
     /// Revise the flat slash deadline after funding (mirrors
     /// [`Escrow::amend_slash_deadline`]). Emits
     /// `SlashDeadlineAmended` when the deadline actually changes
@@ -15525,7 +15604,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -15673,7 +15753,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -16255,7 +16336,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -16315,7 +16397,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -16372,7 +16455,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -16429,7 +16513,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -16486,7 +16571,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -16546,7 +16632,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -16606,7 +16693,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -16663,7 +16751,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -16720,7 +16809,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -16777,7 +16867,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -16834,7 +16925,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -16891,7 +16983,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -16948,7 +17041,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -17009,7 +17103,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -17069,7 +17164,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -17129,7 +17225,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -17189,7 +17286,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -17249,7 +17347,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -17310,7 +17409,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -17371,7 +17471,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -17432,7 +17533,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -17492,7 +17594,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]
@@ -17569,7 +17672,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(157), Some(EscrowEventKind::EnglishAuctionBuyoutPriceAmended)); // AV-320: 157 is EnglishAuctionBuyoutPriceAmended
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
-        assert_eq!(EscrowEventKind::from_discriminant(160), None); // AV-322: 159 is EnglishAuctionSellerAmended
+        assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
     }
 
     #[test]

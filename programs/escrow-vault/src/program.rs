@@ -1978,6 +1978,61 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Top up the keeper-bounty pool after funding (AV-328;
+    /// mirrors `Escrow::top_up_keeper_bounty`). ANY signer may
+    /// top the pool up — the funder is a donor, so no
+    /// counterparty signature is required and the state machine
+    /// runs no authority check; the funder's key is recorded
+    /// only as the event actor. `Funded`-only, pause-gated, and
+    /// only an escrow with a live per-crank amount may be topped
+    /// up (`InvalidKeeperBounty`, code 357, on a zero per-crank
+    /// amount or a zero `additional` — the pool would be inert
+    /// or the call a no-op). The real build transfers
+    /// `additional` lamports from the funder's wallet into the
+    /// vault account, so the pool counter and the vault balance
+    /// move together — the state machine alone never mints
+    /// bounty funds. The top-up settles the pool counter in
+    /// place (`saturating_add`, so a top-up past `u64::MAX`
+    /// pins the pool at the ceiling); the next `crank_expired`
+    /// pays `min(per_crank, pool)` from the live pool. Emits
+    /// `KeeperBountyPoolToppedUp` with the topped-up amount in
+    /// the payout leg, mirroring
+    /// `IndexedEscrow::top_up_keeper_bounty`.
+    pub fn top_up_keeper_bounty(
+        ctx: Context<TopUpKeeperBounty>,
+        additional: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let from = escrow.state() as u8;
+        escrow
+            .top_up_keeper_bounty(ctx.accounts.funder.key().to_bytes(), additional)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // AV-18: `now` doubles as the event's `at`; the topped-up
+        // amount rides the payout leg (the AV-124
+        // `KeeperBountyPaid` precedent — the funder is neither
+        // party, so it is neither a taker payout nor an
+        // initializer refund, and the direction is read from the
+        // event kind). `caller` is the topping-up key.
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::KeeperBountyPoolToppedUp,
+            from,
+            escrow.state() as u8,
+            additional,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(ctx.accounts.funder.key()),
+        );
+        Ok(())
+    }
+
     /// Opt in to tranched funding (AV-111; mirrors
     /// `Escrow::with_funding_plan`). `Uninitialized` only, like the
     /// other `initialize_*` opt-ins: the funding schedule is fixed
@@ -9081,6 +9136,22 @@ pub struct TopUpRent<'info> {
     /// real build transfers `lamports` from this key's wallet into
     /// the vault account.
     pub caller: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the event's `at`
+    /// (never an instruction param).
+    pub clock: AccountInfo<'info>,
+}
+
+/// AV-328: accounts for `top_up_keeper_bounty` — any signer
+/// tops the keeper-bounty pool up.
+#[derive(Accounts)]
+pub struct TopUpKeeperBounty<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The topping-up funder — permissionless, so any signer works;
+    /// the state machine records it only as the event actor. The
+    /// real build transfers `additional` lamports from this key's
+    /// wallet into the vault account.
+    pub funder: Signer<'info>,
     /// CHECK: Solana clock sysvar, read for the event's `at`
     /// (never an instruction param).
     pub clock: AccountInfo<'info>,
