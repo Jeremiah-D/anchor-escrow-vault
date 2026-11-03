@@ -649,6 +649,108 @@ impl RentalEscrow {
         Ok(())
     }
 
+    /// Shorten the term end on an `Active` rental (AV-331 —
+    /// Solana rental governance): both parties authorize the change
+    /// (the term is a bilateral use-right window — a unilateral
+    /// cut would let one side pull the other's custody or use
+    /// alone). Check order is authority → state → window → value,
+    /// mirroring AV-292's `extend_term_end`, so a stranger learns
+    /// nothing about the rental's state from the error alone.
+    ///
+    /// Why: the end is fixed at construction
+    /// ([`RentalEscrow::new`]) and [`RentalEscrow::extend_term_end`]
+    /// only ever moves it later, so a term that needs to end early
+    /// — the renter hands the asset back ahead of schedule, the
+    /// owner reclaims it, or the parties renegotiate a shorter
+    /// lease — would force a fresh rental (and a fresh custody
+    /// transfer) for a legitimate early close. Only an `Active`
+    /// rental may shorten, and the new end must still lie in the
+    /// future-or-now and strictly inside the current window:
+    /// `term_start_slot < new_end_slot < term_end_slot` with
+    /// `current_slot <= new_end_slot`.
+    ///
+    /// The window gate is the mirror of AV-292's "already overdue,
+    /// no extension": shortening must not retroactively manufacture
+    /// overdue time. A new end behind `current_slot` would turn use
+    /// already consumed under the old window into overdue days at a
+    /// stroke — the fee has already been accruing against the old
+    /// window, so the cut would conjure overdue days out of use
+    /// that was in term when it happened — hence
+    /// `current_slot > new_end_slot` fails closed with
+    /// [`EscrowError::InvalidRentalTerms`] (code 268). The boundary
+    /// is inclusive, matching [`RentalEscrow::is_in_term`]: a new
+    /// end exactly at `current_slot` is still in term, so the
+    /// rental stays live and the cut is allowed. Growing the window
+    /// is [`RentalEscrow::extend_term_end`]'s job, so a new end at
+    /// or past the current end fails closed with code 268 too — an
+    /// equal-value call is not a re-affirmation but an invalid
+    /// shortening — and a new end at or before the term start
+    /// reuses the [`RentalEscrow::new`] empty-term gate (code 268),
+    /// leaving the current end untouched, because the new value is
+    /// validated before any write.
+    ///
+    /// Only `term_end_slot` changes — the rent amount is not
+    /// repriced (the same total rent covers the shorter window,
+    /// confirmed by both signatures), and the owner, renter, asset,
+    /// term start, `slots_per_day`, late fee, and state are
+    /// untouched — and [`RentalEscrow::is_in_term`],
+    /// [`RentalEscrow::is_overdue`], [`RentalEscrow::late_fee_due`],
+    /// and [`RentalEscrow::return_asset`] read the live window, so
+    /// the new window governs from the revision: a return past the
+    /// new end is overdue and priced against the live late-fee
+    /// terms, while a rental still at or before the new end stays
+    /// in term and does not turn overdue on the spot; a return
+    /// already executed is unaffected. There is no event layer on
+    /// `RentalEscrow`, so no event is emitted for the shortening.
+    /// No new error code: the refusals reuse `Unauthorized` (100),
+    /// `RentalNotActive` (269), and `InvalidRentalTerms` (268).
+    /// Orthogonal to [`RentalEscrow::new`] (that installs the window
+    /// at build time, this shortens it while `Active`), to AV-190
+    /// (that is the rental mechanism itself, this is its window
+    /// revision), to AV-291 (that revises the late-fee terms, this
+    /// revises the term window), to AV-292 (that only extends
+    /// `term_end_slot`, this only shortens it — the opposite
+    /// direction on the same field, each an independent method and
+    /// mutually exclusive per call), to AV-314 (that revises the
+    /// rent, this revises the window), to AV-329 (that revises the
+    /// pace, this revises the window), and to AV-330 (that moves
+    /// the term start, this moves the term end).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller pair that is not exactly owner + renter,
+    /// ([`EscrowError::RentalNotActive`], code 269) once the rental
+    /// is in a terminal state, and
+    /// ([`EscrowError::InvalidRentalTerms`], code 268) when
+    /// `current_slot` is already past the new end, when the new end
+    /// is at or past the current term end, or when the new end is
+    /// at or before the term start — either way the current window
+    /// is untouched.
+    pub fn shorten_term_end(
+        &mut self,
+        owner: [u8; 32],
+        renter: [u8; 32],
+        new_end_slot: u64,
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if owner != self.owner || renter != self.renter {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != RentalState::Active {
+            return Err(EscrowError::RentalNotActive);
+        }
+        if current_slot > new_end_slot {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        if new_end_slot >= self.term_end_slot {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        if new_end_slot <= self.term_start_slot {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        self.term_end_slot = new_end_slot;
+        Ok(())
+    }
+
     /// Audit-event JSON for a return (hand-written):
     /// `{"event":"rental_returned","asset":"<64hex>","late_fee":<u64>,
     /// "overdue_days":<u64>,"late":<bool>}`.
@@ -1749,6 +1851,181 @@ mod rental_escrow_tests {
             .unwrap_err();
         assert_eq!(err, EscrowError::InvalidRentalTerms);
         assert_eq!(r3.rent_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn shorten_term_end_moves_the_live_window() {
+        // AV-331: dual-signed shortening re-judges term and overdue
+        // against the new end, and reprices nothing else.
+        let mut r = open_rental();
+        // Under the old window slot 160 is in term; past the new
+        // end it is 10 slots overdue — a partial day still counts
+        // as a full day, so the fee is 10_000.
+        assert!(r.is_in_term(160));
+        assert!(!r.is_overdue(160));
+        r.shorten_term_end(key(0xAA), key(0xBB), 150, 120).unwrap();
+        assert_eq!(r.term_end_slot(), 150);
+        assert!(r.is_in_term(140));
+        assert!(!r.is_in_term(160));
+        assert!(r.is_overdue(160));
+        assert_eq!(r.late_fee_due(160), 10_000);
+        // 100 slots past the new end is exactly 1 day: 10_000.
+        assert_eq!(r.late_fee_due(250), 10_000);
+        // Nothing else moved.
+        assert_eq!(r.owner(), key(0xAA));
+        assert_eq!(r.renter(), key(0xBB));
+        assert_eq!(r.asset_id(), key(0xCC));
+        assert_eq!(r.rent_amount(), 1_000_000);
+        assert_eq!(r.term_start_slot(), 100);
+        assert_eq!(r.slots_per_day(), 100);
+        assert_eq!(r.state(), RentalState::Active);
+        assert_eq!(r.late_fee(), terms());
+        // The shortened window governs the return settlement: a
+        // return inside the new window is still clean.
+        let receipt = r.return_asset(140).unwrap();
+        assert_eq!(receipt.late_fee_due, 0);
+        assert!(!receipt.was_overdue);
+        assert_eq!(r.state(), RentalState::Returned);
+    }
+
+    #[test]
+    fn shorten_term_end_governs_later_overdue_returns() {
+        // AV-331: past the new end, overdue is priced against the
+        // new window, not the old one.
+        let mut r = open_rental();
+        r.shorten_term_end(key(0xAA), key(0xBB), 150, 120).unwrap();
+        let receipt = r.return_asset(250).unwrap();
+        assert!(receipt.was_overdue);
+        assert_eq!(receipt.overdue_slots, 100);
+        assert_eq!(receipt.overdue_days, 1);
+        assert_eq!(receipt.late_fee_due, 10_000);
+        assert_eq!(r.state(), RentalState::ReturnedLate);
+    }
+
+    #[test]
+    fn shorten_term_end_rejects_grow_and_equal() {
+        // AV-331: shortening only — a longer or equal window is an
+        // invalid shortening, not a re-affirmation, and the current
+        // window is untouched.
+        let mut r = open_rental();
+        let err = r.shorten_term_end(key(0xAA), key(0xBB), 250, 150).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.term_end_slot(), 200);
+        let err = r.shorten_term_end(key(0xAA), key(0xBB), 200, 150).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.term_end_slot(), 200);
+        // The boundary the other way is legal: one slot short of
+        // the end.
+        r.shorten_term_end(key(0xAA), key(0xBB), 199, 150).unwrap();
+        assert_eq!(r.term_end_slot(), 199);
+    }
+
+    #[test]
+    fn shorten_term_end_rejects_already_past_new_end() {
+        // AV-331: shortening must not retroactively manufacture
+        // overdue time — a new end behind the current slot would
+        // turn use already consumed in term into overdue days.
+        let mut r = open_rental();
+        let err = r.shorten_term_end(key(0xAA), key(0xBB), 150, 151).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.term_end_slot(), 200);
+        // The end is inclusive: shortening exactly to the current
+        // slot is still in term, not overdue.
+        let mut r2 = open_rental();
+        r2.shorten_term_end(key(0xAA), key(0xBB), 150, 150).unwrap();
+        assert_eq!(r2.term_end_slot(), 150);
+        assert!(r2.is_in_term(150));
+        assert!(!r2.is_overdue(150));
+        assert_eq!(r2.late_fee_due(150), 0);
+        // Shortening before the term even starts is allowed — the
+        // only window gate is "not yet past the new end".
+        let mut r3 = open_rental();
+        r3.shorten_term_end(key(0xAA), key(0xBB), 150, 50).unwrap();
+        assert_eq!(r3.term_end_slot(), 150);
+    }
+
+    #[test]
+    fn shorten_term_end_rejects_empty_term() {
+        // AV-331: the new end reuses the construction empty-term
+        // gate — at or before the term start is not a term at all.
+        let mut r = open_rental();
+        let err = r.shorten_term_end(key(0xAA), key(0xBB), 100, 50).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.term_end_slot(), 200);
+        let err = r.shorten_term_end(key(0xAA), key(0xBB), 90, 50).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.term_end_slot(), 200);
+    }
+
+    #[test]
+    fn shorten_term_end_is_dual_signed_and_active_only() {
+        // AV-331: a stranger, or either party alone, is refused and
+        // the window is untouched.
+        let mut r = open_rental();
+        let err = r.shorten_term_end(key(9), key(0xBB), 150, 120).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = r.shorten_term_end(key(0xAA), key(9), 150, 120).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(r.term_end_slot(), 200);
+        // Authority is checked before state: a stranger on a
+        // terminal rental still gets Unauthorized.
+        let mut r2 = open_rental();
+        r2.return_asset(150).unwrap();
+        let err = r2.shorten_term_end(key(9), key(0xBB), 150, 120).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        // The parties on a terminal rental get RentalNotActive.
+        let err = r2.shorten_term_end(key(0xAA), key(0xBB), 150, 120).unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(err.code(), 269);
+        let mut r3 = open_rental();
+        r3.cancel(key(0xAA), 50).unwrap();
+        let err = r3.shorten_term_end(key(0xAA), key(0xBB), 150, 50).unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(r3.term_end_slot(), 200);
+    }
+
+    #[test]
+    fn shorten_then_extend_term_end_works_on_the_live_value() {
+        // AV-331 cross-effect: AV-292's extend_term_end reads the
+        // live end, so a shortened window can be extended again —
+        // the two directions are independent methods on the same
+        // field, mutually exclusive per call.
+        let mut r = open_rental();
+        r.shorten_term_end(key(0xAA), key(0xBB), 150, 120).unwrap();
+        assert_eq!(r.term_end_slot(), 150);
+        // Extending back past the shortened end works.
+        r.extend_term_end(key(0xAA), key(0xBB), 300, 120).unwrap();
+        assert_eq!(r.term_end_slot(), 300);
+        assert!(r.is_in_term(250));
+        assert_eq!(r.late_fee_due(250), 0);
+        // ...but extending to the shortened end itself is still an
+        // invalid extension — the equal-value gate reads the live
+        // value, not the original one.
+        let mut r2 = open_rental();
+        r2.shorten_term_end(key(0xAA), key(0xBB), 150, 120).unwrap();
+        let err = r2.extend_term_end(key(0xAA), key(0xBB), 150, 120).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r2.term_end_slot(), 150);
+    }
+
+    #[test]
+    fn shorten_term_end_leaves_pre_start_revision_windows_untouched() {
+        // AV-331 cross-effect: AV-314's rent revision and AV-329's
+        // pace revision gate on the *live start*, which shortening
+        // never moves — so their pre-start windows are unaffected
+        // by a shortened end.
+        let mut r = open_rental();
+        r.shorten_term_end(key(0xAA), key(0xBB), 150, 50).unwrap();
+        assert_eq!(r.term_end_slot(), 150);
+        r.amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 50)
+            .unwrap();
+        assert_eq!(r.rent_amount(), 2_000_000);
+        r.amend_slots_per_day(key(0xAA), key(0xBB), 200, 50)
+            .unwrap();
+        assert_eq!(r.slots_per_day(), 200);
+        assert_eq!(r.term_end_slot(), 150);
     }
 
     #[test]

@@ -1783,8 +1783,8 @@ program error per variant):
 | `EnglishAuctionNotLive` | 265 | `EnglishAuction::place_bid` (AV-189) outside the live window (`current_slot >= end_slot`, strict end) or on a terminal auction |
 | `EnglishAuctionSettleTooEarly` | 266 | `EnglishAuction::settle` (AV-189) at `current_slot < end_slot` — the bidding window has not closed |
 | `EnglishAuctionNotCancellable` | 267 | `EnglishAuction::cancel` (AV-189) after a bid landed, on a terminal auction, or after the window lapsed |
-| `InvalidRentalTerms` | 268 | `RentalEscrow::new` (AV-190) with a zero owner/renter key, owner == renter, a zero rent amount, `term_end_slot <= term_start_slot`, a zero `slots_per_day`, or a late-fee rate/cap above 10_000 bps |
-| `RentalNotActive` | 269 | `RentalEscrow::return_asset` (AV-190) on a rental already in a terminal state |
+| `InvalidRentalTerms` | 268 | `RentalEscrow::new` (AV-190) with a zero owner/renter key, owner == renter, a zero rent amount, `term_end_slot <= term_start_slot`, a zero `slots_per_day`, or a late-fee rate/cap above 10_000 bps; also `extend_term_end` (AV-292) on an already-overdue rental or with `new_end_slot <= term_end_slot`, `shorten_term_end` (AV-331) with `current_slot > new_end_slot`, `new_end_slot >= term_end_slot`, or `new_end_slot <= term_start_slot`, `amend_rent_amount` (AV-314) with a zero rent, `amend_slots_per_day` (AV-329) with a zero pace, and `amend_term_start_slot` (AV-330) once the term has started or with the new start at/before `current_slot` or at/past `term_end_slot` |
+| `RentalNotActive` | 269 | `RentalEscrow::return_asset` (AV-190) on a rental already in a terminal state; also `extend_term_end` (AV-292), `amend_rent_amount` (AV-314), `amend_slots_per_day` (AV-329), `amend_term_start_slot` (AV-330), and `shorten_term_end` (AV-331) on a terminal rental |
 | `RentalCancelNotAllowed` | 270 | `RentalEscrow::cancel` (AV-190) after `term_start_slot` or on a terminal rental |
 | `InvalidSealedBid` | 272 | `SealedBidAuction::new` (AV-192) with a zero seller key, `commit_start_slot >= reveal_start_slot`, or `reveal_start_slot >= end_slot`; also `commit_bid` with a zero bidder key or zero commitment; also `amend_sealed_bid_reveal_start_slot` (AV-303) outside the `new()` window or at/before `current_slot`; also `amend_sealed_bid_commit_start_slot` (AV-304) outside the `new()` window or at/before `current_slot`; also `amend_sealed_bid_end_slot` (AV-305) at/before `reveal_start_slot`; also `amend_sealed_bid_seller` (AV-323) with a zero new seller |
 | `SealedBidNotLive` | 273 | Sealed-bid commit/reveal (AV-192) outside its phase or on a terminal auction; also `amend_sealed_bid_min_bid` (AV-302) and `amend_sealed_bid_reveal_start_slot` (AV-303) once the reveal has started or on a terminal auction; also `amend_sealed_bid_commit_start_slot` (AV-304) once the commit window has opened or on a terminal auction; also `amend_sealed_bid_end_slot` (AV-305) once the reveal has started or on a terminal auction; also `amend_sealed_bid_seller` (AV-323) once the first commitment has landed or on a terminal auction |
@@ -7998,6 +7998,34 @@ expires, custody returns to the owner automatically.
   cancellation and pre-start revision windows) while advancing it
   pulls the term forward (and narrows them); `late_fee_due` /
   `return_asset` only read the term end and are unaffected. No event
+  is emitted — `RentalEscrow` has no event layer — and no new error
+  code: the refusals reuse `Unauthorized` (100), `RentalNotActive`
+  (269), and `InvalidRentalTerms` (268).
+- **Shortening the term (AV-331)**: `shorten_term_end` moves the
+  term end earlier on an `Active` rental, authorized by owner +
+  renter together — the term is a bilateral use-right window, so a
+  unilateral cut would let one side pull the other's custody or use
+  alone. The mirror of AV-292's extension: shortening only, never
+  growth — the new end must lie strictly inside the current window
+  (`term_start_slot < new_end_slot < term_end_slot`) and still be in
+  the future-or-now (`current_slot <= new_end_slot`); a new end at
+  or past the current end is an invalid shortening (an equal-value
+  call is not a re-affirmation), and a new end at or before the
+  term start reuses the construction empty-term gate (both refusals
+  are `InvalidRentalTerms`, code 268, with the window untouched).
+  The window gate is AV-292's "already overdue, no extension" in
+  reverse: a new end behind `current_slot` would retroactively turn
+  use already consumed in term into overdue days, so it fails
+  closed with code 268 — while the boundary is inclusive, matching
+  `is_in_term`: a new end exactly at `current_slot` is still in
+  term, so the rental stays live and the cut is allowed. Only
+  `term_end_slot` changes — the rent amount is not repriced, since
+  the same total rent covers the shorter window — and `is_in_term`
+  / `is_overdue` / `late_fee_due` / `return_asset` read the live
+  window, so a return past the new end is overdue and priced
+  against the live late-fee terms, while a rental still at or
+  before the new end stays in term and does not turn overdue on
+  the spot; a return already executed is never restated. No event
   is emitted — `RentalEscrow` has no event layer — and no new error
   code: the refusals reuse `Unauthorized` (100), `RentalNotActive`
   (269), and `InvalidRentalTerms` (268).
