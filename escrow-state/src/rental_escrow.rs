@@ -556,6 +556,99 @@ impl RentalEscrow {
         Ok(())
     }
 
+    /// Revise the term start slot on an `Active` rental (AV-330 —
+    /// Solana rental governance): both parties authorize the change
+    /// (the term window is a bilateral use-right window — a
+    /// unilateral shift would let one side move the other's custody
+    /// or use alone). Check order is authority → state → window →
+    /// value, mirroring AV-314's `amend_rent_amount`, so a stranger
+    /// learns nothing about the rental's state from the error alone.
+    ///
+    /// Why: the start is fixed at construction
+    /// ([`RentalEscrow::new`]), but the parties may agree to move
+    /// the term — a start that cannot be revised would force a fresh
+    /// rental (and a fresh custody transfer) for a legitimate
+    /// reschedule. Only an `Active` rental may revise, and only
+    /// before the term starts: once the term has begun the renter
+    /// has taken custody, and moving the start would retroactively
+    /// rewrite use already consumed. Before the start there is no
+    /// consumed use and no accrued fee, so a rescheduled start is a
+    /// clean move.
+    ///
+    /// The new start must lie strictly in the future and strictly
+    /// before the term end: `current_slot < new_term_start_slot <
+    /// term_end_slot`. A start at or behind the current slot fails
+    /// closed with [`EscrowError::InvalidRentalTerms`] (code 268) —
+    /// a revised term must still be in the future, otherwise the
+    /// revision would backdate the opening and instantly kill the
+    /// cancellation window (the AV-304 future-slot gate) — and a
+    /// start at or past the term end reuses the [`RentalEscrow::new`]
+    /// empty-term gate (code 268), leaving the current start
+    /// untouched, because the new value is validated before any
+    /// write. Re-affirming the current start is a no-op that writes
+    /// nothing — but the no-op check sits after the window gate, so
+    /// a same-value call at or after the term start is still refused
+    /// (code 268), following AV-314's gate order. Only
+    /// `term_start_slot` changes — the owner, renter, asset, rent
+    /// amount, term end, `slots_per_day`, late fee, and state are
+    /// untouched — and [`RentalEscrow::is_in_term`],
+    /// [`RentalEscrow::cancel`], [`RentalEscrow::amend_rent_amount`],
+    /// and [`RentalEscrow::amend_slots_per_day`] all read the live
+    /// start, so the new start governs from the next evaluation:
+    /// delaying it pushes the term (and widens the cancellation and
+    /// pre-start revision windows), advancing it pulls the term
+    /// forward (and narrows them); [`RentalEscrow::late_fee_due`] /
+    /// [`RentalEscrow::return_asset`] are unaffected — they only read
+    /// `term_end_slot`. A return already executed is unaffected.
+    /// There is no event layer on `RentalEscrow`, so no event is
+    /// emitted for the revision or its no-op. No new error code: the
+    /// refusals reuse `Unauthorized` (100), `RentalNotActive`
+    /// (269), and `InvalidRentalTerms` (268). Orthogonal to
+    /// [`RentalEscrow::new`] (that installs the start at build time,
+    /// this revises it while `Active` and pre-term), to AV-190 (that
+    /// is the rental mechanism itself, this is its window revision),
+    /// to AV-291 (that revises the late-fee terms, this revises the
+    /// window), to AV-292 (that only extends `term_end_slot` and
+    /// leaves the start untouched, this only moves the start), to
+    /// AV-314 (that revises the rent, this revises the start the
+    /// rent's pre-start gate reads), and to AV-329 (that revises
+    /// the pace, this revises the start the pace's pre-start gate
+    /// reads).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller pair that is not exactly owner + renter,
+    /// ([`EscrowError::RentalNotActive`], code 269) once the rental
+    /// is in a terminal state, and
+    /// ([`EscrowError::InvalidRentalTerms`], code 268) once
+    /// `term_start_slot` has arrived, when the new start is at or
+    /// behind `current_slot`, or when the new start is at or past
+    /// `term_end_slot` — either way the current start is untouched.
+    pub fn amend_term_start_slot(
+        &mut self,
+        owner: [u8; 32],
+        renter: [u8; 32],
+        new_term_start_slot: u64,
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if owner != self.owner || renter != self.renter {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != RentalState::Active {
+            return Err(EscrowError::RentalNotActive);
+        }
+        if current_slot >= self.term_start_slot {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        if new_term_start_slot <= current_slot {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        if new_term_start_slot >= self.term_end_slot {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        self.term_start_slot = new_term_start_slot;
+        Ok(())
+    }
+
     /// Audit-event JSON for a return (hand-written):
     /// `{"event":"rental_returned","asset":"<64hex>","late_fee":<u64>,
     /// "overdue_days":<u64>,"late":<bool>}`.
@@ -1419,6 +1512,243 @@ mod rental_escrow_tests {
         assert_eq!(r.slots_per_day(), 100);
         assert_eq!(r.state(), RentalState::Active);
         assert_eq!(r.late_fee_due(300), 10_000);
+    }
+
+    #[test]
+    fn amend_term_start_slot_moves_the_live_start() {
+        // AV-330: dual-signed reschedule delays the term; the live
+        // start governs term membership and the cancel window, and
+        // the late fee (which only reads the end) is untouched.
+        let mut r = open_rental();
+        assert!(r.is_in_term(120));
+        r.amend_term_start_slot(key(0xAA), key(0xBB), 150, 50)
+            .unwrap();
+        assert_eq!(r.term_start_slot(), 150);
+        assert!(!r.is_in_term(120)); // no longer in term
+        assert!(r.is_in_term(160));
+        assert_eq!(r.late_fee_due(300), 10_000);
+        // Nothing else moved.
+        assert_eq!(r.owner(), key(0xAA));
+        assert_eq!(r.renter(), key(0xBB));
+        assert_eq!(r.asset_id(), key(0xCC));
+        assert_eq!(r.rent_amount(), 1_000_000);
+        assert_eq!(r.term_end_slot(), 200);
+        assert_eq!(r.slots_per_day(), 100);
+        assert_eq!(r.late_fee(), terms());
+        assert_eq!(r.state(), RentalState::Active);
+        // Delaying widens the cancel window: slot 120 was past the
+        // old start (uncancellable), now it is before the new one.
+        r.cancel(key(0xAA), 120).unwrap();
+        assert_eq!(r.state(), RentalState::Cancelled);
+    }
+
+    #[test]
+    fn amend_term_start_slot_advance_pulls_the_term_forward() {
+        // AV-330: advancing the start pulls the term forward — a
+        // slot that was pre-term is in term now, and the cancel
+        // window narrows with it.
+        let mut r = open_rental();
+        assert!(!r.is_in_term(75));
+        r.amend_term_start_slot(key(0xAA), key(0xBB), 50, 10)
+            .unwrap();
+        assert_eq!(r.term_start_slot(), 50);
+        assert!(r.is_in_term(75));
+        // Slot 75 is now past the (new) start: no longer cancellable.
+        let err = r.cancel(key(0xAA), 75).unwrap_err();
+        assert_eq!(err, EscrowError::RentalCancelNotAllowed);
+        assert_eq!(err.code(), 270);
+        assert_eq!(r.state(), RentalState::Active);
+        // The moved start governs the return settlement window.
+        let receipt = r.return_asset(75).unwrap();
+        assert_eq!(receipt.late_fee_due, 0);
+        assert!(!receipt.was_overdue);
+        assert_eq!(r.state(), RentalState::Returned);
+    }
+
+    #[test]
+    fn amend_term_start_slot_is_dual_signed() {
+        // AV-330: a stranger, or either party alone, is refused and
+        // the start is untouched.
+        let mut r = open_rental();
+        let err = r
+            .amend_term_start_slot(key(9), key(0xBB), 150, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = r
+            .amend_term_start_slot(key(0xAA), key(9), 150, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = r
+            .amend_term_start_slot(key(9), key(9), 150, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(r.term_start_slot(), 100);
+        // Authority is checked before state: a stranger on a
+        // terminal rental still gets Unauthorized, not
+        // RentalNotActive.
+        let mut r2 = open_rental();
+        r2.return_asset(150).unwrap();
+        let err = r2
+            .amend_term_start_slot(key(9), key(0xBB), 150, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_term_start_slot_rejects_terminal_rentals() {
+        // AV-330: Returned / ReturnedLate / Cancelled are terminal.
+        let mut r = open_rental();
+        r.return_asset(150).unwrap();
+        let err = r
+            .amend_term_start_slot(key(0xAA), key(0xBB), 150, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(err.code(), 269);
+        assert_eq!(r.term_start_slot(), 100);
+
+        let mut r2 = open_rental();
+        r2.return_asset(300).unwrap();
+        assert_eq!(r2.state(), RentalState::ReturnedLate);
+        let err = r2
+            .amend_term_start_slot(key(0xAA), key(0xBB), 150, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+
+        let mut r3 = open_rental();
+        r3.cancel(key(0xAA), 50).unwrap();
+        let err = r3
+            .amend_term_start_slot(key(0xAA), key(0xBB), 150, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(r3.term_start_slot(), 100);
+    }
+
+    #[test]
+    fn amend_term_start_slot_only_before_term_start() {
+        // AV-330: once the term starts the start is frozen — the
+        // renter has custody, and moving the start would rewrite
+        // use already consumed.
+        let mut r = open_rental();
+        // Exactly at the term start: too late.
+        let err = r
+            .amend_term_start_slot(key(0xAA), key(0xBB), 150, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.term_start_slot(), 100);
+        // Mid-term: too late.
+        let err = r
+            .amend_term_start_slot(key(0xAA), key(0xBB), 150, 150)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.term_start_slot(), 100);
+        // A same-value re-affirmation at the start is still refused
+        // — the no-op sits after the window gate.
+        let err = r
+            .amend_term_start_slot(key(0xAA), key(0xBB), 100, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.term_start_slot(), 100);
+        // One slot before the term starts: still reschedulable.
+        r.amend_term_start_slot(key(0xAA), key(0xBB), 150, 99)
+            .unwrap();
+        assert_eq!(r.term_start_slot(), 150);
+    }
+
+    #[test]
+    fn amend_term_start_slot_new_start_must_be_in_the_future() {
+        // AV-330: the revised term must still be in the future —
+        // backdating the opening would instantly kill the cancel
+        // window, so a start at or behind the current slot is
+        // refused with the current start untouched.
+        let mut r = open_rental();
+        // Exactly at the current slot: not in the future.
+        let err = r
+            .amend_term_start_slot(key(0xAA), key(0xBB), 50, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.term_start_slot(), 100);
+        // Behind the current slot: also refused.
+        let err = r
+            .amend_term_start_slot(key(0xAA), key(0xBB), 40, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.term_start_slot(), 100);
+        // The boundary the other way is legal: one slot past now.
+        r.amend_term_start_slot(key(0xAA), key(0xBB), 51, 50)
+            .unwrap();
+        assert_eq!(r.term_start_slot(), 51);
+    }
+
+    #[test]
+    fn amend_term_start_slot_new_start_must_precede_the_end() {
+        // AV-330: the new() empty-term gate, reused — a start at or
+        // past the term end is an empty term, not a reschedule.
+        let mut r = open_rental();
+        let err = r
+            .amend_term_start_slot(key(0xAA), key(0xBB), 200, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.term_start_slot(), 100);
+        let err = r
+            .amend_term_start_slot(key(0xAA), key(0xBB), 250, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.term_start_slot(), 100);
+        // The boundary the other way is legal: one slot before the end.
+        r.amend_term_start_slot(key(0xAA), key(0xBB), 199, 50)
+            .unwrap();
+        assert_eq!(r.term_start_slot(), 199);
+    }
+
+    #[test]
+    fn amend_term_start_slot_identical_value_is_a_noop() {
+        // AV-330: re-affirming the current start writes nothing.
+        let mut r = open_rental();
+        r.amend_term_start_slot(key(0xAA), key(0xBB), 100, 50)
+            .unwrap();
+        assert_eq!(r.term_start_slot(), 100);
+        assert_eq!(r.state(), RentalState::Active);
+        assert!(r.is_in_term(150));
+        assert_eq!(r.late_fee_due(300), 10_000);
+    }
+
+    #[test]
+    fn amend_term_start_slot_moves_the_pre_start_revision_window() {
+        // AV-330 cross-effect: AV-314's rent revision (and AV-329's
+        // pace revision) gate on the *live* start, so moving the
+        // start moves their windows with it.
+        // Delaying 100 -> 150 reopens slot 120 for rent revision:
+        // it was past the old start (refused), now it is before the
+        // new one.
+        let mut r = open_rental();
+        let err = r
+            .amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 120)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        r.amend_term_start_slot(key(0xAA), key(0xBB), 150, 50)
+            .unwrap();
+        r.amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 120)
+            .unwrap();
+        assert_eq!(r.rent_amount(), 2_000_000);
+        // Advancing 100 -> 50 closes slot 75 for rent revision: it
+        // was before the old start (allowed), now it is past the new
+        // one.
+        let mut r2 = open_rental();
+        r2.amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 75)
+            .unwrap();
+        assert_eq!(r2.rent_amount(), 2_000_000);
+        let mut r3 = open_rental();
+        r3.amend_term_start_slot(key(0xAA), key(0xBB), 50, 10)
+            .unwrap();
+        let err = r3
+            .amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 75)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r3.rent_amount(), 1_000_000);
     }
 
     #[test]

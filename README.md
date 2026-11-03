@@ -7976,6 +7976,31 @@ expires, custody returns to the owner automatically.
   has no event layer — and no new error code: the refusals reuse
   `Unauthorized` (100), `RentalNotActive` (269), and
   `InvalidRentalTerms` (268).
+- **Revising the term start (AV-330)**: `amend_term_start_slot`
+  revises the `term_start_slot` on an `Active` rental, authorized by
+  owner + renter together — the term window is a bilateral use-right
+  window, so a unilateral shift would let one side move the other's
+  custody or use alone. Only before the term starts: once the term
+  has begun the renter has custody, and moving the start would
+  retroactively rewrite use already consumed; before the start there
+  is no consumed use and no accrued fee, so a rescheduled start is a
+  clean move. The new start must lie strictly in the future and
+  strictly before the term end (`current_slot < new_start <
+  term_end_slot`) — a start at or behind the current slot would
+  backdate the opening and instantly kill the cancellation window,
+  and a start at or past the term end reuses the construction
+  empty-term gate (both refusals are `InvalidRentalTerms`, code 268,
+  with the current start untouched); re-affirming the current start
+  is a no-op, but only before the term starts — the no-op sits after
+  the window gate. Only `term_start_slot` changes, and `is_in_term`
+  / `cancel` / `amend_rent_amount` / `amend_slots_per_day` read the
+  live start, so delaying it pushes the term (and widens the
+  cancellation and pre-start revision windows) while advancing it
+  pulls the term forward (and narrows them); `late_fee_due` /
+  `return_asset` only read the term end and are unaffected. No event
+  is emitted — `RentalEscrow` has no event layer — and no new error
+  code: the refusals reuse `Unauthorized` (100), `RentalNotActive`
+  (269), and `InvalidRentalTerms` (268).
 
 New error codes (never renumbered): `InvalidRentalTerms` (268),
 `RentalNotActive` (269), `RentalCancelNotAllowed` (270). Pure logic:
