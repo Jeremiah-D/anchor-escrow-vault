@@ -751,6 +751,101 @@ impl RentalEscrow {
         Ok(())
     }
 
+    /// Revise the asset identifier on an `Active` rental before the
+    /// term starts (AV-332 — Solana rental governance): both parties
+    /// authorize the change (the asset is a bilaterally escrowed
+    /// subject — a unilateral rewrite would let one side swap the
+    /// escrowed item for another alone). Check order is authority →
+    /// state → window → value, mirroring AV-330's
+    /// `amend_term_start_slot`, so a stranger learns nothing about
+    /// the rental's state from the error alone.
+    ///
+    /// Why: the asset id is fixed at construction
+    /// ([`RentalEscrow::new`]) and there is no other revision entry
+    /// point, so a rental opened against the wrong asset — a mistyped
+    /// NFT mint, the wrong token account, or the parties renegotiating
+    /// to lease a different item — would force the owner to cancel
+    /// the rental (pre-term only) and open a fresh one with a fresh
+    /// custody transfer, or else return settlement and the audit trail
+    /// would attribute the return to the wrong asset. Only an
+    /// `Active` rental may revise the asset, and only before the term
+    /// starts: once the term has begun the renter physically holds
+    /// the original asset, so swapping the id would point return
+    /// settlement and audit at an asset that was never escrowed;
+    /// before the start nobody holds it and no fee has accrued, so
+    /// the swap is a clean redirect.
+    ///
+    /// The value gate is new in this item and deliberately asymmetric
+    /// with [`RentalEscrow::new`], which does not validate `asset_id`
+    /// (a placeholder id, even the zero id, may open a rental):
+    /// revision refuses a zero `new_asset_id` with
+    /// [`EscrowError::InvalidRentalTerms`] (code 268), failing closed
+    /// rather than letting the parties blank the escrowed identifier
+    /// into "no asset" while rent and late-fee terms keep accruing.
+    /// Restating the current asset is a no-op — but the no-op check
+    /// sits after the window gate, following AV-330's gate order, so
+    /// a same-value restatement after the term has started is still
+    /// refused with code 268.
+    ///
+    /// Only `asset_id` changes — the owner, renter, rent amount,
+    /// term start, term end, `slots_per_day`, late fee, and state are
+    /// untouched — and [`RentalEscrow::return_audit_json`] and
+    /// [`RentalEscrow::cancel_audit_json`] read the live asset id, so
+    /// the new asset governs from the next audit: a return or cancel
+    /// after the revision carries the new asset hex, while a return
+    /// already executed is unaffected (its JSON string is already on
+    /// disk); [`RentalEscrow::late_fee_due`] and
+    /// [`RentalEscrow::return_asset`] never read `asset_id`, so fee
+    /// math is unaffected by the change. There is no event layer on
+    /// `RentalEscrow`, so no event is emitted for the revision.
+    /// No new error code: the refusals reuse `Unauthorized` (100),
+    /// `RentalNotActive` (269), and `InvalidRentalTerms` (268).
+    /// Orthogonal to [`RentalEscrow::new`] (that installs the asset
+    /// at build time, this revises it while `Active` and pre-term),
+    /// to AV-190 (that is the rental mechanism itself, this is its
+    /// asset revision), to AV-187 (that transfers NFT ownership,
+    /// this revises the use-right escrow's asset placeholder and
+    /// never touches ownership), to AV-291 (that revises the late-fee
+    /// terms, this revises the asset), to AV-292 (that extends the
+    /// term end, this revises the asset), to AV-314 (that revises the
+    /// rent, this revises the asset), to AV-329 (that revises the
+    /// pace, this revises the asset), to AV-330 (that moves the term
+    /// start, this revises the asset), and to AV-331 (that shortens
+    /// the term end, this revises the asset).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller pair that is not exactly owner + renter,
+    /// ([`EscrowError::RentalNotActive`], code 269) once the rental
+    /// is in a terminal state, and
+    /// ([`EscrowError::InvalidRentalTerms`], code 268) once
+    /// `term_start_slot` has arrived, or when the new asset id is
+    /// the zero key — either way the current asset is untouched.
+    pub fn amend_asset_id(
+        &mut self,
+        owner: [u8; 32],
+        renter: [u8; 32],
+        new_asset_id: [u8; 32],
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if owner != self.owner || renter != self.renter {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != RentalState::Active {
+            return Err(EscrowError::RentalNotActive);
+        }
+        if current_slot >= self.term_start_slot {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        if new_asset_id == [0u8; 32] {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        if new_asset_id == self.asset_id {
+            return Ok(());
+        }
+        self.asset_id = new_asset_id;
+        Ok(())
+    }
+
     /// Audit-event JSON for a return (hand-written):
     /// `{"event":"rental_returned","asset":"<64hex>","late_fee":<u64>,
     /// "overdue_days":<u64>,"late":<bool>}`.
@@ -2026,6 +2121,205 @@ mod rental_escrow_tests {
             .unwrap();
         assert_eq!(r.slots_per_day(), 200);
         assert_eq!(r.term_end_slot(), 150);
+    }
+
+    #[test]
+    fn amend_asset_id_revises_the_live_asset() {
+        // AV-332: a pre-term revision swaps the escrowed identifier
+        // and the getter reads the new value.
+        let mut r = open_rental();
+        assert_eq!(r.asset_id(), key(0xCC));
+        r.amend_asset_id(key(0xAA), key(0xBB), key(0xDD), 50)
+            .unwrap();
+        assert_eq!(r.asset_id(), key(0xDD));
+        // Only the asset moves — every other field is untouched.
+        assert_eq!(r.owner(), key(0xAA));
+        assert_eq!(r.renter(), key(0xBB));
+        assert_eq!(r.rent_amount(), 1_000_000);
+        assert_eq!(r.term_start_slot(), 100);
+        assert_eq!(r.term_end_slot(), 200);
+        assert_eq!(r.slots_per_day(), 100);
+        assert_eq!(r.late_fee(), terms());
+        assert_eq!(r.state(), RentalState::Active);
+        // A second revision works on the live value.
+        r.amend_asset_id(key(0xAA), key(0xBB), key(0xEE), 60)
+            .unwrap();
+        assert_eq!(r.asset_id(), key(0xEE));
+    }
+
+    #[test]
+    fn amend_asset_id_is_dual_signed_and_active_only() {
+        // AV-332: a stranger, or either party alone, is refused and
+        // the asset is untouched — the asset is a bilaterally
+        // escrowed subject, so a unilateral rewrite would swap the
+        // escrowed item alone.
+        let mut r = open_rental();
+        let err = r
+            .amend_asset_id(key(9), key(0xBB), key(0xDD), 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = r
+            .amend_asset_id(key(0xAA), key(9), key(0xDD), 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = r
+            .amend_asset_id(key(9), key(9), key(0xDD), 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(r.asset_id(), key(0xCC));
+        // Authority is checked before state: a stranger on a
+        // terminal rental still gets Unauthorized.
+        let mut r2 = open_rental();
+        r2.return_asset(150).unwrap();
+        let err = r2
+            .amend_asset_id(key(9), key(0xBB), key(0xDD), 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        // The parties on a terminal rental get RentalNotActive.
+        let err = r2
+            .amend_asset_id(key(0xAA), key(0xBB), key(0xDD), 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(err.code(), 269);
+        assert_eq!(r2.asset_id(), key(0xCC));
+        let mut r3 = open_rental();
+        r3.cancel(key(0xAA), 50).unwrap();
+        let err = r3
+            .amend_asset_id(key(0xAA), key(0xBB), key(0xDD), 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(r3.asset_id(), key(0xCC));
+    }
+
+    #[test]
+    fn amend_asset_id_only_before_term_start() {
+        // AV-332: once the term has begun the renter physically
+        // holds the original asset — swapping the id would point
+        // return settlement and audit at an asset never escrowed.
+        let mut r = open_rental();
+        let err = r
+            .amend_asset_id(key(0xAA), key(0xBB), key(0xDD), 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.asset_id(), key(0xCC));
+        let err = r
+            .amend_asset_id(key(0xAA), key(0xBB), key(0xDD), 150)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.asset_id(), key(0xCC));
+    }
+
+    #[test]
+    fn amend_asset_id_rejects_zero_asset() {
+        // AV-332: the zero-asset gate is new in this item and
+        // deliberately asymmetric with new(), which does not validate
+        // asset_id — revision fails closed rather than blanking the
+        // escrowed identifier into "no asset" while rent and
+        // late-fee terms keep accruing.
+        let mut r = open_rental();
+        let err = r
+            .amend_asset_id(key(0xAA), key(0xBB), [0u8; 32], 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.asset_id(), key(0xCC));
+    }
+
+    #[test]
+    fn amend_asset_id_identical_value_is_a_noop() {
+        // AV-332: restating the current asset pre-term is a no-op,
+        // but the no-op check sits after the window gate — a
+        // same-value restatement after the term has started is still
+        // refused, following AV-330's gate order.
+        let mut r = open_rental();
+        r.amend_asset_id(key(0xAA), key(0xBB), key(0xCC), 50)
+            .unwrap();
+        assert_eq!(r.asset_id(), key(0xCC));
+        assert_eq!(r.state(), RentalState::Active);
+        let err = r
+            .amend_asset_id(key(0xAA), key(0xBB), key(0xCC), 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.asset_id(), key(0xCC));
+    }
+
+    #[test]
+    fn amend_asset_id_at_the_slot_before_term_start_is_allowed() {
+        // AV-332: the boundary is the term start itself — one slot
+        // before it, nobody holds the asset yet, so the swap is a
+        // clean redirect.
+        let mut r = open_rental();
+        r.amend_asset_id(key(0xAA), key(0xBB), key(0xDD), 99)
+            .unwrap();
+        assert_eq!(r.asset_id(), key(0xDD));
+    }
+
+    #[test]
+    fn amend_asset_id_governs_the_next_audit() {
+        // AV-332: the audit JSONs read the live asset id, so a return
+        // or cancel after the revision carries the new asset hex.
+        let mut r = open_rental();
+        r.amend_asset_id(key(0xAA), key(0xBB), key(0xDD), 50)
+            .unwrap();
+        let receipt = r.return_asset(150).unwrap();
+        let j = r.return_audit_json(receipt);
+        assert!(j.contains("\"asset\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\""));
+        assert!(!j.contains("cccc"));
+        // A return already executed keeps the asset it was audited
+        // under — its JSON string is already on disk.
+        let mut r2 = open_rental();
+        let receipt = r2.return_asset(150).unwrap();
+        let j = r2.return_audit_json(receipt);
+        assert!(j.contains("\"asset\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\""));
+        // Same for a cancelled rental.
+        let mut r3 = open_rental();
+        r3.amend_asset_id(key(0xAA), key(0xBB), key(0xDD), 50)
+            .unwrap();
+        let j = r3.cancel_audit_json();
+        assert!(j.contains("\"asset\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\""));
+        assert_eq!(j, "{\"event\":\"rental_cancelled\",\"asset\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}");
+    }
+
+    #[test]
+    fn amend_asset_id_leaves_other_revisions_and_fees_untouched() {
+        // AV-332 cross-effect: after the revision, the AV-314/329/
+        // 330/331 revisions still work on the live values, and the
+        // late-fee settlement is unaffected — fee math never reads
+        // the asset id.
+        let mut r = open_rental();
+        r.amend_asset_id(key(0xAA), key(0xBB), key(0xDD), 50)
+            .unwrap();
+        r.amend_rent_amount(key(0xAA), key(0xBB), 2_000_000, 50)
+            .unwrap();
+        assert_eq!(r.rent_amount(), 2_000_000);
+        r.amend_slots_per_day(key(0xAA), key(0xBB), 200, 50)
+            .unwrap();
+        assert_eq!(r.slots_per_day(), 200);
+        r.amend_term_start_slot(key(0xAA), key(0xBB), 150, 50)
+            .unwrap();
+        assert_eq!(r.term_start_slot(), 150);
+        r.shorten_term_end(key(0xAA), key(0xBB), 180, 50)
+            .unwrap();
+        assert_eq!(r.term_end_slot(), 180);
+        assert_eq!(r.asset_id(), key(0xDD));
+        // The fee at 100 slots past the (shortened) end, 200
+        // slots/day: 1 overdue day on the revised rent —
+        // 2_000_000 * 100 / 10_000 = 20_000 — is priced exactly as
+        // it would be without the asset change.
+        assert_eq!(r.late_fee_due(280), 20_000);
+        let receipt = r.return_asset(280).unwrap();
+        assert_eq!(receipt.late_fee_due, 20_000);
+        assert_eq!(receipt.overdue_days, 1);
+        // And on an unrevised rental the same overdue return prices
+        // identically apart from the rent revision itself: the asset
+        // change contributes nothing to the fee.
+        let mut r2 = open_rental();
+        assert_eq!(r2.late_fee_due(300), 10_000);
+        r2.amend_asset_id(key(0xAA), key(0xBB), key(0xDD), 50)
+            .unwrap();
+        assert_eq!(r2.late_fee_due(300), 10_000);
     }
 
     #[test]

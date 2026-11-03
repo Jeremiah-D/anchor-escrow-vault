@@ -1783,8 +1783,8 @@ program error per variant):
 | `EnglishAuctionNotLive` | 265 | `EnglishAuction::place_bid` (AV-189) outside the live window (`current_slot >= end_slot`, strict end) or on a terminal auction |
 | `EnglishAuctionSettleTooEarly` | 266 | `EnglishAuction::settle` (AV-189) at `current_slot < end_slot` — the bidding window has not closed |
 | `EnglishAuctionNotCancellable` | 267 | `EnglishAuction::cancel` (AV-189) after a bid landed, on a terminal auction, or after the window lapsed |
-| `InvalidRentalTerms` | 268 | `RentalEscrow::new` (AV-190) with a zero owner/renter key, owner == renter, a zero rent amount, `term_end_slot <= term_start_slot`, a zero `slots_per_day`, or a late-fee rate/cap above 10_000 bps; also `extend_term_end` (AV-292) on an already-overdue rental or with `new_end_slot <= term_end_slot`, `shorten_term_end` (AV-331) with `current_slot > new_end_slot`, `new_end_slot >= term_end_slot`, or `new_end_slot <= term_start_slot`, `amend_rent_amount` (AV-314) with a zero rent, `amend_slots_per_day` (AV-329) with a zero pace, and `amend_term_start_slot` (AV-330) once the term has started or with the new start at/before `current_slot` or at/past `term_end_slot` |
-| `RentalNotActive` | 269 | `RentalEscrow::return_asset` (AV-190) on a rental already in a terminal state; also `extend_term_end` (AV-292), `amend_rent_amount` (AV-314), `amend_slots_per_day` (AV-329), `amend_term_start_slot` (AV-330), and `shorten_term_end` (AV-331) on a terminal rental |
+| `InvalidRentalTerms` | 268 | `RentalEscrow::new` (AV-190) with a zero owner/renter key, owner == renter, a zero rent amount, `term_end_slot <= term_start_slot`, a zero `slots_per_day`, or a late-fee rate/cap above 10_000 bps; also `extend_term_end` (AV-292) on an already-overdue rental or with `new_end_slot <= term_end_slot`, `shorten_term_end` (AV-331) with `current_slot > new_end_slot`, `new_end_slot >= term_end_slot`, or `new_end_slot <= term_start_slot`, `amend_rent_amount` (AV-314) with a zero rent, `amend_slots_per_day` (AV-329) with a zero pace, and `amend_term_start_slot` (AV-330) once the term has started or with the new start at/before `current_slot` or at/past `term_end_slot`, and `amend_asset_id` (AV-332) once the term has started or with a zero new asset id |
+| `RentalNotActive` | 269 | `RentalEscrow::return_asset` (AV-190) on a rental already in a terminal state; also `extend_term_end` (AV-292), `amend_rent_amount` (AV-314), `amend_slots_per_day` (AV-329), `amend_term_start_slot` (AV-330), and `shorten_term_end` (AV-331) on a terminal rental, and `amend_asset_id` (AV-332) on a terminal rental |
 | `RentalCancelNotAllowed` | 270 | `RentalEscrow::cancel` (AV-190) after `term_start_slot` or on a terminal rental |
 | `InvalidSealedBid` | 272 | `SealedBidAuction::new` (AV-192) with a zero seller key, `commit_start_slot >= reveal_start_slot`, or `reveal_start_slot >= end_slot`; also `commit_bid` with a zero bidder key or zero commitment; also `amend_sealed_bid_reveal_start_slot` (AV-303) outside the `new()` window or at/before `current_slot`; also `amend_sealed_bid_commit_start_slot` (AV-304) outside the `new()` window or at/before `current_slot`; also `amend_sealed_bid_end_slot` (AV-305) at/before `reveal_start_slot`; also `amend_sealed_bid_seller` (AV-323) with a zero new seller |
 | `SealedBidNotLive` | 273 | Sealed-bid commit/reveal (AV-192) outside its phase or on a terminal auction; also `amend_sealed_bid_min_bid` (AV-302) and `amend_sealed_bid_reveal_start_slot` (AV-303) once the reveal has started or on a terminal auction; also `amend_sealed_bid_commit_start_slot` (AV-304) once the commit window has opened or on a terminal auction; also `amend_sealed_bid_end_slot` (AV-305) once the reveal has started or on a terminal auction; also `amend_sealed_bid_seller` (AV-323) once the first commitment has landed or on a terminal auction |
@@ -8029,6 +8029,32 @@ expires, custody returns to the owner automatically.
   is emitted — `RentalEscrow` has no event layer — and no new error
   code: the refusals reuse `Unauthorized` (100), `RentalNotActive`
   (269), and `InvalidRentalTerms` (268).
+- **Revising the asset (AV-332)**: `amend_asset_id` revises the
+  `asset_id` on an `Active` rental, authorized by owner + renter
+  together — the asset is a bilaterally escrowed subject, so a
+  unilateral rewrite would let one side swap the escrowed item for
+  another alone. Only before the term starts: once the term has
+  begun the renter physically holds the original asset, and swapping
+  the id would point return settlement and audit at an asset that
+  was never escrowed; before the start nobody holds it and no fee
+  has accrued, so the swap is a clean redirect (a mistyped NFT
+  mint, the wrong token account, or the parties renegotiating to
+  lease a different item no longer forces a cancel-and-reopen).
+  The value gate is deliberately asymmetric with construction,
+  which does not validate `asset_id`: revision refuses a zero new
+  asset id (`InvalidRentalTerms`, code 268) rather than blanking
+  the escrowed identifier into "no asset" while rent and late-fee
+  terms keep accruing; re-affirming the current asset is a no-op,
+  but only before the term starts — the no-op sits after the
+  window gate, so a same-value restatement after the term has
+  started is still refused with code 268. Only `asset_id` changes,
+  and `return_audit_json` / `cancel_audit_json` read the live
+  asset id, so the new asset governs from the next audit while a
+  return already executed is never restated; `late_fee_due` /
+  `return_asset` never read `asset_id`, so fee math is unaffected
+  by the change. No event is emitted — `RentalEscrow` has no event
+  layer — and no new error code: the refusals reuse `Unauthorized`
+  (100), `RentalNotActive` (269), and `InvalidRentalTerms` (268).
 
 New error codes (never renumbered): `InvalidRentalTerms` (268),
 `RentalNotActive` (269), `RentalCancelNotAllowed` (270). Pure logic:
