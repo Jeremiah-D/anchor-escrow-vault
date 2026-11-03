@@ -446,6 +446,64 @@ impl BidDepositAuction {
         Ok(())
     }
 
+    /// Revise the auction the book is attached to before the first
+    /// registration lands (AV-327).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the seller key is the book's authority, the
+    /// same gate as [`Self::forfeit`]) and only while no bidder has
+    /// registered (`deposit_count == 0`): a registered bidder's
+    /// receipt names the auction their deposit is locked under (see
+    /// [`Self::register`]), so the book must not be re-pointed at a
+    /// different auction once receipts exist — every later receipt
+    /// would hang under the wrong auction name. Refused with
+    /// [`EscrowError::BidDepositAlreadySettled`] (code 284) once the
+    /// book is settled, and with
+    /// [`EscrowError::InvalidBidDeposit`] (code 282) once a deposit
+    /// is registered.
+    ///
+    /// Check order is authority → settled → registration → value,
+    /// mirroring [`Self::amend_bid_deposit_amount`] (AV-324): a
+    /// stranger is refused even on a settled book, and a settled
+    /// book refuses even the seller. A zero new auction reuses the
+    /// [`Self::new`] gate ([`EscrowError::InvalidBidDeposit`], code
+    /// 282), the original auction untouched. Revising to the current
+    /// auction is a no-op.
+    ///
+    /// Only `auction` changes: `kind`, `seller`,
+    /// `deposit_amount`, entries, count, and settled are untouched.
+    /// The next [`Self::register`] receipt names the new auction.
+    ///
+    /// Pure logic: this method changes state only. The revision is
+    /// recorded for the indexer as
+    /// [`Self::auction_audit_json`] (a string event name, no
+    /// numeric event ID — the deposit audit convention); a failed
+    /// revision and a no-op re-affirmation record nothing. No Vault
+    /// layout change, no new error code: the gates reuse 100/282/284.
+    pub fn amend_bid_deposit_auction(
+        &mut self,
+        authority: [u8; 32],
+        new_auction: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        if authority != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.settled {
+            return Err(EscrowError::BidDepositAlreadySettled);
+        }
+        if self.count > 0 {
+            return Err(EscrowError::InvalidBidDeposit);
+        }
+        if new_auction == self.auction {
+            return Ok(());
+        }
+        if new_auction == [0u8; 32] {
+            return Err(EscrowError::InvalidBidDeposit);
+        }
+        self.auction = new_auction;
+        Ok(())
+    }
+
     /// The current state of one bidder's deposit.
     ///
     /// Refused ([`EscrowError::BidDepositNotRegistered`], code 283)
@@ -670,6 +728,20 @@ impl BidDepositAuction {
         s.push_str(&format!("{:?}", self.kind));
         s.push('"');
         s.push('}');
+        s
+    }
+
+    /// Audit-event JSON for an auction revision (hand-written):
+    /// `{"event":"bid_deposit_auction_amended",
+    /// "previous_auction":"<64hex>","auction":"<64hex>"}`.
+    /// Emitted only on an actual change — a no-op re-affirmation
+    /// records nothing.
+    pub fn auction_audit_json(&self, previous_auction: [u8; 32]) -> String {
+        let mut s = String::from("{\"event\":\"bid_deposit_auction_amended\",\"previous_auction\":\"");
+        s.push_str(&hex64(&previous_auction));
+        s.push_str("\",\"auction\":\"");
+        s.push_str(&hex64(&self.auction));
+        s.push_str("\"}");
         s
     }
 }
@@ -1372,6 +1444,132 @@ mod bid_deposit_tests {
         let j = b.kind_audit_json(AuctionKind::SealedBid);
         assert!(j.contains("\"previous_kind\":\"SealedBid\""));
         assert!(j.contains("\"kind\":\"Dutch\""));
+    }
+
+    #[test]
+    fn amend_bid_deposit_auction_is_seller_only() {
+        let mut b = open_book();
+        // A stranger is refused, even on an empty book.
+        let err = b.amend_bid_deposit_auction(key(9), key(0xC0)).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(b.auction(), key(0xA0));
+        // A bidder is refused too — authority is checked first,
+        // before the post-registration gate.
+        b.register(key(1)).unwrap();
+        let err = b.amend_bid_deposit_auction(key(1), key(0xC0)).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(b.auction(), key(0xA0));
+    }
+
+    #[test]
+    fn amend_bid_deposit_auction_refused_after_settlement() {
+        let mut b = open_book();
+        b.register(key(1)).unwrap();
+        b.settle(Some(key(1))).unwrap();
+        assert!(b.is_settled());
+        let err = b.amend_bid_deposit_auction(key(0xAA), key(0xC0)).unwrap_err();
+        assert_eq!(err, EscrowError::BidDepositAlreadySettled);
+        assert_eq!(err.code(), 284);
+        assert_eq!(b.auction(), key(0xA0));
+        // Authority still wins on a settled book: a stranger is
+        // Unauthorized, not AlreadySettled.
+        let err = b.amend_bid_deposit_auction(key(9), key(0xC0)).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_bid_deposit_auction_locks_after_first_registration() {
+        let mut b = open_book();
+        let r = b.register(key(1)).unwrap();
+        assert_eq!(r.auction, key(0xA0));
+        let err = b.amend_bid_deposit_auction(key(0xAA), key(0xC0)).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidBidDeposit);
+        assert_eq!(err.code(), 282);
+        assert_eq!(b.auction(), key(0xA0));
+        // The registered bidder's receipt stands: settlement still
+        // reports the original auction.
+        let s = b.settle(Some(key(1))).unwrap();
+        assert_eq!(s.applied, 1000);
+        assert_eq!(b.auction(), key(0xA0));
+        assert_conservation(&b);
+    }
+
+    #[test]
+    fn amend_bid_deposit_auction_rejects_zero() {
+        let mut b = open_book();
+        let err = b.amend_bid_deposit_auction(key(0xAA), [0u8; 32]).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidBidDeposit);
+        assert_eq!(err.code(), 282);
+        assert_eq!(b.auction(), key(0xA0));
+        // The original auction still governs — a later valid revision
+        // works.
+        b.amend_bid_deposit_auction(key(0xAA), key(0xC0)).unwrap();
+        assert_eq!(b.auction(), key(0xC0));
+    }
+
+    #[test]
+    fn amend_bid_deposit_auction_same_value_is_noop() {
+        let mut b = open_book();
+        // Re-affirming the current auction succeeds and changes
+        // nothing — the pure-logic method emits no event, so there
+        // is no event to assert here; the state pin is the auction.
+        b.amend_bid_deposit_auction(key(0xAA), key(0xA0)).unwrap();
+        assert_eq!(b.auction(), key(0xA0));
+        assert_eq!(b.deposit_count(), 0);
+        assert!(!b.is_settled());
+        assert_eq!(b.kind(), AuctionKind::English);
+        assert_eq!(b.seller(), key(0xAA));
+        assert_eq!(b.deposit_amount(), 1000);
+    }
+
+    #[test]
+    fn amend_bid_deposit_auction_revises_before_first_registration() {
+        let mut b = open_book();
+        b.amend_bid_deposit_auction(key(0xAA), key(0xC0)).unwrap();
+        assert_eq!(b.auction(), key(0xC0));
+        // Only the auction changes.
+        assert_eq!(b.kind(), AuctionKind::English);
+        assert_eq!(b.seller(), key(0xAA));
+        assert_eq!(b.deposit_amount(), 1000);
+        assert_eq!(b.deposit_count(), 0);
+        assert!(!b.is_settled());
+        assert_conservation(&b);
+        // The revision is repeatable while nobody has registered.
+        b.amend_bid_deposit_auction(key(0xAA), key(0xD0)).unwrap();
+        assert_eq!(b.auction(), key(0xD0));
+    }
+
+    #[test]
+    fn register_after_auction_revision_receipt_names_new_auction() {
+        let mut b = open_book();
+        b.amend_bid_deposit_auction(key(0xAA), key(0xC0)).unwrap();
+        let r = b.register(key(1)).unwrap();
+        // The receipt locks the new auction — the old auction id is
+        // no longer accepted anywhere on this book.
+        assert_eq!(r.auction, key(0xC0));
+        assert_ne!(r.auction, key(0xA0));
+        assert_eq!(r.amount, 1000);
+        b.register(key(2)).unwrap();
+        assert_conservation(&b);
+        let s = b.settle(Some(key(1))).unwrap();
+        assert_eq!(s.applied, 1000);
+        assert_eq!(s.refunded, 1);
+    }
+
+    #[test]
+    fn amend_bid_deposit_auction_audit_json() {
+        let mut b = open_book();
+        b.amend_bid_deposit_auction(key(0xAA), key(0xC0)).unwrap();
+        let j = b.auction_audit_json(key(0xA0));
+        assert_eq!(
+            j,
+            format!(
+                "{{\"event\":\"bid_deposit_auction_amended\",\"previous_auction\":\"{}\",\"auction\":\"{}\"}}",
+                "a0".repeat(32),
+                "c0".repeat(32)
+            )
+        );
     }
 
     #[test]

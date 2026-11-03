@@ -2884,6 +2884,18 @@ deposits `settle` should have confiscated. Audited as
 `bid_deposit_kind_amended` (hand-written JSON, string event name,
 no numeric event ID).
 
+Auction revision (AV-327): `amend_bid_deposit_auction()` lets
+the seller re-point the book at a different auction before the
+first registration (`deposit_count == 0`) — seller-only, refused
+after settlement or once a bidder has registered, so no bidder's
+receipt is left naming the wrong auction: a receipt is the
+settlement credential, and a book opened under the wrong auction id
+would hang every later deposit under a name nobody settles. A
+zero new auction reuses the `new()` gate and re-affirming the
+current auction is a no-op; the next `register` receipt names the
+new auction. Audited as `bid_deposit_auction_amended`
+(hand-written JSON, string event name, no numeric event ID).
+
 New error codes (never renumbered): `InvalidBidDeposit` (282),
 `BidDepositNotRegistered` (283), `BidDepositAlreadySettled` (284),
 `BidDepositBookFull` (285). Pure logic: no Vault layout change, no
