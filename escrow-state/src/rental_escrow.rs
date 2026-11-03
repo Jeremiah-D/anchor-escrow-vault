@@ -168,6 +168,12 @@ impl RentalEscrow {
         self.term_end_slot
     }
 
+    /// Slots per day — the pace the overdue-day computation divides
+    /// by ([`RentalEscrow::late_fee_due`], [`RentalEscrow::return_asset`]).
+    pub fn slots_per_day(&self) -> u64 {
+        self.slots_per_day
+    }
+
     /// Current lifecycle state.
     pub fn state(&self) -> RentalState {
         self.state
@@ -473,6 +479,80 @@ impl RentalEscrow {
             return Err(EscrowError::InvalidRentalTerms);
         }
         self.rent_amount = new_rent_amount;
+        Ok(())
+    }
+
+    /// Revise the overdue-day pace on an `Active` rental (AV-329 —
+    /// Solana rental governance): both parties authorize the change
+    /// (the pace is a bilateral economic term — a unilateral rewrite
+    /// would let one side reprice the other's overdue cost alone).
+    /// Check order is authority → state → window → value, mirroring
+    /// AV-314's `amend_rent_amount`, so a stranger learns nothing
+    /// about the rental's state from the error alone.
+    ///
+    /// Why: the pace is fixed at construction
+    /// ([`RentalEscrow::new`]), but the parties may renegotiate how
+    /// fast overdue days accrue before the term starts — a pace that
+    /// cannot be revised would force a fresh rental (and a fresh
+    /// custody transfer) for a legitimate new day length. Only an
+    /// `Active` rental may revise, and only before the term starts:
+    /// once the term has begun fees have been accruing against the
+    /// old pace, and repricing it would rebase the overdue-day
+    /// count on consumed use. Before the start there is no consumed
+    /// use and no accrued fee, so a renegotiated pace is a clean
+    /// re-price.
+    ///
+    /// The new pace reuses the [`RentalEscrow::new`] gate exactly:
+    /// a zero pace fails closed with
+    /// [`EscrowError::InvalidRentalTerms`] (code 268), leaving the
+    /// current pace untouched, because the new value is validated
+    /// before any write. Re-affirming the current pace is a no-op
+    /// that writes nothing. Only `slots_per_day` changes — the
+    /// owner, renter, asset, rent amount, term slots, late fee, and
+    /// state are untouched — and [`RentalEscrow::late_fee_due`] /
+    /// [`RentalEscrow::return_asset`] read the live pace, so the new
+    /// pace governs from the next billing (the ceiling division
+    /// `overdue_slots / slots_per_day` reprices both the day count
+    /// and the fee); a return already executed is unaffected. There
+    /// is no event layer on `RentalEscrow`, so no event is emitted
+    /// for the revision or its no-op. No new error code: the
+    /// refusals reuse `Unauthorized` (100), `RentalNotActive`
+    /// (269), and `InvalidRentalTerms` (268). Orthogonal to
+    /// [`RentalEscrow::new`] (that installs the pace at build time,
+    /// this revises it while `Active` and pre-term), to AV-190
+    /// (that is the rental mechanism itself, this is its pace
+    /// revision), to AV-291 (that revises the late-fee terms, this
+    /// revises the pace those terms divide by), to AV-292 (that
+    /// extends the term window, this revises the pace), and to
+    /// AV-314 (that revises the rent, this revises the pace).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller pair that is not exactly owner + renter,
+    /// ([`EscrowError::RentalNotActive`], code 269) once the rental
+    /// is in a terminal state, and
+    /// ([`EscrowError::InvalidRentalTerms`], code 268) once
+    /// `term_start_slot` has arrived or when the new pace is zero —
+    /// either way the current pace is untouched.
+    pub fn amend_slots_per_day(
+        &mut self,
+        owner: [u8; 32],
+        renter: [u8; 32],
+        new_slots_per_day: u64,
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if owner != self.owner || renter != self.renter {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != RentalState::Active {
+            return Err(EscrowError::RentalNotActive);
+        }
+        if current_slot >= self.term_start_slot {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        if new_slots_per_day == 0 {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        self.slots_per_day = new_slots_per_day;
         Ok(())
     }
 
@@ -1171,6 +1251,172 @@ mod rental_escrow_tests {
         r.amend_rent_amount(key(0xAA), key(0xBB), 1_000_000, 50)
             .unwrap();
         assert_eq!(r.rent_amount(), 1_000_000);
+        assert_eq!(r.state(), RentalState::Active);
+        assert_eq!(r.late_fee_due(300), 10_000);
+    }
+
+    #[test]
+    fn amend_slots_per_day_revises_the_live_pace() {
+        // AV-329: dual-signed re-pacing before the term starts
+        // reprices future billings only.
+        let mut r = open_rental();
+        assert_eq!(r.slots_per_day(), 100);
+        assert_eq!(r.late_fee_due(300), 10_000);
+        r.amend_slots_per_day(key(0xAA), key(0xBB), 50, 50).unwrap();
+        assert_eq!(r.slots_per_day(), 50);
+        // The live pace prices the same overdue slot: 100 overdue
+        // slots are 2 days at 50 slots/day now.
+        assert_eq!(r.late_fee_due(300), 20_000);
+        // Nothing else moved.
+        assert_eq!(r.owner(), key(0xAA));
+        assert_eq!(r.renter(), key(0xBB));
+        assert_eq!(r.asset_id(), key(0xCC));
+        assert_eq!(r.rent_amount(), 1_000_000);
+        assert_eq!(r.term_start_slot(), 100);
+        assert_eq!(r.term_end_slot(), 200);
+        assert_eq!(r.state(), RentalState::Active);
+        assert_eq!(r.late_fee(), terms());
+    }
+
+    #[test]
+    fn amend_slots_per_day_governs_return_settlement() {
+        // AV-329: the amended pace governs the return settlement —
+        // the receipt's day count and fee both reprice.
+        let mut r = open_rental();
+        r.amend_slots_per_day(key(0xAA), key(0xBB), 50, 50).unwrap();
+        let receipt = r.return_asset(300).unwrap();
+        assert!(receipt.was_overdue);
+        assert_eq!(receipt.overdue_slots, 100);
+        assert_eq!(receipt.overdue_days, 2);
+        assert_eq!(receipt.late_fee_due, 20_000);
+        assert_eq!(r.state(), RentalState::ReturnedLate);
+    }
+
+    #[test]
+    fn amend_slots_per_day_slower_pace_charges_fewer_days() {
+        // AV-329: slowing the pace cuts the charged days — the
+        // ceiling division reprices in both directions.
+        let mut r = open_rental();
+        // 250 overdue slots = 3 charged days at 100 slots/day.
+        assert_eq!(r.late_fee_due(450), 30_000);
+        r.amend_slots_per_day(key(0xAA), key(0xBB), 200, 50).unwrap();
+        // 250 overdue slots = 2 charged days at 200 slots/day.
+        assert_eq!(r.late_fee_due(450), 20_000);
+        let receipt = r.return_asset(450).unwrap();
+        assert_eq!(receipt.overdue_days, 2);
+        assert_eq!(receipt.late_fee_due, 20_000);
+        assert_eq!(r.state(), RentalState::ReturnedLate);
+    }
+
+    #[test]
+    fn amend_slots_per_day_is_dual_signed() {
+        // AV-329: a stranger, or either party alone, is refused and
+        // the pace is untouched.
+        let mut r = open_rental();
+        let err = r
+            .amend_slots_per_day(key(9), key(0xBB), 50, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = r
+            .amend_slots_per_day(key(0xAA), key(9), 50, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = r
+            .amend_slots_per_day(key(9), key(9), 50, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(r.slots_per_day(), 100);
+        // Authority is checked before state: a stranger on a
+        // terminal rental still gets Unauthorized, not
+        // RentalNotActive.
+        let mut r2 = open_rental();
+        r2.return_asset(150).unwrap();
+        let err = r2
+            .amend_slots_per_day(key(9), key(0xBB), 50, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_slots_per_day_rejects_terminal_rentals() {
+        // AV-329: Returned / ReturnedLate / Cancelled are terminal.
+        let mut r = open_rental();
+        r.return_asset(150).unwrap();
+        let err = r
+            .amend_slots_per_day(key(0xAA), key(0xBB), 50, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(err.code(), 269);
+        assert_eq!(r.slots_per_day(), 100);
+
+        let mut r2 = open_rental();
+        r2.return_asset(300).unwrap();
+        assert_eq!(r2.state(), RentalState::ReturnedLate);
+        let err = r2
+            .amend_slots_per_day(key(0xAA), key(0xBB), 50, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+
+        let mut r3 = open_rental();
+        r3.cancel(key(0xAA), 50).unwrap();
+        let err = r3
+            .amend_slots_per_day(key(0xAA), key(0xBB), 50, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(r3.slots_per_day(), 100);
+    }
+
+    #[test]
+    fn amend_slots_per_day_only_before_term_start() {
+        // AV-329: once the term starts the pace is frozen — fees
+        // have been accruing against the old pace.
+        let mut r = open_rental();
+        // Exactly at the term start: too late.
+        let err = r
+            .amend_slots_per_day(key(0xAA), key(0xBB), 50, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.slots_per_day(), 100);
+        // Mid-term: too late.
+        let err = r
+            .amend_slots_per_day(key(0xAA), key(0xBB), 50, 150)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(r.slots_per_day(), 100);
+        // One slot before the term starts: still renegotiable.
+        r.amend_slots_per_day(key(0xAA), key(0xBB), 50, 99)
+            .unwrap();
+        assert_eq!(r.slots_per_day(), 50);
+    }
+
+    #[test]
+    fn amend_slots_per_day_reuses_the_construction_gate() {
+        // AV-329: a zero pace fails closed with the original pace
+        // untouched (the overdue computation would divide by zero).
+        let mut r = open_rental();
+        let err = r
+            .amend_slots_per_day(key(0xAA), key(0xBB), 0, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.slots_per_day(), 100);
+        // The boundary itself is legal: a pace of 1 passes.
+        r.amend_slots_per_day(key(0xAA), key(0xBB), 1, 50).unwrap();
+        assert_eq!(r.slots_per_day(), 1);
+        // At 1 slot/day every overdue slot is a charged day: 100
+        // days uncapped would be 1_000_000, capped at 20% of rent.
+        assert_eq!(r.late_fee_due(300), 200_000);
+    }
+
+    #[test]
+    fn amend_slots_per_day_identical_value_is_a_noop() {
+        // AV-329: re-affirming the current pace writes nothing.
+        let mut r = open_rental();
+        r.amend_slots_per_day(key(0xAA), key(0xBB), 100, 50)
+            .unwrap();
+        assert_eq!(r.slots_per_day(), 100);
         assert_eq!(r.state(), RentalState::Active);
         assert_eq!(r.late_fee_due(300), 10_000);
     }

@@ -7957,6 +7957,25 @@ expires, custody returns to the owner automatically.
   is emitted — `RentalEscrow` has no event layer — and no new error
   code: the refusals reuse `Unauthorized` (100), `RentalNotActive`
   (269), and `InvalidRentalTerms` (268).
+- **Revising the overdue-day pace (AV-329)**: `amend_slots_per_day`
+  revises the `slots_per_day` pace on an `Active` rental, authorized
+  by owner + renter together — the pace is a bilateral economic term,
+  so a unilateral rewrite would let one side reprice the other's
+  overdue cost alone. Only before the term starts: once the term has
+  begun fees have been accruing against the old pace, so repricing it
+  would rebase the overdue-day count on consumed use; before the start
+  there is no consumed use and no accrued fee, so a renegotiated pace
+  is a clean re-price. The new pace reuses the construction gate (a
+  zero pace fails closed with `InvalidRentalTerms`, code 268, and the
+  current pace is untouched); re-affirming the current pace is a
+  no-op. Only `slots_per_day` changes, and `late_fee_due` /
+  `return_asset` read the live pace, so the new pace governs from the
+  next billing — the ceiling division `overdue_slots / slots_per_day`
+  reprices both the day count and the fee — while a return already
+  executed is never restated. No event is emitted — `RentalEscrow`
+  has no event layer — and no new error code: the refusals reuse
+  `Unauthorized` (100), `RentalNotActive` (269), and
+  `InvalidRentalTerms` (268).
 
 New error codes (never renumbered): `InvalidRentalTerms` (268),
 `RentalNotActive` (269), `RentalCancelNotAllowed` (270). Pure logic:
