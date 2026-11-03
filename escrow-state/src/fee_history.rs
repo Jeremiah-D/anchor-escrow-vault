@@ -331,6 +331,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // settled keeps its rate and accrued yield is
         // never clawed back.
         | EscrowEventKind::InterestRateAmended
+        // AV-333: a revised compound-interest mode carries no
+        // fee leg — only the mode flag flips; yield already
+        // folded stays principal and yield already paid stays
+        // paid, while the take / dispute / claim paths re-read
+        // the live flag at the next settlement.
+        | EscrowEventKind::CompoundInterestAmended
         // AV-261: a revised price gate moves no
         // funds — the gated payout paths re-read the
         // live gate at every release / claim; a payout
@@ -1318,6 +1324,12 @@ mod fee_history_tests {
         // settled keeps its rate and accrued yield is
         // never clawed back.
         | EscrowEventKind::InterestRateAmended
+        // AV-333: a revised compound-interest mode carries no
+        // fee leg — only the mode flag flips; yield already
+        // folded stays principal and yield already paid stays
+        // paid, while the take / dispute / claim paths re-read
+        // the live flag at the next settlement.
+        | EscrowEventKind::CompoundInterestAmended
         // AV-261: a revised price gate moves no
         // funds — the gated payout paths re-read the
         // live gate at every release / claim; a payout

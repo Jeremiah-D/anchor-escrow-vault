@@ -26831,6 +26831,66 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Revise the compound-interest mode after funding
+    /// (AV-333): the post-funding counterpart to
+    /// [`Escrow::with_compound_interest`] (`Uninitialized`-only
+    /// initial opt-in). Dual-signed governance, `Funded`-only,
+    /// pause first — paralleling
+    /// [`Escrow::amend_interest_rate`]. Flips only the mode
+    /// flag — it never restates history: yield already folded
+    /// stays principal (`interest_compounded` and `amount`
+    /// untouched) and yield already paid out stays in
+    /// `interest_paid`; only future settlements price through
+    /// the new mode. The read points re-read the live flag at
+    /// every call — [`Escrow::take_accrued_interest`],
+    /// [`Escrow::settle_dispute_interest`] and the
+    /// [`Escrow::claim_interest`] mutual-exclusion gate (code
+    /// 178) — so a flip governs the very next settlement while
+    /// a settlement already made keeps the mode it settled
+    /// under. A dispute cannot flip the mode (`Funded`-only
+    /// bars `Disputed`, so the dispute window settles under
+    /// the frozen mode). Re-affirming the current mode is a
+    /// no-op (succeeds, writes nothing, emits no event,
+    /// paralleling `amend_interest_rate`). No layout change
+    /// (the 1-byte flag is rewritten in place) and no new
+    /// error code (`Unauthorized` / `InvalidStateTransition`;
+    /// 178 is a read-point consequence, not raised here).
+    /// Emits `CompoundInterestAmended` on the event layer,
+    /// except for the no-op re-affirmation. Orthogonal to
+    /// AV-117 (that is the compounding mechanism itself, this
+    /// item is the mode switch), to AV-107 (that is the
+    /// simple-interest harvest path, this item is the switch
+    /// between harvest and fold), to AV-260 (that is the rate,
+    /// this item is the mode), to AV-119 (that is the dispute
+    /// window, this item is the mode outside a dispute) and
+    /// to AV-266 / AV-328 (keeper bounty, untouched).
+    pub fn amend_compound_interest(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        enabled: bool,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_interest_rate`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // No-op: re-affirming the current mode writes nothing,
+        // so the event layer emits nothing for it.
+        if enabled == self.compound_interest {
+            return Ok(());
+        }
+        self.compound_interest = enabled;
+        Ok(())
+    }
+
+
 
     /// Revise the oracle price gate after funding
     /// (AV-261): the post-funding counterpart to
@@ -51115,7 +51175,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
-        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
     }
 
     #[test]
@@ -68327,7 +68388,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(158), Some(EscrowEventKind::FundingStartAmended)); // AV-321: 158 is FundingStartAmended
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
-        assert_eq!(EscrowEventKind::from_discriminant(161), None); // AV-328: 160 is KeeperBountyPoolToppedUp
+        assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -68570,9 +68632,10 @@ mod event_history_tests {
         // `EnglishAuctionBuyoutPriceAmended` (AV-320), 158 is
         // `FundingStartAmended` (AV-321), 159 is
         // `EnglishAuctionSellerAmended` (AV-322), 160 is
-        // `KeeperBountyPoolToppedUp` (AV-328) and 161 is the
+        // `KeeperBountyPoolToppedUp` (AV-328), 161 is
+        // `CompoundInterestAmended` (AV-333) and 162 is the
         // first still-unknown byte.
-        for bad in [161u8, 255] {
+        for bad in [162u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -77476,6 +77539,242 @@ mod interest_tests {
         // Re-affirming the same rate is a no-op: no new event.
         e.amend_interest_rate(ALICE, BOB, 1_000, FUND_AT).unwrap();
         assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    fn compound_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_interest(500)
+            .unwrap()
+            .with_compound_interest()
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_compound_interest_rejects_stranger_and_single_party() {
+        // Dual-signature governance: one party alone — or a
+        // stranger pair — cannot flip the other's yield mode.
+        let mut e = interest_escrow(500);
+        assert_eq!(
+            e.amend_compound_interest(MALLORY, BOB, true),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_compound_interest(ALICE, ALICE, true),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_compound_interest(ALICE, MALLORY, true),
+            Err(EscrowError::Unauthorized)
+        );
+        assert!(!e.compound_interest(), "failed calls flip nothing");
+    }
+
+    #[test]
+    fn amend_compound_interest_rejects_non_funded_states() {
+        // Uninitialized: the builder owns the initial opt-in.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        assert_eq!(
+            bare.amend_compound_interest(ALICE, BOB, true),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Activated: funded money is the lock-in point, not activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_compound_interest(ALICE, BOB, true),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: the dispute window settles under the frozen mode.
+        let mut disputed = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        disputed.fund(ALICE, FUND_AT).unwrap();
+        disputed
+            .escalate(ALICE, FUND_AT + 3_153_600, disputed.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(disputed.state(), EscrowState::Disputed);
+        assert_eq!(
+            disputed.amend_compound_interest(ALICE, BOB, true),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(!disputed.compound_interest());
+        // Terminal: a released escrow's mode is history, not policy.
+        let mut released = interest_escrow(500);
+        released.release(ALICE, FUND_AT, 1_000_000, None, BOB).unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_compound_interest(ALICE, BOB, true),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Terminal: same for a cancelled escrow.
+        let mut cancelled = interest_escrow(500);
+        cancelled.cancel(ALICE, None, ALICE, FUND_AT).unwrap();
+        assert_eq!(cancelled.state(), EscrowState::Cancelled);
+        assert_eq!(
+            cancelled.amend_compound_interest(ALICE, BOB, true),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_compound_interest_rejects_when_paused() {
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_compound_interest(ALICE, BOB, true),
+            Err(EscrowError::Paused)
+        );
+        assert!(!paused.compound_interest());
+    }
+
+    #[test]
+    fn amend_compound_interest_same_value_is_noop() {
+        // Re-affirming the current mode succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = interest_escrow(500);
+        e.amend_compound_interest(ALICE, BOB, false).unwrap();
+        assert!(!e.compound_interest());
+        assert_eq!(e.state(), EscrowState::Funded);
+        let mut c = compound_escrow();
+        c.amend_compound_interest(ALICE, BOB, true).unwrap();
+        assert!(c.compound_interest());
+        assert_eq!(c.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_compound_interest_indexed_emits_event_noop_and_failed_emit_nothing() {
+        let funded = interest_escrow(500);
+        let mut e = IndexedEscrow::wrap([0x1D; 32], funded);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_compound_interest(ALICE, ALICE, true, FUND_AT),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_compound_interest(ALICE, BOB, true, FUND_AT).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::CompoundInterestAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        assert_eq!(ev.amounts.refund, 0);
+        assert_eq!(ev.amounts.penalty, 0);
+        // Re-affirming the same mode is a no-op: no new event.
+        e.amend_compound_interest(ALICE, BOB, true, FUND_AT).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_compound_interest_on_simple_escrow_folds_next_take_and_blocks_claim() {
+        // A simple escrow that opts into compounding mid-flight:
+        // the outstanding claim folds on the next take, and the
+        // standalone harvest is refused from the flip on.
+        let mut e = interest_escrow(500);
+        e.settle_interest(FUND_AT + YEAR);
+        assert_eq!(e.interest_accrued(), 50_000);
+        e.amend_compound_interest(ALICE, BOB, true).unwrap();
+        assert!(e.compound_interest());
+        let err = e.claim_interest(BOB, FUND_AT + YEAR).unwrap_err();
+        assert_eq!(err, EscrowError::CompoundInterestActive);
+        assert_eq!(err.code(), 178);
+        assert_eq!(e.interest_accrued(), 50_000, "refused claim settles nothing");
+        // The next take folds instead of paying out: a partial
+        // release (1_050_000, 500_000 paid out, 550_000 locked).
+        let (payout, fee) = e.release(ALICE, FUND_AT + YEAR, 500_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (500_000, 0));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_050_000);
+        assert_eq!(e.interest_compounded(), 50_000);
+        assert_eq!(e.interest_accrued(), 0);
+        assert_eq!(e.interest_paid(), 0, "compound never pays out separately");
+    }
+
+    #[test]
+    fn amend_compound_interest_off_compound_escrow_pays_next_take_and_allows_claim() {
+        // A compound escrow that opts out mid-flight: the
+        // outstanding claim pays out on the next take, and the
+        // standalone harvest is open again from the flip on.
+        let mut e = compound_escrow();
+        e.settle_interest(FUND_AT + YEAR);
+        assert_eq!(e.interest_accrued(), 50_000);
+        e.amend_compound_interest(ALICE, BOB, false).unwrap();
+        assert!(!e.compound_interest());
+        assert_eq!(e.claim_interest(BOB, FUND_AT + YEAR).unwrap(), 50_000);
+        assert_eq!(e.interest_paid(), 50_000);
+        assert_eq!(e.interest_compounded(), 0);
+        assert_eq!(e.interest_accrued(), 0);
+    }
+
+    #[test]
+    fn amend_compound_interest_off_keeps_folded_yield_as_principal() {
+        // Closing the mode never un-folds: yield already folded
+        // stays principal, and the next slice prices the grown
+        // remainder — then pays out instead of folding.
+        let mut e = compound_escrow();
+        e.settle_interest(FUND_AT + YEAR);
+        assert_eq!(e.interest_accrued(), 50_000);
+        let (payout, fee) = e.release(ALICE, FUND_AT + YEAR, 500_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (500_000, 0));
+        assert_eq!(e.amount(), 1_050_000);
+        assert_eq!(e.interest_compounded(), 50_000);
+        e.amend_compound_interest(ALICE, BOB, false).unwrap();
+        assert!(!e.compound_interest());
+        assert_eq!(e.amount(), 1_050_000, "folded yield stays principal");
+        assert_eq!(e.interest_compounded(), 50_000);
+        // Next year prices the grown remainder (550_000) at 5%:
+        // 27_500 — and now pays out instead of folding.
+        e.settle_interest(FUND_AT + 2 * YEAR);
+        assert_eq!(e.interest_accrued(), 27_500);
+        assert_eq!(e.claim_interest(BOB, FUND_AT + 2 * YEAR).unwrap(), 27_500);
+        assert_eq!(e.interest_paid(), 27_500);
+        assert_eq!(e.interest_compounded(), 50_000, "the folded leg never moves");
+    }
+
+    #[test]
+    fn amend_compound_interest_on_keeps_already_paid_yield_in_interest_paid() {
+        // Opening the mode never restates the paid leg: yield
+        // already harvested stays in `interest_paid`, and only
+        // the next slice folds.
+        let mut e = interest_escrow(500);
+        assert_eq!(e.claim_interest(BOB, FUND_AT + YEAR / 2).unwrap(), 25_000);
+        assert_eq!(e.interest_paid(), 25_000);
+        e.amend_compound_interest(ALICE, BOB, true).unwrap();
+        assert!(e.compound_interest());
+        assert_eq!(e.interest_paid(), 25_000, "paid yield stays paid");
+        assert_eq!(e.interest_compounded(), 0);
+        // The next half-year folds on the next take; the paid leg
+        // is untouched.
+        e.settle_interest(FUND_AT + YEAR);
+        assert_eq!(e.interest_accrued(), 25_000);
+        let (payout, fee) = e.release(ALICE, FUND_AT + YEAR, 500_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (500_000, 0));
+        assert_eq!(e.interest_compounded(), 25_000);
+        assert_eq!(e.interest_paid(), 25_000);
     }
 }
 
