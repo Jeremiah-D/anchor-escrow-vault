@@ -385,6 +385,67 @@ impl BidDepositAuction {
         Ok(())
     }
 
+    /// Revise the auction kind before the first registration lands
+    /// (AV-326).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the seller key is the book's authority, the
+    /// same gate as [`Self::forfeit`]) and only while no bidder has
+    /// registered (`deposit_count == 0`): a registered bidder locked
+    /// their deposit under the old kind's settlement treatment, so
+    /// the terms must not be rewritten under them. Refused with
+    /// [`EscrowError::BidDepositAlreadySettled`] (code 284) once the
+    /// book is settled, and with
+    /// [`EscrowError::InvalidBidDeposit`] (code 282) once a deposit
+    /// is registered.
+    ///
+    /// Check order is authority → settled → registration,
+    /// mirroring [`Self::amend_bid_deposit_amount`] (AV-324): a
+    /// stranger is refused even on a settled book, and a settled
+    /// book refuses even the seller. There is no value gate —
+    /// [`AuctionKind`] is a closed three-variant enum, so every
+    /// variant is legal. Revising to the current kind is a no-op.
+    ///
+    /// Only `kind` changes: `auction`, `seller`,
+    /// `deposit_amount`, entries, count, and settled are untouched.
+    /// The kind is the settlement entrypoint's only routing
+    /// condition — [`Self::settle`] refuses a sealed-bid book and
+    /// [`Self::settle_sealed`] refuses any other kind — so revising
+    /// it reroutes the next settlement: a book built English by
+    /// mistake would otherwise refuse `settle` forever once
+    /// re-keyed sealed (and `settle_sealed` would forfeit every
+    /// never-revealing English bidder), while a sealed book built
+    /// English would refund no-reveal deposits `settle` should have
+    /// confiscated. Before the first registration nobody has locked
+    /// funds under the old kind, so the reroute is safe.
+    ///
+    /// Pure logic: this method changes state only. The revision is
+    /// recorded for the indexer as [`Self::kind_audit_json`] (a
+    /// string event name, no numeric event ID — the deposit audit
+    /// convention); a failed revision and a no-op re-affirmation
+    /// record nothing. No Vault layout change, no new error code:
+    /// the gates reuse 100/282/284.
+    pub fn amend_bid_deposit_kind(
+        &mut self,
+        authority: [u8; 32],
+        new_kind: AuctionKind,
+    ) -> Result<(), EscrowError> {
+        if authority != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.settled {
+            return Err(EscrowError::BidDepositAlreadySettled);
+        }
+        if self.count > 0 {
+            return Err(EscrowError::InvalidBidDeposit);
+        }
+        if new_kind == self.kind {
+            return Ok(());
+        }
+        self.kind = new_kind;
+        Ok(())
+    }
+
     /// The current state of one bidder's deposit.
     ///
     /// Refused ([`EscrowError::BidDepositNotRegistered`], code 283)
@@ -588,6 +649,25 @@ impl BidDepositAuction {
         s.push_str(&hex64(&previous_seller));
         s.push_str("\",\"seller\":\"");
         s.push_str(&hex64(&self.seller));
+        s.push('"');
+        s.push('}');
+        s
+    }
+
+    /// Audit-event JSON for an auction-kind revision (hand-written):
+    /// `{"event":"bid_deposit_kind_amended","auction":"<64hex>",
+    /// "previous_kind":"<English|Dutch|SealedBid>",
+    /// "kind":"<English|Dutch|SealedBid>"}`. Kind names render via
+    /// `Debug` (`{:?}` — [`AuctionKind`] derives `Debug` only, no
+    /// `Display`). Emitted only on an actual change — a no-op
+    /// re-affirmation records nothing.
+    pub fn kind_audit_json(&self, previous_kind: AuctionKind) -> String {
+        let mut s = String::from("{\"event\":\"bid_deposit_kind_amended\",\"auction\":\"");
+        s.push_str(&hex64(&self.auction));
+        s.push_str("\",\"previous_kind\":\"");
+        s.push_str(&format!("{:?}", previous_kind));
+        s.push_str("\",\"kind\":\"");
+        s.push_str(&format!("{:?}", self.kind));
         s.push('"');
         s.push('}');
         s
@@ -1139,6 +1219,159 @@ mod bid_deposit_tests {
                 "bb".repeat(32)
             )
         );
+    }
+
+    #[test]
+    fn amend_bid_deposit_kind_is_seller_only() {
+        let mut b = open_book();
+        // A stranger is refused, even on an empty book.
+        let err = b.amend_bid_deposit_kind(key(9), AuctionKind::SealedBid).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(b.kind(), AuctionKind::English);
+        // A bidder is refused too — authority is checked first,
+        // before the post-registration gate.
+        b.register(key(1)).unwrap();
+        let err = b.amend_bid_deposit_kind(key(1), AuctionKind::Dutch).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(b.kind(), AuctionKind::English);
+    }
+
+    #[test]
+    fn amend_bid_deposit_kind_refused_after_settlement() {
+        let mut b = open_book();
+        b.register(key(1)).unwrap();
+        b.settle(Some(key(1))).unwrap();
+        assert!(b.is_settled());
+        let err = b.amend_bid_deposit_kind(key(0xAA), AuctionKind::SealedBid).unwrap_err();
+        assert_eq!(err, EscrowError::BidDepositAlreadySettled);
+        assert_eq!(err.code(), 284);
+        assert_eq!(b.kind(), AuctionKind::English);
+        // Authority still wins on a settled book: a stranger is
+        // Unauthorized, not AlreadySettled.
+        let err = b.amend_bid_deposit_kind(key(9), AuctionKind::Dutch).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_bid_deposit_kind_locks_after_first_registration() {
+        let mut b = open_book();
+        b.register(key(1)).unwrap();
+        let err = b.amend_bid_deposit_kind(key(0xAA), AuctionKind::SealedBid).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidBidDeposit);
+        assert_eq!(err.code(), 282);
+        assert_eq!(b.kind(), AuctionKind::English);
+        // The registered bidder's terms stand: settlement still
+        // follows the original kind — the open-bid entrypoint works.
+        let s = b.settle(Some(key(1))).unwrap();
+        assert_eq!(s.applied, 1000);
+        assert_conservation(&b);
+    }
+
+    #[test]
+    fn amend_bid_deposit_kind_same_value_is_noop() {
+        let mut b = open_book();
+        // Re-affirming the current kind succeeds and changes
+        // nothing — the pure-logic method emits no event, so there
+        // is no event to assert here; the state pin is the kind.
+        b.amend_bid_deposit_kind(key(0xAA), AuctionKind::English).unwrap();
+        assert_eq!(b.kind(), AuctionKind::English);
+        assert_eq!(b.deposit_count(), 0);
+        assert!(!b.is_settled());
+        assert_eq!(b.deposit_amount(), 1000);
+        assert_eq!(b.seller(), key(0xAA));
+    }
+
+    #[test]
+    fn amend_bid_deposit_kind_revises_before_first_registration() {
+        let mut b = open_book();
+        b.amend_bid_deposit_kind(key(0xAA), AuctionKind::SealedBid).unwrap();
+        assert_eq!(b.kind(), AuctionKind::SealedBid);
+        // Only the kind changes.
+        assert_eq!(b.auction(), key(0xA0));
+        assert_eq!(b.seller(), key(0xAA));
+        assert_eq!(b.deposit_amount(), 1000);
+        assert_eq!(b.deposit_count(), 0);
+        assert!(!b.is_settled());
+        assert_conservation(&b);
+    }
+
+    #[test]
+    fn amend_bid_deposit_kind_is_repeatable_before_first_registration() {
+        let mut b = open_book();
+        b.amend_bid_deposit_kind(key(0xAA), AuctionKind::Dutch).unwrap();
+        assert_eq!(b.kind(), AuctionKind::Dutch);
+        b.amend_bid_deposit_kind(key(0xAA), AuctionKind::SealedBid).unwrap();
+        assert_eq!(b.kind(), AuctionKind::SealedBid);
+        // The final kind governs the next settlement: a sealed-bid
+        // book forfeits the never-revealing bidder.
+        b.register(key(1)).unwrap();
+        b.register(key(2)).unwrap();
+        b.mark_revealed(key(1)).unwrap();
+        let s = b.settle_sealed(Some(key(1))).unwrap();
+        assert_eq!((s.applied, s.refunded, s.forfeited), (1000, 0, 1));
+        assert_conservation(&b);
+    }
+
+    #[test]
+    fn english_to_sealed_revision_reroutes_settlement() {
+        let mut b = open_book();
+        b.amend_bid_deposit_kind(key(0xAA), AuctionKind::SealedBid).unwrap();
+        b.register(key(1)).unwrap(); // reveals, wins
+        b.register(key(2)).unwrap(); // ghosts — never reveals
+        b.mark_revealed(key(1)).unwrap();
+        // The open-bid entrypoint now refuses the sealed book.
+        let err = b.settle(Some(key(1))).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidBidDeposit);
+        assert!(!b.is_settled());
+        // The sealed entrypoint applies the no-reveal confiscation.
+        let s = b.settle_sealed(Some(key(1))).unwrap();
+        assert_eq!(s.winner, Some(key(1)));
+        assert_eq!(s.applied, 1000);
+        assert_eq!(s.refunded, 0);
+        assert_eq!(s.forfeited, 1);
+        assert_eq!(b.state_of(key(2)).unwrap(), DepositState::Forfeited);
+        assert_conservation(&b);
+    }
+
+    #[test]
+    fn sealed_to_english_revision_reroutes_settlement() {
+        let mut b = open_sealed_book();
+        b.amend_bid_deposit_kind(key(0xAA), AuctionKind::English).unwrap();
+        b.register(key(1)).unwrap();
+        b.register(key(2)).unwrap();
+        // The sealed entrypoint now refuses the open-bid book.
+        let err = b.settle_sealed(Some(key(1))).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidBidDeposit);
+        assert!(!b.is_settled());
+        // The open-bid entrypoint refunds every loser in full — no
+        // no-reveal confiscation on a book that is no longer sealed.
+        let s = b.settle(Some(key(1))).unwrap();
+        assert_eq!(s.winner, Some(key(1)));
+        assert_eq!(s.applied, 500);
+        assert_eq!(s.refunded, 1);
+        assert_eq!(s.forfeited, 0);
+        assert_eq!(b.state_of(key(2)).unwrap(), DepositState::Refunded);
+        assert_conservation(&b);
+    }
+
+    #[test]
+    fn amend_bid_deposit_kind_audit_json() {
+        let mut b = open_book();
+        b.amend_bid_deposit_kind(key(0xAA), AuctionKind::SealedBid).unwrap();
+        let j = b.kind_audit_json(AuctionKind::English);
+        assert_eq!(
+            j,
+            format!(
+                "{{\"event\":\"bid_deposit_kind_amended\",\"auction\":\"{}\",\"previous_kind\":\"English\",\"kind\":\"SealedBid\"}}",
+                "a0".repeat(32)
+            )
+        );
+        // Dutch renders by its Debug name too.
+        b.amend_bid_deposit_kind(key(0xAA), AuctionKind::Dutch).unwrap();
+        let j = b.kind_audit_json(AuctionKind::SealedBid);
+        assert!(j.contains("\"previous_kind\":\"SealedBid\""));
+        assert!(j.contains("\"kind\":\"Dutch\""));
     }
 
     #[test]
