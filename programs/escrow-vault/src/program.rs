@@ -7988,6 +7988,14 @@ pub enum EscrowVaultEventKind {
     /// names the kind so the indexer can follow the revised legs
     /// and the new Σ amount).
     BasketAmended,
+    /// AV-341: the taker withdrew a filed slash appeal before the
+    /// panel decided it (`Escrow::withdraw_appeal`). Mirrors
+    /// `escrow_state::EscrowEventKind::AppealWithdrawn`. No Anchor
+    /// instruction surface (AV-341 is logic + event layer only, the
+    /// AV-260/AV-266 precedent — the on-chain event stream still
+    /// names the kind so the indexer can follow the conceded appeal
+    /// and the forfeited bond).
+    AppealWithdrawn,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -8152,6 +8160,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::BasketAmended => {
             EscrowVaultEventKind::BasketAmended
+        }
+        escrow_state::EscrowEventKind::AppealWithdrawn => {
+            EscrowVaultEventKind::AppealWithdrawn
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled

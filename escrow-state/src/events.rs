@@ -1030,6 +1030,7 @@
 //! | GovernanceDelayAmended (AV-334) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a proposal already staged; only the `governance_delay_secs` window moves, so `amount`, `expires_at`, `state`, and the live proposal are untouched — a proposal already live keeps the `delay_secs` snapshotted at propose time and executes off that snapshot, while the next `propose_governance` stages under the new window — and the 16 routed config changes keep following the live window (direct calls still refused with code 219 on a delay-on escrow, proposals still execute only once the live window elapses) |
 //! | ExpiryShortened (AV-338) | 0 | 0 | 0 | 0 — shortening moves no funds and never restates a settlement already made; only `expires_at` moves, so `amount`, `released`, `funded_total`, `state`, and `extension_count` are untouched — shortening is not an extension — and the next `cancel_expired` / `escalate` reads the live deadline, so a cancel after the shortening exits at the new expiry while a cancel already settled keeps the deadline it settled under |
 //! | BasketAmended (AV-340) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a settlement already made; only the leg table and the derived `amount` move, so `released`, `funded_total`, `state`, and `expires_at` are untouched, and the next `fund` prices the new Σ while the next `release_basket` settles the new legs (an old mint settles as `InvalidBasket`) and a leg already settled keeps the table it settled under |
+//! | AppealWithdrawn (AV-341) | 0 | 0 | 0 | the appeal bond forfeited to the initializer when the taker withdraws a filed appeal before the panel decides it (0 when no bond was locked; from == to == `Funded`; the slash stands, like an upheld appeal) |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2923,6 +2924,18 @@ pub enum EscrowEventKind {
     /// event needs no extra field. A no-op re-affirmation of the
     /// current table emits nothing.
     BasketAmended,
+    /// AV-341: the taker withdrew a filed slash appeal before the
+    /// panel decided it ([`Escrow::withdraw_appeal`]). `from == to
+    /// ==` the current state (a concession, not a lifecycle move —
+    /// like [`EscrowEventKind::AppealExpired`]); the appeal moves
+    /// terminally to `Upheld` — the concession upholds the original
+    /// ruling — and the locked appeal bond, if any, rides
+    /// `amounts.penalty` (forfeited to the initializer, `0` when no
+    /// bond was locked). The panel ballot stays as the audit trail
+    /// of the votes cast before the withdrawal. Always emitted on
+    /// success: the call fails unless a `Filed` appeal is withdrawn,
+    /// so there is no no-op case.
+    AppealWithdrawn,
 }
 
 impl EscrowEventKind {
@@ -3450,6 +3463,10 @@ impl EscrowEventKind {
             // discriminants 0–163 stay stable for already-serialized
             // histories.
             164 => Self::BasketAmended,
+            // AV-341: appended after BasketAmended so
+            // discriminants 0–164 stay stable for already-serialized
+            // histories.
+            165 => Self::AppealWithdrawn,
             _ => return None,
         })
     }
@@ -3660,6 +3677,7 @@ impl EscrowEventKind {
             Self::GovernanceDelayAmended => "governance_delay_amended",
             Self::ExpiryShortened => "expiry_shortened",
             Self::BasketAmended => "basket_amended",
+            Self::AppealWithdrawn => "appeal_withdrawn",
             Self::SlashDeadlineAmended => "slash_deadline_amended",
             Self::AmountBoundsAmended => "amount_bounds_amended",
             Self::MilestoneLatePenaltyBpsAmended => "milestone_late_penalty_bps_amended",
@@ -3904,6 +3922,7 @@ impl EscrowEventKind {
             "governance_delay_amended" => Self::GovernanceDelayAmended,
             "expiry_shortened" => Self::ExpiryShortened,
             "basket_amended" => Self::BasketAmended,
+            "appeal_withdrawn" => Self::AppealWithdrawn,
             "slash_deadline_amended" => Self::SlashDeadlineAmended,
             "amount_bounds_amended" => Self::AmountBoundsAmended,
             "milestone_late_penalty_bps_amended" => Self::MilestoneLatePenaltyBpsAmended,
@@ -4143,12 +4162,14 @@ impl EventAmounts {
         }
     }
 
-    /// A slash-appeal uphold or window-lapse forfeiture (AV-103): the
-    /// forfeited appeal bond rides `penalty` — a penalty-like sink
-    /// routed to the initializer, neither a taker payout nor an
-    /// initializer refund. Rides the
-    /// [`EscrowEventKind::AppealResolved`] event on uphold and the
-    /// [`EscrowEventKind::AppealExpired`] event on expiry.
+    /// A slash-appeal uphold, window-lapse, or withdrawal forfeiture
+    /// (AV-103): the forfeited appeal bond rides `penalty` — a
+    /// penalty-like sink routed to the initializer, neither a taker
+    /// payout nor an initializer refund. Rides the
+    /// [`EscrowEventKind::AppealResolved`] event on uphold, the
+    /// [`EscrowEventKind::AppealExpired`] event on expiry, and the
+    /// [`EscrowEventKind::AppealWithdrawn`] event on withdrawal
+    /// (AV-341).
     pub(crate) fn appeal_bond_forfeited(forfeited: u64) -> Self {
         Self {
             payout: 0,
@@ -12201,6 +12222,54 @@ impl IndexedEscrow {
         Ok(forfeited)
     }
 
+    /// Withdraw a filed slash appeal before the panel decides it
+    /// (AV-341; mirrors [`Escrow::withdraw_appeal`]): `Funded ->
+    /// Funded` — the taker concedes the slash, ending the appeal
+    /// early (an out-of-court settlement). The appeal moves
+    /// terminally to `Upheld` and the locked appeal bond (if any) is
+    /// forfeited to the initializer. Emits
+    /// [`EscrowEventKind::AppealWithdrawn`] (from == to ==
+    /// `Funded`, `amounts.penalty` = the forfeited bond) with the
+    /// taker as the actor. There is deliberately no deadline gate:
+    /// the window gates the filing, not the concession — a `Filed`
+    /// appeal may still be withdrawn after the deadline, racing the
+    /// permissionless [`Escrow::expire_appeal`] sweep. On executor
+    /// failure the state machine rolls back and nothing is emitted,
+    /// like every other failed transition. `at` is both the event
+    /// timestamp and the state machine's `now`. Returns the forfeited
+    /// bond (`0` when no bond was locked) so the caller can size the
+    /// transfer to the initializer.
+    ///
+    /// [`Escrow::withdraw_appeal`]: super::Escrow::withdraw_appeal
+    pub fn withdraw_appeal(&mut self, taker: [u8; 32], at: u64) -> Result<u64, EscrowError> {
+        let from = self.inner.state();
+        // AV-133: scheduled auto-recovery before the transition (the
+        // inner method repeats the check idempotently).
+        let pause_state = self.inner.state();
+        let (pause_was, pause_schedule, auto_unpaused) = self.begin_auto_unpause(at);
+        let forfeited = match self.inner.withdraw_appeal(taker, at) {
+            Ok(v) => v,
+            Err(e) => {
+                self.restore_auto_unpause_on_failure(pause_was, pause_schedule, auto_unpaused);
+                return Err(e);
+            }
+        };
+        self.emit_auto_unpause(pause_state, at, auto_unpaused);
+        self.push_event(
+            EscrowEventKind::AppealWithdrawn,
+            from,
+            self.inner.state(),
+            EventAmounts::appeal_bond_forfeited(forfeited),
+            at,
+            None,
+            None,
+            None,
+            None,
+            Some(taker),
+        );
+        Ok(forfeited)
+    }
+
     /// Grant an operator a bounded slice of the caller's authority
     /// (AV-104; mirrors [`Escrow::delegate_authority`]). Emits
     /// [`EscrowEventKind::DelegationGranted`] (`from == to ==` the
@@ -15889,7 +15958,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -16042,7 +16112,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -16629,7 +16700,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -16694,7 +16766,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -16756,7 +16829,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -16818,7 +16892,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -16880,7 +16955,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -16945,7 +17021,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17010,7 +17087,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17072,7 +17150,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17134,7 +17213,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17196,7 +17276,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17258,7 +17339,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17320,7 +17402,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17382,7 +17465,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17448,7 +17532,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17513,7 +17598,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17578,7 +17664,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17643,7 +17730,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17708,7 +17796,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17774,7 +17863,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17840,7 +17930,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17906,7 +17997,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17971,7 +18063,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -17993,7 +18086,8 @@ mod event_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened));
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended));
-        assert_eq!(EscrowEventKind::from_discriminant(165), None);
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn));
+        assert_eq!(EscrowEventKind::from_discriminant(166), None);
     }
 
     #[test]
@@ -18011,7 +18105,8 @@ mod event_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened));
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended));
-        assert_eq!(EscrowEventKind::from_discriminant(165), None);
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn));
+        assert_eq!(EscrowEventKind::from_discriminant(166), None);
     }
 
     #[test]
@@ -18028,7 +18123,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended));
-        assert_eq!(EscrowEventKind::from_discriminant(165), None);
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn));
+        assert_eq!(EscrowEventKind::from_discriminant(166), None);
     }
 
     #[test]
@@ -18041,7 +18137,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(kind));
         assert_eq!(kind.name(), "basket_amended");
         assert_eq!(EscrowEventKind::from_name("basket_amended"), Some(kind));
-        assert_eq!(EscrowEventKind::from_discriminant(165), None);
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn));
+        assert_eq!(EscrowEventKind::from_discriminant(166), None);
     }
 
     #[test]
@@ -18123,7 +18220,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]

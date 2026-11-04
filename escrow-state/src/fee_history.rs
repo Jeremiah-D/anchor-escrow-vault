@@ -603,6 +603,7 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         | EscrowEventKind::BasketExpiredCancelled
         | EscrowEventKind::DenylistUpdated
         | EscrowEventKind::AppealExpired
+        | EscrowEventKind::AppealWithdrawn
         | EscrowEventKind::DelegationGranted
         | EscrowEventKind::DelegationRevoked
         | EscrowEventKind::SwapLinked
@@ -1603,6 +1604,7 @@ mod fee_history_tests {
                 | EscrowEventKind::BasketExpiredCancelled
                 | EscrowEventKind::DenylistUpdated
                 | EscrowEventKind::AppealExpired
+                | EscrowEventKind::AppealWithdrawn
                 | EscrowEventKind::DelegationGranted
                 | EscrowEventKind::DelegationRevoked
                 | EscrowEventKind::SwapLinked

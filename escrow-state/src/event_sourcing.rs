@@ -58,6 +58,10 @@
 //!     taker-supplied funds the fold never booked (the bond is
 //!     additional inflow outside the principal) — so it is the
 //!     symmetric no-op too.
+//!   - `AppealWithdrawn` (AV-341): a withdrawn appeal forfeits the
+//!     bond the same way — the taker concedes before the panel
+//!     decides, so the bond is taker-supplied funds the fold never
+//!     booked either.
 //!   - `KeeperBountyPaid` (AV-124): the bounty pool is
 //!     initializer-supplied funds the fold never booked (the pool is
 //!     additional inflow outside the principal, the AV-103
@@ -613,6 +617,9 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // AV-103: an expired appeal forfeits the bond — taker-supplied
         // funds the fold never booked (the bond is additional inflow
         // outside the principal) — so it is the symmetric no-op too.
+        // AV-341: a withdrawn appeal forfeits the bond the same way —
+        // the taker concedes before the panel decides, so the bond is
+        // taker-supplied funds the fold never booked either.
         // AV-150: freezing / restarting the vesting unlock clock is a
         // Funded → Funded schedule-config flip — no funds move; the
         // schedule's window shift on resume is time math, not a
@@ -621,6 +628,7 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         | EscrowEventKind::VestingResumed
         | EscrowEventKind::AppealResolved
         | EscrowEventKind::AppealExpired
+        | EscrowEventKind::AppealWithdrawn
         // AV-174: a protocol-fee withdrawal moves no *fold-tracked*
         // funds — the fee already left `locked` at payout time as part
         // of the gross release (the AV-17 routing-slice rule); the
@@ -1578,6 +1586,7 @@ mod event_sourcing_tests {
                 | EscrowEventKind::AppealFiled
                 | EscrowEventKind::AppealResolved
                 | EscrowEventKind::AppealExpired
+                | EscrowEventKind::AppealWithdrawn
                 | EscrowEventKind::EvidenceFiled
                 // AV-150: the vesting unlock clock freezes / restarts —
                 // a Funded → Funded schedule-config flip, no funds move.

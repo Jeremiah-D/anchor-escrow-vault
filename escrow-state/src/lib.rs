@@ -19491,6 +19491,79 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(forfeited)
     }
 
+    /// Withdraw a filed slash appeal before the panel decides it
+    /// (AV-341): `Funded -> Funded` — the taker concedes the slash
+    /// before the deadline, ending the appeal early (an out-of-court
+    /// settlement). The appeal moves terminally to
+    /// [`AppealState::Upheld`] — the concession upholds the original
+    /// ruling — and the locked appeal bond — if any — is forfeited to
+    /// the initializer: the anti-malicious-appeal-delay rule, so a
+    /// taker cannot file and then walk away for free.
+    ///
+    /// Authorization: only the taker may withdraw their own appeal
+    /// ([`EscrowError::Unauthorized`] otherwise — the initializer
+    /// cannot withdraw it for them). Check order is deliberate
+    /// (pause, reentrancy, authority, state, appeal — the crate
+    /// convention): a stranger learns nothing about the appeal.
+    ///
+    /// There is deliberately no deadline gate: the window gates the
+    /// filing, not the concession — a `Filed` appeal may still be
+    /// withdrawn after the deadline, racing the permissionless
+    /// [`Escrow::expire_appeal`] sweep; whichever lands first wins.
+    ///
+    /// Returns the forfeited bond (`0` when no bond was locked) so
+    /// the real build can size the transfer to the initializer.
+    ///
+    /// Emits nothing by itself — the
+    /// [`EscrowEventKind::AppealWithdrawn`](crate::EscrowEventKind::AppealWithdrawn)
+    /// indexer event is emitted by the `IndexedEscrow` wrapper (and
+    /// the Anchor layer).
+    pub fn withdraw_appeal(&mut self, taker: [u8; 32], now: u64) -> Result<u64, EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
+        self.require_not_paused()?;
+        // AV-36: reentrancy guard — the withdrawal moves the
+        // forfeited bond.
+        self.require_not_reentrant()?;
+        // Authority: only the taker may withdraw their own appeal.
+        // Checked before state validity.
+        if taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Only a filed appeal can be withdrawn — withdrawing a
+        // never-filed or already-resolved appeal is rejected.
+        if !matches!(self.appeal_state, AppealState::Filed) {
+            return Err(EscrowError::InvalidAppealWindow);
+        }
+        let forfeited = self.appeal_bond_paid;
+        self.appeal_bond_paid = 0;
+        // AV-106: when the pool is opted in the forfeit credits the
+        // pool instead of the initializer — the bond stays in the
+        // vault, no transfer.
+        if self.insurance_pool && forfeited > 0 {
+            self.pool_paid = self
+                .pool_paid
+                .checked_add(forfeited)
+                .ok_or(EscrowError::InvalidAppealWindow)?;
+            self.pool_inflow = self
+                .pool_inflow
+                .checked_add(forfeited)
+                .ok_or(EscrowError::InvalidAppealWindow)?;
+        }
+        // The concession upholds the original ruling: the slash
+        // stands, and the ballot stays as the audit trail of the
+        // votes cast before the withdrawal.
+        self.appeal_state = AppealState::Upheld;
+        self.touch_deadman_clock(now);
+        Ok(forfeited)
+    }
+
     /// Opt in to an arbiter-panel multisig judgment (AV-65 — Solana
     /// governance / payment anti-single-point-of-failure): replace the
     /// single dispute arbiter with an N-member panel and an M-vote
@@ -52750,7 +52823,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
     }
 
     #[test]
@@ -71798,7 +71872,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
-        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -72045,9 +72120,10 @@ mod event_history_tests {
         // `CompoundInterestAmended` (AV-333), 162 is
         // `GovernanceDelayAmended` (AV-334), 163 is
         // `ExpiryShortened` (AV-338), 164 is
-        // `BasketAmended` (AV-340) and 165 is the
+        // `BasketAmended` (AV-340), 165 is
+        // `AppealWithdrawn` (AV-341) and 166 is the
         // first still-unknown byte.
-        for bad in [165u8, 255] {
+        for bad in [166u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -79280,6 +79356,247 @@ mod appeal_bond_tests {
             "the forfeited bond rides amounts.penalty"
         );
         assert_eq!(expired.amounts.payout, 0);
+    }
+
+    #[test]
+    fn withdraw_appeal_rejects_a_stranger_and_the_initializer() {
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        // A panel member is still a stranger to the taker's appeal.
+        assert_eq!(
+            e.withdraw_appeal(M1, DEADLINE + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        // So is the initializer — they cannot concede for the taker.
+        assert_eq!(
+            e.withdraw_appeal(ALICE, DEADLINE + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.appeal_state(), AppealState::Filed, "state unchanged");
+        assert_eq!(e.appeal_bond_paid(), BOND, "bond untouched");
+    }
+
+    #[test]
+    fn withdraw_appeal_rejects_a_never_filed_appeal() {
+        let mut e = bonded_slashed();
+        assert_eq!(
+            e.withdraw_appeal(BOB, DEADLINE + 1),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+    }
+
+    #[test]
+    fn withdraw_appeal_rejects_an_already_resolved_appeal() {
+        // Resolved by the panel: the verdict stands, no concession.
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.review_appeal(M1, true).unwrap();
+        e.review_appeal(M2, true).unwrap();
+        assert_eq!(e.appeal_state(), AppealState::Upheld);
+        assert_eq!(
+            e.withdraw_appeal(BOB, DEADLINE + 2),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+        // Swept by the deadline: the sweep already settled it.
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.expire_appeal(ALICE, DEADLINE + WINDOW + 1).unwrap();
+        assert_eq!(e.appeal_state(), AppealState::Expired);
+        assert_eq!(
+            e.withdraw_appeal(BOB, DEADLINE + WINDOW + 2),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+    }
+
+    #[test]
+    fn withdraw_appeal_rejects_a_non_funded_escrow() {
+        // The state gate fires before the appeal gate: a released
+        // escrow refuses even though its appeal is terminally Upheld.
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.review_appeal(M1, true).unwrap();
+        e.review_appeal(M2, true).unwrap();
+        e.release(ALICE, DEADLINE + 2, AMOUNT - SLASHED, None, BOB)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.withdraw_appeal(BOB, DEADLINE + 3),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn withdraw_appeal_forfeits_the_bond_and_upholds_the_slash() {
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        let forfeited = e.withdraw_appeal(BOB, DEADLINE + 2).unwrap();
+        assert_eq!(
+            forfeited, BOND,
+            "the forfeited bond is returned for transfer sizing"
+        );
+        assert_eq!(e.appeal_bond_paid(), 0);
+        assert_eq!(e.appeal_state(), AppealState::Upheld);
+        assert_eq!(e.penalty_paid(), SLASHED, "the slash stands");
+        assert_eq!(e.released_amount(), 0, "bond never mixed into released");
+        // A withdrawn appeal is terminal: no more votes, no second
+        // withdrawal, no re-filing.
+        assert_eq!(
+            e.review_appeal(M1, true),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+        assert_eq!(
+            e.withdraw_appeal(BOB, DEADLINE + 3),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+        assert_eq!(
+            e.file_appeal(BOB, DEADLINE + 3),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+        assert!(!e.is_appeal_under_review());
+    }
+
+    #[test]
+    fn withdraw_appeal_after_the_deadline_still_works() {
+        // No deadline gate: the window gates the filing, not the
+        // concession — a Filed appeal may still be withdrawn after
+        // the deadline, racing the permissionless sweep.
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        let forfeited = e.withdraw_appeal(BOB, DEADLINE + WINDOW + 1).unwrap();
+        assert_eq!(forfeited, BOND);
+        assert_eq!(e.appeal_state(), AppealState::Upheld);
+        // The sweep loses the race: the appeal is already settled.
+        assert_eq!(
+            e.expire_appeal(ALICE, DEADLINE + WINDOW + 2),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+    }
+
+    #[test]
+    fn withdraw_appeal_with_no_bond_returns_zero() {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        let forfeited = e.withdraw_appeal(BOB, DEADLINE + 2).unwrap();
+        assert_eq!(forfeited, 0, "no bond was ever locked");
+        assert_eq!(e.appeal_state(), AppealState::Upheld);
+        assert_eq!(e.penalty_paid(), SLASHED, "the slash stands");
+    }
+
+    #[test]
+    fn withdraw_appeal_credits_the_pool_when_opted_in() {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+            .with_appeal_bond(BOND)
+            .unwrap()
+            .with_insurance_pool()
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        assert_eq!(e.pool_paid(), SLASHED, "slash routes to the pool");
+        assert_eq!(e.pool_slashed(), SLASHED);
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        let forfeited = e.withdraw_appeal(BOB, DEADLINE + 2).unwrap();
+        assert_eq!(forfeited, BOND);
+        assert_eq!(e.appeal_bond_paid(), 0);
+        assert_eq!(e.appeal_state(), AppealState::Upheld);
+        assert_eq!(
+            e.pool_paid(),
+            SLASHED + BOND,
+            "forfeit credits the pool, no transfer"
+        );
+        assert_eq!(e.pool_inflow(), SLASHED + BOND);
+        assert_eq!(e.pool_slashed(), SLASHED, "slash principal untouched");
+    }
+
+    #[test]
+    fn withdraw_appeal_keeps_the_ballot_as_audit_trail() {
+        let mut e = bonded_slashed();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        e.review_appeal(M1, true).unwrap();
+        let ballot_before = e.appeal_ballot();
+        assert_eq!(ballot_before.voted, 1);
+        e.withdraw_appeal(BOB, DEADLINE + 2).unwrap();
+        assert_eq!(e.appeal_state(), AppealState::Upheld);
+        assert_eq!(
+            e.appeal_ballot(),
+            ballot_before,
+            "votes cast before the withdrawal stay on the record"
+        );
+    }
+
+    #[test]
+    fn indexed_wrapper_emits_the_withdrawal_event() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT, [0xF1; 32], T0)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+            .with_appeal_bond(BOND)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        let before = e.event_count();
+        let forfeited = e.withdraw_appeal(BOB, DEADLINE + 2).unwrap();
+        assert_eq!(forfeited, BOND);
+        assert_eq!(e.event_count(), before + 1);
+        let withdrawn = &e.events()[before];
+        assert_eq!(withdrawn.kind, EscrowEventKind::AppealWithdrawn);
+        assert_eq!(withdrawn.from, EscrowState::Funded);
+        assert_eq!(withdrawn.to, EscrowState::Funded);
+        assert_eq!(
+            withdrawn.amounts.penalty, BOND,
+            "the forfeited bond rides amounts.penalty"
+        );
+        assert_eq!(withdrawn.amounts.payout, 0);
+        assert_eq!(withdrawn.appeal_outcome, None, "no panel verdict");
+        // The actor rides the history ring, not the event struct.
+        let recorded = e.event_history().into_iter().last().unwrap();
+        assert_eq!(recorded.kind, EscrowEventKind::AppealWithdrawn);
+        assert_eq!(recorded.actor, Some(BOB[..8].try_into().unwrap()), "the taker concedes");
+    }
+
+    #[test]
+    fn indexed_wrapper_withdrawal_failure_emits_nothing() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT, [0xF1; 32], T0)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_appeal_window(WINDOW)
+            .unwrap()
+            .with_appeal_bond(BOND)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        e.file_appeal(BOB, DEADLINE + 1).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.withdraw_appeal(ALICE, DEADLINE + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "a failed call emits nothing");
+        assert_eq!(e.inner().appeal_state(), AppealState::Filed);
+        assert_eq!(e.inner().appeal_bond_paid(), BOND);
     }
 
     #[test]
