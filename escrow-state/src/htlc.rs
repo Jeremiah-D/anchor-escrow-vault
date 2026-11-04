@@ -293,6 +293,76 @@ impl HtlcLock {
         Ok(())
     }
 
+    /// Revise the hashlock (AV-343).
+    ///
+    /// A mis-committed digest locks the swap leg permanently: the
+    /// maker hashed the wrong secret, used the wrong domain separator,
+    /// or committed a digest that does not match the counterparty
+    /// chain's leg, and then every correct secret fails
+    /// [`HtlcLock::check_claim`]'s `sha256(preimage) == hashlock`
+    /// with [`EscrowError::HtlcHashlockMismatch`]. Before this method
+    /// the only remedy was abandoning the lock and rebuilding it with
+    /// a new hashlock and fresh funding; the funds were otherwise
+    /// stuck until `expiry_slot`, when only the maker could refund.
+    ///
+    /// Check order is authority → state → timelock → value, mirroring
+    /// [`HtlcLock::amend_htlc_expiry_slot`] (AV-339):
+    ///
+    /// 1. `maker` + `taker` must both match the lock, else
+    ///    [`EscrowError::Unauthorized`] — the hashlock is the taker's
+    ///    claim condition, so the maker alone could swap in a digest
+    ///    the taker can never satisfy (griefing), and the taker alone
+    ///    could re-key the swap and break the counterparty leg's
+    ///    atomicity. The taker must verify offline that
+    ///    `sha256(own secret) == new_hashlock` before co-signing;
+    ///    [`HtlcLock::can_claim`] can simulate the new digest;
+    /// 2. `state == Locked`, else
+    ///    [`EscrowError::InvalidStateTransition`] (`Claimed` /
+    ///    `Refunded` are terminal — there is no digest left to fix);
+    /// 3. `current_slot < expiry_slot`, else
+    ///    [`EscrowError::HtlcClaimExpired`] — once the window closes
+    ///    only the refund path remains, and revising the digest
+    ///    cannot revive a claim. Revival needs
+    ///    [`HtlcLock::amend_htlc_expiry_slot`] first (also dual-signed),
+    ///    deliberately *not* reusing AV-339's "a lapsed window can be
+    ///    extended" semantics for the digest itself;
+    /// 4. re-affirming the current digest is `Ok(())` and changes
+    ///    nothing. The timelock gate runs before the no-op check, so
+    ///    re-affirming a digest in an expired window still fails with
+    ///    `HtlcClaimExpired`.
+    ///
+    /// No non-zero gate on the new digest: it is opaque, and
+    /// [`HtlcLock::new`] accepts zero / `0xFF` digests (pinned by
+    /// `zero_and_all_ff_digests_are_valid_hashlocks`). Only the 32
+    /// `hashlock` bytes move — maker, taker, amount, `expiry_slot`,
+    /// and state are untouched. The new digest governs the next
+    /// evaluation: [`HtlcLock::claim`] and [`HtlcLock::can_claim`]
+    /// read the live value; an action already executed keeps the
+    /// digest it settled under. There is no event layer on `HtlcLock`
+    /// (like `OptionEscrow`), so no event is emitted.
+    pub fn amend_htlc_hashlock(
+        &mut self,
+        maker: [u8; 32],
+        taker: [u8; 32],
+        new_hashlock: [u8; 32],
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if maker != self.maker || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != HtlcState::Locked {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        if current_slot >= self.expiry_slot {
+            return Err(EscrowError::HtlcClaimExpired);
+        }
+        if new_hashlock == self.hashlock {
+            return Ok(());
+        }
+        self.hashlock = new_hashlock;
+        Ok(())
+    }
+
     /// Whether the taker's claim window is still open at
     /// `current_slot` (`current_slot < expiry_slot`), independent of
     /// state — a convenience for keeper scans.
@@ -572,11 +642,11 @@ mod htlc_tests {
 
     // AV-339: amend_htlc_expiry_slot.
 
-    fn assert_lock_intact(lock: &HtlcLock, expiry_slot: u64, state: HtlcState) {
+    fn assert_lock_intact(lock: &HtlcLock, expiry_slot: u64, hashlock: [u8; 32], state: HtlcState) {
         assert_eq!(lock.expiry_slot, expiry_slot);
         assert_eq!(lock.maker, MAKER);
         assert_eq!(lock.taker, TAKER);
-        assert_eq!(lock.hashlock, sha256(&preimage()));
+        assert_eq!(lock.hashlock, hashlock);
         assert_eq!(lock.amount, AMOUNT);
         assert_eq!(lock.state, state);
     }
@@ -590,25 +660,25 @@ mod htlc_tests {
             .unwrap_err();
         assert_eq!(err, EscrowError::Unauthorized);
         assert_eq!(err.code(), 100);
-        assert_lock_intact(&lock, EXPIRY_SLOT, HtlcState::Locked);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
         // Maker alone: the taker slot is a stranger.
         let err = lock
             .amend_htlc_expiry_slot(MAKER, STRANGER, 3_000, CURRENT_SLOT)
             .unwrap_err();
         assert_eq!(err, EscrowError::Unauthorized);
-        assert_lock_intact(&lock, EXPIRY_SLOT, HtlcState::Locked);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
         // Taker alone: the maker slot is a stranger.
         let err = lock
             .amend_htlc_expiry_slot(STRANGER, TAKER, 3_000, CURRENT_SLOT)
             .unwrap_err();
         assert_eq!(err, EscrowError::Unauthorized);
-        assert_lock_intact(&lock, EXPIRY_SLOT, HtlcState::Locked);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
         // Swapped roles are not the maker/taker pair either.
         let err = lock
             .amend_htlc_expiry_slot(TAKER, MAKER, 3_000, CURRENT_SLOT)
             .unwrap_err();
         assert_eq!(err, EscrowError::Unauthorized);
-        assert_lock_intact(&lock, EXPIRY_SLOT, HtlcState::Locked);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
     }
 
     #[test]
@@ -620,7 +690,7 @@ mod htlc_tests {
             .unwrap_err();
         assert_eq!(err, EscrowError::InvalidStateTransition);
         assert_eq!(err.code(), 101);
-        assert_lock_intact(&lock, EXPIRY_SLOT, HtlcState::Claimed);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Claimed);
     }
 
     #[test]
@@ -631,7 +701,7 @@ mod htlc_tests {
             .amend_htlc_expiry_slot(MAKER, TAKER, 3_000, EXPIRY_SLOT)
             .unwrap_err();
         assert_eq!(err, EscrowError::InvalidStateTransition);
-        assert_lock_intact(&lock, EXPIRY_SLOT, HtlcState::Refunded);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Refunded);
     }
 
     #[test]
@@ -643,13 +713,13 @@ mod htlc_tests {
             .unwrap_err();
         assert_eq!(err, EscrowError::InvalidHtlcLock);
         assert_eq!(err.code(), 251);
-        assert_lock_intact(&lock, EXPIRY_SLOT, HtlcState::Locked);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
         // In the past.
         let err = lock
             .amend_htlc_expiry_slot(MAKER, TAKER, CURRENT_SLOT - 1, CURRENT_SLOT)
             .unwrap_err();
         assert_eq!(err, EscrowError::InvalidHtlcLock);
-        assert_lock_intact(&lock, EXPIRY_SLOT, HtlcState::Locked);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
     }
 
     #[test]
@@ -658,7 +728,7 @@ mod htlc_tests {
         assert!(lock
             .amend_htlc_expiry_slot(MAKER, TAKER, EXPIRY_SLOT, CURRENT_SLOT)
             .is_ok());
-        assert_lock_intact(&lock, EXPIRY_SLOT, HtlcState::Locked);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
         // Still claimable under the re-affirmed window.
         assert_eq!(lock.claim(TAKER, &preimage(), CURRENT_SLOT).unwrap(), AMOUNT);
     }
@@ -716,7 +786,7 @@ mod htlc_tests {
         lock.amend_htlc_expiry_slot(MAKER, TAKER, 1_500, CURRENT_SLOT)
             .unwrap();
         assert_eq!(lock.expiry_slot, 1_500);
-        assert_lock_intact(&lock, 1_500, HtlcState::Locked);
+        assert_lock_intact(&lock, 1_500, sha256(&preimage()), HtlcState::Locked);
     }
 
     #[test]
@@ -730,13 +800,222 @@ mod htlc_tests {
             .amend_htlc_expiry_slot(MAKER, TAKER, EXPIRY_SLOT, 2_500)
             .unwrap_err();
         assert_eq!(err, EscrowError::InvalidHtlcLock);
-        assert_lock_intact(&lock, EXPIRY_SLOT, HtlcState::Locked);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
         // Extending past the current slot from the lapsed window is
         // still allowed: the lock is live, only its window moved.
         lock.amend_htlc_expiry_slot(MAKER, TAKER, 3_000, 2_500)
             .unwrap();
         assert!(lock.claim_window_open(2_500));
         assert_eq!(lock.claim(TAKER, &preimage(), 2_500).unwrap(), AMOUNT);
+    }
+
+    // AV-343: amend_htlc_hashlock.
+
+    fn new_preimage() -> Vec<u8> {
+        b"corrected-swap-secret-7".to_vec()
+    }
+
+    fn new_hashlock() -> [u8; 32] {
+        sha256(&new_preimage())
+    }
+
+    #[test]
+    fn amend_hashlock_rejects_stranger_and_single_sided_pairs() {
+        let mut lock = lock();
+        let new = new_hashlock();
+        // Stranger pair: neither side matches.
+        let err = lock
+            .amend_htlc_hashlock(STRANGER, STRANGER, new, CURRENT_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // Maker alone: the taker slot is a stranger.
+        let err = lock
+            .amend_htlc_hashlock(MAKER, STRANGER, new, CURRENT_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // Taker alone: the maker slot is a stranger.
+        let err = lock
+            .amend_htlc_hashlock(STRANGER, TAKER, new, CURRENT_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // Swapped roles are not the maker/taker pair either.
+        let err = lock
+            .amend_htlc_hashlock(TAKER, MAKER, new, CURRENT_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+    }
+
+    #[test]
+    fn amend_hashlock_rejects_claimed_lock() {
+        let mut lock = lock();
+        lock.claim(TAKER, &preimage(), CURRENT_SLOT).unwrap();
+        let err = lock
+            .amend_htlc_hashlock(MAKER, TAKER, new_hashlock(), CURRENT_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        assert_eq!(err.code(), 101);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Claimed);
+    }
+
+    #[test]
+    fn amend_hashlock_rejects_refunded_lock() {
+        let mut lock = lock();
+        lock.refund(MAKER, EXPIRY_SLOT).unwrap();
+        let err = lock
+            .amend_htlc_hashlock(MAKER, TAKER, new_hashlock(), EXPIRY_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Refunded);
+    }
+
+    #[test]
+    fn amend_hashlock_rejects_expired_window() {
+        // The window has closed (slot == expiry) but nobody refunded
+        // yet, so the lock is still Locked — and still unrevisable:
+        // revising the digest cannot revive a claim.
+        let mut lock = lock();
+        let err = lock
+            .amend_htlc_hashlock(MAKER, TAKER, new_hashlock(), EXPIRY_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::HtlcClaimExpired);
+        assert_eq!(err.code(), 254);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // Past expiry: same error, and the digest is still the old one.
+        let err = lock
+            .amend_htlc_hashlock(MAKER, TAKER, new_hashlock(), EXPIRY_SLOT + 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::HtlcClaimExpired);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // The timelock gate runs before the no-op check: re-affirming
+        // the current digest in an expired window still fails.
+        let err = lock
+            .amend_htlc_hashlock(MAKER, TAKER, sha256(&preimage()), EXPIRY_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::HtlcClaimExpired);
+    }
+
+    #[test]
+    fn amend_hashlock_equal_value_is_noop() {
+        let mut lock = lock();
+        assert!(lock
+            .amend_htlc_hashlock(MAKER, TAKER, sha256(&preimage()), CURRENT_SLOT)
+            .is_ok());
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // The original secret still claims under the re-affirmed digest.
+        assert_eq!(lock.claim(TAKER, &preimage(), CURRENT_SLOT).unwrap(), AMOUNT);
+    }
+
+    #[test]
+    fn amend_hashlock_retargets_claim() {
+        let mut lock = lock();
+        lock.amend_htlc_hashlock(MAKER, TAKER, new_hashlock(), CURRENT_SLOT)
+            .unwrap();
+        assert_eq!(lock.hashlock, new_hashlock());
+        // The old secret no longer satisfies the digest.
+        let err = lock.claim(TAKER, &preimage(), CURRENT_SLOT).unwrap_err();
+        assert_eq!(err, EscrowError::HtlcHashlockMismatch);
+        assert_eq!(lock.state, HtlcState::Locked);
+        // The new secret claims and returns the amount.
+        assert_eq!(
+            lock.claim(TAKER, &new_preimage(), CURRENT_SLOT).unwrap(),
+            AMOUNT
+        );
+        assert_eq!(lock.state, HtlcState::Claimed);
+    }
+
+    #[test]
+    fn amend_hashlock_moves_only_the_hashlock() {
+        let mut lock = lock();
+        lock.amend_htlc_hashlock(MAKER, TAKER, new_hashlock(), CURRENT_SLOT)
+            .unwrap();
+        assert_lock_intact(&lock, EXPIRY_SLOT, new_hashlock(), HtlcState::Locked);
+        // The revised digest is itself revisable, back to the original.
+        lock.amend_htlc_hashlock(MAKER, TAKER, sha256(&preimage()), CURRENT_SLOT)
+            .unwrap();
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+    }
+
+    #[test]
+    fn amend_hashlock_can_claim_follows_live_hashlock() {
+        let mut lock = lock();
+        lock.amend_htlc_hashlock(MAKER, TAKER, new_hashlock(), CURRENT_SLOT)
+            .unwrap();
+        // The old secret no longer simulates as claimable...
+        assert_eq!(
+            lock.can_claim(&preimage(), CURRENT_SLOT).unwrap_err(),
+            EscrowError::HtlcHashlockMismatch
+        );
+        // ...while the new secret does, without moving state.
+        assert_eq!(lock.can_claim(&new_preimage(), CURRENT_SLOT).unwrap(), AMOUNT);
+        assert_eq!(lock.state, HtlcState::Locked);
+    }
+
+    #[test]
+    fn amend_hashlock_combines_with_av339_window_extension() {
+        // Expired window: revising the digest is refused outright.
+        let mut lock = lock();
+        let err = lock
+            .amend_htlc_hashlock(MAKER, TAKER, new_hashlock(), 2_500)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::HtlcClaimExpired);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // AV-339 first: extend the window (also dual-signed).
+        lock.amend_htlc_expiry_slot(MAKER, TAKER, 3_000, 2_500)
+            .unwrap();
+        // Now the digest revision succeeds, and the new secret claims
+        // inside the new window.
+        lock.amend_htlc_hashlock(MAKER, TAKER, new_hashlock(), 2_500)
+            .unwrap();
+        assert_eq!(lock.hashlock, new_hashlock());
+        assert_eq!(
+            lock.claim(TAKER, &new_preimage(), 2_500).unwrap(),
+            AMOUNT
+        );
+        assert_eq!(lock.state, HtlcState::Claimed);
+    }
+
+    #[test]
+    fn amend_hashlock_accepts_degenerate_digests() {
+        // No non-zero gate: the digest is opaque, like at `new()` time.
+        let mut lock = lock();
+        lock.amend_htlc_hashlock(MAKER, TAKER, [0u8; 32], CURRENT_SLOT)
+            .unwrap();
+        assert_eq!(lock.hashlock, [0u8; 32]);
+        // No preimage hashes to the zero digest, so claims fail the
+        // hashlock check rather than anything else.
+        assert_eq!(
+            lock.claim(TAKER, b"anything", CURRENT_SLOT).unwrap_err(),
+            EscrowError::HtlcHashlockMismatch
+        );
+        lock.amend_htlc_hashlock(MAKER, TAKER, [0xFF; 32], CURRENT_SLOT)
+            .unwrap();
+        assert_eq!(lock.hashlock, [0xFF; 32]);
+        assert_lock_intact(&lock, EXPIRY_SLOT, [0xFF; 32], HtlcState::Locked);
+    }
+
+    #[test]
+    fn amend_hashlock_failed_calls_leave_no_state_change() {
+        // Every failure mode on one lock, then a single intact check.
+        let mut lock = lock();
+        let new = new_hashlock();
+        assert_eq!(
+            lock.amend_htlc_hashlock(STRANGER, TAKER, new, CURRENT_SLOT)
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(
+            lock.amend_htlc_hashlock(MAKER, TAKER, new, EXPIRY_SLOT)
+                .unwrap_err(),
+            EscrowError::HtlcClaimExpired
+        );
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // And the lock is still fully usable afterwards.
+        assert_eq!(lock.claim(TAKER, &preimage(), CURRENT_SLOT).unwrap(), AMOUNT);
     }
 
     #[test]

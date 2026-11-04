@@ -7796,6 +7796,35 @@ settle-or-refund together — atomicity without a trusted relayer.
   window it settled under. No event layer exists on `HtlcLock` (like
   `OptionEscrow`), so no event is emitted, and there is no Vault
   layout change. (Solana: HTLC / atomic-swap timeout coordination.)
+- **Revising the hashlock (AV-343)**:
+  `HtlcLock::amend_htlc_hashlock(maker, taker, new_hashlock,
+  current_slot)` moves only `hashlock` — maker, taker, amount,
+  `expiry_slot`, and state are untouched — so a mis-committed digest
+  (wrong secret hashed, wrong domain separator, digest mismatching
+  the counterparty chain's leg) can be corrected instead of
+  abandoning the lock and rebuilding it with fresh funding; before
+  this, every correct secret failed `claim` with
+  `HtlcHashlockMismatch` and the funds sat locked until `expiry_slot`.
+  Both parties must sign (a stranger, the maker alone, or the taker
+  alone gets `Unauthorized`, code 100 — the hashlock is the taker's
+  claim condition, so the maker alone could swap in a digest the
+  taker can never satisfy, and the taker alone could re-key the swap
+  and break the counterparty leg's atomicity; the taker verifies
+  offline that `sha256(own secret) == new_hashlock` before
+  co-signing, and `can_claim` can simulate the new digest);
+  `Claimed` / `Refunded` locks refuse with `InvalidStateTransition`
+  (code 101); a closed window refuses with `HtlcClaimExpired` (code
+  254) — revising the digest cannot revive a claim, revival needs
+  AV-339's window extension first, also dual-signed. Re-affirming
+  the current digest in a live window is `Ok(())` and changes
+  nothing, and the timelock gate runs before the no-op check, so
+  re-affirming in an expired window still fails. No non-zero gate on
+  the new digest (it is opaque, like at `new()` time). `claim` and
+  `can_claim` read the live digest, so the new value governs the next
+  evaluation; an action already executed keeps the digest it settled
+  under. No event layer exists on `HtlcLock`, so no event is emitted,
+  and there is no Vault layout change. (Solana: cross-chain atomic
+  swap / payment fintech.)
 - **Orthogonality**: AV-185's `release_authorization_hash` unlocks
   with an EVM *signature* — this unlocks with a hash *preimage*;
   AV-137's commit-reveal hides an arbitration *vote* — this hides the
