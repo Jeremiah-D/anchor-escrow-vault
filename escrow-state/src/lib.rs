@@ -4630,6 +4630,15 @@ pub enum EscrowError {
     /// is left untouched. Never renumbered (see
     /// [`EscrowError::code`]).
     InvalidAutoUnpauseAt,
+    /// AV-337: [`Escrow::execute_governance`] on a proposal past
+    /// its expiry (`now > proposed_at + delay_secs +
+    /// MAX_GOVERNANCE_PROPOSAL_AGE_SECS`) — a forgotten proposal
+    /// must not execute months later, after its config intent and
+    /// the escrow's context have drifted. The proposal is left live
+    /// (the failure clears nothing); the exit is
+    /// [`Escrow::cancel_governance`]. Never renumbered (see
+    /// [`EscrowError::code`]).
+    GovernanceProposalExpired,
 }
 
 impl EscrowError {
@@ -5045,6 +5054,8 @@ impl EscrowError {
             EscrowError::InvalidCollectionAllowlist => 358,
             // AV-287: appended, never renumbered.
             EscrowError::InvalidAutoUnpauseAt => 359,
+            // AV-337: appended, never renumbered.
+            EscrowError::GovernanceProposalExpired => 360,
         }
     }
 
@@ -5442,6 +5453,8 @@ impl EscrowError {
             EscrowError::InvalidCollectionAllowlist,
             // AV-287: appended, never renumbered.
             EscrowError::InvalidAutoUnpauseAt,
+            // AV-337: appended, never renumbered.
+            EscrowError::GovernanceProposalExpired,
         ]
     }
 }
@@ -5775,6 +5788,18 @@ pub const GOVERNANCE_ACTION_PAYLOAD_LEN: usize = 8 * 32 + 8 * 8 + 1;
 /// Serialized length of a [`GovernanceAction`]: 1-byte kind +
 /// [`GOVERNANCE_ACTION_PAYLOAD_LEN`]-byte payload.
 pub const GOVERNANCE_ACTION_LEN: usize = 1 + GOVERNANCE_ACTION_PAYLOAD_LEN;
+
+/// How long a delayed-governance proposal stays executable after
+/// its delay window elapses (AV-337): 30 days
+/// (`30 * 24 * 3_600 = 2_592_000` seconds). Long enough to cover a
+/// real veto/execution lag, short enough that a forgotten proposal
+/// cannot execute months later, after its config intent and the
+/// escrow's context have drifted. The expiry is derived from the
+/// proposal's own snapshot (`proposed_at + delay_secs + this`), so
+/// a later [`Escrow::amend_governance_delay`] never moves a live
+/// proposal's deadline. No layout change: the expiry is computed,
+/// never stored.
+pub const MAX_GOVERNANCE_PROPOSAL_AGE_SECS: u64 = 2_592_000;
 
 /// A live delayed-governance proposal: the staged
 /// [`GovernanceAction`], who proposed it, when, and the delay window
@@ -25962,6 +25987,21 @@ let fee = self.charge_protocol_fee(claimable)?;
         self.governance_proposal
     }
 
+    /// The instant the live delayed-governance proposal stops being
+    /// executable (AV-337): `proposed_at + delay_secs +
+    /// MAX_GOVERNANCE_PROPOSAL_AGE_SECS`, for UI/indexer display of
+    /// the deadline. `None` when no proposal is live — or when the
+    /// expiry cannot be represented (checked addition overflows), in
+    /// which case [`Escrow::execute_governance`] refuses the proposal
+    /// with [`EscrowError::InvalidGovernanceDelay`] anyway.
+    pub fn governance_proposal_expires_at(&self) -> Option<u64> {
+        let proposal = self.governance_proposal?;
+        proposal
+            .proposed_at
+            .checked_add(proposal.delay_secs)?
+            .checked_add(MAX_GOVERNANCE_PROPOSAL_AGE_SECS)
+    }
+
     /// Stage a delayed governance action (AV-158): either party may
     /// propose — the delay window gives the other party the veto, so
     /// no dual signature is needed at propose time.
@@ -26053,6 +26093,14 @@ let fee = self.charge_protocol_fee(claimable)?;
     ///    checked — a wrapping window would let a far-future
     ///    proposal execute immediately, so overflow is
     ///    [`EscrowError::InvalidGovernanceDelay`], never a wrap).
+    /// 5. `now > proposed_at + delay_secs +
+    ///    MAX_GOVERNANCE_PROPOSAL_AGE_SECS` is
+    ///    [`EscrowError::GovernanceProposalExpired`] (AV-337) — the
+    ///    proposal is stale; the failure clears nothing and the exit
+    ///    is [`Escrow::cancel_governance`]. The check is variant-
+    ///    agnostic: it runs before the action `match`, so all
+    ///    seventeen actions (AV-158 + AV-335 + AV-336) share the
+    ///    same expiry.
     pub fn execute_governance(
         &mut self,
         executor: [u8; 32],
@@ -26076,6 +26124,19 @@ let fee = self.charge_protocol_fee(claimable)?;
             .ok_or(EscrowError::InvalidGovernanceDelay)?;
         if now < eligible_at {
             return Err(EscrowError::GovernanceDelayNotElapsed);
+        }
+        // AV-337: the proposal is stale past its expiry — a
+        // forgotten proposal must not execute after its config intent
+        // has drifted. Checked addition throughout (the same overflow
+        // convention as the delay check above: never a wrap). The
+        // proposal stays live on this failure, exactly as the
+        // delay-not-elapsed failure leaves it live — the exit is
+        // `cancel_governance`.
+        let expires_at = eligible_at
+            .checked_add(MAX_GOVERNANCE_PROPOSAL_AGE_SECS)
+            .ok_or(EscrowError::InvalidGovernanceDelay)?;
+        if now > expires_at {
+            return Err(EscrowError::GovernanceProposalExpired);
         }
         // Drive the inner transitions with the escrow's own
         // (initializer, taker): the executor was already authorized
@@ -44608,6 +44669,12 @@ mod error_code_tests {
             359,
             "amend_auto_unpause_at with a new Some(t) at or before now — a schedule already due on arrival would fire on the next clock-bearing transition, so the revision is refused and the live schedule is untouched (AV-287)",
         ),
+        // AV-337: appended, never renumbered.
+        (
+            EscrowError::GovernanceProposalExpired,
+            360,
+            "execute_governance after the proposal's expiry (now > proposed_at + delay_secs + 30 days) — a stale proposal must not execute after its config intent has drifted; the proposal stays live for cancel (AV-337)",
+        ),
     ];
 
     #[test]
@@ -54512,6 +54579,220 @@ mod governance_delay_tests {
         assert_eq!(EscrowError::GovernanceDelayNotElapsed.code(), 218);
         assert_eq!(EscrowError::GovernanceActionNotProposed.code(), 219);
         assert_eq!(EscrowError::InvalidGovernanceDelay.code(), 220);
+        assert_eq!(EscrowError::GovernanceProposalExpired.code(), 360);
+    }
+
+    // ----- AV-337: delayed-governance proposal expiry -----
+
+    /// The expiry instant for a proposal made at `T0`: the delay
+    /// elapses at `T0 + DELAY`, the proposal stays executable for
+    /// another `MAX_GOVERNANCE_PROPOSAL_AGE_SECS` after that.
+    const PROPOSAL_EXPIRES_AT: u64 = T0 + DELAY + MAX_GOVERNANCE_PROPOSAL_AGE_SECS;
+
+    #[test]
+    fn execute_within_expiry_window_succeeds() {
+        let mut e = quorum_delay_escrow();
+        e.propose_governance(
+            BOB,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        // One second before the deadline the proposal is still live.
+        e.execute_governance(ALICE, PROPOSAL_EXPIRES_AT - 1).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn execute_exactly_at_expiry_succeeds() {
+        // The boundary is inclusive: `now > expires_at` refuses,
+        // `now == expires_at` still executes.
+        let mut e = quorum_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        e.execute_governance(BOB, PROPOSAL_EXPIRES_AT).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+    }
+
+    #[test]
+    fn execute_one_second_past_expiry_refused_and_proposal_survives() {
+        let mut e = quorum_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        let err = e
+            .execute_governance(ALICE, PROPOSAL_EXPIRES_AT + 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::GovernanceProposalExpired);
+        assert_eq!(err.code(), 360);
+        // The failure clears nothing: the proposal stays live for
+        // cancel, and the threshold never moved.
+        assert!(e.governance_proposal().is_some());
+        assert_eq!(e.quorum().unwrap().threshold(), 2);
+    }
+
+    #[test]
+    fn execute_before_window_still_refused_as_not_elapsed() {
+        // The expiry check sits after the delay check: too early is
+        // still 218, not 360.
+        let mut e = quorum_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + DELAY - 1).unwrap_err(),
+            EscrowError::GovernanceDelayNotElapsed
+        );
+        assert!(e.governance_proposal().is_some());
+    }
+
+    #[test]
+    fn expiry_overflow_is_invalid_delay() {
+        // `proposed_at + delay_secs` fits but adding the 30-day age
+        // overflows: the expiry cannot be represented, so the
+        // proposal can never execute — 220, never a wrap.
+        let proposed_at = u64::MAX - DELAY - MAX_GOVERNANCE_PROPOSAL_AGE_SECS + 1;
+        let eligible_at = proposed_at + DELAY;
+        let mut e = quorum_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            proposed_at,
+        )
+        .unwrap();
+        let err = e.execute_governance(ALICE, eligible_at).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidGovernanceDelay);
+        assert_eq!(err.code(), 220);
+        assert!(e.governance_proposal().is_some());
+    }
+
+    #[test]
+    fn expired_proposal_cancels_cleanly() {
+        // Cancel is the exit for a stale proposal: no pause guard,
+        // no state gate, no expiry gate on the veto itself.
+        let mut e = quorum_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        e.cancel_governance(BOB).unwrap();
+        assert!(e.governance_proposal().is_none());
+        assert_eq!(e.quorum().unwrap().threshold(), 2);
+        // And it is gone for good — executing afterwards finds
+        // nothing to execute, even past the deadline.
+        assert_eq!(
+            e.execute_governance(ALICE, PROPOSAL_EXPIRES_AT + 1).unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+    }
+
+    #[test]
+    fn pause_takes_priority_over_expiry_check() {
+        // The pause guard fires before the expiry check, exactly as
+        // it fires before the delay check.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[A1, A2, A3], &[1, 1, 1], 2).unwrap())
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        e.pause(ALICE, None).unwrap();
+        assert_eq!(
+            e.execute_governance(ALICE, PROPOSAL_EXPIRES_AT + 1).unwrap_err(),
+            EscrowError::Paused
+        );
+        assert!(e.governance_proposal().is_some());
+    }
+
+    #[test]
+    fn stranger_still_unauthorized_on_expired_proposal() {
+        // Authority is checked before the expiry: a stranger learns
+        // nothing about whether the proposal is stale.
+        let mut e = quorum_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute_governance(MALLORY, PROPOSAL_EXPIRES_AT + 1).unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert!(e.governance_proposal().is_some());
+    }
+
+    #[test]
+    fn expires_at_reader_with_and_without_proposal() {
+        let mut e = quorum_delay_escrow();
+        assert_eq!(e.governance_proposal_expires_at(), None);
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        assert_eq!(
+            e.governance_proposal_expires_at(),
+            Some(T0 + DELAY + MAX_GOVERNANCE_PROPOSAL_AGE_SECS)
+        );
+        // The reader follows the proposal's own snapshot, not the
+        // live window: revising the delay never moves it.
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(e.governance_proposal_expires_at(), None);
+    }
+
+    #[test]
+    fn av336_split_shares_half_also_bound_by_expiry() {
+        // The expiry check runs before the action `match`, so the
+        // AV-336 split-shares halves share it with the AV-158 four.
+        let mut e = split_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::amend_payout_split_shares_first(&[
+                (ALICE, 700_000),
+                (BOB, 300_000),
+            ])
+            .unwrap(),
+            T0,
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute_governance(ALICE, PROPOSAL_EXPIRES_AT + 1).unwrap_err(),
+            EscrowError::GovernanceProposalExpired
+        );
+        assert_eq!(
+            e.payout_split().as_slice(),
+            vec![(ALICE, 600_000), (BOB, 400_000)]
+        );
+        // At the deadline itself the same proposal still executes.
+        e.execute_governance(ALICE, PROPOSAL_EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.payout_split().as_slice(),
+            vec![(ALICE, 700_000), (BOB, 300_000)]
+        );
     }
 }
 
@@ -74674,7 +74955,7 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
         assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
-        assert_eq!(EscrowError::all().len(), 251); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1; AV-284: +1; AV-287: +1 auto-unpause-at error
+        assert_eq!(EscrowError::all().len(), 252); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1; AV-284: +1; AV-287: +1 auto-unpause-at error; AV-337: +1 governance-proposal-expired error
     }
 
     #[test]

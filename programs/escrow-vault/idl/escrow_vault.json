@@ -2107,7 +2107,8 @@
     {"code": 356, "name": "FundingNotStarted"},
     {"code": 357, "name": "InvalidKeeperBounty"},
     {"code": 358, "name": "InvalidCollectionAllowlist"},
-    {"code": 359, "name": "InvalidAutoUnpauseAt"}
+    {"code": 359, "name": "InvalidAutoUnpauseAt"},
+    {"code": 360, "name": "GovernanceProposalExpired"}
   ],
   "metadata": {
     "generator": "escrow-state idl_json pipeline (AV-29)",
