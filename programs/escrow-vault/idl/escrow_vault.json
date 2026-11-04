@@ -2020,6 +2020,7 @@
     {"code": 260, "name": "AlreadyClaimed"},
     {"code": 261, "name": "DistributionExpired"},
     {"code": 262, "name": "DistributionNotExpired"},
+    {"code": 361, "name": "DistributionClaimsStarted"},
     {"code": 263, "name": "InvalidEnglishAuction"},
     {"code": 264, "name": "EnglishAuctionBidTooLow"},
     {"code": 265, "name": "EnglishAuctionNotLive"},

@@ -7876,10 +7876,24 @@ root, not N accounts.
   code 261); the maker's reclaim window is `current_slot >=
   expiry_slot` (inclusive), and reclaiming early is
   `DistributionNotExpired` (262). Reclaim is maker-only and terminal.
+- **Root correction before the first claim** (AV-342): the maker may
+  fix a mis-published root with `amend_merkle_root` — maker-only
+  (`Unauthorized`, code 100), `Active` only (`InvalidStateTransition`,
+  code 101, once `Reclaimed`), inside the claim window
+  (`DistributionExpired`, code 261, at `current_slot >= expiry_slot`),
+  and only while nothing is claimed (`DistributionClaimsStarted`,
+  code 361, once `claimed_count > 0` — the nullifier bitmap and
+  `claimed_amount` are bound to the old root). A zero new root is
+  `InvalidDistribution` (258); re-affirming the current root is a
+  no-op. Only the 32-byte root moves — `total_amount`, `leaf_count`,
+  the window, and the bitmap are untouched. `root_amended_audit_json`
+  records the old and new roots (string event name
+  `distributor_root_amended`, no new event code).
 
 New error codes (never renumbered): `InvalidDistribution` (258),
 `InvalidMerkleProof` (259), `AlreadyClaimed` (260),
-`DistributionExpired` (261), `DistributionNotExpired` (262). Pure
+`DistributionExpired` (261), `DistributionNotExpired` (262),
+`DistributionClaimsStarted` (361). Pure
 logic: no Vault layout change, no `VAULT_SPACE` bump. (Solana /
 payments fintech: batch distribution / airdrops.)
 

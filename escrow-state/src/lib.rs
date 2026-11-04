@@ -4639,6 +4639,13 @@ pub enum EscrowError {
     /// [`Escrow::cancel_governance`]. Never renumbered (see
     /// [`EscrowError::code`]).
     GovernanceProposalExpired,
+    /// AV-342: [`MerkleDistributor::amend_merkle_root`] once a leaf
+    /// has been claimed — the nullifier bitmap and `claimed_amount`
+    /// are bound to the old root, so rewriting the root would strand
+    /// the claimed accounting. The root is frozen once
+    /// `claimed_count > 0`; the exit is a fresh distribution. Never
+    /// renumbered (see [`EscrowError::code`]).
+    DistributionClaimsStarted,
 }
 
 impl EscrowError {
@@ -5056,6 +5063,8 @@ impl EscrowError {
             EscrowError::InvalidAutoUnpauseAt => 359,
             // AV-337: appended, never renumbered.
             EscrowError::GovernanceProposalExpired => 360,
+            // AV-342: appended, never renumbered.
+            EscrowError::DistributionClaimsStarted => 361,
         }
     }
 
@@ -5299,6 +5308,8 @@ impl EscrowError {
             EscrowError::DistributionExpired,
             // AV-188: appended, never renumbered.
             EscrowError::DistributionNotExpired,
+            // AV-342: appended, never renumbered.
+            EscrowError::DistributionClaimsStarted,
             // AV-189: appended, never renumbered.
             EscrowError::InvalidEnglishAuction,
             // AV-189: appended, never renumbered.
@@ -44970,6 +44981,12 @@ mod error_code_tests {
             360,
             "execute_governance after the proposal's expiry (now > proposed_at + delay_secs + 30 days) — a stale proposal must not execute after its config intent has drifted; the proposal stays live for cancel (AV-337)",
         ),
+        // AV-342: appended, never renumbered.
+        (
+            EscrowError::DistributionClaimsStarted,
+            361,
+            "amend_merkle_root after the first claim — claimed leaves are bound to the old root, so the root is frozen once claimed_count > 0; amend before any claim, or publish a fresh distribution (AV-342)",
+        ),
     ];
 
     #[test]
@@ -75764,7 +75781,7 @@ mod arbiter_panel_tests {
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceStale));
         assert_eq!(EscrowError::OraclePriceUnreliable.code(), 281);
         assert!(EscrowError::all().contains(&EscrowError::OraclePriceUnreliable));
-        assert_eq!(EscrowError::all().len(), 252); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1; AV-284: +1; AV-287: +1 auto-unpause-at error; AV-337: +1 governance-proposal-expired error
+        assert_eq!(EscrowError::all().len(), 253); // AV-195: +7, AV-196: +6, AV-197: +5; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1; AV-284: +1; AV-287: +1 auto-unpause-at error; AV-337: +1 governance-proposal-expired error; AV-342: +1 distribution-claims-started error
     }
 
     #[test]

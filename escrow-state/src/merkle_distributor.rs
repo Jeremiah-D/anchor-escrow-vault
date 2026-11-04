@@ -258,6 +258,63 @@ impl MerkleDistributor {
         Ok(self.unclaimed_amount())
     }
 
+    /// Correct a mis-published root before the first claim. A root
+    /// computed with the wrong domain separator, leaf order, or leaf
+    /// construction bricks every `claim` (`InvalidMerkleProof`), and
+    /// without this the only exit is waiting out the expiry slot for
+    /// `reclaim` — the funds sit locked until then.
+    ///
+    /// Check order: authority → state → window → pristine → value.
+    /// Maker-only (`Unauthorized`); `Active` only
+    /// (`InvalidStateTransition` once `Reclaimed`); inside the claim
+    /// window (`DistributionExpired` at `current_slot >= expiry_slot`,
+    /// mirroring `claim` — after expiry only `reclaim` is left);
+    /// only while nothing is claimed (`DistributionClaimsStarted`
+    /// once `claimed_count > 0` — the nullifier bitmap and
+    /// `claimed_amount` are bound to the old root, so rewriting it
+    /// would strand the claimed accounting); the new root must be
+    /// non-zero (`InvalidDistribution` — a zero root can never
+    /// verify a leaf, so amending toward it only bricks the
+    /// distribution; `new()` tolerates a zero root, this revision
+    /// deliberately does not). Re-affirming the current root is a
+    /// no-op `Ok(())`: no write, no event.
+    ///
+    /// Only the 32-byte root moves. `total_amount`, `leaf_count`,
+    /// `created_slot`, `expiry_slot`, the nullifier bitmap,
+    /// `claimed_count`, and `claimed_amount` are untouched — the leaf
+    /// set and the total are unchanged, so this is a root correction,
+    /// not a new distribution (a different recipient set needs a
+    /// fresh distribution). Audit with
+    /// [`MerkleDistributor::root_amended_audit_json`], only on an
+    /// actual change.
+    pub fn amend_merkle_root(
+        &mut self,
+        maker: [u8; 32],
+        new_root: [u8; 32],
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if maker != self.maker {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != DistributorState::Active {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        if current_slot >= self.expiry_slot {
+            return Err(EscrowError::DistributionExpired);
+        }
+        if self.claimed_count > 0 {
+            return Err(EscrowError::DistributionClaimsStarted);
+        }
+        if new_root == [0u8; 32] {
+            return Err(EscrowError::InvalidDistribution);
+        }
+        if new_root == self.root {
+            return Ok(());
+        }
+        self.root = new_root;
+        Ok(())
+    }
+
     /// Audit-event JSON for a claim (hand-written):
     /// `{"event":"distributor_claimed","root":"<64hex>","leaf_index":<n>,
     /// "amount":<u64>,"claimed_count":<n>}`.
@@ -284,6 +341,25 @@ impl MerkleDistributor {
         s.push_str(&reclaimed.to_string());
         s.push_str(",\"claimed_count\":");
         s.push_str(&self.claimed_count.to_string());
+        s.push('}');
+        s
+    }
+
+    /// Audit-event JSON for a root amendment (call only on an actual
+    /// change — a same-root no-op emits nothing):
+    /// `{"event":"distributor_root_amended","old_root":"<64hex>",
+    /// "new_root":"<64hex>","leaf_count":<n>,"total_amount":<u64>}`.
+    /// `old_root` is the root this call replaced; the new root is
+    /// read off `self`.
+    pub fn root_amended_audit_json(&self, old_root: [u8; 32]) -> String {
+        let mut s = String::from("{\"event\":\"distributor_root_amended\",\"old_root\":\"");
+        s.push_str(&hex64(&old_root));
+        s.push_str("\",\"new_root\":\"");
+        s.push_str(&hex64(&self.root));
+        s.push_str("\",\"leaf_count\":");
+        s.push_str(&self.leaf_count.to_string());
+        s.push_str(",\"total_amount\":");
+        s.push_str(&self.total_amount.to_string());
         s.push('}');
         s
     }
@@ -542,17 +618,240 @@ mod tests {
         assert_eq!(EscrowError::AlreadyClaimed.code(), 260);
         assert_eq!(EscrowError::DistributionExpired.code(), 261);
         assert_eq!(EscrowError::DistributionNotExpired.code(), 262);
+        assert_eq!(EscrowError::DistributionClaimsStarted.code(), 361);
         for e in [
             EscrowError::InvalidDistribution,
             EscrowError::InvalidMerkleProof,
             EscrowError::AlreadyClaimed,
             EscrowError::DistributionExpired,
             EscrowError::DistributionNotExpired,
+            EscrowError::DistributionClaimsStarted,
         ] {
             assert!(EscrowError::all().contains(&e));
         }
         // AV-189 appends 5 English-auction errors after these; AV-190
         // appends 3 rental-escrow errors after those.
-        assert_eq!(EscrowError::all().len(), 252); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1; AV-284: +1; AV-287: +1 auto-unpause-at error; AV-337: +1 governance-proposal-expired error
+        assert_eq!(EscrowError::all().len(), 253); // AV-195: +7 social-recovery errors, AV-196: +6 jury-sortition errors, AV-197: +5 payment-channel errors; AV-209: +4; AV-214: +6; AV-215: +1; AV-217: +3; AV-218: +2; AV-220: +1; AV-225: +1; AV-228: +1; AV-266: +1; AV-284: +1; AV-287: +1 auto-unpause-at error; AV-337: +1 governance-proposal-expired error; AV-342: +1 distribution-claims-started error
+    }
+
+    // ----- AV-342: amend_merkle_root -----
+
+    #[test]
+    fn amend_root_by_stranger_is_rejected_and_root_unchanged() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        let before = d.root();
+        let (corrected_root, _) = build_tree(&[(key(1), 250u64), (key(2), 100)]);
+        let err = d
+            .amend_merkle_root(key(0xBB), corrected_root, 500)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(d.root(), before);
+        assert_eq!(d.state(), DistributorState::Active);
+    }
+
+    #[test]
+    fn amend_root_on_reclaimed_distribution_is_rejected() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        d.reclaim(key(0xAA), 1000).unwrap();
+        assert_eq!(d.state(), DistributorState::Reclaimed);
+        let (new_root, _) = build_tree(&[(key(1), 250u64), (key(2), 100)]);
+        let err = d.amend_merkle_root(key(0xAA), new_root, 1001).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        assert_eq!(err.code(), 101);
+        // State check precedes the window check: even past expiry a
+        // reclaimed distribution refuses on state, not on expiry.
+        assert_eq!(d.root(), build_tree(&leaves).0);
+    }
+
+    #[test]
+    fn amend_root_after_expiry_is_rejected() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        let (new_root, _) = build_tree(&[(key(1), 250u64), (key(2), 100)]);
+        // At the expiry slot the claim window is already closed.
+        let err = d.amend_merkle_root(key(0xAA), new_root, 1000).unwrap_err();
+        assert_eq!(err, EscrowError::DistributionExpired);
+        assert_eq!(err.code(), 261);
+        // Past expiry too.
+        let err = d.amend_merkle_root(key(0xAA), new_root, 5000).unwrap_err();
+        assert_eq!(err, EscrowError::DistributionExpired);
+        assert_eq!(d.root(), build_tree(&leaves).0);
+    }
+
+    #[test]
+    fn amend_root_after_first_claim_is_rejected_and_old_claims_still_work() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        d.claim(0, key(1), 100, &proofs[0], 500).unwrap();
+        assert_eq!(d.claimed_count(), 1);
+
+        let (new_root, _) = build_tree(&[(key(1), 250u64), (key(2), 100)]);
+        let err = d.amend_merkle_root(key(0xAA), new_root, 500).unwrap_err();
+        assert_eq!(err, EscrowError::DistributionClaimsStarted);
+        assert_eq!(err.code(), 361);
+        // The old root still governs: the remaining leaf claims under it.
+        assert_eq!(d.root(), build_tree(&leaves).0);
+        let got = d.claim(1, key(2), 250, &proofs[1], 500).unwrap();
+        assert_eq!(got, 250);
+        assert_eq!(d.claimed_count(), 2);
+        assert_eq!(d.claimed_amount(), 350);
+    }
+
+    #[test]
+    fn amend_root_to_zero_is_rejected_and_root_unchanged() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        let before = d.root();
+        let err = d.amend_merkle_root(key(0xAA), [0u8; 32], 500).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidDistribution);
+        assert_eq!(err.code(), 258);
+        assert_eq!(d.root(), before);
+
+        // Fail-closed beats the same-root no-op: a zero-root
+        // distribution amended toward zero is still refused.
+        let zero = MerkleDistributor::new([0u8; 32], 350, key(0xAA), 2, 100, 1000).unwrap();
+        let mut zero = zero;
+        let err = zero.amend_merkle_root(key(0xAA), [0u8; 32], 500).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidDistribution);
+        assert_eq!(zero.root(), [0u8; 32]);
+    }
+
+    #[test]
+    fn amend_root_to_same_root_is_noop() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        let before = d.root();
+        d.amend_merkle_root(key(0xAA), before, 500).unwrap();
+        assert_eq!(d.root(), before);
+        assert_eq!(d.state(), DistributorState::Active);
+        assert_eq!(d.claimed_count(), 0);
+        assert_eq!(d.unclaimed_amount(), 350);
+        // The distribution still works exactly as before.
+        d.claim(0, key(1), 100, &proofs[0], 500).unwrap();
+    }
+
+    #[test]
+    fn amend_root_before_first_claim_rewrites_root() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, old_proofs) = open_distribution(&leaves);
+        let old_root = d.root();
+        // Corrected builder output: same recipients, same total (350),
+        // different per-leaf split, hence a different root.
+        let corrected = [(key(1), 250u64), (key(2), 100)];
+        let (new_root, new_proofs) = build_tree(&corrected);
+        assert_ne!(new_root, old_root);
+
+        d.amend_merkle_root(key(0xAA), new_root, 500).unwrap();
+        assert_eq!(d.root(), new_root);
+
+        // Old proofs no longer verify against the new root.
+        let err = d.claim(0, key(1), 100, &old_proofs[0], 500).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMerkleProof);
+        // New proofs claim under the corrected root.
+        let got = d.claim(0, key(1), 250, &new_proofs[0], 500).unwrap();
+        assert_eq!(got, 250);
+        let got = d.claim(1, key(2), 100, &new_proofs[1], 500).unwrap();
+        assert_eq!(got, 100);
+        assert_eq!(d.unclaimed_amount(), 0);
+    }
+
+    #[test]
+    fn amend_root_leaves_totals_and_bitmap_untouched() {
+        let leaves = [(key(1), 100u64), (key(2), 250), (key(3), 50)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        let (new_root, _) = build_tree(&[(key(1), 50u64), (key(2), 100), (key(3), 250)]);
+        d.amend_merkle_root(key(0xAA), new_root, 500).unwrap();
+
+        assert_eq!(d.leaf_count(), 3);
+        assert_eq!(d.unclaimed_amount(), 400);
+        assert_eq!(d.claimed_count(), 0);
+        assert_eq!(d.claimed_amount(), 0);
+        assert!(!d.is_claimed(0));
+        assert!(!d.is_claimed(1));
+        assert!(!d.is_claimed(2));
+        // The claim window is unchanged: still open before expiry,
+        // still closed at it (checked with the corrected proofs).
+        let (_, new_proofs) = build_tree(&[(key(1), 50u64), (key(2), 100), (key(3), 250)]);
+        let err = d.claim(0, key(1), 50, &new_proofs[0], 1000).unwrap_err();
+        assert_eq!(err, EscrowError::DistributionExpired);
+        assert_eq!(d.claim(0, key(1), 50, &proofs[0], 999).unwrap_err(),
+                   EscrowError::InvalidMerkleProof); // old proof, new root
+        let got = d.claim(0, key(1), 50, &new_proofs[0], 999).unwrap();
+        assert_eq!(got, 50);
+    }
+
+    #[test]
+    fn root_amended_audit_json_is_pinned() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        let old_root = d.root();
+        let (new_root, _) = build_tree(&[(key(1), 250u64), (key(2), 100)]);
+        d.amend_merkle_root(key(0xAA), new_root, 500).unwrap();
+        let j = d.root_amended_audit_json(old_root);
+        let expected = format!(
+            "{{\"event\":\"distributor_root_amended\",\"old_root\":\"{}\",\"new_root\":\"{}\",\"leaf_count\":2,\"total_amount\":350}}",
+            hex64(&old_root),
+            hex64(&new_root)
+        );
+        assert_eq!(j, expected);
+    }
+
+    #[test]
+    fn failed_amend_calls_leave_no_state_change() {
+        // A distribution with one claim already made: every failing
+        // amend must leave the claimed accounting exactly as it was.
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        d.claim(0, key(1), 100, &proofs[0], 500).unwrap();
+        let root = d.root();
+        let (new_root, _) = build_tree(&[(key(1), 250u64), (key(2), 100)]);
+
+        // Stranger, zero root, past expiry, and claims-started — all fail.
+        // (The zero-root call on this already-claimed distribution
+        // refuses on the pristine check, which precedes the value
+        // check; the zero-root value refusal itself is pinned in
+        // amend_root_to_zero_is_rejected_and_root_unchanged.)
+        assert_eq!(
+            d.amend_merkle_root(key(0xBB), new_root, 500).unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(
+            d.amend_merkle_root(key(0xAA), [0u8; 32], 500).unwrap_err(),
+            EscrowError::DistributionClaimsStarted
+        );
+        assert_eq!(
+            d.amend_merkle_root(key(0xAA), new_root, 1000).unwrap_err(),
+            EscrowError::DistributionExpired
+        );
+        assert_eq!(
+            d.amend_merkle_root(key(0xAA), new_root, 500).unwrap_err(),
+            EscrowError::DistributionClaimsStarted
+        );
+        assert_eq!(d.root(), root);
+        assert_eq!(d.state(), DistributorState::Active);
+        assert_eq!(d.claimed_count(), 1);
+        assert_eq!(d.claimed_amount(), 100);
+        assert_eq!(d.unclaimed_amount(), 250);
+        assert!(d.is_claimed(0));
+        assert!(!d.is_claimed(1));
+    }
+
+    #[test]
+    fn amend_check_order_is_authority_first() {
+        // A stranger calling on an expired, claimed distribution gets
+        // Unauthorized — authority precedes state, window, and pristine.
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        d.claim(0, key(1), 100, &proofs[0], 500).unwrap();
+        let (new_root, _) = build_tree(&[(key(1), 250u64), (key(2), 100)]);
+        let err = d.amend_merkle_root(key(0xBB), new_root, 5000).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        // ...and the maker on the same distribution gets the window
+        // error before the pristine error (window precedes claimed).
+        let err = d.amend_merkle_root(key(0xAA), new_root, 5000).unwrap_err();
+        assert_eq!(err, EscrowError::DistributionExpired);
     }
 }
