@@ -1543,7 +1543,7 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
     // `execute_governance`, not re-litigated here.
     let governance_proposal = if c.option_present("governance_proposal")? {
         let kind = c.u8()?;
-        if kind > 3 {
+        if kind > 14 {
             return Err(AccountDecodeError::InvalidGovernanceActionKind(kind));
         }
         let payload_bytes = c.read(GOVERNANCE_ACTION_PAYLOAD_LEN)?;
@@ -1555,6 +1555,10 @@ pub fn decode_vault_account(data: &[u8]) -> Result<Escrow, AccountDecodeError> {
             let count = match kind {
                 1 => payload[320],
                 3 => payload[128],
+                8 => payload[80],
+                12 => payload[256],
+                13 => payload[64],
+                14 => payload[256],
                 _ => 0,
             };
             AccountDecodeError::InvalidGovernanceActionLen { kind, count }

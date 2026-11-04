@@ -1381,7 +1381,7 @@ pub struct Escrow {
     /// last so every earlier field offset stays stable.
     mint_allowlist: Option<MintAllowlist>,
     /// AV-158: the opt-in governance delay window in seconds. `0`
-    /// means no delay (backward compatible) — the four dual-signed
+    /// means no delay (backward compatible) — the dual-signed
     /// config changes stay immediate. Set once via
     /// [`Escrow::with_governance_delay`] on an `Uninitialized` escrow;
     /// a zero window is rejected there, so `0` unambiguously means
@@ -5595,9 +5595,9 @@ impl MintAllowlist {
 
 // ---------- AV-158: delayed dual-signed governance ----------
 //
-// The four dual-signed config changes (`update_quorum`,
-// `update_attestors`, `rotate_taker`, `update_payout_allowlist`) can
-// opt in to a two-phase propose → delay → execute/cancel protocol via
+// The fifteen dual-signed config changes (the four AV-158 actions
+// plus the eleven AV-335 actions) can opt in to a two-phase
+// propose → delay → execute/cancel protocol via
 // `Escrow::with_governance_delay`. The delay is the anti-flash-
 // governance rule: a malicious threshold change proposed while an
 // attestor is dark cannot take effect before the other party has had
@@ -5613,14 +5613,38 @@ impl MintAllowlist {
 // Wire format (fixed reservations, zero-padded per variant — the
 // crate's usual treatment, cf. AV-157's allowlist tail):
 // - `GovernanceAction`: 1-byte kind (0 = UpdateQuorum, 1 =
-//   UpdateAttestors, 2 = RotateTaker, 3 = UpdatePayoutAllowlist) +
+//   UpdateAttestors, 2 = RotateTaker, 3 = UpdatePayoutAllowlist,
+//   4 = AmendFundingStart, 5 = AmendSettlementMint, 6 =
+//   AmendJuryPanelSize, 7 = AmendEventCapacity, 8 =
+//   AmendVestingCurve, 9 = AmendDutchAuctionWindow, 10 =
+//   AmendSubscriptionPeriodSecs, 11 = AmendDefaultJudgment, 12 =
+//   UpdateSettlementMintAllowlist, 13 = UpdateTieredQuorum, 14 =
+//   UpdateArbiterPanelMembers) +
 //   [`GOVERNANCE_ACTION_PAYLOAD_LEN`]-byte payload. Per-kind layout:
 //   kind 0: payload[0..8] = new_threshold LE;
 //   kind 1: payload[0..256] = 8 attestor keys, payload[256..320] =
 //   8 weights LE, payload[320] = live count;
 //   kind 2: payload[0..32] = new_taker;
 //   kind 3: payload[0..128] = 4 allowlist addresses, payload[128] =
-//   live count (0 = clear the allowlist).
+//   live count (0 = clear the allowlist);
+//   kind 4: payload[0..8] = new_start_at LE;
+//   kind 5: payload[0..32] = new_settle_mint;
+//   kind 6: payload[0] = new_panel_size;
+//   kind 7: payload[0] = new_capacity;
+//   kind 8: payload[0..80] = 8 curve tiers, 10 bytes each (8-byte
+//   `at` LE + 2-byte `unlocked_bps` LE — the same 10-byte tier slot
+//   as [`VESTING_CURVE_LEN`]), payload[80] = live count;
+//   kind 9: payload[0..8] = new_start_at LE, payload[8..16] =
+//   new_end_at LE;
+//   kind 10: payload[0..8] = new_period_secs LE;
+//   kind 11: payload[0..8] = deadline_secs LE, payload[8..16] =
+//   default_taker_amount LE;
+//   kind 12: payload[0..256] = 8 allowlist mints, payload[256] =
+//   live count (0 = clear the allowlist);
+//   kind 13: payload[0..64] = 4 tiers, 16 bytes each (8-byte
+//   max_amount LE + 8-byte threshold LE), payload[64] = live count;
+//   kind 14: payload[0..256] = 8 panel members, payload[256] =
+//   live count.
 // - `GovernanceProposal`: the action + 32-byte proposer +
 //   8-byte `proposed_at` + 8-byte `delay_secs` (the configured delay
 //   snapshotted at propose time, so an in-flight proposal keeps its
@@ -5656,6 +5680,48 @@ pub enum GovernanceAction {
     /// back to `None`, mirroring the direct call's empty-list rule).
     UpdatePayoutAllowlist {
         addrs: [[u8; 32]; MAX_PAYOUT_ALLOWLIST],
+        count: u8,
+    },
+    /// [`Escrow::amend_funding_start`] with this start (AV-335).
+    AmendFundingStart { new_start_at: u64 },
+    /// [`Escrow::amend_settlement_mint`] with this mint (AV-335).
+    AmendSettlementMint { new_settle_mint: [u8; 32] },
+    /// [`Escrow::amend_jury_panel_size`] with this size (AV-335).
+    AmendJuryPanelSize { new_panel_size: u8 },
+    /// [`Escrow::amend_event_capacity`] with this capacity (AV-335).
+    AmendEventCapacity { new_capacity: u8 },
+    /// [`Escrow::amend_vesting_curve`] with this curve (AV-335).
+    AmendVestingCurve { curve: VestingCurve },
+    /// [`Escrow::amend_dutch_auction_window`] with this window
+    /// (AV-335): the window is judged at execute time, not propose
+    /// time — a window that opens before the delay elapses fails
+    /// at execution, leaving the proposal live.
+    AmendDutchAuctionWindow { new_start_at: u64, new_end_at: u64 },
+    /// [`Escrow::amend_subscription_period_secs`] with this cadence
+    /// (AV-335).
+    AmendSubscriptionPeriodSecs { new_period_secs: u64 },
+    /// [`Escrow::amend_default_judgment`] with these terms (AV-335).
+    AmendDefaultJudgment {
+        deadline_secs: u64,
+        default_taker_amount: u64,
+    },
+    /// [`Escrow::update_settlement_mint_allowlist`] with these mints
+    /// (AV-335): only `mints[..count]` are live (`count == 0`
+    /// clears the allowlist back to `None`, mirroring the direct
+    /// call's empty-list rule).
+    UpdateSettlementMintAllowlist {
+        mints: [[u8; 32]; MAX_SETTLEMENT_MINT_ALLOWLIST],
+        count: u8,
+    },
+    /// [`Escrow::update_tiered_quorum`] with this tier table (AV-335).
+    UpdateTieredQuorum {
+        tiers: [Tier; MAX_TIERS],
+        count: u8,
+    },
+    /// [`Escrow::update_arbiter_panel_members`] with these members
+    /// (AV-335): only `members[..count]` are live.
+    UpdateArbiterPanelMembers {
+        members: [[u8; 32]; MAX_PANEL_MEMBERS],
         count: u8,
     },
 }
@@ -5710,13 +5776,30 @@ pub const GOVERNANCE_DELAY_TAIL_LEN: usize = 8;
 
 impl GovernanceAction {
     /// The 1-byte wire kind: 0 = UpdateQuorum, 1 = UpdateAttestors,
-    /// 2 = RotateTaker, 3 = UpdatePayoutAllowlist.
+    /// 2 = RotateTaker, 3 = UpdatePayoutAllowlist, 4 =
+    /// AmendFundingStart, 5 = AmendSettlementMint, 6 =
+    /// AmendJuryPanelSize, 7 = AmendEventCapacity, 8 =
+    /// AmendVestingCurve, 9 = AmendDutchAuctionWindow, 10 =
+    /// AmendSubscriptionPeriodSecs, 11 = AmendDefaultJudgment, 12 =
+    /// UpdateSettlementMintAllowlist, 13 = UpdateTieredQuorum, 14 =
+    /// UpdateArbiterPanelMembers.
     pub(crate) fn kind_byte(&self) -> u8 {
         match self {
             GovernanceAction::UpdateQuorum { .. } => 0,
             GovernanceAction::UpdateAttestors { .. } => 1,
             GovernanceAction::RotateTaker { .. } => 2,
             GovernanceAction::UpdatePayoutAllowlist { .. } => 3,
+            GovernanceAction::AmendFundingStart { .. } => 4,
+            GovernanceAction::AmendSettlementMint { .. } => 5,
+            GovernanceAction::AmendJuryPanelSize { .. } => 6,
+            GovernanceAction::AmendEventCapacity { .. } => 7,
+            GovernanceAction::AmendVestingCurve { .. } => 8,
+            GovernanceAction::AmendDutchAuctionWindow { .. } => 9,
+            GovernanceAction::AmendSubscriptionPeriodSecs { .. } => 10,
+            GovernanceAction::AmendDefaultJudgment { .. } => 11,
+            GovernanceAction::UpdateSettlementMintAllowlist { .. } => 12,
+            GovernanceAction::UpdateTieredQuorum { .. } => 13,
+            GovernanceAction::UpdateArbiterPanelMembers { .. } => 14,
         }
     }
 
@@ -5752,6 +5835,69 @@ impl GovernanceAction {
                     out[i * 32..(i + 1) * 32].copy_from_slice(a);
                 }
                 out[128] = *count;
+            }
+            GovernanceAction::AmendFundingStart { new_start_at } => {
+                out[..8].copy_from_slice(&new_start_at.to_le_bytes());
+            }
+            GovernanceAction::AmendSettlementMint { new_settle_mint } => {
+                out[..32].copy_from_slice(new_settle_mint);
+            }
+            GovernanceAction::AmendJuryPanelSize { new_panel_size } => {
+                out[0] = *new_panel_size;
+            }
+            GovernanceAction::AmendEventCapacity { new_capacity } => {
+                out[0] = *new_capacity;
+            }
+            GovernanceAction::AmendVestingCurve { curve } => {
+                let n = curve.tier_count() as usize;
+                for i in 0..n {
+                    // `tier(i)` is `Some` for `i < tier_count` by
+                    // construction.
+                    let (at, bps) = curve.tier(i).expect("live tier");
+                    out[i * 10..i * 10 + 8].copy_from_slice(&at.to_le_bytes());
+                    out[i * 10 + 8..i * 10 + 10].copy_from_slice(&bps.to_le_bytes());
+                }
+                out[80] = curve.tier_count();
+            }
+            GovernanceAction::AmendDutchAuctionWindow {
+                new_start_at,
+                new_end_at,
+            } => {
+                out[..8].copy_from_slice(&new_start_at.to_le_bytes());
+                out[8..16].copy_from_slice(&new_end_at.to_le_bytes());
+            }
+            GovernanceAction::AmendSubscriptionPeriodSecs { new_period_secs } => {
+                out[..8].copy_from_slice(&new_period_secs.to_le_bytes());
+            }
+            GovernanceAction::AmendDefaultJudgment {
+                deadline_secs,
+                default_taker_amount,
+            } => {
+                out[..8].copy_from_slice(&deadline_secs.to_le_bytes());
+                out[8..16].copy_from_slice(&default_taker_amount.to_le_bytes());
+            }
+            GovernanceAction::UpdateSettlementMintAllowlist { mints, count } => {
+                let n = (*count as usize).min(MAX_SETTLEMENT_MINT_ALLOWLIST);
+                for (i, m) in mints[..n].iter().enumerate() {
+                    out[i * 32..(i + 1) * 32].copy_from_slice(m);
+                }
+                out[256] = *count;
+            }
+            GovernanceAction::UpdateTieredQuorum { tiers, count } => {
+                let n = (*count as usize).min(MAX_TIERS);
+                for (i, t) in tiers[..n].iter().enumerate() {
+                    out[i * 16..i * 16 + 8].copy_from_slice(&t.max_amount.to_le_bytes());
+                    out[i * 16 + 8..i * 16 + 16]
+                        .copy_from_slice(&t.threshold.to_le_bytes());
+                }
+                out[64] = *count;
+            }
+            GovernanceAction::UpdateArbiterPanelMembers { members, count } => {
+                let n = (*count as usize).min(MAX_PANEL_MEMBERS);
+                for (i, m) in members[..n].iter().enumerate() {
+                    out[i * 32..(i + 1) * 32].copy_from_slice(m);
+                }
+                out[256] = *count;
             }
         }
         out
@@ -5806,6 +5952,117 @@ impl GovernanceAction {
                 }
                 Some(GovernanceAction::UpdatePayoutAllowlist { addrs, count })
             }
+            4 => {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&payload[..8]);
+                Some(GovernanceAction::AmendFundingStart {
+                    new_start_at: u64::from_le_bytes(b),
+                })
+            }
+            5 => {
+                let mut new_settle_mint = [0u8; 32];
+                new_settle_mint.copy_from_slice(&payload[..32]);
+                Some(GovernanceAction::AmendSettlementMint { new_settle_mint })
+            }
+            6 => Some(GovernanceAction::AmendJuryPanelSize {
+                new_panel_size: payload[0],
+            }),
+            7 => Some(GovernanceAction::AmendEventCapacity {
+                new_capacity: payload[0],
+            }),
+            8 => {
+                let count = payload[80];
+                if count == 0 || count as usize > MAX_VESTING_CURVE_TIERS {
+                    return None;
+                }
+                // Structural decode only — the curve's shape rules
+                // (strictly increasing tiers, final 10_000 bps) are
+                // enforced by `validate_governance_action` at propose
+                // time, not re-litigated here.
+                let mut tiers = [(0u64, 0u16); MAX_VESTING_CURVE_TIERS];
+                for i in 0..count as usize {
+                    let mut at = [0u8; 8];
+                    at.copy_from_slice(&payload[i * 10..i * 10 + 8]);
+                    let mut bps = [0u8; 2];
+                    bps.copy_from_slice(&payload[i * 10 + 8..i * 10 + 10]);
+                    tiers[i] = (u64::from_le_bytes(at), u16::from_le_bytes(bps));
+                }
+                Some(GovernanceAction::AmendVestingCurve {
+                    curve: VestingCurve { tiers, count },
+                })
+            }
+            9 => {
+                let mut start = [0u8; 8];
+                start.copy_from_slice(&payload[..8]);
+                let mut end = [0u8; 8];
+                end.copy_from_slice(&payload[8..16]);
+                Some(GovernanceAction::AmendDutchAuctionWindow {
+                    new_start_at: u64::from_le_bytes(start),
+                    new_end_at: u64::from_le_bytes(end),
+                })
+            }
+            10 => {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&payload[..8]);
+                Some(GovernanceAction::AmendSubscriptionPeriodSecs {
+                    new_period_secs: u64::from_le_bytes(b),
+                })
+            }
+            11 => {
+                let mut deadline = [0u8; 8];
+                deadline.copy_from_slice(&payload[..8]);
+                let mut amount = [0u8; 8];
+                amount.copy_from_slice(&payload[8..16]);
+                Some(GovernanceAction::AmendDefaultJudgment {
+                    deadline_secs: u64::from_le_bytes(deadline),
+                    default_taker_amount: u64::from_le_bytes(amount),
+                })
+            }
+            12 => {
+                let count = payload[256];
+                if count as usize > MAX_SETTLEMENT_MINT_ALLOWLIST {
+                    return None;
+                }
+                // `count == 0` clears the allowlist (mirroring the
+                // direct call's empty-list rule) — always decodable.
+                let mut mints = [[0u8; 32]; MAX_SETTLEMENT_MINT_ALLOWLIST];
+                for i in 0..count as usize {
+                    mints[i].copy_from_slice(&payload[i * 32..(i + 1) * 32]);
+                }
+                Some(GovernanceAction::UpdateSettlementMintAllowlist { mints, count })
+            }
+            13 => {
+                let count = payload[64];
+                if count == 0 || count as usize > MAX_TIERS {
+                    return None;
+                }
+                let mut tiers = [Tier {
+                    max_amount: 0,
+                    threshold: 0,
+                }; MAX_TIERS];
+                for i in 0..count as usize {
+                    let mut max_amount = [0u8; 8];
+                    max_amount.copy_from_slice(&payload[i * 16..i * 16 + 8]);
+                    let mut threshold = [0u8; 8];
+                    threshold.copy_from_slice(&payload[i * 16 + 8..i * 16 + 16]);
+                    tiers[i] = Tier {
+                        max_amount: u64::from_le_bytes(max_amount),
+                        threshold: u64::from_le_bytes(threshold),
+                    };
+                }
+                Some(GovernanceAction::UpdateTieredQuorum { tiers, count })
+            }
+            14 => {
+                let count = payload[256];
+                if count == 0 || count as usize > MAX_PANEL_MEMBERS {
+                    return None;
+                }
+                let mut members = [[0u8; 32]; MAX_PANEL_MEMBERS];
+                for i in 0..count as usize {
+                    members[i].copy_from_slice(&payload[i * 32..(i + 1) * 32]);
+                }
+                Some(GovernanceAction::UpdateArbiterPanelMembers { members, count })
+            }
             _ => None,
         }
     }
@@ -5846,6 +6103,64 @@ impl GovernanceAction {
         Some(GovernanceAction::UpdatePayoutAllowlist {
             addrs: a,
             count: addrs.len() as u8,
+        })
+    }
+
+    /// Convenience constructor for the settlement-mint-allowlist
+    /// action from a slice (AV-335; bounds-checked: at most
+    /// [`MAX_SETTLEMENT_MINT_ALLOWLIST`] entries; an empty slice
+    /// clears the allowlist, mirroring
+    /// [`Escrow::update_settlement_mint_allowlist`]). The list
+    /// rules themselves (zero mints, duplicates) are validated
+    /// against the live escrow by [`Escrow::propose_governance`].
+    pub fn update_settlement_mint_allowlist(mints: &[[u8; 32]]) -> Option<Self> {
+        if mints.len() > MAX_SETTLEMENT_MINT_ALLOWLIST {
+            return None;
+        }
+        let mut m = [[0u8; 32]; MAX_SETTLEMENT_MINT_ALLOWLIST];
+        m[..mints.len()].copy_from_slice(mints);
+        Some(GovernanceAction::UpdateSettlementMintAllowlist {
+            mints: m,
+            count: mints.len() as u8,
+        })
+    }
+
+    /// Convenience constructor for the tiered-quorum action from a
+    /// slice (AV-335; bounds-checked: 1 to [`MAX_TIERS`] tiers — an
+    /// empty table would leave releases with no quorum gate). The
+    /// table rules themselves (strictly increasing ceilings,
+    /// non-decreasing thresholds, open-ended top tier) are validated
+    /// against the live escrow by [`Escrow::propose_governance`].
+    pub fn update_tiered_quorum(tiers: &[Tier]) -> Option<Self> {
+        if tiers.is_empty() || tiers.len() > MAX_TIERS {
+            return None;
+        }
+        let mut t = [Tier {
+            max_amount: 0,
+            threshold: 0,
+        }; MAX_TIERS];
+        t[..tiers.len()].copy_from_slice(tiers);
+        Some(GovernanceAction::UpdateTieredQuorum {
+            tiers: t,
+            count: tiers.len() as u8,
+        })
+    }
+
+    /// Convenience constructor for the arbiter-panel-members action
+    /// from a slice (AV-335; bounds-checked: 1 to
+    /// [`MAX_PANEL_MEMBERS`] members — an empty roster would leave
+    /// disputes with no panel). The roster rules themselves (zero
+    /// keys, duplicates, the threshold fit) are validated against
+    /// the live escrow by [`Escrow::propose_governance`].
+    pub fn update_arbiter_panel_members(members: &[[u8; 32]]) -> Option<Self> {
+        if members.is_empty() || members.len() > MAX_PANEL_MEMBERS {
+            return None;
+        }
+        let mut m = [[0u8; 32]; MAX_PANEL_MEMBERS];
+        m[..members.len()].copy_from_slice(members);
+        Some(GovernanceAction::UpdateArbiterPanelMembers {
+            members: m,
+            count: members.len() as u8,
         })
     }
 }
@@ -25345,10 +25660,10 @@ let fee = self.charge_protocol_fee(claimable)?;
 
     // ---------- AV-158: delayed dual-signed governance ----------
     //
-    // The four dual-signed config changes (`update_quorum`,
-    // `update_attestors`, `rotate_taker`, `update_payout_allowlist`)
-    // can opt in to a two-phase propose → delay → execute/cancel
-    // protocol. The delay is the anti-flash-governance rule: a
+    // The fifteen dual-signed config changes (the four AV-158
+    // actions plus the eleven AV-335 actions) can opt in to a
+    // two-phase propose → delay → execute/cancel protocol. The delay
+    // is the anti-flash-governance rule: a
     // malicious threshold change proposed while an attestor is dark
     // cannot take effect before the other party has had the full
     // window to cancel it.
@@ -25371,10 +25686,10 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// [`Escrow::with_timelock`]. `delay_secs` must be non-zero
     /// ([`EscrowError::InvalidGovernanceDelay`] otherwise — a zero
     /// window is not a delay; leave the delay off instead). Once
-    /// opted in, the four dual-signed config changes
-    /// ([`Escrow::update_quorum`], [`Escrow::update_attestors`],
-    /// [`Escrow::rotate_taker`],
-    /// [`Escrow::update_payout_allowlist`]) refuse direct calls with
+    /// opted in, the dual-signed config changes (the four AV-158
+    /// actions plus the eleven AV-335 actions — and
+    /// `amend_payout_split_shares`, gated but variant-less until
+    /// AV-336) refuse direct calls with
     /// [`EscrowError::GovernanceActionNotProposed`] and move only
     /// through [`Escrow::propose_governance`] /
     /// [`Escrow::execute_governance`] /
@@ -25437,7 +25752,10 @@ let fee = self.charge_protocol_fee(claimable)?;
     ///    delay-less escrow the direct dual-signed calls stay live);
     /// 4. the action's state gate (`Uninitialized` / `Funded` for the
     ///    quorum and allowlist actions, plus `Activated` for
-    ///    `rotate_taker` — mirroring the underlying transitions);
+    ///    `rotate_taker` — mirroring the underlying transitions;
+    ///    AV-335: `AmendFundingStart` is `Uninitialized` /
+    ///    `Activated` only, the other ten new actions are
+    ///    `Funded`-only);
     /// 5. the action params validated against the live escrow (the
     ///    same rules the direct call enforces: threshold range, the
     ///    attestor-set rules via `QuorumPolicy::new`, the zero-key
@@ -25561,6 +25879,115 @@ let fee = self.charge_protocol_fee(claimable)?;
                     true,
                 )?;
             }
+            GovernanceAction::AmendFundingStart { new_start_at } => {
+                self.amend_funding_start_impl(
+                    self.initializer,
+                    self.taker,
+                    new_start_at,
+                    true,
+                )?;
+            }
+            GovernanceAction::AmendSettlementMint { new_settle_mint } => {
+                self.amend_settlement_mint_impl(
+                    self.initializer,
+                    self.taker,
+                    new_settle_mint,
+                    true,
+                )?;
+            }
+            GovernanceAction::AmendJuryPanelSize { new_panel_size } => {
+                self.amend_jury_panel_size_impl(
+                    self.initializer,
+                    self.taker,
+                    new_panel_size,
+                    true,
+                )?;
+            }
+            GovernanceAction::AmendEventCapacity { new_capacity } => {
+                self.amend_event_capacity_impl(
+                    self.initializer,
+                    self.taker,
+                    new_capacity,
+                    true,
+                )?;
+            }
+            GovernanceAction::AmendVestingCurve { curve } => {
+                // The curve's window checks run against the execute
+                // time `now`, not the propose time — a curve that
+                // would claw back already-vested funds at execution
+                // fails here, leaving the proposal live.
+                self.amend_vesting_curve_impl(
+                    self.initializer,
+                    self.taker,
+                    curve,
+                    now,
+                    true,
+                )?;
+            }
+            GovernanceAction::AmendDutchAuctionWindow {
+                new_start_at,
+                new_end_at,
+            } => {
+                // The window is judged at execute time: a window
+                // that already opened by the time the delay elapses
+                // fails here, leaving the proposal live for cancel
+                // or for a fresh proposal.
+                self.amend_dutch_auction_window_impl(
+                    self.initializer,
+                    self.taker,
+                    new_start_at,
+                    new_end_at,
+                    now,
+                    true,
+                )?;
+            }
+            GovernanceAction::AmendSubscriptionPeriodSecs { new_period_secs } => {
+                self.amend_subscription_period_secs_impl(
+                    self.initializer,
+                    self.taker,
+                    new_period_secs,
+                    true,
+                )?;
+            }
+            GovernanceAction::AmendDefaultJudgment {
+                deadline_secs,
+                default_taker_amount,
+            } => {
+                self.amend_default_judgment_impl(
+                    self.initializer,
+                    self.taker,
+                    deadline_secs,
+                    default_taker_amount,
+                    true,
+                )?;
+            }
+            GovernanceAction::UpdateSettlementMintAllowlist { mints, count } => {
+                let n = count as usize;
+                self.update_settlement_mint_allowlist_impl(
+                    self.initializer,
+                    self.taker,
+                    &mints[..n],
+                    true,
+                )?;
+            }
+            GovernanceAction::UpdateTieredQuorum { tiers, count } => {
+                let n = count as usize;
+                self.update_tiered_quorum_impl(
+                    self.initializer,
+                    self.taker,
+                    &tiers[..n],
+                    true,
+                )?;
+            }
+            GovernanceAction::UpdateArbiterPanelMembers { members, count } => {
+                let n = count as usize;
+                self.update_arbiter_panel_members_impl(
+                    self.initializer,
+                    self.taker,
+                    &members[..n],
+                    true,
+                )?;
+            }
         }
         self.governance_proposal = None;
         Ok(())
@@ -25592,7 +26019,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// Whether `action` may be proposed/executed in the current
     /// state — mirrors the underlying transition's state gate
     /// (`Uninitialized` / `Funded` for the quorum and allowlist
-    /// actions, plus `Activated` for `rotate_taker`).
+    /// actions, plus `Activated` for `rotate_taker`; AV-335:
+    /// `AmendFundingStart` is `Uninitialized` / `Activated` only,
+    /// the other ten new actions are `Funded`-only).
     fn governance_action_state_ok(&self, action: &GovernanceAction) -> bool {
         match action {
             GovernanceAction::UpdateQuorum { .. }
@@ -25608,6 +26037,33 @@ let fee = self.charge_protocol_fee(claimable)?;
                     self.state,
                     EscrowState::Uninitialized | EscrowState::Activated | EscrowState::Funded
                 )
+            }
+            // AV-335: the funding window moves only before any funds
+            // land (`Uninitialized` / `Activated`).
+            GovernanceAction::AmendFundingStart { .. } => {
+                matches!(
+                    self.state,
+                    EscrowState::Uninitialized | EscrowState::Activated
+                )
+            }
+            // AV-335: the other ten new actions revise post-funding
+            // config and are `Funded`-only, mirroring their inner
+            // transitions. The gate is deliberately NOT widened to
+            // `Uninitialized` for them: a proposal staged
+            // pre-funding would succeed at propose time and fail at
+            // execute time, breaking the propose-time fail-fast
+            // design.
+            GovernanceAction::AmendSettlementMint { .. }
+            | GovernanceAction::AmendJuryPanelSize { .. }
+            | GovernanceAction::AmendEventCapacity { .. }
+            | GovernanceAction::AmendVestingCurve { .. }
+            | GovernanceAction::AmendDutchAuctionWindow { .. }
+            | GovernanceAction::AmendSubscriptionPeriodSecs { .. }
+            | GovernanceAction::AmendDefaultJudgment { .. }
+            | GovernanceAction::UpdateSettlementMintAllowlist { .. }
+            | GovernanceAction::UpdateTieredQuorum { .. }
+            | GovernanceAction::UpdateArbiterPanelMembers { .. } => {
+                matches!(self.state, EscrowState::Funded)
             }
         }
     }
@@ -25661,6 +26117,182 @@ let fee = self.charge_protocol_fee(claimable)?;
                 // direct call's empty-list rule) — always valid.
                 if n > 0 {
                     let _ = PayoutAllowlist::new(&addrs[..n])?;
+                }
+                Ok(())
+            }
+            GovernanceAction::AmendFundingStart { .. } => {
+                // No value gate: any start is a valid window — the
+                // state gate (`Uninitialized` / `Activated`) plus the
+                // funded-total / funding-plan / partial-funding gates
+                // in the inner transition are the whole check, and
+                // they re-run at execute time.
+                Ok(())
+            }
+            GovernanceAction::AmendSettlementMint { new_settle_mint } => {
+                if *new_settle_mint == [0u8; 32] {
+                    return Err(EscrowError::InvalidMint);
+                }
+                Ok(())
+            }
+            GovernanceAction::AmendJuryPanelSize { new_panel_size } => {
+                if *new_panel_size == 0 || *new_panel_size as usize > MAX_JURORS {
+                    return Err(EscrowError::InvalidJurySize);
+                }
+                Ok(())
+            }
+            GovernanceAction::AmendEventCapacity { new_capacity } => {
+                if *new_capacity == 0 || *new_capacity as usize > MAX_EVENT_HISTORY {
+                    return Err(EscrowError::InvalidEventCapacity);
+                }
+                // The no-drop rule: the new capacity must cover every
+                // retained entry. The ring-wrap gate (a full ring is
+                // frozen) re-runs in the inner transition at execute
+                // time.
+                if *new_capacity < self.event_count {
+                    return Err(EscrowError::InvalidEventCapacity);
+                }
+                Ok(())
+            }
+            GovernanceAction::AmendVestingCurve { curve } => {
+                // The curve-construction shape rules (cf.
+                // `VestingCurve::stepped`): strictly increasing
+                // unlock times and basis points, final tier exactly
+                // 10_000. The window fit (every tier inside the live
+                // schedule) is checked here too when a schedule is
+                // attached; the anti-clawback floor is `now`
+                // dependent and re-runs in the inner transition at
+                // execute time.
+                let n = curve.tier_count() as usize;
+                if n == 0 || n > MAX_VESTING_CURVE_TIERS {
+                    return Err(EscrowError::InvalidVestingCurve);
+                }
+                let mut prev: Option<(u64, u16)> = None;
+                for i in 0..n {
+                    let (at, bps) =
+                        curve.tier(i).ok_or(EscrowError::InvalidVestingCurve)?;
+                    if bps > 10_000 {
+                        return Err(EscrowError::InvalidVestingCurve);
+                    }
+                    if let Some((prev_at, prev_bps)) = prev {
+                        if at <= prev_at || bps <= prev_bps {
+                            return Err(EscrowError::InvalidVestingCurve);
+                        }
+                    }
+                    prev = Some((at, bps));
+                }
+                if prev.map(|(_, bps)| bps) != Some(10_000) {
+                    return Err(EscrowError::InvalidVestingCurve);
+                }
+                if let Some(schedule) = self.vesting {
+                    for i in 0..n {
+                        let (at, _) =
+                            curve.tier(i).ok_or(EscrowError::InvalidVestingCurve)?;
+                        if at < schedule.start() || at > schedule.end() {
+                            return Err(EscrowError::InvalidVestingCurve);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            GovernanceAction::AmendDutchAuctionWindow {
+                new_start_at,
+                new_end_at,
+            } => {
+                // Only the shape rule (`start < end`) is judged at
+                // propose time — whether the window is still
+                // pre-open is `now` dependent and re-runs in the
+                // inner transition at execute time.
+                if *new_start_at >= *new_end_at {
+                    return Err(EscrowError::InvalidAuctionParams);
+                }
+                Ok(())
+            }
+            GovernanceAction::AmendSubscriptionPeriodSecs { new_period_secs } => {
+                if *new_period_secs == 0 {
+                    return Err(EscrowError::InvalidSubscription);
+                }
+                if let Some(schedule) = self.subscription {
+                    if (schedule.periods as u128 - 1) * *new_period_secs as u128
+                        > self.expires_at as u128
+                    {
+                        return Err(EscrowError::InvalidSubscription);
+                    }
+                }
+                Ok(())
+            }
+            GovernanceAction::AmendDefaultJudgment {
+                deadline_secs,
+                default_taker_amount,
+            } => {
+                if *deadline_secs == 0 {
+                    return Err(EscrowError::DefaultJudgmentNotDue);
+                }
+                if *default_taker_amount > self.amount {
+                    return Err(EscrowError::ReleaseExceedsLocked);
+                }
+                Ok(())
+            }
+            GovernanceAction::UpdateSettlementMintAllowlist { mints, count } => {
+                let n = *count as usize;
+                if n > MAX_SETTLEMENT_MINT_ALLOWLIST {
+                    return Err(EscrowError::InvalidSettlementMintAllowlist);
+                }
+                // `count == 0` clears the allowlist (mirroring the
+                // direct call's empty-list rule) — always valid.
+                if n > 0 {
+                    let _ = SettlementMintAllowlist::new(&mints[..n])?;
+                }
+                Ok(())
+            }
+            GovernanceAction::UpdateTieredQuorum { tiers, count } => {
+                // The table's ordering rules (cf.
+                // `TieredQuorum::new`, minus the wrapped-base
+                // reachability check, which needs the live policy
+                // and re-runs in the inner transition at execute
+                // time): non-empty, strictly increasing ceilings,
+                // non-decreasing thresholds, every threshold
+                // reachable in principle (non-zero), top tier
+                // open-ended.
+                let n = *count as usize;
+                if n == 0 || n > MAX_TIERS {
+                    return Err(EscrowError::InvalidQuorum);
+                }
+                let mut prev_ceiling: Option<u64> = None;
+                let mut prev_threshold: u64 = 0;
+                for tier in &tiers[..n] {
+                    if let Some(prev) = prev_ceiling {
+                        if tier.max_amount <= prev {
+                            return Err(EscrowError::InvalidQuorum);
+                        }
+                    }
+                    if tier.threshold < prev_threshold || tier.threshold == 0 {
+                        return Err(EscrowError::InvalidQuorum);
+                    }
+                    prev_ceiling = Some(tier.max_amount);
+                    prev_threshold = tier.threshold;
+                }
+                if prev_ceiling != Some(u64::MAX) {
+                    return Err(EscrowError::InvalidQuorum);
+                }
+                Ok(())
+            }
+            GovernanceAction::UpdateArbiterPanelMembers { members, count } => {
+                // The roster shape (cf. `ArbiterPanel::new`, minus
+                // the threshold fit, which needs the live panel's
+                // threshold and re-runs in the inner transition at
+                // execute time): 1..=8 members, no zero key, no
+                // duplicate.
+                let n = *count as usize;
+                if n == 0 || n > MAX_PANEL_MEMBERS {
+                    return Err(EscrowError::InvalidArbiterPanel);
+                }
+                if members[..n].contains(&[0u8; 32]) {
+                    return Err(EscrowError::InvalidArbiterPanel);
+                }
+                for (i, m) in members[..n].iter().enumerate() {
+                    if members[..i].contains(m) {
+                        return Err(EscrowError::InvalidArbiterPanel);
+                    }
                 }
                 Ok(())
             }
@@ -26907,7 +27539,7 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// — and there is deliberately no clearing path: a window the
     /// initializer funded under cannot be silently removed, which
     /// would restore the immediate single-proposal path for the
-    /// four routed config changes, paralleling
+    /// routed config changes, paralleling
     /// `amend_price_gate`'s no-clearing rule). Post-funding
     /// installation is allowed (`0 -> X`, `X > 0`): an escrow
     /// funded without a delay may opt in later, since both parties
@@ -36334,7 +36966,7 @@ pub(crate) mod anchor_idl_tests {
                             (code 220); writes the governance_delay_secs tail \
                             field in place (see PARAM_FIELD_MAP); no indexer \
                             event (pre-fund configuration). Once set, the \
-                            four dual-signed config changes move only through \
+                            dual-signed config changes move only through \
                             the propose → delay → execute/cancel protocol",
         },
         InstructionSpec {
@@ -51781,10 +52413,11 @@ mod release_cooling_tests {
 
 // ---------- AV-158: delayed dual-signed governance ----------
 //
-// `with_governance_delay` opts the four dual-signed config changes
+// `with_governance_delay` opts the dual-signed config changes
 // (`update_quorum`, `update_attestors`, `rotate_taker`,
-// `update_payout_allowlist`) into a propose → delay → execute/cancel
-// protocol. Deterministic injected clocks throughout; no network.
+// `update_payout_allowlist`, plus the eleven AV-335 actions) into a
+// propose → delay → execute/cancel protocol. Deterministic injected
+// clocks throughout; no network.
 #[cfg(test)]
 mod governance_delay_tests {
     use super::*;
@@ -51804,6 +52437,12 @@ mod governance_delay_tests {
     const ARBITER: [u8; 32] = [0xA8; 32];
     const WEEK: u64 = 604_800; // 7 days
     const HOUR: u64 = 3_600;
+    // AV-335 fixtures.
+    const M1: [u8; 32] = [0x51; 32];
+    const M2: [u8; 32] = [0x52; 32];
+    const M3: [u8; 32] = [0x53; 32];
+    const SETTLE_MINT: [u8; 32] = [0x5E; 32];
+    const NEW_SETTLE_MINT: [u8; 32] = [0x6E; 32];
 
     fn delay_escrow() -> Escrow {
         Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
@@ -52497,6 +53136,715 @@ mod governance_delay_tests {
         // Release works immediately despite the governance delay.
         let (payout, fee) = e.release(ALICE, T0, AMOUNT, None, BOB).unwrap();
         assert_eq!(payout + fee, AMOUNT);
+    }
+
+    // ---------- AV-335: delayed-governance action-set extension ----
+    //
+    // The eleven new `GovernanceAction` variants (kind 4–14) open the
+    // delayed path for the twelve routed `amend_*` / `update_*`
+    // methods AV-334 catalogued — all but `amend_payout_split_shares`,
+    // whose 641-byte table cannot fit the 321-byte fixed payload
+    // (AV-336). Deterministic injected clocks throughout; no network.
+
+    /// Funded delay-on escrow carrying every AV-335-revisable config
+    /// except the mutually exclusive vesting curve / Dutch auction
+    /// (last-wins: only one may be attached, so those two get their
+    /// own fixtures below).
+    fn kitchen_sink_funded_delay_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_funding_start(T0)
+            .unwrap()
+            .with_settlement_mint(SETTLE_MINT)
+            .unwrap()
+            .with_settlement_mint_allowlist(&[M1, M2])
+            .unwrap()
+            .with_tiered_quorum(
+                TieredQuorum::new(
+                    QuorumPolicy::new(&[A1, A2, A3], &[1, 1, 1], 2).unwrap(),
+                    &[
+                        Tier {
+                            max_amount: 100_000,
+                            threshold: 1,
+                        },
+                        Tier {
+                            max_amount: u64::MAX,
+                            threshold: 2,
+                        },
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .with_jury(3)
+            .unwrap()
+            .with_event_capacity(32)
+            .unwrap()
+            .with_arbiter_panel(&[A1, A2, A3], 2)
+            .unwrap()
+            .with_arbitration_deadline(86_400, 400_000)
+            .unwrap()
+            .with_subscription(86_400, 10, 100_000)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    /// Funded delay-on escrow with a vesting schedule + curve.
+    fn vesting_curve_funded_delay_escrow() -> Escrow {
+        let schedule = VestingSchedule::new(T0, T0 + 1_000_000).unwrap();
+        let curve = VestingCurve::stepped(
+            &[(T0 + 100_000, 5_000), (T0 + 1_000_000, 10_000)],
+            T0,
+            T0 + 1_000_000,
+        )
+        .unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_vesting_curve(schedule, curve)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    /// Funded delay-on escrow with a Dutch auction.
+    fn dutch_funded_delay_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_dutch_auction(T0 + 100_000, T0 + 200_000, 5_000)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn av335_funding_start_full_path() {
+        // AmendFundingStart is the only new action proposable
+        // pre-funding: the window moves while the escrow is still
+        // `Uninitialized`.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_funding_start(T0 + 1_000)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::AmendFundingStart {
+                new_start_at: T0 + 2_000,
+            },
+            T0,
+        )
+        .unwrap();
+        assert!(e.governance_proposal().is_some());
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(e.funding_start(), T0 + 2_000);
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_settlement_mint_full_path() {
+        let mut e = kitchen_sink_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::AmendSettlementMint {
+                new_settle_mint: NEW_SETTLE_MINT,
+            },
+            T0,
+        )
+        .unwrap();
+        e.execute_governance(BOB, T0 + DELAY).unwrap();
+        assert_eq!(e.settlement_mint(), Some(NEW_SETTLE_MINT));
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_jury_panel_size_full_path_emits_governance_events() {
+        let funded = kitchen_sink_funded_delay_escrow();
+        let mut e = IndexedEscrow::wrap([0x1D; 32], funded);
+        let before = e.event_count();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::AmendJuryPanelSize { new_panel_size: 5 },
+            T0,
+        )
+        .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::GovernanceProposed);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        e.execute_governance(BOB, T0 + DELAY).unwrap();
+        assert_eq!(e.event_count(), before + 2);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::GovernanceExecuted);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(e.inner().jury_panel_size(), 5);
+        assert!(e.inner().governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_event_capacity_full_path() {
+        let mut e = kitchen_sink_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::AmendEventCapacity { new_capacity: 48 },
+            T0,
+        )
+        .unwrap();
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(e.event_capacity(), 48);
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_arbiter_panel_members_full_path() {
+        let mut e = kitchen_sink_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::update_arbiter_panel_members(&[A1, A2, MALLORY])
+                .unwrap(),
+            T0,
+        )
+        .unwrap();
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        let panel = e.arbiter_panel().expect("panel configured");
+        assert_eq!(panel.n, 3);
+        assert_eq!(&panel.members[..3], &[A1, A2, MALLORY]);
+        // The threshold rides along untouched.
+        assert_eq!(panel.threshold, 2);
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_vesting_curve_full_path() {
+        let mut e = vesting_curve_funded_delay_escrow();
+        let new_curve = VestingCurve::stepped(
+            &[(T0 + 200_000, 5_000), (T0 + 1_000_000, 10_000)],
+            T0,
+            T0 + 1_000_000,
+        )
+        .unwrap();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::AmendVestingCurve { curve: new_curve },
+            T0,
+        )
+        .unwrap();
+        // Executed at T0 + DELAY, before the new curve's first tier
+        // unlocks anything — the anti-clawback floor is clear.
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(e.vesting_curve(), Some(new_curve));
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_dutch_auction_window_full_path() {
+        let mut e = dutch_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::AmendDutchAuctionWindow {
+                new_start_at: T0 + 300_000,
+                new_end_at: T0 + 400_000,
+            },
+            T0,
+        )
+        .unwrap();
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        let auction = e.auction().expect("auction configured");
+        assert_eq!(auction.start_at(), T0 + 300_000);
+        assert_eq!(auction.end_at(), T0 + 400_000);
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_subscription_period_full_path() {
+        let mut e = kitchen_sink_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::AmendSubscriptionPeriodSecs {
+                new_period_secs: 43_200,
+            },
+            T0,
+        )
+        .unwrap();
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(
+            e.subscription_schedule().unwrap().period_secs,
+            43_200
+        );
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_default_judgment_full_path() {
+        let mut e = kitchen_sink_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::AmendDefaultJudgment {
+                deadline_secs: 172_800,
+                default_taker_amount: 500_000,
+            },
+            T0,
+        )
+        .unwrap();
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        let terms = e.default_judgment().expect("judgment configured");
+        assert_eq!(terms.deadline_secs, 172_800);
+        assert_eq!(terms.default_taker_amount, 500_000);
+        // The new terms need a fresh taker countersign.
+        assert!(!e.default_judgment_confirmed());
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_settlement_mint_allowlist_full_path_and_clear() {
+        let mut e = kitchen_sink_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::update_settlement_mint_allowlist(&[M1, M3])
+                .unwrap(),
+            T0,
+        )
+        .unwrap();
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(
+            e.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1, M3]
+        );
+        // A second round clears the allowlist (`count == 0`).
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::update_settlement_mint_allowlist(&[]).unwrap(),
+            T0 + DELAY,
+        )
+        .unwrap();
+        e.execute_governance(ALICE, T0 + 2 * DELAY).unwrap();
+        assert!(e.settlement_mint_allowlist().is_none());
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_tiered_quorum_full_path() {
+        let mut e = kitchen_sink_funded_delay_escrow();
+        let new_tiers = [
+            Tier {
+                max_amount: 200_000,
+                threshold: 1,
+            },
+            Tier {
+                max_amount: u64::MAX,
+                threshold: 3,
+            },
+        ];
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::update_tiered_quorum(&new_tiers).unwrap(),
+            T0,
+        )
+        .unwrap();
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(e.tiered_quorum().unwrap().tiers(), &new_tiers);
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_direct_calls_refused_when_delayed() {
+        // On a delay-opted-in escrow all twelve routed config
+        // changes move only through propose/execute — including
+        // `amend_payout_split_shares`, which AV-335 deliberately
+        // excludes from the action set (AV-336 owns its path).
+        let mut e = kitchen_sink_funded_delay_escrow();
+        assert_eq!(
+            e.update_settlement_mint_allowlist(ALICE, BOB, &[M1])
+                .unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(
+            e.amend_settlement_mint(ALICE, BOB, NEW_SETTLE_MINT)
+                .unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(
+            e.amend_funding_start(ALICE, BOB, T0 + 9_999).unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(
+            e.update_tiered_quorum(
+                ALICE,
+                BOB,
+                &[Tier {
+                    max_amount: u64::MAX,
+                    threshold: 1
+                }]
+            )
+            .unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(
+            e.amend_jury_panel_size(ALICE, BOB, 5).unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(
+            e.amend_event_capacity(ALICE, BOB, 48).unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(
+            e.update_arbiter_panel_members(ALICE, BOB, &[A1, A2, MALLORY])
+                .unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(
+            e.amend_payout_split_shares(ALICE, BOB, &[(A1, 500_000), (A2, 500_000)], T0)
+                .unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        let curve = VestingCurve::stepped(
+            &[(T0 + 100_000, 5_000), (T0 + 1_000_000, 10_000)],
+            T0,
+            T0 + 1_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            e.amend_vesting_curve(ALICE, BOB, curve, T0).unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(
+            e.amend_dutch_auction_window(ALICE, BOB, T0 + 300_000, T0 + 400_000, T0)
+                .unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(
+            e.amend_subscription_period_secs(ALICE, BOB, 43_200)
+                .unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(
+            e.amend_default_judgment(ALICE, BOB, 172_800, 500_000)
+                .unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+    }
+
+    #[test]
+    fn av335_kind_byte_encode_decode_round_trip() {
+        // Every new variant round-trips through kind_byte 4–14 +
+        // encode/decode with its params intact.
+        let curve = VestingCurve::stepped(
+            &[(T0 + 100_000, 5_000), (T0 + 1_000_000, 10_000)],
+            T0,
+            T0 + 1_000_000,
+        )
+        .unwrap();
+        let actions = [
+            GovernanceAction::AmendFundingStart {
+                new_start_at: T0 + 2_000,
+            },
+            GovernanceAction::AmendSettlementMint {
+                new_settle_mint: NEW_SETTLE_MINT,
+            },
+            GovernanceAction::AmendJuryPanelSize { new_panel_size: 5 },
+            GovernanceAction::AmendEventCapacity { new_capacity: 48 },
+            GovernanceAction::AmendVestingCurve { curve },
+            GovernanceAction::AmendDutchAuctionWindow {
+                new_start_at: T0 + 300_000,
+                new_end_at: T0 + 400_000,
+            },
+            GovernanceAction::AmendSubscriptionPeriodSecs {
+                new_period_secs: 43_200,
+            },
+            GovernanceAction::AmendDefaultJudgment {
+                deadline_secs: 172_800,
+                default_taker_amount: 500_000,
+            },
+            GovernanceAction::update_settlement_mint_allowlist(&[M1, M3]).unwrap(),
+            GovernanceAction::update_tiered_quorum(&[
+                Tier {
+                    max_amount: 200_000,
+                    threshold: 1,
+                },
+                Tier {
+                    max_amount: u64::MAX,
+                    threshold: 3,
+                },
+            ])
+            .unwrap(),
+            GovernanceAction::update_arbiter_panel_members(&[A1, A2, MALLORY]).unwrap(),
+        ];
+        for (i, action) in actions.iter().enumerate() {
+            let kind = 4 + i as u8;
+            assert_eq!(action.kind_byte(), kind, "kind {kind}");
+            let payload = action.encode_payload();
+            assert_eq!(
+                GovernanceAction::decode(kind, &payload),
+                Some(*action),
+                "kind {kind} round-trip"
+            );
+        }
+        // Unknown kinds fail closed.
+        let payload = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
+        assert_eq!(GovernanceAction::decode(15, &payload), None);
+        assert_eq!(GovernanceAction::decode(255, &payload), None);
+        // Out-of-range live counts fail closed.
+        let mut bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
+        bad[80] = 9; // vesting curve count > 8
+        assert_eq!(GovernanceAction::decode(8, &bad), None);
+        bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
+        bad[256] = 9; // settlement-mint allowlist count > 8
+        assert_eq!(GovernanceAction::decode(12, &bad), None);
+        bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
+        bad[64] = 5; // tiered quorum count > 4
+        assert_eq!(GovernanceAction::decode(13, &bad), None);
+        bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
+        bad[256] = 9; // arbiter panel count > 8
+        assert_eq!(GovernanceAction::decode(14, &bad), None);
+        // The slice constructors refuse out-of-range input, and the
+        // allowlist constructors accept the empty (clear) slice.
+        assert!(
+            GovernanceAction::update_settlement_mint_allowlist(&[[0u8; 32]; 9])
+                .is_none()
+        );
+        assert!(
+            GovernanceAction::update_settlement_mint_allowlist(&[])
+                .unwrap()
+                .encode_payload()[256]
+                == 0
+        );
+        assert!(GovernanceAction::update_tiered_quorum(&[]).is_none());
+        assert!(
+            GovernanceAction::update_tiered_quorum(&[Tier {
+                max_amount: u64::MAX,
+                threshold: 1
+            }; 5])
+            .is_none()
+        );
+        assert!(GovernanceAction::update_arbiter_panel_members(&[]).is_none());
+        assert!(
+            GovernanceAction::update_arbiter_panel_members(&[[0u8; 32]; 9]).is_none()
+        );
+    }
+
+    #[test]
+    fn av335_propose_rejects_wrong_state() {
+        // The ten Funded-only actions cannot be staged pre-funding:
+        // propose fails fast with 101 and stages nothing.
+        let mut e = delay_escrow();
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::AmendJuryPanelSize { new_panel_size: 5 },
+                T0
+            )
+            .unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        assert!(e.governance_proposal().is_none());
+        // ... and neither can the funding-start action once funded.
+        let mut funded = funded_delay_escrow();
+        assert_eq!(
+            funded
+                .propose_governance(
+                    ALICE,
+                    GovernanceAction::AmendFundingStart {
+                        new_start_at: T0 + 2_000
+                    },
+                    T0
+                )
+                .unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        assert!(funded.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_execute_before_delay_keeps_proposal() {
+        let mut e = kitchen_sink_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::AmendJuryPanelSize { new_panel_size: 5 },
+            T0,
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + DELAY - 1).unwrap_err(),
+            EscrowError::GovernanceDelayNotElapsed
+        );
+        // The proposal stays live for retry — and the config is
+        // untouched while the delay runs.
+        assert!(e.governance_proposal().is_some());
+        assert_eq!(e.jury_panel_size(), 3);
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(e.jury_panel_size(), 5);
+    }
+
+    #[test]
+    fn av335_cancel_veto_blocks_execute() {
+        let mut e = kitchen_sink_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::AmendEventCapacity { new_capacity: 48 },
+            T0,
+        )
+        .unwrap();
+        e.cancel_governance(BOB).unwrap();
+        assert!(e.governance_proposal().is_none());
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + DELAY + 1).unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(e.event_capacity(), 32);
+    }
+
+    #[test]
+    fn av335_propose_fail_fast_bad_params() {
+        let mut e = kitchen_sink_funded_delay_escrow();
+        // Zero jury size.
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::AmendJuryPanelSize { new_panel_size: 0 },
+                T0
+            )
+            .unwrap_err(),
+            EscrowError::InvalidJurySize
+        );
+        // Empty tier table.
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::UpdateTieredQuorum {
+                    tiers: [Tier {
+                        max_amount: 0,
+                        threshold: 0
+                    }; MAX_TIERS],
+                    count: 0,
+                },
+                T0
+            )
+            .unwrap_err(),
+            EscrowError::InvalidQuorum
+        );
+        // Duplicate allowlist mint.
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::update_settlement_mint_allowlist(&[M1, M1])
+                    .unwrap(),
+                T0
+            )
+            .unwrap_err(),
+            EscrowError::InvalidSettlementMintAllowlist
+        );
+        // A malformed curve: non-increasing unlock times, decoded
+        // from raw payload bytes (decode is structural only — the
+        // shape rules fire at propose time).
+        let mut payload = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
+        let at0 = (T0 + 200_000).to_le_bytes();
+        let at1 = (T0 + 100_000).to_le_bytes();
+        payload[0..8].copy_from_slice(&at0);
+        payload[8..10].copy_from_slice(&5_000u16.to_le_bytes());
+        payload[10..18].copy_from_slice(&at1);
+        payload[18..20].copy_from_slice(&10_000u16.to_le_bytes());
+        payload[80] = 2;
+        let bad_curve = GovernanceAction::decode(8, &payload)
+            .expect("structural decode accepts the shape");
+        assert_eq!(
+            e.propose_governance(ALICE, bad_curve, T0).unwrap_err(),
+            EscrowError::InvalidVestingCurve
+        );
+        // A zero settlement mint.
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::AmendSettlementMint {
+                    new_settle_mint: [0u8; 32]
+                },
+                T0
+            )
+            .unwrap_err(),
+            EscrowError::InvalidMint
+        );
+        // No failed proposal staged anything.
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_dutch_window_stale_at_execute_keeps_proposal() {
+        // The proposed window opens before the delay elapses, so the
+        // execute-time window check refuses it — and the proposal
+        // stays live (a failed execution never clears it).
+        let mut e = dutch_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::AmendDutchAuctionWindow {
+                new_start_at: T0 + 50_000,
+                new_end_at: T0 + 60_000,
+            },
+            T0,
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + DELAY).unwrap_err(),
+            EscrowError::AuctionNotActive
+        );
+        assert!(e.governance_proposal().is_some());
+        // The auction itself is untouched.
+        assert_eq!(e.auction().unwrap().start_at(), T0 + 100_000);
+        // The veto is the only exit for the stranded proposal.
+        e.cancel_governance(BOB).unwrap();
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_funding_start_proposal_stranded_by_funding() {
+        // The known edge: a funding-start proposal staged while
+        // `Uninitialized` goes stale if the escrow funds before the
+        // delay elapses — execute then fails 101 and the proposal
+        // stays live until either party cancels it. Not silent.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_funding_start(T0 + 1_000)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::AmendFundingStart {
+                new_start_at: T0 + 2_000,
+            },
+            T0,
+        )
+        .unwrap();
+        // Fund once the live window opens (funding_start is still
+        // the live T0 + 1_000 — the proposal has not applied).
+        e.fund(ALICE, T0 + 1_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + 1_000 + DELAY)
+                .unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        assert!(e.governance_proposal().is_some());
+        assert_eq!(e.funding_start(), T0 + 1_000);
+        e.cancel_governance(BOB).unwrap();
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av335_layout_lengths_unchanged() {
+        // Zero layout change: the fixed payload still fits the
+        // largest variant, and the vault space / rent are untouched.
+        assert_eq!(GOVERNANCE_ACTION_PAYLOAD_LEN, 321);
+        assert_eq!(GOVERNANCE_ACTION_LEN, 322);
+        assert_eq!(GOVERNANCE_PROPOSAL_LEN, 370);
+        assert_eq!(GOVERNANCE_PROPOSAL_TAIL_LEN, 371);
+        assert_eq!(VAULT_SPACE, 8332);
     }
 
     #[test]

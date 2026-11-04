@@ -3940,10 +3940,9 @@ pub mod escrow_vault {
     /// `Escrow::with_governance_delay`). `Uninitialized` only, like
     /// `initialize_quorum`: the delay window is fixed before funds
     /// move. `0` is `InvalidGovernanceDelay` (a zero window is not a
-    /// delay); once set, the four dual-signed config changes
-    /// (`update_quorum`, `update_attestors`, `rotate_taker`,
-    /// `update_payout_allowlist`) move only through the
-    /// propose → delay → execute/cancel protocol.
+    /// delay); once set, the dual-signed config changes (the four
+    /// AV-158 actions plus the eleven AV-335 actions) move only
+    /// through the propose → delay → execute/cancel protocol.
     pub fn initialize_governance_delay(
         ctx: Context<InitializeGovernanceDelay>,
         delay_secs: u64,
@@ -7234,10 +7233,10 @@ pub struct MintAllowlist {
     pub len: u8,
 }
 
-/// Skeleton mirror of `escrow_state::GovernanceAction` (AV-158): the
-/// staged governance action — one of the four dual-signed config
-/// changes. The `UpdateAttestors` variant carries fixed-size arrays
-/// (only the first `count` entries are live).
+/// Skeleton mirror of `escrow_state::GovernanceAction` (AV-158,
+/// AV-335): the staged governance action — one of the dual-signed
+/// config changes. The `UpdateAttestors` variant carries fixed-size
+/// arrays (only the first `count` entries are live).
 #[derive(
     AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq,
 )]
@@ -7254,6 +7253,44 @@ pub enum GovernanceAction {
     RotateTaker { new_taker: [u8; 32] },
     /// Update the payout allowlist.
     UpdatePayoutAllowlist { addrs: [[u8; 32]; 4], count: u8 },
+    /// Revise the funding start (AV-335).
+    AmendFundingStart { new_start_at: u64 },
+    /// Revise the settlement mint (AV-335).
+    AmendSettlementMint { new_settle_mint: [u8; 32] },
+    /// Revise the dispute jury size (AV-335).
+    AmendJuryPanelSize { new_panel_size: u8 },
+    /// Revise the event-history ring capacity (AV-335).
+    AmendEventCapacity { new_capacity: u8 },
+    /// Replace the vesting curve (AV-335).
+    AmendVestingCurve { curve: VestingCurve },
+    /// Revise the Dutch-auction window (AV-335).
+    AmendDutchAuctionWindow { new_start_at: u64, new_end_at: u64 },
+    /// Revise the subscription cadence (AV-335).
+    AmendSubscriptionPeriodSecs { new_period_secs: u64 },
+    /// Revise the default-judgment terms (AV-335).
+    AmendDefaultJudgment {
+        deadline_secs: u64,
+        default_taker_amount: u64,
+    },
+    /// Update the settlement-mint allowlist (AV-335).
+    UpdateSettlementMintAllowlist { mints: [[u8; 32]; 8], count: u8 },
+    /// Replace the tiered-quorum table (AV-335).
+    UpdateTieredQuorum { tiers: [Tier; 4], count: u8 },
+    /// Replace the arbiter panel roster (AV-335).
+    UpdateArbiterPanelMembers { members: [[u8; 32]; 8], count: u8 },
+}
+
+/// Skeleton mirror of `escrow_state::Tier` (AV-335): one amount tier
+/// of a tiered quorum — a release of `amount <= max_amount` must
+/// reach the `threshold` attestor-weight sum.
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq,
+)]
+pub struct Tier {
+    /// Inclusive amount ceiling of this tier, in base units.
+    pub max_amount: u64,
+    /// Weight-sum threshold for releases landing in this tier.
+    pub threshold: u64,
 }
 
 /// Skeleton mirror of `escrow_state::GovernanceProposal` (AV-158):
@@ -10726,6 +10763,86 @@ fn convert_governance_action(
                 &addrs[..count as usize],
             )
             .map_err(|e| escrow_error(e))
+        }
+        GovernanceAction::AmendFundingStart { new_start_at } => {
+            Ok(escrow_state::GovernanceAction::AmendFundingStart { new_start_at })
+        }
+        GovernanceAction::AmendSettlementMint { new_settle_mint } => {
+            Ok(escrow_state::GovernanceAction::AmendSettlementMint { new_settle_mint })
+        }
+        GovernanceAction::AmendJuryPanelSize { new_panel_size } => {
+            Ok(escrow_state::GovernanceAction::AmendJuryPanelSize { new_panel_size })
+        }
+        GovernanceAction::AmendEventCapacity { new_capacity } => {
+            Ok(escrow_state::GovernanceAction::AmendEventCapacity { new_capacity })
+        }
+        GovernanceAction::AmendVestingCurve { curve } => {
+            // The mirror curve carries tiers only — the window it
+            // must fit comes from the live vesting schedule and is
+            // checked by `propose_governance` at propose time, so
+            // the conversion validates the shape here against the
+            // widest possible window and lets the state machine
+            // re-check the fit against the live schedule.
+            if curve.count == 0 || curve.count as usize > 8 {
+                return Err(escrow_error(escrow_state::EscrowError::InvalidVestingCurve));
+            }
+            let mut tuples = [(0u64, 0u16); 8];
+            for (i, t) in curve.tiers[..curve.count as usize].iter().enumerate() {
+                tuples[i] = (t.at, t.unlocked_bps);
+            }
+            let state_curve =
+                escrow_state::VestingCurve::stepped(&tuples[..curve.count as usize], 0, u64::MAX)
+                    .map_err(|e| escrow_error(e))?;
+            Ok(escrow_state::GovernanceAction::AmendVestingCurve { curve: state_curve })
+        }
+        GovernanceAction::AmendDutchAuctionWindow {
+            new_start_at,
+            new_end_at,
+        } => Ok(escrow_state::GovernanceAction::AmendDutchAuctionWindow {
+            new_start_at,
+            new_end_at,
+        }),
+        GovernanceAction::AmendSubscriptionPeriodSecs { new_period_secs } => {
+            Ok(escrow_state::GovernanceAction::AmendSubscriptionPeriodSecs { new_period_secs })
+        }
+        GovernanceAction::AmendDefaultJudgment {
+            deadline_secs,
+            default_taker_amount,
+        } => Ok(escrow_state::GovernanceAction::AmendDefaultJudgment {
+            deadline_secs,
+            default_taker_amount,
+        }),
+        GovernanceAction::UpdateSettlementMintAllowlist { mints, count } => {
+            if count as usize > 8 {
+                return Err(escrow_error(
+                    escrow_state::EscrowError::InvalidSettlementMintAllowlist,
+                ));
+            }
+            escrow_state::GovernanceAction::update_settlement_mint_allowlist(
+                &mints[..count as usize],
+            )
+            .ok_or_else(|| escrow_error(escrow_state::EscrowError::InvalidSettlementMintAllowlist))
+        }
+        GovernanceAction::UpdateTieredQuorum { tiers, count } => {
+            if count as usize > 4 {
+                return Err(escrow_error(escrow_state::EscrowError::InvalidQuorum));
+            }
+            let state_tiers: Vec<escrow_state::Tier> = tiers[..count as usize]
+                .iter()
+                .map(|t| escrow_state::Tier {
+                    max_amount: t.max_amount,
+                    threshold: t.threshold,
+                })
+                .collect();
+            escrow_state::GovernanceAction::update_tiered_quorum(&state_tiers)
+                .ok_or_else(|| escrow_error(escrow_state::EscrowError::InvalidQuorum))
+        }
+        GovernanceAction::UpdateArbiterPanelMembers { members, count } => {
+            if count as usize > 8 {
+                return Err(escrow_error(escrow_state::EscrowError::InvalidArbiterPanel));
+            }
+            escrow_state::GovernanceAction::update_arbiter_panel_members(&members[..count as usize])
+                .ok_or_else(|| escrow_error(escrow_state::EscrowError::InvalidArbiterPanel))
         }
     }
 }

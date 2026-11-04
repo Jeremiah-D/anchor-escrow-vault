@@ -447,16 +447,35 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
             ("mints", IdlType::Array(ArrayElem::PublicKey, 8)),
             ("len", IdlType::U8),
         ],
-        // GovernanceAction { kind: u8, payload: [u8; 321] } (AV-158):
-        // the staged delayed-governance action. The 1-byte kind is 0 =
-        // UpdateQuorum, 1 = UpdateAttestors, 2 = RotateTaker, 3 =
-        // UpdatePayoutAllowlist; the 321-byte payload carries the
-        // kind's params at fixed offsets, zero-padded (kind 0:
-        // payload[0..8] = new_threshold LE; kind 1: payload[0..256] =
-        // 8 attestor keys, payload[256..320] = 8 weights LE,
-        // payload[320] = live count; kind 2: payload[0..32] =
-        // new_taker; kind 3: payload[0..128] = 4 addresses,
-        // payload[128] = live count, 0 = clear).
+        // GovernanceAction { kind: u8, payload: [u8; 321] } (AV-158,
+        // AV-335): the staged delayed-governance action. The 1-byte
+        // kind is 0 = UpdateQuorum, 1 = UpdateAttestors, 2 =
+        // RotateTaker, 3 = UpdatePayoutAllowlist, 4 =
+        // AmendFundingStart, 5 = AmendSettlementMint, 6 =
+        // AmendJuryPanelSize, 7 = AmendEventCapacity, 8 =
+        // AmendVestingCurve, 9 = AmendDutchAuctionWindow, 10 =
+        // AmendSubscriptionPeriodSecs, 11 = AmendDefaultJudgment, 12
+        // = UpdateSettlementMintAllowlist, 13 = UpdateTieredQuorum,
+        // 14 = UpdateArbiterPanelMembers; the 321-byte payload
+        // carries the kind's params at fixed offsets, zero-padded
+        // (kind 0: payload[0..8] = new_threshold LE; kind 1:
+        // payload[0..256] = 8 attestor keys, payload[256..320] = 8
+        // weights LE, payload[320] = live count; kind 2:
+        // payload[0..32] = new_taker; kind 3: payload[0..128] = 4
+        // addresses, payload[128] = live count, 0 = clear; kind 4:
+        // payload[0..8] = new_start_at LE; kind 5: payload[0..32] =
+        // new_settle_mint; kind 6: payload[0] = new_panel_size;
+        // kind 7: payload[0] = new_capacity; kind 8:
+        // payload[0..80] = 8 curve tiers (10 bytes each),
+        // payload[80] = live count; kind 9: payload[0..8] =
+        // new_start_at LE, payload[8..16] = new_end_at LE; kind 10:
+        // payload[0..8] = new_period_secs LE; kind 11:
+        // payload[0..8] = deadline_secs LE, payload[8..16] =
+        // default_taker_amount LE; kind 12: payload[0..256] = 8
+        // mints, payload[256] = live count, 0 = clear; kind 13:
+        // payload[0..64] = 4 tiers (16 bytes each), payload[64] =
+        // live count; kind 14: payload[0..256] = 8 members,
+        // payload[256] = live count).
         "GovernanceAction" => vec![
             ("kind", IdlType::U8),
             ("payload", IdlType::Array(ArrayElem::U8, 321)),

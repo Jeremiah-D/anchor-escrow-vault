@@ -1155,6 +1155,106 @@ fn write_governance_action(s: &mut String, action: &GovernanceAction) {
             }
             s.push_str("]}");
         }
+        GovernanceAction::AmendFundingStart { new_start_at } => {
+            s.push_str("{\"kind\":\"amend_funding_start\",\"new_start_at\":");
+            s.push_str(&new_start_at.to_string());
+            s.push('}');
+        }
+        GovernanceAction::AmendSettlementMint { new_settle_mint } => {
+            s.push_str("{\"kind\":\"amend_settlement_mint\",\"new_settle_mint\":\"");
+            s.push_str(&hex32(new_settle_mint));
+            s.push_str("\"}");
+        }
+        GovernanceAction::AmendJuryPanelSize { new_panel_size } => {
+            s.push_str("{\"kind\":\"amend_jury_panel_size\",\"new_panel_size\":");
+            s.push_str(&new_panel_size.to_string());
+            s.push('}');
+        }
+        GovernanceAction::AmendEventCapacity { new_capacity } => {
+            s.push_str("{\"kind\":\"amend_event_capacity\",\"new_capacity\":");
+            s.push_str(&new_capacity.to_string());
+            s.push('}');
+        }
+        GovernanceAction::AmendVestingCurve { curve } => {
+            s.push_str("{\"kind\":\"amend_vesting_curve\",\"tiers\":[");
+            for i in 0..curve.tier_count() as usize {
+                if i > 0 {
+                    s.push(',');
+                }
+                let (at, bps) = curve.tier(i).unwrap_or((0, 0));
+                s.push_str("{\"at\":");
+                s.push_str(&at.to_string());
+                s.push_str(",\"unlocked_bps\":");
+                s.push_str(&bps.to_string());
+                s.push('}');
+            }
+            s.push_str("]}");
+        }
+        GovernanceAction::AmendDutchAuctionWindow {
+            new_start_at,
+            new_end_at,
+        } => {
+            s.push_str("{\"kind\":\"amend_dutch_auction_window\",\"new_start_at\":");
+            s.push_str(&new_start_at.to_string());
+            s.push_str(",\"new_end_at\":");
+            s.push_str(&new_end_at.to_string());
+            s.push('}');
+        }
+        GovernanceAction::AmendSubscriptionPeriodSecs { new_period_secs } => {
+            s.push_str(
+                "{\"kind\":\"amend_subscription_period_secs\",\"new_period_secs\":",
+            );
+            s.push_str(&new_period_secs.to_string());
+            s.push('}');
+        }
+        GovernanceAction::AmendDefaultJudgment {
+            deadline_secs,
+            default_taker_amount,
+        } => {
+            s.push_str("{\"kind\":\"amend_default_judgment\",\"deadline_secs\":");
+            s.push_str(&deadline_secs.to_string());
+            s.push_str(",\"default_taker_amount\":");
+            s.push_str(&default_taker_amount.to_string());
+            s.push('}');
+        }
+        GovernanceAction::UpdateSettlementMintAllowlist { mints, count } => {
+            s.push_str("{\"kind\":\"update_settlement_mint_allowlist\",\"mints\":[");
+            for i in 0..*count as usize {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push('"');
+                s.push_str(&hex32(&mints[i]));
+                s.push('"');
+            }
+            s.push_str("]}");
+        }
+        GovernanceAction::UpdateTieredQuorum { tiers, count } => {
+            s.push_str("{\"kind\":\"update_tiered_quorum\",\"tiers\":[");
+            for i in 0..*count as usize {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str("{\"max_amount\":");
+                s.push_str(&tiers[i].max_amount.to_string());
+                s.push_str(",\"threshold\":");
+                s.push_str(&tiers[i].threshold.to_string());
+                s.push('}');
+            }
+            s.push_str("]}");
+        }
+        GovernanceAction::UpdateArbiterPanelMembers { members, count } => {
+            s.push_str("{\"kind\":\"update_arbiter_panel_members\",\"members\":[");
+            for i in 0..*count as usize {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push('"');
+                s.push_str(&hex32(&members[i]));
+                s.push('"');
+            }
+            s.push_str("]}");
+        }
     }
 }
 
