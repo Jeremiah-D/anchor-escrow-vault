@@ -6694,6 +6694,35 @@ the Σ fee — sized for the program's per-mint transfers, and emit a
 single `BasketReleased` / `BasketCancelled` event carrying the Σ
 amounts (bit-identical in the event fold to the per-leg sequence).
 
+### Revising the basket (AV-340)
+
+A leg table fixed wrong at build time (a mistyped mint, a wrong leg
+amount, a leg swapped out in negotiation) can be revised before
+funding with `Escrow::amend_basket(initializer, taker, legs)` — no
+cancel-and-rebuild, so the quorum / attestor / milestone configuration
+already attached to the escrow survives. Both parties must sign
+(either mismatch is `Unauthorized`, code 100); the call is
+`Uninitialized` / `Activated`-only (anything else is
+`InvalidStateTransition`, code 101), and an escrow that already took
+money refuses even while its state still looks pre-funding — partial
+funding holds `Uninitialized` while deposits accumulate, so the
+funded-total bar is a second, independent gate. A plain escrow with no
+basket is refused with `InvalidBasket` (code 152): amendment never
+installs a basket mid-flight. The whole new table is re-validated by
+`BasketLegs::new` before any write, so an illegal table is code 152
+and the original legs stay untouched; re-affirming the current table is
+a no-op that emits nothing. Only the leg table and the derived `amount`
+(the new Σ) move — `released`, `funded_total`, `state`, and
+`expires_at` are untouched — and an attached funding plan's
+`total_amount` is rebuilt to the new Σ (its tranche budget untouched,
+no tranche consumed pre-funding). The new table governs from the next
+evaluation: `fund` books the new Σ and `release_basket` settles the new
+legs (an old mint settles as `InvalidBasket`). The change emits
+`BasketAmended` (discriminant 164) with zero amounts. No vault layout
+change, no new error code, and no new Anchor instruction — logic plus
+event layer only, with the event kind mirrored in the program for the
+indexer.
+
 ## Configuration templates (AV-72)
 
 The `with_*` builders compose freely, but freedom is also a footgun: an

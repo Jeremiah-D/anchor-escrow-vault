@@ -20369,6 +20369,118 @@ let fee = self.charge_protocol_fee(claimable)?;
         self.basket
     }
 
+    /// Revise the multi-mint basket leg table before funding
+    /// (AV-340 — Solana multi-mint / payment fintech): the
+    /// initializer and the taker may jointly correct a leg table
+    /// fixed wrong at build time (a mistyped mint, a wrong leg
+    /// amount, a leg swapped out in negotiation) without
+    /// cancelling and rebuilding the escrow and losing the
+    /// quorum / attestor / milestone configuration already
+    /// attached to it.
+    ///
+    /// Check order mirrors [`Escrow::amend_funding_start`]:
+    /// pause, then dual-signature authority (both parties must
+    /// authorize — the leg table is the bilateral multi-mint
+    /// composition, so one party rewriting it alone would
+    /// unilaterally redefine the other's locked composition and
+    /// total), then state, then the funded-total bar, then the
+    /// basket presence and the table itself:
+    /// - state: `Uninitialized` or `Activated` only. Once funded,
+    ///   each leg carries a `released` counter and `fund` has
+    ///   already booked `funded_total` against the old Σ, so
+    ///   revising the legs would restate a funded ledger.
+    /// - funded total: the state gate alone is not clean —
+    ///   `fund_partial` / `fund_tranche` hold `Uninitialized` /
+    ///   `Activated` while deposits accumulate, so an escrow
+    ///   that already took money would pass it (the AV-321
+    ///   second bar, [`EscrowError::InvalidStateTransition`]).
+    /// - basket: an escrow with no basket is refused with
+    ///   [`EscrowError::InvalidBasket`] — amendment never
+    ///   installs a basket mid-flight (the
+    ///   `amend_vesting_schedule` fail-closed precedent).
+    /// - table: the whole table is re-validated by
+    ///   [`BasketLegs::new`] before any write, so an illegal
+    ///   table (empty, over [`MAX_BASKET_LEGS`] legs, a zero
+    ///   mint, a zero leg amount, a duplicate mint, or a Σ
+    ///   overflowing `u64`) is [`EscrowError::InvalidBasket`]
+    ///   and the original leg table stays untouched.
+    ///
+    /// No-op: re-affirming the current leg table succeeds but
+    /// writes nothing, so the event layer emits nothing for it
+    /// (the pre-funding legs all carry `released == 0`, so the
+    /// equality check is clean). Only the leg table and the
+    /// derived `amount` move (`amount` becomes the new Σ, like
+    /// [`Escrow::with_basket`]); `released`, `funded_total`,
+    /// `state`, `expires_at`, and every other field are untouched.
+    /// When a funding plan is already attached, its
+    /// `total_amount` is rebuilt to the new Σ (the
+    /// [`FundingPlan::from_parts`] precedent from
+    /// `amend_funding_plan_max_tranches`) — the plan schedules
+    /// the deposit of the escrow's `amount`, and the
+    /// `with_funding_plan` total == amount pin is preserved;
+    /// `max_tranches` is untouched and `tranches_used` is 0
+    /// pre-funding (the funded-total gate above guarantees no
+    /// tranche was consumed), so no funded tranche is ever
+    /// restated. The new table governs from the next evaluation:
+    /// `fund` funds the new Σ and `release_basket` settles the
+    /// new legs (an old mint settles as `InvalidBasket`).
+    /// No layout change (the 386-byte basket region is rewritten
+    /// in place) and no new error code (`Unauthorized` /
+    /// `InvalidStateTransition` / `InvalidBasket`). Emits
+    /// `BasketAmended` on the event layer, except for the no-op
+    /// re-affirmation.
+    pub fn amend_basket(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        legs: &[([u8; 32], u64)],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_funding_start`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Activated => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // AV-321: the state gate alone is not clean — `fund_partial`
+        // / `fund_tranche` hold `Uninitialized` / `Activated` while
+        // deposits accumulate, so an escrow that already took money
+        // would pass it. The funded-total gate is the second,
+        // independent bar.
+        if self.funded_total != 0 {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        // Fail-closed: only an escrow already carrying a basket may
+        // revise its legs — amendment never installs a basket
+        // after the fact.
+        let current = self.basket.ok_or(EscrowError::InvalidBasket)?;
+        // The builder's gate, before any write, so a refused
+        // revision leaves the original leg table untouched.
+        let basket = BasketLegs::new(legs)?;
+        // No-op: re-affirming the current leg table writes nothing,
+        // so the event layer emits nothing for it.
+        if basket == current {
+            return Ok(());
+        }
+        self.amount = basket.total_amount();
+        self.basket = Some(basket);
+        // A funding plan schedules the deposit of the escrow's
+        // amount, so its total tracks the new Σ; the budget and
+        // the (zero) consumed count are carried over unchanged.
+        if let Some(plan) = self.funding_plan {
+            self.funding_plan = Some(FundingPlan::from_parts(
+                basket.total_amount(),
+                plan.max_tranches(),
+                plan.tranches_used(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Attach the multi-recipient payout-split table (AV-108).
     /// Builder-style: only valid on an `Uninitialized` escrow, so the
     /// distribution set is fixed before any funds move — mirroring
@@ -49073,6 +49185,7 @@ mod basket_settlement_tests {
     const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
     const MINT_A: [u8; 32] = [0xA1; 32];
     const MINT_B: [u8; 32] = [0xB2; 32];
+    const MINT_C: [u8; 32] = [0xC3; 32];
     const EXPIRES_AT: u64 = 1_800_000_000;
     const NOW: u64 = 1_700_000_000;
 
@@ -49229,6 +49342,271 @@ mod basket_settlement_tests {
             e.with_basket(&[(MINT_A, 1_000)]),
             Err(EscrowError::InvalidStateTransition)
         );
+    }
+
+    // ---------- AV-340: pre-funding basket leg-table revision ----------
+
+    fn uninitialized_basket_escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap()
+    }
+
+    #[test]
+    fn amend_basket_rejects_stranger_and_single_party() {
+        // Dual signature: either key alone (or a stranger) is
+        // Unauthorized, and a refused revision moves nothing.
+        let mut e = uninitialized_basket_escrow();
+        assert_eq!(
+            e.amend_basket(MALLORY, BOB, &[(MINT_A, 1_500), (MINT_B, 2_000)]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_basket(ALICE, MALLORY, &[(MINT_A, 1_500), (MINT_B, 2_000)]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_basket(MALLORY, MALLORY, &[(MINT_A, 1_500), (MINT_B, 2_000)]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.amount(), 3_000, "failed calls move nothing");
+        let basket = e.basket().expect("basket attached");
+        assert_eq!(basket.as_slice()[0].amount, 1_000);
+        assert_eq!(basket.as_slice()[1].amount, 2_000);
+    }
+
+    #[test]
+    fn amend_basket_rejects_when_paused() {
+        // The pause guard fires before the authority and state gates.
+        let mut e = Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap();
+        e.pause(ALICE, None).unwrap();
+        assert_eq!(
+            e.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_B, 2_000)]),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(e.amount(), 3_000, "failed calls move nothing");
+        assert_eq!(e.basket().unwrap().as_slice()[0].amount, 1_000);
+    }
+
+    #[test]
+    fn amend_basket_rejects_funded_and_terminal_states() {
+        // Funded: each leg already carries a released counter and
+        // fund() booked funded_total against the old Σ.
+        let mut funded = uninitialized_basket_escrow();
+        funded.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            funded.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_B, 2_000)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(funded.amount(), 3_000, "failed calls move nothing");
+        // Released: settling every leg is terminal, same refusal.
+        funded.release_basket(ALICE, NOW, Some(MINT_A)).unwrap();
+        funded.release_basket(ALICE, NOW, Some(MINT_B)).unwrap();
+        assert_eq!(funded.state(), EscrowState::Released);
+        assert_eq!(
+            funded.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_B, 2_000)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(funded.basket().unwrap().as_slice()[0].amount, 1_000);
+    }
+
+    #[test]
+    fn amend_basket_rejects_plain_escrow() {
+        // Amendment never installs a basket mid-flight.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            plain.amend_basket(ALICE, BOB, &[(MINT_A, 1_000)]),
+            Err(EscrowError::InvalidBasket)
+        );
+        assert_eq!(plain.basket(), None);
+        assert_eq!(plain.amount(), 1_000_000);
+    }
+
+    #[test]
+    fn amend_basket_rejects_invalid_tables_and_keeps_original() {
+        // Every BasketLegs::new violation surfaces as InvalidBasket
+        // and the original leg table stays untouched.
+        let cases: Vec<Vec<([u8; 32], u64)>> = vec![
+            vec![],
+            (0..9).map(|i| ([i as u8 + 1; 32], 1)).collect(),
+            vec![([0u8; 32], 1_000)],
+            vec![(MINT_A, 0)],
+            vec![(MINT_A, 1_000), (MINT_A, 2_000)],
+            vec![(MINT_A, u64::MAX), (MINT_B, 1)],
+        ];
+        for legs in cases {
+            let mut e = uninitialized_basket_escrow();
+            assert_eq!(
+                e.amend_basket(ALICE, BOB, &legs),
+                Err(EscrowError::InvalidBasket),
+                "legs {legs:?}"
+            );
+            assert_eq!(e.amount(), 3_000, "failed calls move nothing");
+            let basket = e.basket().expect("basket attached");
+            assert_eq!(basket.len, 2);
+            assert_eq!(basket.as_slice()[0], BasketLeg {
+                mint: MINT_A,
+                amount: 1_000,
+                released: 0,
+            });
+            assert_eq!(basket.as_slice()[1].mint, MINT_B);
+        }
+    }
+
+    #[test]
+    fn amend_basket_same_table_is_noop() {
+        // Re-affirming the current leg table succeeds but changes
+        // nothing observable; the event layer (tested below) emits
+        // nothing for it.
+        let mut e = uninitialized_basket_escrow();
+        e.amend_basket(ALICE, BOB, &[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap();
+        assert_eq!(e.amount(), 3_000);
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.basket().unwrap().len, 2);
+    }
+
+    #[test]
+    fn amend_basket_revises_legs_and_derived_amount() {
+        // Only the leg table and the derived amount move: the state,
+        // the counters and the deadline are untouched.
+        let mut e = uninitialized_basket_escrow();
+        e.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_C, 3_500)])
+            .unwrap();
+        assert_eq!(e.amount(), 5_000);
+        let basket = e.basket().expect("basket attached");
+        assert_eq!(basket.len, 2);
+        assert_eq!(basket.as_slice()[0].mint, MINT_A);
+        assert_eq!(basket.as_slice()[0].amount, 1_500);
+        assert_eq!(basket.as_slice()[1].mint, MINT_C);
+        assert_eq!(basket.as_slice()[1].amount, 3_500);
+        assert!(basket.as_slice().iter().all(|l| l.released == 0));
+        assert_eq!(basket.total_amount(), 5_000);
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.funded_total(), 0);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+    }
+
+    #[test]
+    fn amend_basket_works_from_activated() {
+        // A dual-signature escrow that both parties activated may
+        // still revise its legs — activation is not funding.
+        let mut e = Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Activated);
+        e.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_C, 3_500)])
+            .unwrap();
+        assert_eq!(e.amount(), 5_000);
+        assert_eq!(e.state(), EscrowState::Activated);
+        assert_eq!(e.basket().unwrap().as_slice()[1].mint, MINT_C);
+    }
+
+    #[test]
+    fn amend_basket_rejects_partially_funded_escrow() {
+        // AV-321: the state gate alone is not clean — partial
+        // funding holds Uninitialized while deposits accumulate,
+        // so an escrow that already took money refuses even
+        // though its state still looks pre-funding.
+        let mut e = Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap()
+            .with_partial_funding()
+            .unwrap();
+        e.fund_partial(ALICE, 500, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.funded_total(), 500);
+        assert_eq!(
+            e.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_B, 2_000)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.amount(), 3_000, "failed calls move nothing");
+        assert_eq!(e.basket().unwrap().as_slice()[0].amount, 1_000);
+    }
+
+    #[test]
+    fn amend_basket_fund_prices_new_sigma_and_release_settles_new_legs() {
+        // The new table governs from the next evaluation: fund()
+        // books the new Σ, release_basket settles the new legs,
+        // and an old mint is refused as InvalidBasket.
+        let mut e = uninitialized_basket_escrow();
+        e.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_C, 3_500)])
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.funded_total(), 5_000);
+        assert_eq!(
+            e.release_basket(ALICE, NOW, Some(MINT_B)),
+            Err(EscrowError::InvalidBasket)
+        );
+        let (payout, _fee) = e.release_basket(ALICE, NOW, Some(MINT_C)).unwrap();
+        assert_eq!(payout, 3_500);
+        assert_eq!(e.state(), EscrowState::Funded);
+        let (payout, _fee) = e.release_basket(ALICE, NOW, Some(MINT_A)).unwrap();
+        assert_eq!(payout, 1_500);
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.released_amount(), 5_000);
+    }
+
+    #[test]
+    fn amend_basket_rebuilds_attached_funding_plan_total() {
+        // The plan schedules the deposit of the escrow's amount, so
+        // its total tracks the new Σ; the tranche budget is
+        // untouched and no tranche was consumed pre-funding.
+        let mut e = uninitialized_basket_escrow();
+        e.with_funding_plan(3_000, 3).unwrap();
+        e.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_C, 3_500)])
+            .unwrap();
+        let plan = e.funding_plan().expect("plan attached");
+        assert_eq!(plan.total_amount(), 5_000);
+        assert_eq!(plan.max_tranches(), 3);
+        assert_eq!(plan.tranches_used(), 0);
+        // The rebuilt plan stays usable: one tranche of the new Σ
+        // completes the funding.
+        e.fund_tranche(ALICE, 5_000, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.funded_total(), 5_000);
+    }
+
+    #[test]
+    fn amend_basket_indexed_emits_event_noop_and_failed_emit_nothing() {
+        let mut e = IndexedEscrow::wrap([0x1D; 32], uninitialized_basket_escrow());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_basket(MALLORY, BOB, &[(MINT_A, 1_500), (MINT_B, 2_000)], NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_C, 3_500)], NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::BasketAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Uninitialized, EscrowState::Uninitialized)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        assert_eq!(ev.amounts.refund, 0);
+        assert_eq!(ev.amounts.penalty, 0);
+        // Re-affirming the new table is a no-op: no new event.
+        e.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_C, 3_500)], NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
     }
 
     #[test]
@@ -52371,7 +52749,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
-        assert_eq!(EscrowEventKind::from_discriminant(164), None); // AV-338: 163 is ExpiryShortened
+        assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
     }
 
     #[test]
@@ -71418,7 +71797,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
-        assert_eq!(EscrowEventKind::from_discriminant(164), None); // AV-338: 163 is ExpiryShortened
+        assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
+        assert_eq!(EscrowEventKind::from_discriminant(165), None); // AV-340: 164 is BasketAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -71664,9 +72044,10 @@ mod event_history_tests {
         // `KeeperBountyPoolToppedUp` (AV-328), 161 is
         // `CompoundInterestAmended` (AV-333), 162 is
         // `GovernanceDelayAmended` (AV-334), 163 is
-        // `ExpiryShortened` (AV-338) and 164 is the
+        // `ExpiryShortened` (AV-338), 164 is
+        // `BasketAmended` (AV-340) and 165 is the
         // first still-unknown byte.
-        for bad in [164u8, 255] {
+        for bad in [165u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
