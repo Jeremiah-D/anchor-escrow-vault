@@ -22728,9 +22728,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// (+ `crank_expired`, via `expire_cancel_locked`),
     /// `cancel_expired_basket`, `slash`, `pool_payout`, `escalate`,
     /// `submit_evidence`, `file_evidence`, `trigger_default_judgment`,
-    /// `file_appeal`, `expire_appeal`, `extend_expiry`, `split_escrow`
-    /// — so the inactivity window measures funded time since the last
-    /// real activity.
+    /// `file_appeal`, `expire_appeal`, `extend_expiry`, `shorten_expiry`
+    /// (AV-338), `split_escrow` — so the inactivity window measures
+    /// funded time since the last real activity.
     ///
     /// Coverage boundary (deliberate, documented): transitions *without*
     /// a clock parameter — `activate`, `cancel`, `cancel_partial`,
@@ -24803,6 +24803,116 @@ let fee = self.charge_protocol_fee(claimable)?;
         }
         self.expires_at = new_expires_at;
         self.extension_count = self.extension_count.saturating_add(1);
+        self.touch_deadman_clock(now);
+        Ok(())
+    }
+
+    /// Shorten the expiry deadline (AV-338): move `expires_at` back to
+    /// `new_expires_at`. The opposite direction of
+    /// [`Escrow::extend_expiry`] — extending only ever lengthens the
+    /// taker's window, but shortening cuts it: it brings forward the
+    /// taker's funding deadline and the moment either party may exit
+    /// via `cancel_expired`, so one side alone must never rewrite the
+    /// other's window. Shortening is therefore a *dual-signature*
+    /// power — both the initializer and the taker must authorize it
+    /// ([`EscrowError::Unauthorized`] when either key mismatches).
+    ///
+    /// Check order (authority → state → expiry → value, the crate
+    /// convention):
+    /// 1. the caller pair must be exactly initializer + taker
+    ///    ([`EscrowError::Unauthorized`]);
+    /// 2. the escrow must be `Uninitialized` or `Funded` — the same
+    ///    gate as [`Escrow::extend_expiry`]: `Activated` is excluded
+    ///    (a dual-sig escrow both parties activated has jointly
+    ///    committed to its terms), as are the terminal states and
+    ///    `Disputed` ([`EscrowError::InvalidStateTransition`]);
+    /// 3. the escrow must not already be expiry-eligible
+    ///    ([`Escrow::is_expiry_eligible`] — an expired escrow exits
+    ///    via `cancel_expired`; shortening cannot resurrect it, nor
+    ///    restate a deadline that has already lapsed);
+    /// 4. `new_expires_at` must move the deadline strictly backward
+    ///    (`>= expires_at` is [`EscrowError::InvalidExpiryExtension`]
+    ///    — equal is not a restatement, larger is
+    ///    [`Escrow::extend_expiry`]'s job) and strictly into the
+    ///    future (`<= now` is [`EscrowError::InvalidExpiryExtension`],
+    ///    fail-closed: an already-past deadline would manufacture a
+    ///    cancel-expired-eligible escrow on the spot).
+    ///
+    /// AV-21: the grace-period semantics carry over unchanged — the
+    /// "already expired" gate uses [`Escrow::is_expiry_eligible`], so
+    /// the keeper's clock-skew grace window applies to shortening
+    /// too. The new-value gate is `now`, not `now + grace_period`:
+    /// expiry eligibility at the *new* deadline still requires `now
+    /// >= new_expires_at + grace_period`, so a new value strictly
+    /// after `now` can never be immediately cancel-eligible — the
+    /// grace only delays eligibility further, it never accelerates
+    /// it. (Inside the current grace window the escrow is not yet
+    /// expired, so shortening is still allowed there, exactly like
+    /// extension.)
+    ///
+    /// AV-46: a paused escrow fails fast (`Paused`) — shortening is
+    /// a config transition, not the pause key-loss escape hatch.
+    ///
+    /// On success only `expires_at` moves. `amount`, `released`,
+    /// `funded_total` and `state` are untouched, and shortening is
+    /// not an extension: `extension_count` does not increment and the
+    /// `max_extension_secs` budget is not consumed. The dead-man's
+    /// clock follows the [`Escrow::extend_expiry`] precedent (the
+    /// call takes a `now` clock parameter and is a successful
+    /// transition, so [`Escrow::touch_deadman_clock`] runs).
+    ///
+    /// The new deadline governs from the next evaluation:
+    /// [`Escrow::cancel_expired`] / [`Escrow::crank_expired`] read
+    /// the live value through [`Escrow::is_expiry_eligible`], and
+    /// [`Escrow::escalate`]'s dispute window closes at the live
+    /// `expires_at` — a shortening can therefore close the dispute
+    /// window and open the expiry exit earlier than the old deadline
+    /// would have. Actions already executed are unaffected, and the
+    /// `ExpiryShortened` indexer event fires via the
+    /// [`IndexedEscrow`](crate::IndexedEscrow) wrapper.
+    ///
+    /// No Vault layout change (a `u64` rewritten in place), no new
+    /// error code (reuses 100 / 101 / 134), no new
+    /// `GovernanceAction` variant (like `extend_expiry`, this is
+    /// outside the AV-334 routed set).
+    pub fn shorten_expiry(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_expires_at: u64,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        // AV-133: scheduled auto-recovery first — a due pause
+        // schedule lifts here, before the AV-46 gate below.
+        self.try_auto_unpause(now);
+        self.require_not_paused()?;
+        // Dual signature: shortening cuts the taker's funding window
+        // and brings forward cancel_expired eligibility, so either
+        // side alone must not rewrite the other's window.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized | EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // An expired escrow cannot be shortened — the unilateral
+        // exit path (`cancel_expired`) owns the expired state.
+        // Grace semantics (AV-21) apply: the full eligibility
+        // predicate is the single source of truth.
+        if self.is_expiry_eligible(now) {
+            return Err(EscrowError::InvalidExpiryExtension);
+        }
+        if new_expires_at >= self.expires_at {
+            return Err(EscrowError::InvalidExpiryExtension);
+        }
+        // A deadline at or before `now` would manufacture an
+        // immediately expiry-eligible escrow — fail closed.
+        if new_expires_at <= now {
+            return Err(EscrowError::InvalidExpiryExtension);
+        }
+        self.expires_at = new_expires_at;
         self.touch_deadman_clock(now);
         Ok(())
     }
@@ -52260,7 +52370,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
-        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
+        assert_eq!(EscrowEventKind::from_discriminant(164), None); // AV-338: 163 is ExpiryShortened
     }
 
     #[test]
@@ -69070,6 +69181,245 @@ mod extension_tests {
     }
 
     #[test]
+    fn shorten_rejects_stranger_and_single_signer() {
+        // Shortening cuts the taker's funding window and brings
+        // forward cancel_expired eligibility, so either side alone
+        // must not rewrite the other's window — dual signature.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let new = EXPIRES_AT - 3_600;
+        assert_eq!(
+            e.shorten_expiry(MALLORY, BOB, new, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.shorten_expiry(ALICE, MALLORY, new, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.shorten_expiry(BOB, ALICE, new, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.expires_at(), EXPIRES_AT, "failed call changes nothing");
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+    }
+
+    #[test]
+    fn shorten_rejects_terminal_states() {
+        // Released / Cancelled / Disputed: the deadline is history.
+        let mut released = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        released.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        released.release(ALICE, EXPIRES_AT, 1_000_000, None, BOB).unwrap();
+        let mut cancelled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        cancelled.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        cancelled.cancel(ALICE, None, ALICE, 0).unwrap();
+        let mut disputed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter([0xEE; 32])
+            .unwrap();
+        disputed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        disputed.escalate(ALICE, T0, 100_000, None, None, 0).unwrap();
+        for (name, mut e) in [
+            ("Released", released),
+            ("Cancelled", cancelled),
+            ("Disputed", disputed),
+        ] {
+            assert_eq!(
+                e.shorten_expiry(ALICE, BOB, EXPIRES_AT - 3_600, T0),
+                Err(EscrowError::InvalidStateTransition),
+                "{name}"
+            );
+            assert_eq!(e.expires_at(), EXPIRES_AT, "{name}: deadline untouched");
+        }
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+    }
+
+    #[test]
+    fn shorten_rejects_already_expired() {
+        // AV-21: the "already expired" gate uses is_expiry_eligible.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap();
+        // Past expires_at + grace: expired, no shortening — the exit
+        // path owns the expired state.
+        assert_eq!(
+            e.shorten_expiry(ALICE, BOB, EXPIRES_AT - 60, EXPIRES_AT + 300),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        // Inside the grace window the escrow is not yet
+        // expiry-eligible, but every valid shorten target is already
+        // past `now` — the `new <= now` gate (not `now + grace`) is
+        // the fail-closed threshold, so this refuses too.
+        assert_eq!(
+            e.shorten_expiry(ALICE, BOB, EXPIRES_AT - 60, EXPIRES_AT + 120),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(e.expires_at(), EXPIRES_AT, "failed call changes nothing");
+        assert_eq!(EscrowError::InvalidExpiryExtension.code(), 134);
+        // Before expiry the same call succeeds.
+        e.shorten_expiry(ALICE, BOB, EXPIRES_AT - 60, T0).unwrap();
+        assert_eq!(e.expires_at(), EXPIRES_AT - 60);
+    }
+
+    #[test]
+    fn shorten_rejects_grow_and_equal() {
+        // Growing the window is extend_expiry's job; equal is not a
+        // restatement — a shortening must strictly move backward.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.shorten_expiry(ALICE, BOB, EXPIRES_AT, T0),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(
+            e.shorten_expiry(ALICE, BOB, EXPIRES_AT + 1, T0),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+        e.shorten_expiry(ALICE, BOB, EXPIRES_AT - 1, T0).unwrap();
+        assert_eq!(e.expires_at(), EXPIRES_AT - 1);
+    }
+
+    #[test]
+    fn shorten_rejects_new_value_at_or_before_now() {
+        // A deadline at or before `now` would manufacture an
+        // immediately expiry-eligible escrow — fail closed.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.shorten_expiry(ALICE, BOB, T0, T0),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(
+            e.shorten_expiry(ALICE, BOB, T0 - 1, T0),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+        // One second past `now` is a live deadline.
+        e.shorten_expiry(ALICE, BOB, T0 + 1, T0).unwrap();
+        assert_eq!(e.expires_at(), T0 + 1);
+    }
+
+    #[test]
+    fn shorten_moves_the_deadline_and_cancel_follows() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let new = T0 + 10_000;
+        e.shorten_expiry(ALICE, BOB, new, T0 + 1).unwrap();
+        assert_eq!(e.expires_at(), new);
+        assert_eq!(e.state(), EscrowState::Funded);
+        // Before the new deadline the expiry exit is still closed.
+        assert!(!e.is_expiry_eligible(new - 1));
+        assert_eq!(
+            e.cancel_expired(ALICE, new - 1, None, ALICE),
+            Err(EscrowError::NotExpired)
+        );
+        // At the new deadline (grace 0) the exit opens — almost a
+        // full day before the old deadline would have.
+        assert!(e.is_expiry_eligible(new));
+        e.cancel_expired(ALICE, new, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn shorten_governs_later_dispute_window() {
+        // The spec's "fund after shorten" case cannot be pinned
+        // through `fund`: the state machine's `fund` carries no
+        // expiry gate (verified empirically — funding 10_000s past
+        // `expires_at` succeeds), so the "new deadline governs the
+        // next evaluation" property is pinned through the paths that
+        // do read the live value. `escalate` closes its dispute
+        // window at the live `expires_at`.
+        fn arbitrated() -> Escrow {
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter([0xEE; 32])
+                .unwrap()
+        }
+        let new = T0 + 10_000;
+        let mut e = arbitrated();
+        e.fund(ALICE, T0).unwrap();
+        e.shorten_expiry(ALICE, BOB, new, T0 + 1).unwrap();
+        // Past the new deadline the dispute window is closed — the
+        // old deadline no longer governs.
+        assert_eq!(
+            e.escalate(ALICE, new, 100_000, None, None, 0),
+            Err(EscrowError::DisputeWindowClosed)
+        );
+        // Before the new deadline escalation still works.
+        let mut e2 = arbitrated();
+        e2.fund(ALICE, T0).unwrap();
+        e2.shorten_expiry(ALICE, BOB, new, T0 + 1).unwrap();
+        e2.escalate(ALICE, new - 1, 100_000, None, None, 0).unwrap();
+        assert_eq!(e2.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn shorten_leaves_extension_budget_untouched() {
+        // Shortening is not an extension: it neither increments the
+        // counter nor consumes the per-call bound, and the budget
+        // stays usable from the shortened deadline.
+        let mut e = extendable();
+        e.extend_expiry(ALICE, EXPIRES_AT + 3_600, T0).unwrap();
+        assert_eq!(e.extension_count(), 1);
+        e.shorten_expiry(ALICE, BOB, EXPIRES_AT + 1_800, T0).unwrap();
+        assert_eq!(e.expires_at(), EXPIRES_AT + 1_800);
+        assert_eq!(e.extension_count(), 1);
+        assert_eq!(e.max_extension_secs(), MAX_EXT);
+        e.extend_expiry(ALICE, EXPIRES_AT + 1_800 + MAX_EXT, T0).unwrap();
+        assert_eq!(e.extension_count(), 2);
+    }
+
+    #[test]
+    fn shorten_leaves_other_fields_untouched() {
+        let mut e = extendable();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.release(ALICE, EXPIRES_AT - 1_800, 400_000, None, BOB).unwrap();
+        let (amount, released, funded_total, state, count) = (
+            e.amount(),
+            e.released_amount(),
+            e.funded_total(),
+            e.state(),
+            e.extension_count(),
+        );
+        e.shorten_expiry(ALICE, BOB, EXPIRES_AT - 7_200, T0).unwrap();
+        assert_eq!(e.expires_at(), EXPIRES_AT - 7_200);
+        assert_eq!(e.amount(), amount);
+        assert_eq!(e.released_amount(), released);
+        assert_eq!(e.funded_total(), funded_total);
+        assert_eq!(e.state(), state);
+        assert_eq!(e.extension_count(), count);
+    }
+
+    #[test]
+    fn shorten_emits_expiry_shortened() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let base = e.events().len();
+        e.shorten_expiry(ALICE, BOB, EXPIRES_AT - 3_600, T0 + 2).unwrap();
+        let ev = *e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::ExpiryShortened);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.at, T0 + 2);
+        assert_eq!(e.events().len(), base + 1);
+        assert_eq!(e.inner().expires_at(), EXPIRES_AT - 3_600);
+    }
+
+    #[test]
+    fn shorten_blocked_while_paused() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause([0xDD; 32], None).unwrap();
+        assert_eq!(
+            e.shorten_expiry(ALICE, BOB, EXPIRES_AT - 3_600, T0),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+    }
+
+    #[test]
     fn keeper_report_annotates_the_renewal_count() {
         // The keeper's expiry listings carry extension_count, so an
         // operator sees how many times the deadline moved.
@@ -71067,7 +71417,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
         assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
-        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
+        assert_eq!(EscrowEventKind::from_discriminant(164), None); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -71312,9 +71663,10 @@ mod event_history_tests {
         // `EnglishAuctionSellerAmended` (AV-322), 160 is
         // `KeeperBountyPoolToppedUp` (AV-328), 161 is
         // `CompoundInterestAmended` (AV-333), 162 is
-        // `GovernanceDelayAmended` (AV-334) and 163 is the
+        // `GovernanceDelayAmended` (AV-334), 163 is
+        // `ExpiryShortened` (AV-338) and 164 is the
         // first still-unknown byte.
-        for bad in [163u8, 255] {
+        for bad in [164u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

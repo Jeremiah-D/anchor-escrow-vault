@@ -535,6 +535,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         | EscrowEventKind::TakerRotated
         | EscrowEventKind::InitializerRotated
         | EscrowEventKind::ExpiryExtended
+        // AV-338: a shortened deadline moves no funds — the
+        // cancel / dispute gates re-read the live deadline at
+        // the next evaluation; a cancel already settled keeps
+        // its deadline.
+        | EscrowEventKind::ExpiryShortened
         | EscrowEventKind::ArbiterRotated
         | EscrowEventKind::FeeRecipientRotated
         | EscrowEventKind::EvidenceSubmitted
@@ -1534,6 +1539,11 @@ mod event_sourcing_tests {
                 | EscrowEventKind::TakerRotated
                 | EscrowEventKind::InitializerRotated
                 | EscrowEventKind::ExpiryExtended
+                // AV-338: a shortened deadline moves no funds — the
+                // cancel / dispute gates re-read the live deadline at
+                // the next evaluation; a cancel already settled keeps
+                // its deadline.
+                | EscrowEventKind::ExpiryShortened
                 | EscrowEventKind::ArbiterRotated
                 | EscrowEventKind::PanelJudgment
                 // AV-137: a blind commit moves no funds; a reveal's

@@ -571,6 +571,9 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         | EscrowEventKind::TakerRotated
         | EscrowEventKind::InitializerRotated
         | EscrowEventKind::ExpiryExtended
+        // AV-338: a shortened deadline carries no fee — all
+        // amounts are zero, like ExpiryExtended.
+        | EscrowEventKind::ExpiryShortened
         | EscrowEventKind::PartiallyCancelled
         | EscrowEventKind::ArbiterRotated
         // A panel vote moves no funds — and `PanelJudgment`'s amounts
@@ -1569,6 +1572,9 @@ mod fee_history_tests {
                 | EscrowEventKind::TakerRotated
                 | EscrowEventKind::InitializerRotated
                 | EscrowEventKind::ExpiryExtended
+                // AV-338: a shortened deadline carries no fee — all
+                // amounts are zero, like ExpiryExtended.
+                | EscrowEventKind::ExpiryShortened
                 | EscrowEventKind::PartiallyCancelled
                 | EscrowEventKind::ArbiterRotated
                 | EscrowEventKind::PanelJudgment
