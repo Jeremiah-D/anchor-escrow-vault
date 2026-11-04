@@ -26890,6 +26890,101 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Revise the governance delay window after funding
+    /// (AV-334): the post-funding counterpart to
+    /// [`Escrow::with_governance_delay`] (`Uninitialized`-only
+    /// initial opt-in). Dual-signed governance, `Funded`-only,
+    /// pause first — paralleling
+    /// [`Escrow::amend_interest_rate`]. Only the window moves:
+    /// the delay is the meta-parameter that paces every other
+    /// config revision, so a window set wrong at funding time (a
+    /// week too slow for fast settlement, a day too short to stop
+    /// flash governance) or needed only later (an attestor going
+    /// dark mid-flight) can now be fixed without cancelling and
+    /// re-funding the escrow. The builder's gate, unchanged:
+    /// `new_delay_secs == 0` is
+    /// [`EscrowError::InvalidGovernanceDelay`] (0 is not a delay
+    /// — and there is deliberately no clearing path: a window the
+    /// initializer funded under cannot be silently removed, which
+    /// would restore the immediate single-proposal path for the
+    /// four routed config changes, paralleling
+    /// `amend_price_gate`'s no-clearing rule). Post-funding
+    /// installation is allowed (`0 -> X`, `X > 0`): an escrow
+    /// funded without a delay may opt in later, since both parties
+    /// sign. Lengthening and shortening are allowed (`X -> Y`,
+    /// `Y > 0`). Re-affirming the current window is a no-op
+    /// (succeeds, writes nothing, emits no event, paralleling
+    /// `amend_interest_rate`).
+    ///
+    /// Deliberately no routing gate: this method carries no
+    /// `!via_delayed` branch. [`GovernanceAction`] has only four
+    /// variants and none of them revises the delay, and
+    /// `execute_governance` is the only `via_delayed = true`
+    /// caller — so a gated design would self-lock on a delay-on
+    /// escrow (the direct call refused with code 219 and no
+    /// delayed path to take instead), killing the method for
+    /// exactly the escrows that need it. Dual signature *is* the
+    /// second signature here, so no veto window is needed, and
+    /// the method is self-healing: a mis-set window can always be
+    /// fixed by another dual-signed revision, because this method
+    /// itself is never delay-gated.
+    ///
+    /// Semantics: only the window moves — a proposal already live
+    /// keeps the `delay_secs` snapshotted at propose time
+    /// ([`Escrow::execute_governance`] executes off the
+    /// snapshot), so a revision neither accelerates nor delays a
+    /// proposal already in flight; the new window governs only
+    /// proposals staged after the revision. With `delay == 0` no
+    /// proposal can be live at all (`propose_governance` refuses
+    /// with code 220), so post-funding installation has zero
+    /// interaction with pending proposals. No layout change (the
+    /// `u64` window is rewritten in place) and no new error code
+    /// (`Unauthorized` / `InvalidStateTransition` /
+    /// `InvalidGovernanceDelay`; 219 is a routing-gate consequence
+    /// of the *other* methods, never raised here). Emits
+    /// `GovernanceDelayAmended` on the event layer, except for
+    /// the no-op re-affirmation. Orthogonal to AV-158 (that is
+    /// the delay mechanism itself, this item is the window), to
+    /// AV-260 (that is the interest rate, this item is the
+    /// meta-parameter window), to AV-261 (that is the price gate,
+    /// this item is the window), to AV-266 (that is the keeper
+    /// bounty per-crank amount, this item is the window), to
+    /// AV-321 (that is the funding window, this item is the
+    /// governance delay window) and to AV-333 (that is the
+    /// compound-interest mode, this item is the window).
+    pub fn amend_governance_delay(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_delay_secs: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_interest_rate`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // The builder's gate, unchanged: a zero window is not a
+        // delay, and there is no clearing path back to 0. Checked
+        // after state so a failed amendment never writes, and the
+        // stored window stays as it was.
+        if new_delay_secs == 0 {
+            return Err(EscrowError::InvalidGovernanceDelay);
+        }
+        // No-op: re-affirming the current window writes nothing,
+        // so the event layer emits nothing for it.
+        if new_delay_secs == self.governance_delay_secs {
+            return Ok(());
+        }
+        self.governance_delay_secs = new_delay_secs;
+        Ok(())
+    }
+
 
 
     /// Revise the oracle price gate after funding
@@ -51176,7 +51271,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -51705,12 +51801,27 @@ mod governance_delay_tests {
     const A1: [u8; 32] = [0x11; 32];
     const A2: [u8; 32] = [0x12; 32];
     const A3: [u8; 32] = [0x13; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const WEEK: u64 = 604_800; // 7 days
+    const HOUR: u64 = 3_600;
 
     fn delay_escrow() -> Escrow {
         Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
             .unwrap()
             .with_governance_delay(DELAY)
             .unwrap()
+    }
+
+    fn funded_delay_escrow() -> Escrow {
+        let mut e = delay_escrow();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    fn funded_quorum_delay_escrow() -> Escrow {
+        let mut e = quorum_delay_escrow();
+        e.fund(ALICE, T0).unwrap();
+        e
     }
 
     fn quorum_delay_escrow() -> Escrow {
@@ -51895,6 +52006,283 @@ mod governance_delay_tests {
                 .unwrap_err(),
             EscrowError::GovernanceActionNotProposed
         );
+    }
+
+    #[test]
+    fn amend_governance_delay_rejects_stranger_and_single_party() {
+        // Dual-signature governance: one party alone — or a
+        // stranger pair — cannot move the other's veto window.
+        let mut e = funded_delay_escrow();
+        assert_eq!(
+            e.amend_governance_delay(MALLORY, BOB, HOUR),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_governance_delay(ALICE, ALICE, HOUR),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_governance_delay(ALICE, MALLORY, HOUR),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.governance_delay_secs(), DELAY, "failed calls move nothing");
+    }
+
+    #[test]
+    fn amend_governance_delay_rejects_non_funded_states() {
+        // Uninitialized: the builder owns the initial opt-in.
+        let mut bare = delay_escrow();
+        assert_eq!(
+            bare.amend_governance_delay(ALICE, BOB, HOUR),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.governance_delay_secs(), DELAY);
+        // Activated: funding is the lock-in point, not activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_governance_delay(ALICE, BOB, HOUR),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.governance_delay_secs(), DELAY);
+        // Disputed: the dispute window settles under the frozen window.
+        let mut disputed = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        disputed.fund(ALICE, T0).unwrap();
+        disputed
+            .escalate(ALICE, T0 + 3_153_600, disputed.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(disputed.state(), EscrowState::Disputed);
+        assert_eq!(
+            disputed.amend_governance_delay(ALICE, BOB, HOUR),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(disputed.governance_delay_secs(), DELAY);
+        // Terminal: a released escrow's window is history, not policy.
+        let mut released = funded_delay_escrow();
+        released.release(ALICE, T0, AMOUNT, None, BOB).unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_governance_delay(ALICE, BOB, HOUR),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(released.governance_delay_secs(), DELAY);
+        // Terminal: same for a cancelled escrow.
+        let mut cancelled = funded_delay_escrow();
+        cancelled.cancel(ALICE, None, ALICE, T0).unwrap();
+        assert_eq!(cancelled.state(), EscrowState::Cancelled);
+        assert_eq!(
+            cancelled.amend_governance_delay(ALICE, BOB, HOUR),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(cancelled.governance_delay_secs(), DELAY);
+    }
+
+    #[test]
+    fn amend_governance_delay_rejects_when_paused() {
+        // The pause guard fires before the authority and state gates.
+        let mut paused = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_governance_delay(ALICE, BOB, HOUR),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.governance_delay_secs(), DELAY);
+    }
+
+    #[test]
+    fn amend_governance_delay_rejects_zero_new_delay() {
+        // The builder's gate, unchanged: 0 is not a delay.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(e.governance_delay_secs(), 0);
+        let err = e.amend_governance_delay(ALICE, BOB, 0).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidGovernanceDelay);
+        assert_eq!(err.code(), 220);
+        assert_eq!(e.governance_delay_secs(), 0, "failed calls move nothing");
+    }
+
+    #[test]
+    fn amend_governance_delay_rejects_closing_the_delay() {
+        // There is no clearing path: X -> 0 is refused, so the
+        // veto window the initializer funded under cannot be
+        // silently removed.
+        let mut e = funded_delay_escrow();
+        let err = e.amend_governance_delay(ALICE, BOB, 0).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidGovernanceDelay);
+        assert_eq!(err.code(), 220);
+        assert_eq!(e.governance_delay_secs(), DELAY, "failed calls move nothing");
+    }
+
+    #[test]
+    fn amend_governance_delay_same_value_is_noop() {
+        // Re-affirming the current window succeeds but changes
+        // nothing observable; the event layer (tested below)
+        // emits nothing for it.
+        let mut e = funded_delay_escrow();
+        e.amend_governance_delay(ALICE, BOB, DELAY).unwrap();
+        assert_eq!(e.governance_delay_secs(), DELAY);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_governance_delay_indexed_emits_event_noop_and_failed_emit_nothing() {
+        let funded = funded_delay_escrow();
+        let mut e = IndexedEscrow::wrap([0x1D; 32], funded);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_governance_delay(ALICE, ALICE, HOUR, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_governance_delay(ALICE, BOB, HOUR, T0).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::GovernanceDelayAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        assert_eq!(ev.amounts.refund, 0);
+        assert_eq!(ev.amounts.penalty, 0);
+        // Re-affirming the same window is a no-op: no new event.
+        e.amend_governance_delay(ALICE, BOB, HOUR, T0).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_governance_delay_opens_delay_after_funding() {
+        // A delay-less escrow may opt in post-funding: proposing
+        // flips from refused (220) to staged, and the staged
+        // action executes under the new window.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(QuorumPolicy::new(&[A1, A2, A3], &[1, 1, 1], 2).unwrap())
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(e.governance_delay_secs(), 0);
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::UpdateQuorum { new_threshold: 1 },
+                T0,
+            )
+            .unwrap_err(),
+            EscrowError::InvalidGovernanceDelay
+        );
+        e.amend_governance_delay(ALICE, BOB, DELAY).unwrap();
+        assert_eq!(e.governance_delay_secs(), DELAY);
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + DELAY - 1).unwrap_err(),
+            EscrowError::GovernanceDelayNotElapsed
+        );
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn amend_governance_delay_lengthens_window_for_new_proposals() {
+        // Lengthening governs only proposals staged after the
+        // revision: the old one-day window no longer suffices.
+        let mut e = funded_quorum_delay_escrow();
+        e.amend_governance_delay(ALICE, BOB, WEEK).unwrap();
+        assert_eq!(e.governance_delay_secs(), WEEK);
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + DELAY).unwrap_err(),
+            EscrowError::GovernanceDelayNotElapsed
+        );
+        assert_eq!(e.quorum().unwrap().threshold(), 2, "early execution moves nothing");
+        e.execute_governance(ALICE, T0 + WEEK).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+    }
+
+    #[test]
+    fn amend_governance_delay_leaves_in_flight_proposal_snapshot() {
+        // A proposal already live keeps the delay snapshotted at
+        // propose time: lengthening the window afterwards neither
+        // delays nor accelerates it.
+        let mut e = funded_quorum_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        let p = e.governance_proposal().expect("proposal live");
+        assert_eq!(p.delay_secs, DELAY);
+        e.amend_governance_delay(ALICE, BOB, WEEK).unwrap();
+        assert_eq!(e.governance_delay_secs(), WEEK);
+        // Still executable at the old snapshot deadline, even
+        // though the new week-long window has not elapsed.
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn amend_governance_delay_success_reads_new_value_and_routing_follows_new_window() {
+        // Only the window moves: state, amount, and expiry are
+        // untouched, the direct routed calls stay gated, and the
+        // next proposal executes under the shortened window.
+        let mut e = funded_quorum_delay_escrow();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), AMOUNT);
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+        e.amend_governance_delay(ALICE, BOB, HOUR).unwrap();
+        assert_eq!(e.governance_delay_secs(), HOUR);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), AMOUNT);
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+        // The routing gate follows the new window: the direct
+        // dual-signed call is still refused with 219.
+        assert_eq!(
+            e.update_quorum(ALICE, BOB, 1).unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(
+            EscrowError::GovernanceActionNotProposed.code(),
+            219
+        );
+        // A proposal staged after the revision executes after
+        // just one hour — the old day-long window is gone.
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        e.execute_governance(ALICE, T0 + HOUR).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+        assert!(e.governance_proposal().is_none());
     }
 
     #[test]
@@ -68389,7 +68777,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -68633,9 +69022,10 @@ mod event_history_tests {
         // `FundingStartAmended` (AV-321), 159 is
         // `EnglishAuctionSellerAmended` (AV-322), 160 is
         // `KeeperBountyPoolToppedUp` (AV-328), 161 is
-        // `CompoundInterestAmended` (AV-333) and 162 is the
+        // `CompoundInterestAmended` (AV-333), 162 is
+        // `GovernanceDelayAmended` (AV-334) and 163 is the
         // first still-unknown byte.
-        for bad in [162u8, 255] {
+        for bad in [163u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

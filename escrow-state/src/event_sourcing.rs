@@ -295,6 +295,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // paid, while the take / dispute / claim paths re-read
         // the live flag at the next settlement.
         | EscrowEventKind::CompoundInterestAmended
+        // AV-334: a revised governance delay window moves no
+        // funds — only the window moves; a proposal already live
+        // keeps the delay snapshotted at propose time, while the
+        // next proposal stages under the new window.
+        | EscrowEventKind::GovernanceDelayAmended
         // AV-261: a revised price gate moves no
         // funds — the gated payout paths re-read the
         // live gate at every release / claim; a payout
@@ -1289,6 +1294,11 @@ mod event_sourcing_tests {
         // paid, while the take / dispute / claim paths re-read
         // the live flag at the next settlement.
         | EscrowEventKind::CompoundInterestAmended
+        // AV-334: a revised governance delay window moves no
+        // funds — only the window moves; a proposal already live
+        // keeps the delay snapshotted at propose time, while the
+        // next proposal stages under the new window.
+        | EscrowEventKind::GovernanceDelayAmended
         // AV-261: a revised price gate moves no
         // funds — the gated payout paths re-read the
         // live gate at every release / claim; a payout

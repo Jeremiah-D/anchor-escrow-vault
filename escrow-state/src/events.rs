@@ -757,6 +757,16 @@
 //!   settlement already made keeps the mode it settled under.
 //!   A failed revision emits nothing, and a no-op
 //!   re-affirmation of the current mode emits nothing either.
+//! - `amend_governance_delay` emits
+//!   [`EscrowEventKind::GovernanceDelayAmended`] on every
+//!   successful revision that actually changes the window
+//!   (AV-334) — `from == to ==` the current state, all amounts
+//!   zero; only the `governance_delay_secs` window moves, so a
+//!   proposal already live keeps the `delay_secs` snapshotted at
+//!   propose time and the new window governs only proposals
+//!   staged after the revision. A failed revision emits
+//!   nothing, and a no-op re-affirmation of the current window
+//!   emits nothing either.
 //! - `submit_panel_judgment` emits [`EscrowEventKind::PanelJudgment`]
 //!   on every successful vote (AV-65) — `from == to == Disputed`, the
 //!   member's key in `caller`, the voted split in `amounts.payout`:
@@ -1011,6 +1021,7 @@
 //! | EnglishAuctionSellerAmended (AV-322) | 0 | 0 | 0 | 0 — rotating moves no funds and never restates a bid already placed; only `seller` moves, so `reserve_price`, `min_increment`, the windows, anti-sniping, `buyout_price`, `highest_bid`, `bid_count`, and state are untouched, and the next `amend_*` / `cancel` / settle reads the live seller — the old seller is refused at once while the new seller governs |
 //! | KeeperBountyPoolToppedUp (AV-328) | the topped-up amount (`additional`) | 0 | 0 | 0 — topping up moves lamports into the pool from outside the principal (the AV-103 appeal-bond precedent), so the fold books nothing and the amount conservation identity is untouched; only `keeper_bounty_pool` moves, so `per_crank`, `amount`, `released`, and bounty already paid are untouched, and the next `crank_expired` pays `min(per_crank, pool)` from the live pool while a crank already settled keeps the amount it settled under |
 //! | CompoundInterestAmended (AV-333) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a settlement already made; only the `compound_interest` flag flips, so `amount`, `interest_compounded`, `interest_paid`, and `interest_accrued` are untouched — yield already folded stays principal and yield already paid stays paid — and the next `take_accrued_interest` / dispute settlement / `claim_interest` reads the live flag, so a take after the amendment folds under the new mode (and `claim_interest` is refused with code 178 while compounding is on) while a take already settled keeps the mode it settled under |
+//! | GovernanceDelayAmended (AV-334) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a proposal already staged; only the `governance_delay_secs` window moves, so `amount`, `expires_at`, `state`, and the live proposal are untouched — a proposal already live keeps the `delay_secs` snapshotted at propose time and executes off that snapshot, while the next `propose_governance` stages under the new window — and the 16 routed config changes keep following the live window (direct calls still refused with code 219 on a delay-on escrow, proposals still execute only once the live window elapses) |
 //! | VaultClosed (AV-34) | 0 | 0 | 0 | 0 — the rent-exempt deposit reclaimed by the initializer on vault close is carried in `rent_reclaimed`, not in these four fields |
 //! | VaultsBatchClosed (AV-79) | 0 | 0 | 0 | 0 — the Σ rent-exempt deposits reclaimed across the batch, carried in `rent_reclaimed` |
 //! | EscrowSplit (AV-81) | Σ child amounts (the gross re-locked into the child escrows — the parent's pre-split remaining lockup) | 0 | 0 | 0 — the per-child `(child_id, amount)` roster rides the event's `split_children` field |
@@ -2864,6 +2875,22 @@ pub enum EscrowEventKind {
     /// event needs no extra field. A no-op re-affirmation of the
     /// current mode emits nothing.
     CompoundInterestAmended,
+    /// AV-334: the governance delay window was revised by
+    /// dual-signed governance
+    /// ([`Escrow::amend_governance_delay`](crate::Escrow::amend_governance_delay)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::InterestRateAmended`]); all amounts are
+    /// zero — amending moves no funds (only the
+    /// `governance_delay_secs` window moves: a proposal already
+    /// live keeps the `delay_secs` snapshotted at propose time
+    /// and executes off that snapshot, while the next
+    /// `propose_governance` stages under the new window; the 16
+    /// routed config changes keep following the live window).
+    /// The amended window is read from the vault, so the event
+    /// needs no extra field. A no-op re-affirmation of the
+    /// current window emits nothing.
+    GovernanceDelayAmended,
 }
 
 impl EscrowEventKind {
@@ -3379,6 +3406,10 @@ impl EscrowEventKind {
             // discriminants 0–160 stay stable for already-serialized
             // histories.
             161 => Self::CompoundInterestAmended,
+            // AV-334: appended after CompoundInterestAmended so
+            // discriminants 0–161 stay stable for already-serialized
+            // histories.
+            162 => Self::GovernanceDelayAmended,
             _ => return None,
         })
     }
@@ -3586,6 +3617,7 @@ impl EscrowEventKind {
             Self::KeeperBountyPerCrankAmended => "keeper_bounty_per_crank_amended",
             Self::KeeperBountyPoolToppedUp => "keeper_bounty_pool_topped_up",
             Self::CompoundInterestAmended => "compound_interest_amended",
+            Self::GovernanceDelayAmended => "governance_delay_amended",
             Self::SlashDeadlineAmended => "slash_deadline_amended",
             Self::AmountBoundsAmended => "amount_bounds_amended",
             Self::MilestoneLatePenaltyBpsAmended => "milestone_late_penalty_bps_amended",
@@ -3827,6 +3859,7 @@ impl EscrowEventKind {
             "keeper_bounty_per_crank_amended" => Self::KeeperBountyPerCrankAmended,
             "keeper_bounty_pool_topped_up" => Self::KeeperBountyPoolToppedUp,
             "compound_interest_amended" => Self::CompoundInterestAmended,
+            "governance_delay_amended" => Self::GovernanceDelayAmended,
             "slash_deadline_amended" => Self::SlashDeadlineAmended,
             "amount_bounds_amended" => Self::AmountBoundsAmended,
             "milestone_late_penalty_bps_amended" => Self::MilestoneLatePenaltyBpsAmended,
@@ -10218,6 +10251,49 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Revise the governance delay window after funding
+    /// (mirrors [`Escrow::amend_governance_delay`]). Emits
+    /// `GovernanceDelayAmended` when the window actually changes
+    /// (`from == to ==` the current state — the window, not the
+    /// lifecycle state, is what changed; all amounts zero,
+    /// since amending moves no funds — only the window moves, so
+    /// a proposal already live keeps the `delay_secs` snapshotted
+    /// at propose time and executes off that snapshot, while the
+    /// next `propose_governance` stages under the new window and
+    /// the 16 routed config changes keep following the live
+    /// window). The amended window is read from the vault, so the
+    /// event needs no extra field. A failed amendment emits
+    /// nothing, and a no-op re-affirmation of the current window
+    /// emits nothing either, paralleling
+    /// `amend_interest_rate`'s no-op rule.
+    pub fn amend_governance_delay(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_delay_secs: u64,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let before = self.inner.governance_delay_secs();
+        self.inner
+            .amend_governance_delay(initializer, taker, new_delay_secs)?;
+        if self.inner.governance_delay_secs() != before {
+            self.push_event(
+                EscrowEventKind::GovernanceDelayAmended,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Revise the oracle price gate after funding
     /// (mirrors [`Escrow::amend_price_gate`]). Emits
     /// `PriceGateAmended` when the gate actually changes
@@ -15684,7 +15760,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -15834,7 +15911,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -16418,7 +16496,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -16480,7 +16559,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -16539,7 +16619,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -16598,7 +16679,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -16657,7 +16739,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -16719,7 +16802,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -16781,7 +16865,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -16840,7 +16925,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -16899,7 +16985,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -16958,7 +17045,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -17017,7 +17105,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -17076,7 +17165,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -17135,7 +17225,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -17198,7 +17289,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -17260,7 +17352,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -17322,7 +17415,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -17384,7 +17478,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -17446,7 +17541,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -17509,7 +17605,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -17572,7 +17669,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -17635,7 +17733,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -17697,7 +17796,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
@@ -17713,7 +17813,27 @@ mod event_tests {
             EscrowEventKind::from_name("compound_interest_amended"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(162), None);
+        assert_eq!(
+            EscrowEventKind::from_discriminant(162),
+            Some(EscrowEventKind::GovernanceDelayAmended)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(163), None);
+    }
+
+    #[test]
+    fn governance_delay_amended_kind_round_trips() {
+        // AV-334: discriminant 162, appended after
+        // CompoundInterestAmended — 0–161 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::GovernanceDelayAmended;
+        assert_eq!(kind.discriminant(), 162);
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(kind));
+        assert_eq!(kind.name(), "governance_delay_amended");
+        assert_eq!(
+            EscrowEventKind::from_name("governance_delay_amended"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(163), None);
     }
 
     #[test]
@@ -17792,7 +17912,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(159), Some(EscrowEventKind::EnglishAuctionSellerAmended)); // AV-322: 159 is EnglishAuctionSellerAmended
         assert_eq!(EscrowEventKind::from_discriminant(160), Some(EscrowEventKind::KeeperBountyPoolToppedUp)); // AV-328: 160 is KeeperBountyPoolToppedUp
         assert_eq!(EscrowEventKind::from_discriminant(161), Some(EscrowEventKind::CompoundInterestAmended)); // AV-333: 161 is CompoundInterestAmended
-        assert_eq!(EscrowEventKind::from_discriminant(162), None); // AV-333: 161 is CompoundInterestAmended
+        assert_eq!(EscrowEventKind::from_discriminant(162), Some(EscrowEventKind::GovernanceDelayAmended)); // AV-334: 162 is GovernanceDelayAmended
+        assert_eq!(EscrowEventKind::from_discriminant(163), None); // AV-334: 162 is GovernanceDelayAmended
     }
 
     #[test]
