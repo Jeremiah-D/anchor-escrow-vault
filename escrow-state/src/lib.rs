@@ -5595,8 +5595,9 @@ impl MintAllowlist {
 
 // ---------- AV-158: delayed dual-signed governance ----------
 //
-// The fifteen dual-signed config changes (the four AV-158 actions
-// plus the eleven AV-335 actions) can opt in to a two-phase
+// The seventeen dual-signed config changes (the four AV-158 actions
+// plus the eleven AV-335 actions and the two AV-336 split-shares
+// halves) can opt in to a two-phase propose → delay → execute/cancel
 // propose → delay → execute/cancel protocol via
 // `Escrow::with_governance_delay`. The delay is the anti-flash-
 // governance rule: a malicious threshold change proposed while an
@@ -5619,7 +5620,8 @@ impl MintAllowlist {
 //   AmendVestingCurve, 9 = AmendDutchAuctionWindow, 10 =
 //   AmendSubscriptionPeriodSecs, 11 = AmendDefaultJudgment, 12 =
 //   UpdateSettlementMintAllowlist, 13 = UpdateTieredQuorum, 14 =
-//   UpdateArbiterPanelMembers) +
+//   UpdateArbiterPanelMembers, 15 = AmendPayoutSplitSharesFirst, 16
+//   = AmendPayoutSplitSharesSecond) +
 //   [`GOVERNANCE_ACTION_PAYLOAD_LEN`]-byte payload. Per-kind layout:
 //   kind 0: payload[0..8] = new_threshold LE;
 //   kind 1: payload[0..256] = 8 attestor keys, payload[256..320] =
@@ -5644,7 +5646,11 @@ impl MintAllowlist {
 //   kind 13: payload[0..64] = 4 tiers, 16 bytes each (8-byte
 //   max_amount LE + 8-byte threshold LE), payload[64] = live count;
 //   kind 14: payload[0..256] = 8 panel members, payload[256] =
-//   live count.
+//   live count;
+//   kind 15: payload[0..256] = 8 first-half keys, payload[256..320]
+//   = 8 first-half amounts LE, payload[320] = live count —
+//   exactly one fixed payload (8 * 32 + 8 * 8 + 1 = 321);
+//   kind 16: same layout for the second half (shares[8..16)).
 // - `GovernanceProposal`: the action + 32-byte proposer +
 //   8-byte `proposed_at` + 8-byte `delay_secs` (the configured delay
 //   snapshotted at propose time, so an in-flight proposal keeps its
@@ -5724,6 +5730,41 @@ pub enum GovernanceAction {
         members: [[u8; 32]; MAX_PANEL_MEMBERS],
         count: u8,
     },
+    /// [`Escrow::amend_payout_split_shares`] with the first half of
+    /// the split table (AV-336): only `keys[..count]` /
+    /// `amounts[..count]` are live — the proposed shares for
+    /// `shares[0..count)`, merged at execute time with the live tail
+    /// `shares[count..n)`. The live table caps at
+    /// [`MAX_RELEASE_SPLIT_RECIPIENTS`] (8) entries, so the first
+    /// half carries the whole live table in practice; a half whose
+    /// merged table breaks the split rules (Σ ≠ locked amount,
+    /// a recipient the live table does not have) is refused with
+    /// [`EscrowError::InvalidPayoutSplit`], never partially applied.
+    /// An empty half (`count == 0`) leaves the table untouched and
+    /// executes as a no-op, mirroring the direct call's
+    /// re-affirmation.
+    AmendPayoutSplitSharesFirst {
+        keys: [[u8; 32]; MAX_RELEASE_SPLIT_RECIPIENTS],
+        amounts: [u64; MAX_RELEASE_SPLIT_RECIPIENTS],
+        count: u8,
+    },
+    /// [`Escrow::amend_payout_split_shares`] with the second half of
+    /// the split table (AV-336): the proposed shares for
+    /// `shares[8..8+count)`, merged at execute time after the live
+    /// table. The live table caps at [`MAX_RELEASE_SPLIT_RECIPIENTS`]
+    /// (8) entries, so slots `[8..16)` never hold a live entry
+    /// under the current cap — a non-empty second half has no live
+    /// slots to govern and is refused by the merged-table validation
+    /// (`InvalidPayoutSplit`); only the empty second half
+    /// (`count == 0`) executes, as a no-op. The variant is kept as
+    /// decided: each half is exactly one fixed payload (321 bytes),
+    /// so the split needs no layout change, and the kind stays
+    /// reserved if the table ever grows past 8 entries.
+    AmendPayoutSplitSharesSecond {
+        keys: [[u8; 32]; MAX_RELEASE_SPLIT_RECIPIENTS],
+        amounts: [u64; MAX_RELEASE_SPLIT_RECIPIENTS],
+        count: u8,
+    },
 }
 
 /// Serialized length of a [`GovernanceAction`]'s fixed payload: the
@@ -5782,7 +5823,8 @@ impl GovernanceAction {
     /// AmendVestingCurve, 9 = AmendDutchAuctionWindow, 10 =
     /// AmendSubscriptionPeriodSecs, 11 = AmendDefaultJudgment, 12 =
     /// UpdateSettlementMintAllowlist, 13 = UpdateTieredQuorum, 14 =
-    /// UpdateArbiterPanelMembers.
+    /// UpdateArbiterPanelMembers, 15 = AmendPayoutSplitSharesFirst,
+    /// 16 = AmendPayoutSplitSharesSecond.
     pub(crate) fn kind_byte(&self) -> u8 {
         match self {
             GovernanceAction::UpdateQuorum { .. } => 0,
@@ -5800,6 +5842,8 @@ impl GovernanceAction {
             GovernanceAction::UpdateSettlementMintAllowlist { .. } => 12,
             GovernanceAction::UpdateTieredQuorum { .. } => 13,
             GovernanceAction::UpdateArbiterPanelMembers { .. } => 14,
+            GovernanceAction::AmendPayoutSplitSharesFirst { .. } => 15,
+            GovernanceAction::AmendPayoutSplitSharesSecond { .. } => 16,
         }
     }
 
@@ -5898,6 +5942,26 @@ impl GovernanceAction {
                     out[i * 32..(i + 1) * 32].copy_from_slice(m);
                 }
                 out[256] = *count;
+            }
+            GovernanceAction::AmendPayoutSplitSharesFirst {
+                keys,
+                amounts,
+                count,
+            }
+            | GovernanceAction::AmendPayoutSplitSharesSecond {
+                keys,
+                amounts,
+                count,
+            } => {
+                let n = (*count as usize).min(MAX_RELEASE_SPLIT_RECIPIENTS);
+                for (i, k) in keys[..n].iter().enumerate() {
+                    out[i * 32..(i + 1) * 32].copy_from_slice(k);
+                }
+                for (i, a) in amounts[..n].iter().enumerate() {
+                    out[256 + i * 8..256 + (i + 1) * 8]
+                        .copy_from_slice(&a.to_le_bytes());
+                }
+                out[320] = *count;
             }
         }
         out
@@ -6063,6 +6127,38 @@ impl GovernanceAction {
                 }
                 Some(GovernanceAction::UpdateArbiterPanelMembers { members, count })
             }
+            15 | 16 => {
+                let count = payload[320];
+                if count as usize > MAX_RELEASE_SPLIT_RECIPIENTS {
+                    return None;
+                }
+                // `count == 0` is an empty half: it merges to the
+                // live table unchanged and executes as a no-op
+                // (mirroring the direct call's re-affirmation), so
+                // it stays decodable — the merged-table rules fire
+                // in `validate_governance_action` at propose time.
+                let mut keys = [[0u8; 32]; MAX_RELEASE_SPLIT_RECIPIENTS];
+                let mut amounts = [0u64; MAX_RELEASE_SPLIT_RECIPIENTS];
+                for i in 0..count as usize {
+                    keys[i].copy_from_slice(&payload[i * 32..(i + 1) * 32]);
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&payload[256 + i * 8..256 + (i + 1) * 8]);
+                    amounts[i] = u64::from_le_bytes(b);
+                }
+                if kind == 15 {
+                    Some(GovernanceAction::AmendPayoutSplitSharesFirst {
+                        keys,
+                        amounts,
+                        count,
+                    })
+                } else {
+                    Some(GovernanceAction::AmendPayoutSplitSharesSecond {
+                        keys,
+                        amounts,
+                        count,
+                    })
+                }
+            }
             _ => None,
         }
     }
@@ -6161,6 +6257,53 @@ impl GovernanceAction {
         Some(GovernanceAction::UpdateArbiterPanelMembers {
             members: m,
             count: members.len() as u8,
+        })
+    }
+
+    /// Convenience constructor for the first split-shares half from
+    /// a slice (AV-336; bounds-checked: at most
+    /// [`MAX_RELEASE_SPLIT_RECIPIENTS`] entries — an empty slice is
+    /// an empty half, which merges to the live table unchanged and
+    /// executes as a no-op). The half's rules themselves (the merged
+    /// table's Σ, the recipient set and order) are validated against
+    /// the live escrow by [`Escrow::propose_governance`].
+    pub fn amend_payout_split_shares_first(shares: &[([u8; 32], u64)]) -> Option<Self> {
+        if shares.len() > MAX_RELEASE_SPLIT_RECIPIENTS {
+            return None;
+        }
+        let mut keys = [[0u8; 32]; MAX_RELEASE_SPLIT_RECIPIENTS];
+        let mut amounts = [0u64; MAX_RELEASE_SPLIT_RECIPIENTS];
+        for (i, (key, amount)) in shares.iter().enumerate() {
+            keys[i] = *key;
+            amounts[i] = *amount;
+        }
+        Some(GovernanceAction::AmendPayoutSplitSharesFirst {
+            keys,
+            amounts,
+            count: shares.len() as u8,
+        })
+    }
+
+    /// Convenience constructor for the second split-shares half from
+    /// a slice (AV-336; bounds-checked like the first half). The
+    /// live table caps at [`MAX_RELEASE_SPLIT_RECIPIENTS`] entries,
+    /// so under the current cap only the empty second half can ever
+    /// execute (as a no-op) — a non-empty second half is refused by
+    /// the merged-table validation at propose time.
+    pub fn amend_payout_split_shares_second(shares: &[([u8; 32], u64)]) -> Option<Self> {
+        if shares.len() > MAX_RELEASE_SPLIT_RECIPIENTS {
+            return None;
+        }
+        let mut keys = [[0u8; 32]; MAX_RELEASE_SPLIT_RECIPIENTS];
+        let mut amounts = [0u64; MAX_RELEASE_SPLIT_RECIPIENTS];
+        for (i, (key, amount)) in shares.iter().enumerate() {
+            keys[i] = *key;
+            amounts[i] = *amount;
+        }
+        Some(GovernanceAction::AmendPayoutSplitSharesSecond {
+            keys,
+            amounts,
+            count: shares.len() as u8,
         })
     }
 }
@@ -20444,6 +20587,101 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Merge one proposed split-shares half with the live table
+    /// (AV-336), for the delayed-governance execute arm and the
+    /// propose-time validation. The first half replaces live entries
+    /// `[0..count)` and keeps the live tail `[count..n)`; the second
+    /// half governs slots `[8..16)`, which the live table never
+    /// reaches ([`MAX_RELEASE_SPLIT_RECIPIENTS`] is 8), so its merged
+    /// table is the live table followed by the proposed entries —
+    /// any non-empty second half fails the merged table's validation
+    /// (over 8 entries, or a recipient the live table does not have)
+    /// and only the empty second half merges cleanly, as the live
+    /// table itself. A first half longer than the live table
+    /// (`count > n`) likewise merges in recipients the live table
+    /// does not have, so the recipient-equality check in the inner
+    /// transition refuses it — no half can smuggle a new recipient
+    /// in through the merge.
+    fn merged_split_shares(
+        &self,
+        first: bool,
+        keys: &[[u8; 32]; MAX_RELEASE_SPLIT_RECIPIENTS],
+        amounts: &[u64; MAX_RELEASE_SPLIT_RECIPIENTS],
+        count: u8,
+    ) -> Vec<([u8; 32], u64)> {
+        let live = self.payout_split.as_slice();
+        let n = count as usize;
+        if first {
+            let mut merged = Vec::with_capacity(live.len().max(n));
+            for i in 0..live.len().max(n) {
+                if i < n {
+                    merged.push((keys[i], amounts[i]));
+                } else {
+                    merged.push(live[i]);
+                }
+            }
+            merged
+        } else {
+            let mut merged = live;
+            for i in 0..n {
+                merged.push((keys[i], amounts[i]));
+            }
+            merged
+        }
+    }
+
+    /// Validate a proposed split-shares half against the live escrow
+    /// (AV-336): the propose-time half of
+    /// [`Escrow::validate_governance_action`] — build the merged
+    /// table and run the inner transition's full-table validation on
+    /// it, so a half that could never execute is refused at propose
+    /// time. The live-state gates mirror
+    /// `amend_payout_split_shares_impl` and re-run there at execute
+    /// time (zero gate drift): a configured table, the two-party
+    /// gate, no milestone plan / subscription schedule, a zero
+    /// `released` floor, the merged table through
+    /// [`PayoutSplit::new`], and the recipient set and order equal
+    /// to the live table's. `now`-dependent checks (the pause lift)
+    /// stay execute-time.
+    fn validate_split_shares_half(
+        &self,
+        first: bool,
+        keys: &[[u8; 32]; MAX_RELEASE_SPLIT_RECIPIENTS],
+        amounts: &[u64; MAX_RELEASE_SPLIT_RECIPIENTS],
+        count: u8,
+    ) -> Result<(), EscrowError> {
+        if !self.payout_split.is_configured() {
+            return Err(EscrowError::InvalidPayoutSplit);
+        }
+        for (recipient, _) in self.payout_split.as_slice() {
+            if recipient != self.initializer && recipient != self.taker {
+                return Err(EscrowError::InvalidPayoutSplit);
+            }
+        }
+        if self.milestones.is_some() {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        if self.subscription.is_some() {
+            return Err(EscrowError::InvalidSubscription);
+        }
+        if self.released != 0 {
+            return Err(EscrowError::InvalidPayoutSplit);
+        }
+        let merged = self.merged_split_shares(first, keys, amounts, count);
+        let new_split = PayoutSplit::new(&merged, self.amount)?;
+        let current = self.payout_split.as_slice();
+        let revised = new_split.as_slice();
+        if current.len() != revised.len()
+            || current
+                .iter()
+                .zip(revised.iter())
+                .any(|((cur_recipient, _), (new_recipient, _))| cur_recipient != new_recipient)
+        {
+            return Err(EscrowError::InvalidPayoutSplit);
+        }
+        Ok(())
+    }
+
     /// Opt in to multi-taker share claiming (AV-149 — Solana /
     /// payment fintech: the taker side is a group — payroll run,
     /// revenue split, treasury beneficiaries — and each claimant
@@ -25660,8 +25898,9 @@ let fee = self.charge_protocol_fee(claimable)?;
 
     // ---------- AV-158: delayed dual-signed governance ----------
     //
-    // The fifteen dual-signed config changes (the four AV-158
-    // actions plus the eleven AV-335 actions) can opt in to a
+    // The seventeen dual-signed config changes (the four AV-158
+    // actions plus the eleven AV-335 actions and the two AV-336
+    // split-shares halves) can opt in to a two-phase propose → delay
     // two-phase propose → delay → execute/cancel protocol. The delay
     // is the anti-flash-governance rule: a
     // malicious threshold change proposed while an attestor is dark
@@ -25687,9 +25926,8 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// ([`EscrowError::InvalidGovernanceDelay`] otherwise — a zero
     /// window is not a delay; leave the delay off instead). Once
     /// opted in, the dual-signed config changes (the four AV-158
-    /// actions plus the eleven AV-335 actions — and
-    /// `amend_payout_split_shares`, gated but variant-less until
-    /// AV-336) refuse direct calls with
+    /// actions, the eleven AV-335 actions and the two AV-336
+    /// split-shares halves) refuse direct calls with
     /// [`EscrowError::GovernanceActionNotProposed`] and move only
     /// through [`Escrow::propose_governance`] /
     /// [`Escrow::execute_governance`] /
@@ -25755,7 +25993,8 @@ let fee = self.charge_protocol_fee(claimable)?;
     ///    `rotate_taker` — mirroring the underlying transitions;
     ///    AV-335: `AmendFundingStart` is `Uninitialized` /
     ///    `Activated` only, the other ten new actions are
-    ///    `Funded`-only);
+    ///    `Funded`-only; AV-336: the two split-shares halves are
+    ///    `Funded`-only too);
     /// 5. the action params validated against the live escrow (the
     ///    same rules the direct call enforces: threshold range, the
     ///    attestor-set rules via `QuorumPolicy::new`, the zero-key
@@ -25988,6 +26227,40 @@ let fee = self.charge_protocol_fee(claimable)?;
                     true,
                 )?;
             }
+            GovernanceAction::AmendPayoutSplitSharesFirst {
+                keys,
+                amounts,
+                count,
+            } => {
+                // Each half merges with the live table at execute
+                // time and the merged table re-runs the full inner
+                // transition (`via_delayed = true`, `now` is the
+                // execute time) — a half whose merged table no
+                // longer applies fails here, leaving the proposal
+                // live for cancel or a fresh proposal.
+                let merged = self.merged_split_shares(true, &keys, &amounts, count);
+                self.amend_payout_split_shares_impl(
+                    self.initializer,
+                    self.taker,
+                    &merged,
+                    now,
+                    true,
+                )?;
+            }
+            GovernanceAction::AmendPayoutSplitSharesSecond {
+                keys,
+                amounts,
+                count,
+            } => {
+                let merged = self.merged_split_shares(false, &keys, &amounts, count);
+                self.amend_payout_split_shares_impl(
+                    self.initializer,
+                    self.taker,
+                    &merged,
+                    now,
+                    true,
+                )?;
+            }
         }
         self.governance_proposal = None;
         Ok(())
@@ -26021,7 +26294,8 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// (`Uninitialized` / `Funded` for the quorum and allowlist
     /// actions, plus `Activated` for `rotate_taker`; AV-335:
     /// `AmendFundingStart` is `Uninitialized` / `Activated` only,
-    /// the other ten new actions are `Funded`-only).
+    /// the other ten new actions are `Funded`-only; AV-336: the two
+    /// split-shares halves are `Funded`-only too).
     fn governance_action_state_ok(&self, action: &GovernanceAction) -> bool {
         match action {
             GovernanceAction::UpdateQuorum { .. }
@@ -26062,7 +26336,12 @@ let fee = self.charge_protocol_fee(claimable)?;
             | GovernanceAction::AmendDefaultJudgment { .. }
             | GovernanceAction::UpdateSettlementMintAllowlist { .. }
             | GovernanceAction::UpdateTieredQuorum { .. }
-            | GovernanceAction::UpdateArbiterPanelMembers { .. } => {
+            | GovernanceAction::UpdateArbiterPanelMembers { .. }
+            // AV-336: the two split-shares halves revise the
+            // post-funding split table and are `Funded`-only,
+            // mirroring `amend_payout_split_shares_impl`.
+            | GovernanceAction::AmendPayoutSplitSharesFirst { .. }
+            | GovernanceAction::AmendPayoutSplitSharesSecond { .. } => {
                 matches!(self.state, EscrowState::Funded)
             }
         }
@@ -26296,6 +26575,16 @@ let fee = self.charge_protocol_fee(claimable)?;
                 }
                 Ok(())
             }
+            GovernanceAction::AmendPayoutSplitSharesFirst {
+                keys,
+                amounts,
+                count,
+            } => self.validate_split_shares_half(true, keys, amounts, *count),
+            GovernanceAction::AmendPayoutSplitSharesSecond {
+                keys,
+                amounts,
+                count,
+            } => self.validate_split_shares_half(false, keys, amounts, *count),
         }
     }
 
@@ -52415,9 +52704,10 @@ mod release_cooling_tests {
 //
 // `with_governance_delay` opts the dual-signed config changes
 // (`update_quorum`, `update_attestors`, `rotate_taker`,
-// `update_payout_allowlist`, plus the eleven AV-335 actions) into a
-// propose → delay → execute/cancel protocol. Deterministic injected
-// clocks throughout; no network.
+// `update_payout_allowlist`, plus the eleven AV-335 actions and the
+// two AV-336 split-shares halves) into a propose → delay →
+// execute/cancel protocol. Deterministic injected clocks throughout;
+// no network.
 #[cfg(test)]
 mod governance_delay_tests {
     use super::*;
@@ -53589,7 +53879,7 @@ mod governance_delay_tests {
         }
         // Unknown kinds fail closed.
         let payload = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
-        assert_eq!(GovernanceAction::decode(15, &payload), None);
+        assert_eq!(GovernanceAction::decode(17, &payload), None);
         assert_eq!(GovernanceAction::decode(255, &payload), None);
         // Out-of-range live counts fail closed.
         let mut bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
@@ -53840,6 +54130,376 @@ mod governance_delay_tests {
     fn av335_layout_lengths_unchanged() {
         // Zero layout change: the fixed payload still fits the
         // largest variant, and the vault space / rent are untouched.
+        assert_eq!(GOVERNANCE_ACTION_PAYLOAD_LEN, 321);
+        assert_eq!(GOVERNANCE_ACTION_LEN, 322);
+        assert_eq!(GOVERNANCE_PROPOSAL_LEN, 370);
+        assert_eq!(GOVERNANCE_PROPOSAL_TAIL_LEN, 371);
+        assert_eq!(VAULT_SPACE, 8332);
+    }
+
+    // ---------- AV-336: delayed governance for payout split shares --
+    //
+    // The last orphaned amend method: `amend_payout_split_shares`
+    // carried the routing gate but no `GovernanceAction` variant,
+    // because its table was believed to need 641 bytes. The live
+    // table actually caps at 8 entries (`MAX_RELEASE_SPLIT_RECIPIENTS`),
+    // so each half is exactly one fixed payload (321 bytes) and no
+    // layout change is needed — but the decided shape is kept: kind
+    // 15 governs shares[0..8] (the whole live table in practice) and
+    // kind 16 governs shares[8..16] (empty under the current cap, so
+    // only the empty second half can execute, as a no-op).
+    // Deterministic injected clocks throughout; no network.
+
+    /// Funded delay-on escrow with a two-signer split table. Both
+    /// recipients are the two signers, so the impl's two-party gate
+    /// passes; a third-party recipient could never be amended by
+    /// dual signature alone.
+    fn split_funded_delay_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_payout_split(&[(ALICE, 600_000), (BOB, 400_000)])
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn av336_first_half_full_path_emits_governance_events() {
+        let funded = split_funded_delay_escrow();
+        let mut e = IndexedEscrow::wrap([0x1D; 32], funded);
+        let before = e.event_count();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::amend_payout_split_shares_first(&[
+                (ALICE, 700_000),
+                (BOB, 300_000),
+            ])
+            .unwrap(),
+            T0,
+        )
+        .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::GovernanceProposed);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        e.execute_governance(BOB, T0 + DELAY).unwrap();
+        assert_eq!(e.event_count(), before + 2);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::GovernanceExecuted);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(
+            e.inner().payout_split().as_slice(),
+            vec![(ALICE, 700_000), (BOB, 300_000)]
+        );
+        assert!(e.inner().governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av336_both_halves_merged_table_correct() {
+        // The first half rebalances the whole live table; the
+        // (empty) second half then executes as a no-op and the
+        // merged table is exactly the first half's table.
+        let mut e = split_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::amend_payout_split_shares_first(&[
+                (ALICE, 700_000),
+                (BOB, 300_000),
+            ])
+            .unwrap(),
+            T0,
+        )
+        .unwrap();
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(
+            e.payout_split().as_slice(),
+            vec![(ALICE, 700_000), (BOB, 300_000)]
+        );
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::amend_payout_split_shares_second(&[]).unwrap(),
+            T0 + DELAY,
+        )
+        .unwrap();
+        e.execute_governance(ALICE, T0 + 2 * DELAY).unwrap();
+        assert_eq!(
+            e.payout_split().as_slice(),
+            vec![(ALICE, 700_000), (BOB, 300_000)]
+        );
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av336_first_half_partial_keeps_live_tail() {
+        // A first half covering only entry 0 merges with the live
+        // tail: entry 1 keeps its live share (the Σ still has to
+        // balance, so re-affirming entry 0's live amount executes
+        // as a no-op with the tail untouched).
+        let mut e = split_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::amend_payout_split_shares_first(&[(ALICE, 600_000)])
+                .unwrap(),
+            T0,
+        )
+        .unwrap();
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(
+            e.payout_split().as_slice(),
+            vec![(ALICE, 600_000), (BOB, 400_000)]
+        );
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av336_kind_byte_encode_decode_round_trip() {
+        // Both halves round-trip through kind_byte 15/16 +
+        // encode/decode with their params intact; each half fills
+        // exactly one fixed payload.
+        let first = GovernanceAction::amend_payout_split_shares_first(&[
+            (ALICE, 700_000),
+            (BOB, 300_000),
+        ])
+        .unwrap();
+        let second = GovernanceAction::amend_payout_split_shares_second(&[]).unwrap();
+        assert_eq!(first.kind_byte(), 15);
+        assert_eq!(second.kind_byte(), 16);
+        for (kind, action) in [(15u8, first), (16u8, second)] {
+            let payload = action.encode_payload();
+            assert_eq!(payload.len(), GOVERNANCE_ACTION_PAYLOAD_LEN);
+            assert_eq!(
+                GovernanceAction::decode(kind, &payload),
+                Some(action),
+                "kind {kind} round-trip"
+            );
+        }
+        // Unknown kinds fail closed.
+        let payload = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
+        assert_eq!(GovernanceAction::decode(17, &payload), None);
+        assert_eq!(GovernanceAction::decode(255, &payload), None);
+        // Out-of-range live counts fail closed.
+        let mut bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
+        bad[320] = 9; // split-shares half count > 8
+        assert_eq!(GovernanceAction::decode(15, &bad), None);
+        assert_eq!(GovernanceAction::decode(16, &bad), None);
+        // The slice constructors refuse out-of-range input, and the
+        // empty slice is an empty (no-op) half.
+        let too_many = [(ALICE, 100_000u64); 9];
+        assert!(GovernanceAction::amend_payout_split_shares_first(&too_many).is_none());
+        assert!(GovernanceAction::amend_payout_split_shares_second(&too_many).is_none());
+        assert_eq!(
+            GovernanceAction::amend_payout_split_shares_first(&[])
+                .unwrap()
+                .encode_payload()[320],
+            0
+        );
+    }
+
+    #[test]
+    fn av336_direct_call_refused_when_delayed() {
+        // The delayed path now exists, but the direct call on a
+        // delay-on escrow still refuses with 219 — the shares move
+        // only through propose/execute.
+        let mut e = split_funded_delay_escrow();
+        assert_eq!(
+            e.amend_payout_split_shares(
+                ALICE,
+                BOB,
+                &[(ALICE, 700_000), (BOB, 300_000)],
+                T0
+            )
+            .unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(
+            e.payout_split().as_slice(),
+            vec![(ALICE, 600_000), (BOB, 400_000)]
+        );
+    }
+
+    #[test]
+    fn av336_propose_rejects_wrong_state() {
+        // Both halves are `Funded`-only: staging one pre-funding
+        // fails fast with 101 and stages nothing.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_payout_split(&[(ALICE, 600_000), (BOB, 400_000)])
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::amend_payout_split_shares_first(&[
+                    (ALICE, 700_000),
+                    (BOB, 300_000)
+                ])
+                .unwrap(),
+                T0
+            )
+            .unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        assert!(e.governance_proposal().is_none());
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::amend_payout_split_shares_second(&[]).unwrap(),
+                T0
+            )
+            .unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av336_execute_before_delay_keeps_proposal() {
+        let mut e = split_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::amend_payout_split_shares_first(&[
+                (ALICE, 700_000),
+                (BOB, 300_000),
+            ])
+            .unwrap(),
+            T0,
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + DELAY - 1).unwrap_err(),
+            EscrowError::GovernanceDelayNotElapsed
+        );
+        // The proposal stays live for retry — and the table is
+        // untouched while the delay runs.
+        assert!(e.governance_proposal().is_some());
+        assert_eq!(
+            e.payout_split().as_slice(),
+            vec![(ALICE, 600_000), (BOB, 400_000)]
+        );
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(
+            e.payout_split().as_slice(),
+            vec![(ALICE, 700_000), (BOB, 300_000)]
+        );
+    }
+
+    #[test]
+    fn av336_cancel_veto_blocks_execute() {
+        let mut e = split_funded_delay_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::amend_payout_split_shares_first(&[
+                (ALICE, 700_000),
+                (BOB, 300_000),
+            ])
+            .unwrap(),
+            T0,
+        )
+        .unwrap();
+        e.cancel_governance(BOB).unwrap();
+        assert!(e.governance_proposal().is_none());
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + DELAY + 1).unwrap_err(),
+            EscrowError::GovernanceActionNotProposed
+        );
+        assert_eq!(
+            e.payout_split().as_slice(),
+            vec![(ALICE, 600_000), (BOB, 400_000)]
+        );
+    }
+
+    #[test]
+    fn av336_propose_fail_fast_bad_merged_table() {
+        let mut e = split_funded_delay_escrow();
+        // Over-subscribed merged table (Σ 1_100_000 ≠ 1_000_000).
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::amend_payout_split_shares_first(&[
+                    (ALICE, 700_000),
+                    (BOB, 400_000)
+                ])
+                .unwrap(),
+                T0
+            )
+            .unwrap_err(),
+            EscrowError::InvalidPayoutSplit
+        );
+        // A recipient swap is a new distribution, not a rebalance.
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::amend_payout_split_shares_first(&[
+                    (BOB, 400_000),
+                    (ALICE, 600_000)
+                ])
+                .unwrap(),
+                T0
+            )
+            .unwrap_err(),
+            EscrowError::InvalidPayoutSplit
+        );
+        // A first half that moves one share without rebalancing the
+        // other breaks the merged Σ.
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::amend_payout_split_shares_first(&[(ALICE, 700_000)])
+                    .unwrap(),
+                T0
+            )
+            .unwrap_err(),
+            EscrowError::InvalidPayoutSplit
+        );
+        // A non-empty second half has no live slots to govern: the
+        // merged table would carry a recipient the live table does
+        // not have.
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::amend_payout_split_shares_second(&[(ALICE, 600_000)])
+                    .unwrap(),
+                T0
+            )
+            .unwrap_err(),
+            EscrowError::InvalidPayoutSplit
+        );
+        // No failed proposal staged anything.
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn av336_first_half_survives_account_bytes_round_trip() {
+        // A live kind-15 proposal persists through the vault account
+        // bytes: the decoder's kind bound (16) and the kind-15
+        // decode arm agree, and the snapshot JSON names the half.
+        let mut e = split_funded_delay_escrow();
+        let action = GovernanceAction::amend_payout_split_shares_first(&[
+            (ALICE, 700_000),
+            (BOB, 300_000),
+        ])
+        .unwrap();
+        e.propose_governance(ALICE, action, T0).unwrap();
+        assert!(e
+            .snapshot(T0)
+            .to_json()
+            .contains("\"kind\":\"amend_payout_split_shares_first\""));
+        let body = encode_escrow(&e);
+        let mut account = crate::discriminator::vault_account_discriminator().to_vec();
+        account.extend_from_slice(&body);
+        let decoded = crate::discriminator::decode_vault_account(&account).unwrap();
+        assert_eq!(decoded.governance_proposal().unwrap().action, action);
+        assert_eq!(decoded.payout_split().as_slice(), e.payout_split().as_slice());
+    }
+
+    #[test]
+    fn av336_layout_lengths_unchanged() {
+        // Zero layout change: each half fills exactly one fixed
+        // payload, and the vault space / rent are untouched.
         assert_eq!(GOVERNANCE_ACTION_PAYLOAD_LEN, 321);
         assert_eq!(GOVERNANCE_ACTION_LEN, 322);
         assert_eq!(GOVERNANCE_PROPOSAL_LEN, 370);

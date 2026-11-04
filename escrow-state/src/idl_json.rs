@@ -448,15 +448,17 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
             ("len", IdlType::U8),
         ],
         // GovernanceAction { kind: u8, payload: [u8; 321] } (AV-158,
-        // AV-335): the staged delayed-governance action. The 1-byte
-        // kind is 0 = UpdateQuorum, 1 = UpdateAttestors, 2 =
+        // AV-335, AV-336): the staged delayed-governance action. The
+        // 1-byte kind is 0 = UpdateQuorum, 1 = UpdateAttestors, 2 =
         // RotateTaker, 3 = UpdatePayoutAllowlist, 4 =
         // AmendFundingStart, 5 = AmendSettlementMint, 6 =
         // AmendJuryPanelSize, 7 = AmendEventCapacity, 8 =
         // AmendVestingCurve, 9 = AmendDutchAuctionWindow, 10 =
         // AmendSubscriptionPeriodSecs, 11 = AmendDefaultJudgment, 12
         // = UpdateSettlementMintAllowlist, 13 = UpdateTieredQuorum,
-        // 14 = UpdateArbiterPanelMembers; the 321-byte payload
+        // 14 = UpdateArbiterPanelMembers, 15 =
+        // AmendPayoutSplitSharesFirst, 16 =
+        // AmendPayoutSplitSharesSecond; the 321-byte payload
         // carries the kind's params at fixed offsets, zero-padded
         // (kind 0: payload[0..8] = new_threshold LE; kind 1:
         // payload[0..256] = 8 attestor keys, payload[256..320] = 8
@@ -475,7 +477,10 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
         // mints, payload[256] = live count, 0 = clear; kind 13:
         // payload[0..64] = 4 tiers (16 bytes each), payload[64] =
         // live count; kind 14: payload[0..256] = 8 members,
-        // payload[256] = live count).
+        // payload[256] = live count; kind 15: payload[0..256] = 8
+        // first-half keys, payload[256..320] = 8 first-half amounts
+        // LE, payload[320] = live count; kind 16: same layout for
+        // the second half).
         "GovernanceAction" => vec![
             ("kind", IdlType::U8),
             ("payload", IdlType::Array(ArrayElem::U8, 321)),

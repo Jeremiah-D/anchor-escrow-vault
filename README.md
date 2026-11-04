@@ -103,7 +103,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `migrate_schema()` (AV-75; AV-85: chain) | any | — (no state change; stamps the schema version) | initializer **only** (`Unauthorized` otherwise, checked before state validity); a paused escrow fails fast (`Paused`); the gate is a catch-up gate (AV-82: `schema_version < SCHEMA_VERSION` runs — an already-current vault refuses the second call and an unknown future version refuses loudly instead of skipping forward, `InvalidSchemaMigration`, code 140, either way); AV-85: the catch-up is now an explicit N → M step chain — each step re-validates the conservation invariants over the field set it carries (`released <= amount`, `released + skipped <= amount`, `fees_paid <= released`, milestone tranche sum `== amount`, plus `released + penalty_paid <= amount` from the 1 → 2 step on) and any failing step rolls the chain back to the pre-chain snapshot (zero partial migration) — a corrupt vault is refused, never migrated; emits one `SchemaMigrated` per applied step (from == to == the current state, each carrying its from → to versions), always on success; the read-only `migrate_dry_run` previews the step/field plan with zero write impact |
 | `initialize_mint(mint)`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `mint` is the base58 SPL mint address — must decode to 32 bytes, zero address rejected) |
 | `initialize_mint_allowlist(mints)` (AV-157) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; up to 8 base58 SPL mint addresses — empty list disables the allowlist; `with_mint` thereafter rejects unlisted mints with `MintNotAllowlisted`, code 217) |
-| `initialize_governance_delay(delay_secs)` (AV-158) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; the opt-in delay window in seconds for the dual-signed config changes (the four AV-158 actions plus the eleven AV-335 actions) — `0` is `InvalidGovernanceDelay`, code 220; once set, `update_quorum` / `update_attestors` / `rotate_taker` / `update_payout_allowlist` move only through the propose → delay → execute/cancel protocol) |
+| `initialize_governance_delay(delay_secs)` (AV-158) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; the opt-in delay window in seconds for the dual-signed config changes (the four AV-158 actions, the eleven AV-335 actions and the two AV-336 split-shares halves) — `0` is `InvalidGovernanceDelay`, code 220; once set, `update_quorum` / `update_attestors` / `rotate_taker` / `update_payout_allowlist` move only through the propose → delay → execute/cancel protocol) |
 | `amend_governance_delay(initializer, taker, new_delay_secs)` (AV-334) | `Funded` | — (no state change; rewrites `governance_delay_secs` in place) | **both** parties must sign (dual-signature governance — one party alone cannot move the other's veto window, paralleling `amend_interest_rate`); a paused escrow fails fast (`Paused`); `Uninitialized`, `Activated`, terminal states and `Disputed` are `InvalidStateTransition` (the window is locked in at funding — before funding the builder owns the opt-in, after funding only this revision moves it); `new_delay_secs == 0` is `InvalidGovernanceDelay` (code 220, the builder's gate unchanged — 0 is not a delay, and there is deliberately no clearing path back to 0, which would silently restore the immediate single-proposal path for the routed config changes); post-funding installation is allowed (`0 → X`, `X > 0`), lengthening and shortening are allowed (`X → Y`, `Y > 0`); revising to the current window is a no-op (succeeds, writes nothing, emits no event, paralleling `amend_interest_rate`); this method carries no routing gate (no `!via_delayed` branch — `GovernanceAction` has no delay variant and `execute_governance` is the only `via_delayed = true` caller, so a gated design would self-lock on a delay-on escrow; dual signature *is* the second signature, so no veto window is needed, and a mis-set window is always fixable by another dual-signed revision); only the window moves — a proposal already live keeps the `delay_secs` snapshotted at propose time and executes off that snapshot, so a revision neither accelerates nor delays a proposal in flight, and the new window governs only proposals staged after the revision; the 16 routed config changes keep following the live window; orthogonal to AV-158 (that is the delay mechanism itself, this item is the window), to AV-260 (that is the rate, this item is the meta-parameter window), to AV-261 (that is the price gate, this item is the window), to AV-266 (that is the keeper bounty per-crank amount, this item is the window), to AV-321 (that is the funding window, this item is the governance delay window), and to AV-333 (that is the compound-interest mode, this item is the window); emits `GovernanceDelayAmended` (discriminant 162), all amounts zero, except for the no-op re-affirmation |
 | `propose_governance(action)` (AV-158) | any | — (no state change; stages the action) | initializer **or** taker (`Unauthorized` otherwise); records the action + proposer + timestamp; re-proposing replaces a live proposal and restarts the delay clock; a paused escrow fails fast (`Paused`); emits `GovernanceProposed` |
 | `execute_governance()` (AV-158) | any | — (applies the staged config change) | initializer **or** taker (`Unauthorized` otherwise); runs only when `now >= proposed_at + governance_delay_secs` (`GovernanceDelayNotElapsed`, code 218, otherwise) and a proposal is live (`GovernanceActionNotProposed`, code 219, otherwise); a paused escrow fails fast (`Paused`); clears the proposal on success; emits `GovernanceExecuted` |
@@ -2263,10 +2263,10 @@ is unchanged. The freeze is scoped to the taker's schedule-priced
 
 ### Delayed governance (AV-158)
 
-The fifteen dual-signed config changes — the original four
+The seventeen dual-signed config changes — the original four
 (`update_quorum`, `update_attestors`, `rotate_taker`,
-`update_payout_allowlist`) plus the eleven AV-335 actions listed
-below — can opt in to a propose → delay → execute/cancel protocol via
+`update_payout_allowlist`) plus the eleven AV-335 actions and the
+two AV-336 split-shares halves listed below — can opt in to a propose → delay → execute/cancel protocol via
 `initialize_governance_delay(delay_secs)`. The delay is a
 flash-governance defense: if an attestor goes dark, a malicious
 threshold change cannot take effect immediately.
@@ -2350,10 +2350,13 @@ own code and stays live for retry or cancel.
 | 12 | `UpdateSettlementMintAllowlist { mints, count }` | `update_settlement_mint_allowlist` | `Funded` |
 | 13 | `UpdateTieredQuorum { tiers, count }` | `update_tiered_quorum` | `Funded` |
 | 14 | `UpdateArbiterPanelMembers { members, count }` | `update_arbiter_panel_members` | `Funded` |
+| 15 | `AmendPayoutSplitSharesFirst { keys, amounts, count }` | `amend_payout_split_shares` (first half) | `Funded` |
+| 16 | `AmendPayoutSplitSharesSecond { keys, amounts, count }` | `amend_payout_split_shares` (second half) | `Funded` |
 
 `AmendFundingStart` is the only new action proposable before
 funding — the funding window moves only while no funds have landed.
-The ten `Funded`-only actions are deliberately *not* proposable
+The twelve `Funded`-only actions (the ten AV-335 actions plus the
+two AV-336 split-shares halves) are deliberately *not* proposable
 pre-funding: staging one early would succeed at propose time and
 fail at execute time, breaking the propose-time fail-fast design.
 `now`-dependent checks (the vesting anti-clawback floor, the
@@ -2363,11 +2366,19 @@ at execution with the inner transition's code and leaves the
 proposal live.
 
 Two known edges, both pinned by test rather than silent.
-`amend_payout_split_shares` is deliberately excluded: its 16-entry
-table needs 641 bytes, which cannot fit the 321-byte fixed
-`GovernanceAction` payload, so on a delay-on escrow it keeps
-refusing direct calls with code 219 until AV-336 gives it a path
-(payload growth or a split proposal). And a funding-start proposal
+`amend_payout_split_shares` was deliberately excluded by AV-335 on
+the belief that its table needs 641 bytes, which cannot fit the
+321-byte fixed `GovernanceAction` payload — that belief was wrong:
+the live table caps at 8 entries (`MAX_RELEASE_SPLIT_RECIPIENTS`),
+so AV-336 stages it as two half-table variants (kind 15/16, each
+half exactly one payload). Each execution arm merges its half with
+the live table and re-runs the full inner transition, so a half
+whose merged table no longer applies fails with the inner
+transition's code and stays live. One consequence of the 8-entry
+cap: the first half carries the whole live table in practice, and
+a non-empty second half has no live slots to govern — it is refused
+at propose time with `InvalidPayoutSplit` (code 167), while the
+empty second half executes as a no-op. And a funding-start proposal
 staged while `Uninitialized` goes stale if the escrow funds before
 the delay elapses: execute then fails `InvalidStateTransition`
 (code 101), the proposal stays live, and either party must cancel

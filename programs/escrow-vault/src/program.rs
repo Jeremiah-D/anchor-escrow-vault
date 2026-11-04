@@ -3941,8 +3941,9 @@ pub mod escrow_vault {
     /// `initialize_quorum`: the delay window is fixed before funds
     /// move. `0` is `InvalidGovernanceDelay` (a zero window is not a
     /// delay); once set, the dual-signed config changes (the four
-    /// AV-158 actions plus the eleven AV-335 actions) move only
-    /// through the propose → delay → execute/cancel protocol.
+    /// AV-158 actions, the eleven AV-335 actions and the two AV-336
+    /// split-shares halves) move only through the propose → delay →
+    /// execute/cancel protocol.
     pub fn initialize_governance_delay(
         ctx: Context<InitializeGovernanceDelay>,
         delay_secs: u64,
@@ -7234,9 +7235,9 @@ pub struct MintAllowlist {
 }
 
 /// Skeleton mirror of `escrow_state::GovernanceAction` (AV-158,
-/// AV-335): the staged governance action — one of the dual-signed
-/// config changes. The `UpdateAttestors` variant carries fixed-size
-/// arrays (only the first `count` entries are live).
+/// AV-335, AV-336): the staged governance action — one of the
+/// dual-signed config changes. The `UpdateAttestors` variant carries
+/// fixed-size arrays (only the first `count` entries are live).
 #[derive(
     AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq,
 )]
@@ -7278,6 +7279,18 @@ pub enum GovernanceAction {
     UpdateTieredQuorum { tiers: [Tier; 4], count: u8 },
     /// Replace the arbiter panel roster (AV-335).
     UpdateArbiterPanelMembers { members: [[u8; 32]; 8], count: u8 },
+    /// Revise the first half of the payout-split shares (AV-336).
+    AmendPayoutSplitSharesFirst {
+        keys: [[u8; 32]; 8],
+        amounts: [u64; 8],
+        count: u8,
+    },
+    /// Revise the second half of the payout-split shares (AV-336).
+    AmendPayoutSplitSharesSecond {
+        keys: [[u8; 32]; 8],
+        amounts: [u64; 8],
+        count: u8,
+    },
 }
 
 /// Skeleton mirror of `escrow_state::Tier` (AV-335): one amount tier
@@ -10843,6 +10856,38 @@ fn convert_governance_action(
             }
             escrow_state::GovernanceAction::update_arbiter_panel_members(&members[..count as usize])
                 .ok_or_else(|| escrow_error(escrow_state::EscrowError::InvalidArbiterPanel))
+        }
+        GovernanceAction::AmendPayoutSplitSharesFirst {
+            keys,
+            amounts,
+            count,
+        } => {
+            if count as usize > 8 {
+                return Err(escrow_error(escrow_state::EscrowError::InvalidPayoutSplit));
+            }
+            let shares: Vec<([u8; 32], u64)> = keys[..count as usize]
+                .iter()
+                .zip(amounts[..count as usize].iter())
+                .map(|(k, a)| (*k, *a))
+                .collect();
+            escrow_state::GovernanceAction::amend_payout_split_shares_first(&shares)
+                .ok_or_else(|| escrow_error(escrow_state::EscrowError::InvalidPayoutSplit))
+        }
+        GovernanceAction::AmendPayoutSplitSharesSecond {
+            keys,
+            amounts,
+            count,
+        } => {
+            if count as usize > 8 {
+                return Err(escrow_error(escrow_state::EscrowError::InvalidPayoutSplit));
+            }
+            let shares: Vec<([u8; 32], u64)> = keys[..count as usize]
+                .iter()
+                .zip(amounts[..count as usize].iter())
+                .map(|(k, a)| (*k, *a))
+                .collect();
+            escrow_state::GovernanceAction::amend_payout_split_shares_second(&shares)
+                .ok_or_else(|| escrow_error(escrow_state::EscrowError::InvalidPayoutSplit))
         }
     }
 }

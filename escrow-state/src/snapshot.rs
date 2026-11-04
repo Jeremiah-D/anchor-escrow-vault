@@ -1255,6 +1255,43 @@ fn write_governance_action(s: &mut String, action: &GovernanceAction) {
             }
             s.push_str("]}");
         }
+        GovernanceAction::AmendPayoutSplitSharesFirst {
+            keys,
+            amounts,
+            count,
+        }
+        | GovernanceAction::AmendPayoutSplitSharesSecond {
+            keys,
+            amounts,
+            count,
+        } => {
+            // AV-336: the two halves share the JSON shape; the kind
+            // string tells them apart.
+            let kind = if matches!(action, GovernanceAction::AmendPayoutSplitSharesFirst { .. }) {
+                "amend_payout_split_shares_first"
+            } else {
+                "amend_payout_split_shares_second"
+            };
+            s.push_str("{\"kind\":\"");
+            s.push_str(kind);
+            s.push_str("\",\"keys\":[");
+            for i in 0..*count as usize {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push('"');
+                s.push_str(&hex32(&keys[i]));
+                s.push('"');
+            }
+            s.push_str("],\"amounts\":[");
+            for i in 0..*count as usize {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&amounts[i].to_string());
+            }
+            s.push_str("]}");
+        }
     }
 }
 
