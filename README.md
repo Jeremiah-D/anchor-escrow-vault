@@ -7738,6 +7738,28 @@ settle-or-refund together — atomicity without a trusted relayer.
   `current_slot >= expiry_slot` (inclusive — refunding *at* expiry
   succeeds). The maker cannot race the taker's open window
   (`HtlcRefundNotExpired`).
+- **Revising the claim window (AV-339)**:
+  `HtlcLock::amend_htlc_expiry_slot(maker, taker, new_expiry_slot,
+  current_slot)` moves only `expiry_slot` — hashlock, amount, maker,
+  taker, and state are untouched — so the two legs of an atomic swap
+  can coordinate timeouts when the counterparty chain's lock is
+  delayed or re-locked, instead of abandoning the lock and rebuilding
+  it with a new hashlock and fresh funding. Both parties must sign
+  (a stranger, the maker alone, or the taker alone gets
+  `Unauthorized`, code 100 — one side alone could rewrite the other
+  side's claim/refund boundary); `Claimed` / `Refunded` locks refuse
+  with `InvalidStateTransition` (code 101); a new window at or before
+  the current slot fails with `InvalidHtlcLock` (code 251, reusing
+  `new()`'s threshold), and the value gate runs before the no-op
+  check, so re-affirming an already-lapsed window fails rather than
+  silently succeeding (mirroring `amend_option_expiry`, AV-299).
+  Re-affirming the current window in a live window is `Ok(())` and
+  changes nothing. `claim`, `refund`, `can_claim`, and
+  `claim_window_open` all read the live value, so the new window
+  governs the next evaluation; an action already executed keeps the
+  window it settled under. No event layer exists on `HtlcLock` (like
+  `OptionEscrow`), so no event is emitted, and there is no Vault
+  layout change. (Solana: HTLC / atomic-swap timeout coordination.)
 - **Orthogonality**: AV-185's `release_authorization_hash` unlocks
   with an EVM *signature* — this unlocks with a hash *preimage*;
   AV-137's commit-reveal hides an arbitration *vote* — this hides the
