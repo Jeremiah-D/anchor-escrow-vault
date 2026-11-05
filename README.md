@@ -7113,6 +7113,19 @@ much*.
   when the cap is unlimited, so `used_by` stays an honest spend
   meter); failed calls book nothing. Bad configuration fails at
   construction (`InvalidSponsorPolicy`, code 225).
+- **Revising the spend caps (AV-352)**: `amend_spend_caps(new_per_tx_cap,
+  new_cumulative_cap) -> bool` swaps both caps atomically in place —
+  no `new()` rebuild, so booked `used` is never reset (a rebuild
+  would silently forgive spent allowance). Amending to the pair already
+  in force is a `false` no-op; any other pair returns `true` and
+  governs the next `authorize`. Tightening the cumulative cap below
+  already-booked `used` does not error or clear the books — it locks
+  the remaining allowance fail-closed: the next `authorize` for that
+  sponsor returns `SponsorCumulativeCapExceeded` (code 229) until the
+  cap is loosened again. `0` on either cap means unlimited. This is
+  Solana keeper-ops / payments-fintech governance: the operator
+  revises spend authority live without touching the allowlist, the
+  window, or the budget audit ring.
 - **The budget**: `SponsorBudget` is the keeper's fee-budget
   accounting. `fund` tops it up; `deduct(amount, sponsor, escrow,
   at)` spends it — a short deduct fails with `SponsorBudgetExhausted`

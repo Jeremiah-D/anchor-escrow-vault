@@ -173,6 +173,60 @@ impl SponsorPolicy {
             .map(|i| self.used[i])
     }
 
+    /// Revise the spend caps live (AV-352), without rebuilding the
+    /// policy. Any `u64` pair is legal — `0` is the unlimited
+    /// sentinel for either cap — so this returns `bool`, not
+    /// `Result`, following the AV-349 `amend_retry_policy` precedent:
+    /// there is no failable input and no never-triggered error to
+    /// invent. Amending to the pair already in force is a no-op
+    /// returning `false`; any other pair atomically swaps BOTH caps
+    /// (a single-field change still returns `true`, the other field
+    /// untouched) and returns `true`.
+    ///
+    /// `used` is NEVER touched: no reset, no pro-rata rescaling.
+    /// Rebuilding via [`new`](Self::new) zeroes `used` — a sponsor
+    /// who spent 24,000/25,000 would silently get a fresh 25,000 —
+    /// which is exactly the forgiveness this revision path exists
+    /// to avoid. Already-booked authorizations stay booked.
+    /// Tightening the cumulative cap below already-booked `used`
+    /// does NOT error and does NOT clear the books: the next
+    /// [`authorize`](Self::authorize) for that sponsor returns
+    /// [`EscrowError::SponsorCumulativeCapExceeded`] — a fail-closed
+    /// "revoke the remaining allowance". It stays locked because
+    /// `used` only grows (there is no un-book entry), so a later
+    /// loosening is the only way back in. Tightening the per-tx cap
+    /// never permanently locks a sponsor — each transaction is
+    /// judged alone. Loosening either cap takes effect from the next
+    /// `authorize`, which always reads the live values.
+    ///
+    /// No state gate: `SponsorPolicy` is an off-chain keeper-side
+    /// policy object, so revision is an operator-side act, not a
+    /// Vault state transition. No audit event fires — this module
+    /// has no amend audit surface (the only audit surface is
+    /// [`SponsorBudget`]'s 64-entry ring, which this revision does
+    /// not touch) — so the revision behaviour is pinned by tests,
+    /// as in AV-349/AV-350/AV-351.
+    pub fn amend_spend_caps(&mut self, new_per_tx_cap: u64, new_cumulative_cap: u64) -> bool {
+        if self.per_tx_cap == new_per_tx_cap && self.cumulative_cap == new_cumulative_cap {
+            return false;
+        }
+        self.per_tx_cap = new_per_tx_cap;
+        self.cumulative_cap = new_cumulative_cap;
+        true
+    }
+
+    /// The per-transaction lamport cap currently in force (`0` =
+    /// unlimited).
+    pub fn per_tx_cap(&self) -> u64 {
+        self.per_tx_cap
+    }
+
+    /// The per-sponsor cumulative lamport cap currently in force
+    /// (`0` = unlimited).
+    pub fn cumulative_cap(&self) -> u64 {
+        self.cumulative_cap
+    }
+
     /// The pre-submit gate: authorize `sponsor` to pay
     /// `amount_lamports` of fee at `now`. Check order —
     /// sponsor-allowlisted ([`EscrowError::SponsorNotAllowed`]), then
@@ -495,6 +549,159 @@ mod sponsor_tests {
         b.deduct(5_000, SPONSOR_A, ESCROW_X, 0).unwrap();
         assert_eq!(b.balance(), 95_000);
         assert_eq!(p.used_by(&SPONSOR_A), Some(5_000));
+    }
+
+    #[test]
+    fn cap_getters_read_construction_values() {
+        let p = policy();
+        assert_eq!(p.per_tx_cap(), 10_000);
+        assert_eq!(p.cumulative_cap(), 25_000);
+    }
+
+    #[test]
+    fn amend_spend_caps_revises_both_caps() {
+        let mut p = policy();
+        assert!(p.amend_spend_caps(5_000, 50_000));
+        assert_eq!(p.per_tx_cap(), 5_000);
+        assert_eq!(p.cumulative_cap(), 50_000);
+    }
+
+    #[test]
+    fn amend_spend_caps_same_pair_is_noop() {
+        let mut p = policy();
+        assert!(!p.amend_spend_caps(10_000, 25_000));
+        assert_eq!(p.per_tx_cap(), 10_000);
+        assert_eq!(p.cumulative_cap(), 25_000);
+    }
+
+    #[test]
+    fn amend_spend_caps_single_field_change() {
+        let mut p = policy();
+        // Only the cumulative cap moves; per-tx stays put — still true.
+        assert!(p.amend_spend_caps(10_000, 40_000));
+        assert_eq!(p.per_tx_cap(), 10_000);
+        assert_eq!(p.cumulative_cap(), 40_000);
+        // Only the per-tx cap moves this time.
+        assert!(p.amend_spend_caps(7_000, 40_000));
+        assert_eq!(p.per_tx_cap(), 7_000);
+        assert_eq!(p.cumulative_cap(), 40_000);
+    }
+
+    #[test]
+    fn amend_spend_caps_zero_means_unlimited() {
+        let mut p = policy();
+        assert!(p.amend_spend_caps(0, 0));
+        // Amounts over both old caps now pass.
+        assert!(p.authorize(&SPONSOR_A, 20_000, 1_500).is_ok());
+        assert!(p.authorize(&SPONSOR_A, 30_000, 1_500).is_ok());
+        assert_eq!(p.used_by(&SPONSOR_A), Some(50_000));
+    }
+
+    #[test]
+    fn tighten_cumulative_below_used_locks_remaining_allowance() {
+        let mut p = policy();
+        assert!(p.authorize(&SPONSOR_A, 10_000, 1_500).is_ok());
+        assert!(p.authorize(&SPONSOR_A, 10_000, 1_500).is_ok());
+        assert_eq!(p.used_by(&SPONSOR_A), Some(20_000));
+        // Tighten below the booked 20_000: no error, books untouched.
+        assert!(p.amend_spend_caps(10_000, 15_000));
+        assert_eq!(p.used_by(&SPONSOR_A), Some(20_000));
+        // Fail-closed: the next authorize is refused, and books
+        // nothing — the sponsor stays locked until loosened.
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 1, 1_500),
+            Err(EscrowError::SponsorCumulativeCapExceeded)
+        );
+        assert_eq!(p.used_by(&SPONSOR_A), Some(20_000));
+    }
+
+    #[test]
+    fn loosen_cumulative_reopens_authorize() {
+        let mut p = policy();
+        assert!(p.authorize(&SPONSOR_A, 10_000, 1_500).is_ok());
+        assert!(p.authorize(&SPONSOR_A, 10_000, 1_500).is_ok());
+        assert!(p.amend_spend_caps(10_000, 15_000));
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 1, 1_500),
+            Err(EscrowError::SponsorCumulativeCapExceeded)
+        );
+        // Loosening is the only way back in.
+        assert!(p.amend_spend_caps(10_000, 30_000));
+        assert!(p.authorize(&SPONSOR_A, 5_000, 1_500).is_ok());
+        assert_eq!(p.used_by(&SPONSOR_A), Some(25_000));
+    }
+
+    #[test]
+    fn tighten_per_tx_gate_reads_live_value() {
+        let mut p = policy();
+        assert!(p.amend_spend_caps(5_000, 25_000));
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 10_000, 1_500),
+            Err(EscrowError::SponsorAmountExceedsPerTxCap)
+        );
+        // A failed authorize books nothing.
+        assert_eq!(p.used_by(&SPONSOR_A), Some(0));
+        // In-limit authorizes book normally under the new cap.
+        assert!(p.authorize(&SPONSOR_A, 5_000, 1_500).is_ok());
+        assert_eq!(p.used_by(&SPONSOR_A), Some(5_000));
+    }
+
+    #[test]
+    fn amend_spend_caps_does_not_reset_used() {
+        let mut p = policy();
+        assert!(p.authorize(&SPONSOR_A, 10_000, 1_500).is_ok());
+        assert!(p.authorize(&SPONSOR_A, 10_000, 1_500).is_ok());
+        // Unlike a `new()` rebuild, revision keeps the books.
+        assert!(p.amend_spend_caps(5_000, 50_000));
+        assert_eq!(p.used_by(&SPONSOR_A), Some(20_000));
+    }
+
+    #[test]
+    fn amend_spend_caps_does_not_touch_allowlist_or_window() {
+        let mut p = policy();
+        assert!(p.amend_spend_caps(5_000, 50_000));
+        // Non-allowlisted sponsors are still refused first.
+        assert_eq!(
+            p.authorize(&[0xCC; 32], 100, 1_500),
+            Err(EscrowError::SponsorNotAllowed)
+        );
+        // The window is untouched: out-of-window is still refused.
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 100, 999),
+            Err(EscrowError::SponsorWindowInactive)
+        );
+    }
+
+    #[test]
+    fn amend_spend_caps_does_not_touch_budget() {
+        let mut p = policy();
+        let mut b = SponsorBudget::new();
+        b.fund(5_000);
+        b.deduct(2_000, SPONSOR_A, ESCROW_X, 123).unwrap();
+        assert!(p.amend_spend_caps(5_000, 50_000));
+        assert_eq!(b.balance(), 3_000);
+        assert_eq!(b.total_funded(), 5_000);
+        assert_eq!(b.total_spent(), 2_000);
+        assert_eq!(b.audit().len(), 1);
+    }
+
+    #[test]
+    fn repeated_revisions_each_take_effect() {
+        let mut p = policy();
+        assert!(p.amend_spend_caps(8_000, 20_000));
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 9_000, 1_500),
+            Err(EscrowError::SponsorAmountExceedsPerTxCap)
+        );
+        assert!(p.amend_spend_caps(12_000, 20_000));
+        assert!(p.authorize(&SPONSOR_A, 9_000, 1_500).is_ok());
+        assert!(p.amend_spend_caps(12_000, 9_000));
+        // 9_000 booked already meets the tightened cumulative cap.
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 1, 1_500),
+            Err(EscrowError::SponsorCumulativeCapExceeded)
+        );
+        assert_eq!(p.used_by(&SPONSOR_A), Some(9_000));
     }
 
     #[test]
