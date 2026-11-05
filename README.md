@@ -7186,6 +7186,20 @@ this module *detects dead operators and reassigns their work*.
   them does not revive a keeper already latched unhealthy — `scan`
   only latches healthy → unhealthy, and recovery still needs a fresh
   heartbeat. `config()` reads the thresholds currently in force.
+- **Revising the notify retry policy (AV-349)**: `NotifyDispatcher::amend_retry_policy(new_retry)`
+  revises the AV-118 keeper push retry policy live — the input is
+  normalized with the same rules as `RetryPolicy::new`
+  (`max_attempts` clamps to `[1, 16]`, `max_backoff_ms` is raised to
+  `base_backoff_ms` when lower), amending to the policy already in
+  force (after normalization) is a no-op returning `false`, and any
+  other policy replaces `config.retry` wholesale and returns `true`.
+  Only the three retry fields move — `enabled`, `secret`, and `key_id`
+  are untouched, the queue keeps its already-signed payloads as-is,
+  and the stats keep accumulating. The new policy governs the next
+  `pump` (every attempt reads the live config); there is no revision
+  entry mid-pump, and a delivery already popped continues with its
+  popped attempt count. `retry_policy()` reads the policy currently
+  in force.
 
 Honest scope: the registry is off-chain fleet state, not an on-chain
 account — the caller feeds `current_slot` / `now` (the crate has no

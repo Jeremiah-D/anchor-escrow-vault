@@ -710,6 +710,44 @@ impl NotifyDispatcher {
     pub fn pending(&self) -> usize {
         self.queue.len()
     }
+
+    /// Revise the retry policy live (AV-349). The input is normalized
+    /// first, with the same rules as [`RetryPolicy::new`]:
+    /// `max_attempts` clamps to `[1, 16]`, and `max_backoff_ms` is
+    /// raised to `base_backoff_ms` when lower. Amending to the policy
+    /// already in force (after normalization) is a no-op returning
+    /// `false`: nothing moves and no audit event fires — this module
+    /// has no audit ring, so the revision is pinned by tests, as in
+    /// AV-316 ([`HeartbeatRegistry::amend_config`](super::keeper_heartbeat::HeartbeatRegistry::amend_config)).
+    /// Any other policy replaces `config.retry` wholesale and returns
+    /// `true`.
+    ///
+    /// Only the three retry fields move: `enabled`, `secret`, and
+    /// `key_id` are untouched, the queue keeps its already-signed
+    /// payloads as-is, and the stats keep accumulating. The new
+    /// policy governs the next [`pump`](Self::pump) — every attempt
+    /// reads the live config — but there is no revision entry
+    /// mid-pump: `pump` takes `&mut self` and runs single-threaded,
+    /// so no outside caller can amend while a pump is in flight; a
+    /// delivery already popped continues with its popped attempt
+    /// count, it is never reset.
+    pub fn amend_retry_policy(&mut self, new_retry: RetryPolicy) -> bool {
+        let normalized = RetryPolicy::new(
+            new_retry.max_attempts,
+            new_retry.base_backoff_ms,
+            new_retry.max_backoff_ms,
+        );
+        if self.config.retry == normalized {
+            return false;
+        }
+        self.config.retry = normalized;
+        true
+    }
+
+    /// The retry policy currently in force.
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.config.retry
+    }
 }
 
 #[cfg(test)]
@@ -1187,5 +1225,234 @@ mod keeper_notify_tests {
         dispatcher.pump(&mut notifier, &mut |_| {});
         assert_eq!(report.to_json(), before);
         assert_eq!(dispatcher.stats().enqueued, 0); // empty report → no events
+    }
+
+    // -- live retry-policy revision (AV-349) --------------------------------
+
+    #[test]
+    fn amend_retry_policy_normalizes_input() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        // Default policy is 4 attempts / 500ms / 8s.
+        assert_eq!(dispatcher.retry_policy(), RetryPolicy::default());
+
+        // max_attempts 0 clamps to 1.
+        assert!(dispatcher.amend_retry_policy(RetryPolicy::new(0, 500, 8_000)));
+        assert_eq!(dispatcher.retry_policy().max_attempts, 1);
+        // max_attempts 99 clamps to MAX_ATTEMPTS.
+        assert!(dispatcher.amend_retry_policy(RetryPolicy::new(99, 100, 1_000)));
+        assert_eq!(dispatcher.retry_policy().max_attempts, RetryPolicy::MAX_ATTEMPTS);
+        // max_backoff_ms below base is raised to base.
+        assert!(dispatcher.amend_retry_policy(RetryPolicy::new(4, 500, 100)));
+        assert_eq!(dispatcher.retry_policy().max_backoff_ms, 500);
+        assert_eq!(dispatcher.retry_policy().base_backoff_ms, 500);
+    }
+
+    #[test]
+    fn amend_retry_policy_same_value_is_a_noop() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        // Amending to the policy already in force is a no-op.
+        assert!(!dispatcher.amend_retry_policy(RetryPolicy::default()));
+        assert_eq!(dispatcher.retry_policy(), RetryPolicy::default());
+        // Normalization counts: 0 attempts normalizes to 1, which is
+        // the live value once the dispatcher was set to 1 — so the
+        // normalized-equal amend is a no-op too.
+        assert!(dispatcher.amend_retry_policy(RetryPolicy::new(1, 500, 8_000)));
+        assert!(!dispatcher.amend_retry_policy(RetryPolicy::new(0, 500, 8_000)));
+        assert_eq!(dispatcher.retry_policy().max_attempts, 1);
+    }
+
+    #[test]
+    fn amend_retry_policy_replaces_policy_and_getter_reads_it() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let widened = RetryPolicy::new(8, 250, 4_000);
+        assert!(dispatcher.amend_retry_policy(widened));
+        assert_eq!(dispatcher.retry_policy(), widened);
+        // enabled/secret/key_id are untouched by the revision — a
+        // fresh push still signs under the same key id.
+        let report = report_with(vec![action(
+            KeeperActionKind::Claim,
+            0x01,
+            "taker",
+            "vesting_unlocked",
+        )]);
+        dispatcher.push_report(&report, None, None);
+        let mut notifier = RecordingNotifier::new();
+        dispatcher.pump(&mut notifier, &mut |_| {});
+        assert_eq!(notifier.delivered.len(), 1);
+        assert!(notifier.delivered[0]
+            .signature_header
+            .starts_with("key-id=keeper-01,"));
+    }
+
+    #[test]
+    fn amend_retry_policy_keeps_queue_and_signatures() {
+        // Two dispatchers, same config, same report: the amended one
+        // must deliver byte-identical payloads to the untouched one.
+        let report = report_with(vec![
+            action(KeeperActionKind::CancelExpired, 0x01, "initializer", "expired"),
+            action(KeeperActionKind::Claim, 0x02, "taker", "vesting_unlocked"),
+        ]);
+        let mut amended = NotifyDispatcher::new(enabled_config());
+        let mut control = NotifyDispatcher::new(enabled_config());
+        amended.push_report(&report, None, None);
+        control.push_report(&report, None, None);
+        assert_eq!(amended.pending(), 2);
+
+        assert!(amended.amend_retry_policy(RetryPolicy::new(8, 250, 4_000)));
+        assert_eq!(amended.pending(), 2); // queue untouched
+
+        let mut amended_notifier = RecordingNotifier::new();
+        let mut control_notifier = RecordingNotifier::new();
+        amended.pump(&mut amended_notifier, &mut |_| {});
+        control.pump(&mut control_notifier, &mut |_| {});
+        assert_eq!(amended_notifier.delivered, control_notifier.delivered);
+    }
+
+    #[test]
+    fn amend_retry_policy_keeps_stats() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let report = report_with(vec![action(
+            KeeperActionKind::Claim,
+            0x01,
+            "taker",
+            "vesting_unlocked",
+        )]);
+        dispatcher.push_report(&report, None, None);
+        let mut notifier = RecordingNotifier::failing(1);
+        dispatcher.pump(&mut notifier, &mut |_| {});
+        let before = dispatcher.stats();
+        assert_eq!(before.enqueued, 1);
+        assert_eq!(before.delivered, 1);
+        assert_eq!(before.retries, 1);
+        assert_eq!(before.dropped, 0);
+
+        assert!(dispatcher.amend_retry_policy(RetryPolicy::new(8, 250, 4_000)));
+        assert_eq!(dispatcher.stats(), before); // stats untouched
+
+        // Counters keep accumulating across the revision.
+        dispatcher.push_report(&report, None, None);
+        let mut notifier = RecordingNotifier::new();
+        dispatcher.pump(&mut notifier, &mut |_| {});
+        let after = dispatcher.stats();
+        assert_eq!(after.enqueued, 2);
+        assert_eq!(after.delivered, 2);
+        assert_eq!(after.retries, 1);
+        assert_eq!(after.dropped, 0);
+    }
+
+    #[test]
+    fn pump_drops_earlier_under_tightened_max_attempts() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let report = report_with(vec![action(
+            KeeperActionKind::Claim,
+            0x01,
+            "taker",
+            "vesting_unlocked",
+        )]);
+        dispatcher.push_report(&report, None, None);
+        // Tighten from the default 4 attempts to 2.
+        assert!(dispatcher.amend_retry_policy(RetryPolicy::new(2, 500, 8_000)));
+
+        let mut notifier = RecordingNotifier::failing(100);
+        let mut sleeps: Vec<u64> = Vec::new();
+        dispatcher.pump(&mut notifier, &mut |ms| sleeps.push(ms));
+
+        assert_eq!(notifier.attempts, 2); // 1 initial + 1 retry
+        assert!(notifier.delivered.is_empty());
+        assert_eq!(sleeps, vec![500]);
+        let stats = dispatcher.stats();
+        assert_eq!(stats.retries, 1);
+        assert_eq!(stats.dropped, 1);
+    }
+
+    #[test]
+    fn pump_drops_later_under_widened_max_attempts() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let report = report_with(vec![action(
+            KeeperActionKind::Claim,
+            0x01,
+            "taker",
+            "vesting_unlocked",
+        )]);
+        dispatcher.push_report(&report, None, None);
+        // Widen from the default 4 attempts to 8.
+        assert!(dispatcher.amend_retry_policy(RetryPolicy::new(8, 500, 8_000)));
+
+        // Five transport failures, then success: under the old policy
+        // this delivery would have been dropped after 4 attempts.
+        let mut notifier = RecordingNotifier::failing(5);
+        let mut sleeps: Vec<u64> = Vec::new();
+        dispatcher.pump(&mut notifier, &mut |ms| sleeps.push(ms));
+
+        assert_eq!(notifier.attempts, 6);
+        assert_eq!(notifier.delivered.len(), 1);
+        assert_eq!(sleeps, vec![500, 1_000, 2_000, 4_000, 8_000]);
+        let stats = dispatcher.stats();
+        assert_eq!(stats.delivered, 1);
+        assert_eq!(stats.retries, 5);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    #[test]
+    fn pump_sleeps_per_new_delay_sequence() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let report = report_with(vec![action(
+            KeeperActionKind::Claim,
+            0x01,
+            "taker",
+            "vesting_unlocked",
+        )]);
+        dispatcher.push_report(&report, None, None);
+        // New base/cap: 100ms base, 250ms cap — 100, 200, 250, 250.
+        assert!(dispatcher.amend_retry_policy(RetryPolicy::new(16, 100, 250)));
+
+        let mut notifier = RecordingNotifier::failing(4);
+        let mut sleeps: Vec<u64> = Vec::new();
+        dispatcher.pump(&mut notifier, &mut |ms| sleeps.push(ms));
+
+        assert_eq!(notifier.attempts, 5);
+        assert_eq!(notifier.delivered.len(), 1);
+        assert_eq!(sleeps, vec![100, 200, 250, 250]);
+    }
+
+    #[test]
+    fn amend_retry_policy_on_disabled_dispatcher() {
+        let mut dispatcher = NotifyDispatcher::new(NotifyConfig::default());
+        // The revision still writes and is getter-visible on a
+        // disabled dispatcher…
+        assert!(dispatcher.amend_retry_policy(RetryPolicy::new(8, 250, 4_000)));
+        assert_eq!(dispatcher.retry_policy(), RetryPolicy::new(8, 250, 4_000));
+        // …but the push/pump gating is unchanged: disabled still
+        // enqueues nothing.
+        let report = report_with(vec![action(
+            KeeperActionKind::Claim,
+            0x01,
+            "taker",
+            "vesting_unlocked",
+        )]);
+        dispatcher.push_report(&report, None, None);
+        assert_eq!(dispatcher.pending(), 0);
+        assert_eq!(dispatcher.stats(), KeeperNotifyStats::default());
+        let mut notifier = RecordingNotifier::new();
+        dispatcher.pump(&mut notifier, &mut |_| {});
+        assert_eq!(notifier.attempts, 0);
+    }
+
+    #[test]
+    fn repeated_revisions_back_and_forth_take_effect() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let wide = RetryPolicy::new(8, 250, 4_000);
+        let tight = RetryPolicy::new(2, 100, 200);
+        assert!(dispatcher.amend_retry_policy(wide));
+        assert_eq!(dispatcher.retry_policy(), wide);
+        assert!(dispatcher.amend_retry_policy(tight));
+        assert_eq!(dispatcher.retry_policy(), tight);
+        assert!(dispatcher.amend_retry_policy(wide));
+        assert_eq!(dispatcher.retry_policy(), wide);
+        // And back to the default is a real revision too.
+        assert!(dispatcher.amend_retry_policy(RetryPolicy::default()));
+        assert_eq!(dispatcher.retry_policy(), RetryPolicy::default());
+        // Repeating the live value is a no-op.
+        assert!(!dispatcher.amend_retry_policy(RetryPolicy::default()));
     }
 }
