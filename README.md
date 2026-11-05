@@ -7825,6 +7825,37 @@ settle-or-refund together — atomicity without a trusted relayer.
   under. No event layer exists on `HtlcLock`, so no event is emitted,
   and there is no Vault layout change. (Solana: cross-chain atomic
   swap / payment fintech.)
+- **Revising the taker (AV-344)**:
+  `HtlcLock::amend_htlc_taker(maker, taker, new_taker, current_slot)`
+  moves only `taker` — maker, hashlock, amount, `expiry_slot`, and
+  state are untouched — so a mis-addressed taker (old address,
+  associated address, rotated wallet) can be corrected instead of
+  abandoning the lock and rebuilding it with fresh funding; before
+  this, every claim by the rightful party failed `check_claim` with
+  `Unauthorized` and the funds sat locked until `expiry_slot`, when
+  only the maker could refund. Both parties must sign (a stranger,
+  the maker alone, or the taker alone gets `Unauthorized`, code 100
+  — the maker alone could re-point the claim to their own address
+  and, holding the preimage, claim before expiry and steal the swap,
+  and the taker alone could transfer the claim right without the
+  funder's consent; the new taker does not co-sign, mirroring
+  `rotate_taker`, AV-52); `Claimed` / `Refunded` locks refuse with
+  `InvalidStateTransition` (code 101); a closed window refuses with
+  `HtlcClaimExpired` (code 254) — revising the taker cannot revive a
+  claim, revival needs AV-339's window extension first, also
+  dual-signed; a zero address fails with `InvalidHtlcLock` (code
+  251, reusing `new()`'s threshold). Re-affirming the current taker
+  is `Ok(())` and changes nothing, and the timelock gate runs before
+  the no-op check, so re-affirming in an expired window still fails.
+  `new_taker == maker` is not separately gated: dual signature is
+  both parties' consent to an early settlement in advance, and the
+  maker claiming with the known preimage is equivalent to an agreed
+  refund. `claim` and `can_claim` read the live taker, so the new
+  value governs the next evaluation; the refund path reads only the
+  maker and is unaffected; an action already executed keeps the taker
+  it settled under. No event layer exists on `HtlcLock`, so no event
+  is emitted, and there is no Vault layout change. (Solana:
+  cross-chain atomic swap / payment fintech.)
 - **Orthogonality**: AV-185's `release_authorization_hash` unlocks
   with an EVM *signature* — this unlocks with a hash *preimage*;
   AV-137's commit-reveal hides an arbitration *vote* — this hides the
