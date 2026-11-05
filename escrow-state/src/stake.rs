@@ -248,6 +248,35 @@ impl StakeDelegation {
         })
     }
 
+    /// Revise the taker's reward share (`reward_split_bps`).
+    ///
+    /// Only the initializer may revise the split — the split is the
+    /// initializer's unilateral grant of a share of the yield on its
+    /// own staked principal, and the module stores no taker key to
+    /// check a second signature against.
+    ///
+    /// Check order: authority (initializer) → value (`<= 10_000`).
+    /// Revising to the current value is an `Ok(())` no-op. There is
+    /// no state gate: every [`StakeState`] is revisable, and the new
+    /// split applies from the next `Deactivated` settlement onward —
+    /// a settlement already executed keeps the split it settled at.
+    /// Only `reward_split_bps` changes; every other field is
+    /// untouched.
+    pub fn amend_reward_split_bps(
+        &mut self,
+        initializer: [u8; 32],
+        new_reward_split_bps: u16,
+    ) -> Result<(), StakeError> {
+        if initializer != self.initializer {
+            return Err(StakeError::NotInitializer);
+        }
+        if new_reward_split_bps > STAKE_BPS_DENOMINATOR {
+            return Err(StakeError::InvalidRewardSplit);
+        }
+        self.reward_split_bps = new_reward_split_bps;
+        Ok(())
+    }
+
     /// Record the keeper's observation that stake warmup finished:
     /// `Delegated → Active`. Idempotent — re-observing an active
     /// stake is a no-op.
@@ -707,6 +736,149 @@ mod tests {
         assert_eq!(s2.taker_rewards, 15_000);
         assert_eq!(s2.initializer_rewards, 15_000);
         assert_eq!(s2.principal_remaining_after, 0);
+    }
+
+    #[test]
+    fn amend_split_rejects_stranger_and_keeps_split() {
+        let mut d = delegated(1_000_000, 10);
+        assert_eq!(
+            d.amend_reward_split_bps(STRANGER, 8_000).unwrap_err(),
+            StakeError::NotInitializer
+        );
+        assert_eq!(d.reward_split_bps(), 5_000);
+    }
+
+    #[test]
+    fn amend_split_rejects_over_10000_and_keeps_split() {
+        let mut d = delegated(1_000_000, 10);
+        assert_eq!(
+            d.amend_reward_split_bps(INITIALIZER, 10_001).unwrap_err(),
+            StakeError::InvalidRewardSplit
+        );
+        assert_eq!(d.reward_split_bps(), 5_000);
+    }
+
+    #[test]
+    fn amend_split_accepts_zero_and_full_split() {
+        let mut d = delegated(1_000_000, 10);
+        // 0 = the taker takes no rewards.
+        d.amend_reward_split_bps(INITIALIZER, 0).unwrap();
+        assert_eq!(d.reward_split_bps(), 0);
+        // 10_000 = all rewards to the taker.
+        d.amend_reward_split_bps(INITIALIZER, 10_000).unwrap();
+        assert_eq!(d.reward_split_bps(), 10_000);
+    }
+
+    #[test]
+    fn amend_split_same_value_is_noop() {
+        let mut d = delegated(1_000_000, 10);
+        d.amend_reward_split_bps(INITIALIZER, 5_000).unwrap();
+        assert_eq!(d.reward_split_bps(), 5_000);
+        assert_eq!(d.state(), StakeState::Delegated);
+    }
+
+    /// Snapshot every field except `reward_split_bps`, so a test can
+    /// assert an amend left nothing else behind.
+    fn snapshot_except_split(d: &StakeDelegation) -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32], u64, u64, StakeState, u64, u64, u64) {
+        (
+            d.escrow_id(),
+            d.stake_account(),
+            d.vote_account(),
+            d.initializer(),
+            d.principal_lamports(),
+            d.principal_released(),
+            d.state(),
+            d.delegation_epoch(),
+            d.activation_epoch(),
+            d.deactivation_epoch(),
+        )
+    }
+
+    #[test]
+    fn amend_split_allowed_while_delegated() {
+        let mut d = delegated(1_000_000, 10);
+        let before = snapshot_except_split(&d);
+        d.amend_reward_split_bps(INITIALIZER, 8_000).unwrap();
+        assert_eq!(d.reward_split_bps(), 8_000);
+        assert_eq!(snapshot_except_split(&d), before);
+    }
+
+    #[test]
+    fn amend_split_allowed_while_active() {
+        let mut d = delegated(1_000_000, 10);
+        d.note_activation(11).unwrap();
+        let before = snapshot_except_split(&d);
+        d.amend_reward_split_bps(INITIALIZER, 2_500).unwrap();
+        assert_eq!(d.reward_split_bps(), 2_500);
+        assert_eq!(snapshot_except_split(&d), before);
+    }
+
+    #[test]
+    fn amend_split_allowed_while_deactivating() {
+        let mut d = delegated(1_000_000, 10);
+        d.note_activation(11).unwrap();
+        d.begin_deactivation(20).unwrap();
+        let before = snapshot_except_split(&d);
+        d.amend_reward_split_bps(INITIALIZER, 7_500).unwrap();
+        assert_eq!(d.reward_split_bps(), 7_500);
+        assert_eq!(snapshot_except_split(&d), before);
+    }
+
+    #[test]
+    fn amend_split_allowed_while_deactivated() {
+        let mut d = delegated(1_000_000, 10);
+        d.note_activation(11).unwrap();
+        d.begin_deactivation(20).unwrap();
+        d.note_deactivated(21).unwrap();
+        let before = snapshot_except_split(&d);
+        d.amend_reward_split_bps(INITIALIZER, 1_000).unwrap();
+        assert_eq!(d.reward_split_bps(), 1_000);
+        assert_eq!(snapshot_except_split(&d), before);
+    }
+
+    #[test]
+    fn settle_after_amend_uses_new_split() {
+        let mut d = delegated(1_000_000, 10);
+        d.note_activation(11).unwrap();
+        d.begin_deactivation(20).unwrap();
+        d.note_deactivated(21).unwrap();
+        // First leg settles at the original 50% split.
+        let s1 = d.settle(400_000, 1_050_000).unwrap();
+        assert_eq!(s1.taker_rewards, 25_000);
+        assert_eq!(s1.initializer_rewards, 25_000);
+        d.record_principal_release(s1.taker_principal).unwrap();
+        // Renegotiate to 80% before the remaining leg settles.
+        d.amend_reward_split_bps(INITIALIZER, 8_000).unwrap();
+        // The keeper observes the balance after the first payout
+        // landed: 600k remaining principal + 30k rewards.
+        let s2 = d.settle(600_000, 630_000).unwrap();
+        assert_eq!(s2.taker_rewards, 24_000);
+        assert_eq!(s2.initializer_rewards, 6_000);
+        assert_eq!(s2.principal_remaining_after, 0);
+    }
+
+    #[test]
+    fn failed_amend_calls_leave_no_state_change() {
+        let mut d = delegated(1_000_000, 10);
+        d.note_activation(11).unwrap();
+        let before = snapshot_except_split(&d);
+        // Stranger with a bad value, stranger with a good value, and
+        // initializer with a bad value: all fail, none moves anything.
+        assert!(d.amend_reward_split_bps(STRANGER, 10_001).is_err());
+        assert!(d.amend_reward_split_bps(STRANGER, 8_000).is_err());
+        assert!(d.amend_reward_split_bps(INITIALIZER, 10_001).is_err());
+        assert_eq!(d.reward_split_bps(), 5_000);
+        assert_eq!(snapshot_except_split(&d), before);
+    }
+
+    #[test]
+    fn amend_split_checks_authority_before_value() {
+        let mut d = delegated(1_000_000, 10);
+        // Both checks fail at once: the authority error wins.
+        assert_eq!(
+            d.amend_reward_split_bps(STRANGER, 10_001).unwrap_err(),
+            StakeError::NotInitializer
+        );
     }
 
     #[test]

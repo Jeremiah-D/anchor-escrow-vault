@@ -7563,6 +7563,18 @@ failure — the module never fabricates lamports. After the transfers
 land, the keeper calls `record_principal_release` so the sidecar's
 books stay exact.
 
+**Revising the reward split (AV-346).**
+`amend_reward_split_bps(initializer, new_reward_split_bps)` lets
+only the initializer revise the taker's reward share — correcting a
+mis-entered split or renegotiating the yield mid-delegation — without
+discarding the delegation and losing its epoch accounting. The value
+must be `<= 10_000` (0 = the taker takes no rewards, 10_000 = all
+rewards to the taker); revising to the current value is a no-op, and
+there is no state gate, so the split is revisable in any stake state
+and takes effect from the next `Deactivated` settlement onward
+(settlements already executed keep the split they settled at). Only
+`reward_split_bps` changes; every other field is untouched.
+
 ## RPC commitment levels for off-chain reads (AV-171)
 
 Every keeper RPC read carries a commitment level — how final the
