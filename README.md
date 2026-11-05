@@ -7200,6 +7200,21 @@ this module *detects dead operators and reassigns their work*.
   entry mid-pump, and a delivery already popped continues with its
   popped attempt count. `retry_policy()` reads the policy currently
   in force.
+- **Live enable/disable (AV-350)**: `NotifyDispatcher::amend_enabled(enabled)`
+  is the master on/off switch for the AV-118 keeper pushes, revised
+  live — disabling never fails (shutting off pushes needs no secret),
+  while enabling with an empty secret is refused with
+  `NotifyConfigError::EmptySecret` (an unsigned push would be a
+  forgery vector) and leaves the live state untouched; amending to the
+  value already in force is a no-op returning `false`, and any other
+  value replaces `config.enabled` only and returns `true`. Disabling
+  gates both `push_report` and `pump`: the signed pending queue is
+  preserved as-is and keeps delivering after a re-enable — nothing is
+  dropped, nothing is re-signed. Only `enabled` moves — `secret`,
+  `key_id`, the retry policy, the queue, and the stats are untouched,
+  and no audit event fires (the module has no audit ring). The new
+  switch governs the next `push_report` / `pump`; there is no revision
+  entry mid-pump. `is_enabled()` reads the switch currently in force.
 
 Honest scope: the registry is off-chain fleet state, not an on-chain
 account — the caller feeds `current_slot` / `now` (the crate has no

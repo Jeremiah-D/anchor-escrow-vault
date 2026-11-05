@@ -672,7 +672,15 @@ impl NotifyDispatcher {
     /// Never returns `Err`, never panics on notifier failure: failure
     /// is statistics, not control flow — the scan path stays unblocked
     /// by construction, because the scan never calls this.
+    ///
+    /// No-op while disabled ([`amend_enabled`](Self::amend_enabled)):
+    /// the queue is left exactly as it was, so a re-enable drains the
+    /// already-signed payloads — disabling never drops or re-signs
+    /// anything.
     pub fn pump(&mut self, notifier: &mut dyn KeeperNotifier, sleep: &mut dyn FnMut(u64)) {
+        if !self.config.enabled {
+            return;
+        }
         while let Some(delivery) = self.queue.pop_front() {
             let mut attempt: u8 = 0;
             loop {
@@ -747,6 +755,48 @@ impl NotifyDispatcher {
     /// The retry policy currently in force.
     pub fn retry_policy(&self) -> RetryPolicy {
         self.config.retry
+    }
+
+    /// Revise the master enable switch live (AV-350). Check order
+    /// value → secret → same → replace, following
+    /// [`HeartbeatRegistry::amend_config`](super::keeper_heartbeat::HeartbeatRegistry::amend_config)
+    /// and the AV-349 shape: disabling never fails — shutting off
+    /// pushes needs no secret; enabling with an empty secret fails
+    /// with [`NotifyConfigError::EmptySecret`] (the same guard as
+    /// [`NotifyConfig::new`]: an unsigned push would be a forgery
+    /// vector) and leaves the live state exactly as it was;
+    /// amending to the value already in force is a no-op returning
+    /// `Ok(false)` — nothing moves and no audit event fires; any
+    /// other value replaces `config.enabled` only and returns
+    /// `Ok(true)`.
+    ///
+    /// Disabling gates both [`push_report`](Self::push_report)
+    /// (which already reads the live switch) and [`pump`](Self::pump)
+    /// (which returns immediately while disabled): the signed pending
+    /// queue is preserved as-is and keeps delivering after a
+    /// re-enable — nothing is dropped, nothing is re-signed. Only
+    /// `enabled` moves: `secret`, `key_id`, the retry policy, the
+    /// queue, and the stats are untouched, and no audit event fires —
+    /// this module has no audit ring, so the revision is pinned by
+    /// tests, as in AV-316 and AV-349. The new switch governs the
+    /// next `push_report` / `pump` — every call reads the live
+    /// config — but there is no revision entry mid-pump: `pump`
+    /// takes `&mut self` and runs single-threaded, so no outside
+    /// caller can amend while a pump is in flight.
+    pub fn amend_enabled(&mut self, enabled: bool) -> Result<bool, NotifyConfigError> {
+        if enabled && self.config.secret.is_empty() {
+            return Err(NotifyConfigError::EmptySecret);
+        }
+        if self.config.enabled == enabled {
+            return Ok(false);
+        }
+        self.config.enabled = enabled;
+        Ok(true)
+    }
+
+    /// Whether pushes are currently enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.config.enabled
     }
 }
 
@@ -1454,5 +1504,236 @@ mod keeper_notify_tests {
         assert_eq!(dispatcher.retry_policy(), RetryPolicy::default());
         // Repeating the live value is a no-op.
         assert!(!dispatcher.amend_retry_policy(RetryPolicy::default()));
+    }
+
+    // -- live enable/disable revision (AV-350) ----------------------------
+
+    #[test]
+    fn amend_enabled_disable_stops_push_report() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let report = report_with(vec![action(
+            KeeperActionKind::Claim,
+            0x01,
+            "taker",
+            "vesting_unlocked",
+        )]);
+        dispatcher.push_report(&report, None, None);
+        assert_eq!(dispatcher.pending(), 1);
+        assert_eq!(dispatcher.stats().enqueued, 1);
+
+        assert_eq!(dispatcher.amend_enabled(false), Ok(true));
+        assert!(!dispatcher.is_enabled());
+        dispatcher.push_report(&report, None, None);
+        assert_eq!(dispatcher.pending(), 1); // nothing new enqueued
+        assert_eq!(dispatcher.stats().enqueued, 1);
+    }
+
+    #[test]
+    fn amend_enabled_disable_when_already_disabled_is_a_noop() {
+        let mut dispatcher = NotifyDispatcher::new(NotifyConfig::default());
+        assert!(!dispatcher.is_enabled());
+        // Disabling needs no secret: even the empty-secret default
+        // config disables without failing.
+        assert_eq!(dispatcher.amend_enabled(false), Ok(false));
+        assert!(!dispatcher.is_enabled());
+    }
+
+    #[test]
+    fn amend_enabled_re_enable_with_secret_resumes_push() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        assert!(dispatcher.is_enabled());
+        assert_eq!(dispatcher.amend_enabled(false), Ok(true));
+        assert!(!dispatcher.is_enabled());
+
+        assert_eq!(dispatcher.amend_enabled(true), Ok(true));
+        assert!(dispatcher.is_enabled());
+        let report = report_with(vec![action(
+            KeeperActionKind::Claim,
+            0x01,
+            "taker",
+            "vesting_unlocked",
+        )]);
+        dispatcher.push_report(&report, None, None);
+        assert_eq!(dispatcher.pending(), 1);
+        assert_eq!(dispatcher.stats().enqueued, 1);
+    }
+
+    #[test]
+    fn amend_enabled_enable_when_already_enabled_is_a_noop() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        assert_eq!(dispatcher.amend_enabled(true), Ok(false));
+        assert!(dispatcher.is_enabled());
+        // Still live: pushes keep flowing.
+        let report = report_with(vec![action(
+            KeeperActionKind::Claim,
+            0x01,
+            "taker",
+            "vesting_unlocked",
+        )]);
+        dispatcher.push_report(&report, None, None);
+        assert_eq!(dispatcher.pending(), 1);
+    }
+
+    #[test]
+    fn amend_enabled_on_default_dispatcher_rejects_empty_secret() {
+        let mut dispatcher = NotifyDispatcher::new(NotifyConfig::default());
+        assert_eq!(
+            dispatcher.amend_enabled(true),
+            Err(NotifyConfigError::EmptySecret)
+        );
+        // Live state untouched: still disabled, still no queue.
+        assert!(!dispatcher.is_enabled());
+        assert_eq!(dispatcher.pending(), 0);
+        assert_eq!(dispatcher.stats(), KeeperNotifyStats::default());
+        // And the failed enable leaves nothing half-written: a later
+        // disable is still the no-op it was before.
+        assert_eq!(dispatcher.amend_enabled(false), Ok(false));
+    }
+
+    #[test]
+    fn disabled_pump_preserves_queue_and_drains_after_re_enable() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let report = report_with(vec![
+            action(KeeperActionKind::CancelExpired, 0x01, "initializer", "expired"),
+            action(KeeperActionKind::Claim, 0x02, "taker", "vesting_unlocked"),
+        ]);
+        dispatcher.push_report(&report, None, None);
+        assert_eq!(dispatcher.pending(), 2);
+
+        assert_eq!(dispatcher.amend_enabled(false), Ok(true));
+        let mut notifier = RecordingNotifier::new();
+        let mut sleeps = Vec::new();
+        dispatcher.pump(&mut notifier, &mut |ms| sleeps.push(ms));
+        assert_eq!(notifier.attempts, 0);
+        assert!(notifier.delivered.is_empty());
+        assert!(sleeps.is_empty());
+        assert_eq!(dispatcher.pending(), 2); // queue preserved as-is
+        assert_eq!(dispatcher.stats().delivered, 0);
+
+        assert_eq!(dispatcher.amend_enabled(true), Ok(true));
+        dispatcher.pump(&mut notifier, &mut |_| {});
+        assert_eq!(dispatcher.pending(), 0);
+        assert_eq!(notifier.delivered.len(), 2);
+        assert_eq!(dispatcher.stats().delivered, 2);
+    }
+
+    #[test]
+    fn amend_enabled_keeps_stats() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let report = report_with(vec![action(
+            KeeperActionKind::Claim,
+            0x01,
+            "taker",
+            "vesting_unlocked",
+        )]);
+        dispatcher.push_report(&report, None, None);
+        let mut notifier = RecordingNotifier::failing(1);
+        dispatcher.pump(&mut notifier, &mut |_| {});
+        let before = dispatcher.stats();
+        assert_eq!(before.enqueued, 1);
+        assert_eq!(before.delivered, 1);
+        assert_eq!(before.retries, 1);
+        assert_eq!(before.dropped, 0);
+
+        assert_eq!(dispatcher.amend_enabled(false), Ok(true));
+        assert_eq!(dispatcher.stats(), before); // stats untouched
+        assert_eq!(dispatcher.amend_enabled(true), Ok(true));
+        assert_eq!(dispatcher.stats(), before);
+
+        // Counters keep accumulating across the toggle.
+        dispatcher.push_report(&report, None, None);
+        let mut notifier = RecordingNotifier::new();
+        dispatcher.pump(&mut notifier, &mut |_| {});
+        let after = dispatcher.stats();
+        assert_eq!(after.enqueued, 2);
+        assert_eq!(after.delivered, 2);
+        assert_eq!(after.retries, 1);
+        assert_eq!(after.dropped, 0);
+    }
+
+    #[test]
+    fn amend_enabled_keeps_retry_policy_and_signatures() {
+        // Two dispatchers, same config, same report: the toggled one
+        // must deliver byte-identical payloads to the untouched one —
+        // disabling neither re-signs nor drops queued deliveries.
+        let report = report_with(vec![
+            action(KeeperActionKind::CancelExpired, 0x01, "initializer", "expired"),
+            action(KeeperActionKind::Claim, 0x02, "taker", "vesting_unlocked"),
+        ]);
+        let mut toggled = NotifyDispatcher::new(enabled_config());
+        let mut control = NotifyDispatcher::new(enabled_config());
+        toggled.push_report(&report, None, None);
+        control.push_report(&report, None, None);
+        assert_eq!(toggled.pending(), 2);
+
+        assert_eq!(toggled.amend_enabled(false), Ok(true));
+        assert_eq!(toggled.pending(), 2); // queue untouched
+        assert_eq!(toggled.retry_policy(), control.retry_policy());
+        assert_eq!(toggled.amend_enabled(true), Ok(true));
+        assert_eq!(toggled.retry_policy(), RetryPolicy::default());
+
+        let mut toggled_notifier = RecordingNotifier::new();
+        let mut control_notifier = RecordingNotifier::new();
+        toggled.pump(&mut toggled_notifier, &mut |_| {});
+        control.pump(&mut control_notifier, &mut |_| {});
+        assert_eq!(toggled_notifier.delivered, control_notifier.delivered);
+        // The signature headers match the pre-toggle signing exactly.
+        assert!(toggled_notifier.delivered[0]
+            .signature_header
+            .starts_with("key-id=keeper-01,hmac-sha256="));
+    }
+
+    #[test]
+    fn repeated_enable_disable_toggles_take_effect() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let report = report_with(vec![action(
+            KeeperActionKind::Claim,
+            0x01,
+            "taker",
+            "vesting_unlocked",
+        )]);
+        assert_eq!(dispatcher.amend_enabled(false), Ok(true));
+        assert!(!dispatcher.is_enabled());
+        dispatcher.push_report(&report, None, None);
+        assert_eq!(dispatcher.pending(), 0);
+        assert_eq!(dispatcher.amend_enabled(true), Ok(true));
+        assert!(dispatcher.is_enabled());
+        dispatcher.push_report(&report, None, None);
+        assert_eq!(dispatcher.pending(), 1);
+        assert_eq!(dispatcher.amend_enabled(false), Ok(true));
+        assert!(!dispatcher.is_enabled());
+        dispatcher.push_report(&report, None, None);
+        assert_eq!(dispatcher.pending(), 1);
+        assert_eq!(dispatcher.amend_enabled(true), Ok(true));
+        assert!(dispatcher.is_enabled());
+        // Repeating the live value is a no-op either way.
+        assert_eq!(dispatcher.amend_enabled(true), Ok(false));
+        assert_eq!(dispatcher.amend_enabled(false), Ok(true));
+        assert_eq!(dispatcher.amend_enabled(false), Ok(false));
+    }
+
+    #[test]
+    fn pump_while_disabled_never_sleeps_or_retries() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let report = report_with(vec![action(
+            KeeperActionKind::Claim,
+            0x01,
+            "taker",
+            "vesting_unlocked",
+        )]);
+        dispatcher.push_report(&report, None, None);
+        assert_eq!(dispatcher.amend_enabled(false), Ok(true));
+
+        // Even a notifier that would fail on every attempt is never
+        // called while disabled — no attempts, no backoff sleeps.
+        let mut notifier = RecordingNotifier::failing(100);
+        let mut sleeps = Vec::new();
+        dispatcher.pump(&mut notifier, &mut |ms| sleeps.push(ms));
+        assert_eq!(notifier.attempts, 0);
+        assert!(sleeps.is_empty());
+        assert_eq!(dispatcher.pending(), 1);
+        assert_eq!(dispatcher.stats().delivered, 0);
+        assert_eq!(dispatcher.stats().retries, 0);
+        assert_eq!(dispatcher.stats().dropped, 0);
     }
 }
