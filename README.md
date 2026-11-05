@@ -5380,6 +5380,18 @@ prioritization-fee samples it feeds in (e.g. from the cluster's
   responsiveness) are operator-tunable via `PriorityFeeConfig`
   (validated: `window ≥ 1`, `α ∈ (0, 1]`); defaults are starting
   points, not production tuning.
+- **Revising the config live (AV-348)**: `PriorityFeeOracle::amend_config(new_config)`
+  re-validates the candidate (a hand-built config can bypass
+  `PriorityFeeConfig::new`, so this is the second gate), returns
+  `Ok(false)` for a same-value no-op and `Ok(true)` after replacing
+  the whole config — without dropping the samples or EWMA state
+  already absorbed, so recalibrating no longer forces a cold start.
+  A new `alpha` only weights subsequent observations (the old EWMA
+  is never recomputed), a new `window` applies immediately to the
+  next confidence gate, and a new fallback applies immediately to
+  the next low-confidence recommendation. Invalid candidates leave
+  the live config untouched; no new error variant, audit event, or
+  Anchor instruction is added.
 - **Recommendation + confidence**: `recommend()` returns
   `⌈ewma⌉` (rounded *up*, so the suggestion never sits below the
   estimated mean) with `confidence: High` once `samples ≥ window`.

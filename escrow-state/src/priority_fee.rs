@@ -232,6 +232,48 @@ impl PriorityFeeOracle {
         &self.config
     }
 
+    /// Revise the oracle's configuration live, without dropping the
+    /// samples or EWMA state it has already absorbed (AV-348).
+    ///
+    /// Check order is validate → same → replace, mirroring
+    /// [`HeartbeatRegistry::amend_config`](super::keeper_heartbeat::HeartbeatRegistry::amend_config).
+    /// The candidate is re-validated through
+    /// [`PriorityFeeConfig::new`] — a hand-built config can bypass
+    /// that constructor (all fields are `pub`), so this is the
+    /// second validation gate — and an invalid candidate leaves the
+    /// live config untouched. A candidate equal to the live config
+    /// is an `Ok(false)` no-op (nothing written, nothing recorded;
+    /// this module carries no audit ring). Otherwise the whole
+    /// config is replaced and `Ok(true)` is returned.
+    ///
+    /// Only the config moves: `samples` and `ewma` are untouched, so
+    /// this is not a reset (see [`PriorityFeeOracle::reset`]). The
+    /// new config governs the next evaluation: a new `alpha` only
+    /// weights subsequent [`PriorityFeeOracle::observe`] calls (the
+    /// old EWMA value is never recomputed), a new `window` applies
+    /// immediately to the next [`PriorityFeeOracle::recommend`]
+    /// confidence gate (shrinking it can lift `Low` to `High` with
+    /// no new sample, widening it can drop `High` back to the
+    /// fallback), and a new fallback applies immediately to the next
+    /// low-confidence recommendation. There is no caller gate: the
+    /// oracle is keeper-side off-chain pure logic with no Anchor
+    /// instruction surface and no authority key to check.
+    pub fn amend_config(
+        &mut self,
+        new_config: PriorityFeeConfig,
+    ) -> Result<bool, PriorityFeeConfigError> {
+        let validated = PriorityFeeConfig::new(
+            new_config.window,
+            new_config.alpha,
+            new_config.fallback_micro_lamports_per_cu,
+        )?;
+        if self.config == validated {
+            return Ok(false);
+        }
+        self.config = validated;
+        Ok(true)
+    }
+
     /// How many samples have been observed.
     pub fn sample_count(&self) -> usize {
         self.samples
@@ -442,5 +484,171 @@ mod priority_fee_tests {
             fb.to_json(),
             "{\"micro_lamports_per_cu\":10000,\"confidence\":\"low\",\"fallback\":true}"
         );
+    }
+
+    #[test]
+    fn amend_config_rejects_invalid_window_and_changes_nothing() {
+        let mut oracle = PriorityFeeOracle::new(config(3, 0.5, 9_000));
+        oracle.observe(100);
+        oracle.observe(200);
+        let before_config = *oracle.config();
+        let before_rec = oracle.recommend();
+        // Hand-built config bypassing PriorityFeeConfig::new: the
+        // amend path must still reject it.
+        let bad = PriorityFeeConfig {
+            window: 0,
+            alpha: 0.5,
+            fallback_micro_lamports_per_cu: 1_000,
+        };
+        assert_eq!(
+            oracle.amend_config(bad),
+            Err(PriorityFeeConfigError::InvalidWindow)
+        );
+        assert_eq!(*oracle.config(), before_config);
+        assert_eq!(oracle.sample_count(), 2);
+        assert_eq!(oracle.recommend(), before_rec);
+    }
+
+    #[test]
+    fn amend_config_rejects_invalid_alpha_and_changes_nothing() {
+        let mut oracle = PriorityFeeOracle::new(config(3, 0.5, 9_000));
+        oracle.observe(100);
+        let before_config = *oracle.config();
+        for bad_alpha in [0.0, -0.1, 1.000_000_1, 2.0, f64::NAN, f64::INFINITY] {
+            let bad = PriorityFeeConfig {
+                window: 3,
+                alpha: bad_alpha,
+                fallback_micro_lamports_per_cu: 1_000,
+            };
+            assert_eq!(
+                oracle.amend_config(bad),
+                Err(PriorityFeeConfigError::InvalidAlpha),
+                "alpha {bad_alpha} should be rejected"
+            );
+            assert_eq!(*oracle.config(), before_config);
+            assert_eq!(oracle.sample_count(), 1);
+        }
+    }
+
+    #[test]
+    fn amend_config_same_value_is_a_noop() {
+        let mut oracle = PriorityFeeOracle::new(config(2, 0.5, 9_000));
+        oracle.observe(1_000);
+        oracle.observe(2_000);
+        let before_rec = oracle.recommend();
+        assert_eq!(oracle.amend_config(config(2, 0.5, 9_000)), Ok(false));
+        assert_eq!(oracle.sample_count(), 2);
+        assert_eq!(oracle.recommend(), before_rec);
+    }
+
+    #[test]
+    fn amend_config_replaces_config_and_returns_true() {
+        let mut oracle = PriorityFeeOracle::new(config(3, 0.5, 9_000));
+        assert_eq!(oracle.amend_config(config(5, 0.8, 4_000)), Ok(true));
+        assert_eq!(*oracle.config(), config(5, 0.8, 4_000));
+    }
+
+    #[test]
+    fn amend_config_keeps_samples_and_ewma_and_new_alpha_weights_next_observe() {
+        let mut oracle = PriorityFeeOracle::new(config(2, 0.5, 0));
+        oracle.observe(1_000);
+        oracle.observe(2_000);
+        assert_eq!(oracle.recommend().recommended_micro_lamports_per_cu, 1_500);
+        // New alpha 1.0: the old EWMA (1500) is NOT recomputed.
+        assert_eq!(oracle.amend_config(config(2, 1.0, 0)), Ok(true));
+        assert_eq!(oracle.sample_count(), 2);
+        assert_eq!(oracle.recommend().recommended_micro_lamports_per_cu, 1_500);
+        // The next observe uses the new alpha: 1.0 tracks the latest.
+        oracle.observe(3_000);
+        assert_eq!(oracle.recommend().recommended_micro_lamports_per_cu, 3_000);
+    }
+
+    #[test]
+    fn amend_config_shrinking_window_lifts_confidence_without_a_new_sample() {
+        let mut oracle = PriorityFeeOracle::new(config(5, 0.5, 9_000));
+        oracle.observe(100);
+        oracle.observe(200);
+        oracle.observe(300);
+        // ewma = 100 -> 150 -> 225, but only 3 of 5 samples: Low.
+        assert_eq!(oracle.recommend().confidence, Confidence::Low);
+        assert_eq!(oracle.amend_config(config(3, 0.5, 9_000)), Ok(true));
+        let rec = oracle.recommend();
+        assert_eq!(rec.confidence, Confidence::High);
+        assert!(!rec.fallback);
+        assert_eq!(rec.recommended_micro_lamports_per_cu, 225);
+    }
+
+    #[test]
+    fn amend_config_widening_window_drops_back_to_the_new_fallback() {
+        let mut oracle = PriorityFeeOracle::new(config(2, 0.5, 9_000));
+        oracle.observe(100);
+        oracle.observe(200);
+        assert_eq!(oracle.recommend().confidence, Confidence::High);
+        assert_eq!(oracle.amend_config(config(5, 0.5, 7_777)), Ok(true));
+        let rec = oracle.recommend();
+        assert_eq!(rec.confidence, Confidence::Low);
+        assert!(rec.fallback);
+        assert_eq!(rec.recommended_micro_lamports_per_cu, 7_777);
+    }
+
+    #[test]
+    fn amend_config_new_fallback_applies_to_the_next_low_recommendation() {
+        let mut oracle = PriorityFeeOracle::new(config(5, 0.5, 9_000));
+        oracle.observe(100);
+        assert_eq!(
+            oracle.recommend().recommended_micro_lamports_per_cu,
+            9_000
+        );
+        assert_eq!(oracle.amend_config(config(5, 0.5, 1_234)), Ok(true));
+        let rec = oracle.recommend();
+        assert_eq!(rec.confidence, Confidence::Low);
+        assert!(rec.fallback);
+        assert_eq!(rec.recommended_micro_lamports_per_cu, 1_234);
+    }
+
+    #[test]
+    fn amend_config_accepts_boundary_alphas_and_fallback_only_changes() {
+        let mut oracle = PriorityFeeOracle::new(config(2, 0.5, 9_000));
+        assert_eq!(oracle.amend_config(config(2, 1.0, 9_000)), Ok(true));
+        assert_eq!(oracle.amend_config(config(2, f64::MIN_POSITIVE, 9_000)), Ok(true));
+        // Changing only the fallback is still a real revision.
+        assert_eq!(
+            oracle.amend_config(config(2, f64::MIN_POSITIVE, 5_000)),
+            Ok(true)
+        );
+        assert_eq!(*oracle.config(), config(2, f64::MIN_POSITIVE, 5_000));
+    }
+
+    #[test]
+    fn amend_config_repeated_revisions_all_take_effect() {
+        let mut oracle = PriorityFeeOracle::new(config(3, 0.5, 9_000));
+        assert_eq!(oracle.amend_config(config(4, 0.4, 8_000)), Ok(true));
+        assert_eq!(oracle.amend_config(config(2, 0.9, 7_000)), Ok(true));
+        assert_eq!(oracle.amend_config(config(3, 0.5, 9_000)), Ok(true));
+        assert_eq!(*oracle.config(), config(3, 0.5, 9_000));
+    }
+
+    #[test]
+    fn amend_config_failed_call_leaves_all_state_untouched() {
+        let mut oracle = PriorityFeeOracle::new(config(2, 0.5, 9_000));
+        oracle.observe(1_000);
+        oracle.observe(2_000);
+        let before_config = *oracle.config();
+        let before_rec = oracle.recommend();
+        let bad = PriorityFeeConfig {
+            window: 2,
+            alpha: 0.0,
+            fallback_micro_lamports_per_cu: 1_000,
+        };
+        assert_eq!(
+            oracle.amend_config(bad),
+            Err(PriorityFeeConfigError::InvalidAlpha)
+        );
+        assert_eq!(*oracle.config(), before_config);
+        assert_eq!(oracle.sample_count(), 2);
+        assert_eq!(oracle.recommend(), before_rec);
+        // And the oracle still observes normally afterwards.
+        oracle.observe(3_000);
+        assert_eq!(oracle.sample_count(), 3);
     }
 }
