@@ -142,6 +142,11 @@ impl MerkleDistributor {
         })
     }
 
+    /// The current claim-window expiry slot.
+    pub fn expiry_slot(&self) -> u64 {
+        self.expiry_slot
+    }
+
     /// The maker key.
     pub fn maker(&self) -> [u8; 32] {
         self.maker
@@ -315,6 +320,70 @@ impl MerkleDistributor {
         Ok(())
     }
 
+    /// Revise the claim window (AV-345).
+    ///
+    /// The expiry slot is fixed at [`MerkleDistributor::new`] and,
+    /// before this method, there was no way to correct it: a maker who
+    /// set the window too short stranded unclaimed leaves (their only
+    /// exit was waiting out expiry for `reclaim` and rebuilding the
+    /// distribution), and one who set it too long left the funds
+    /// un-reclaimable until the window lapsed. This method moves the
+    /// window without touching anything else.
+    ///
+    /// Check order: authority → state → value, mirroring
+    /// [`crate::HtlcLock::amend_htlc_expiry_slot`] (AV-339):
+    /// maker-only (`Unauthorized`, code 100); `Active` only
+    /// (`InvalidStateTransition`, code 101, once `Reclaimed`); the new
+    /// window must be non-empty (`InvalidDistribution`, code 258, at
+    /// `new_expiry_slot <= current_slot` — reusing `new()`'s
+    /// threshold shape). The value gate runs before the no-op check,
+    /// so re-affirming an already-lapsed window fails the gate rather
+    /// than silently succeeding (same ordering as AV-339).
+    /// Re-affirming the current window in a live window is a no-op
+    /// `Ok(())`: no write, no event.
+    ///
+    /// Unlike [`MerkleDistributor::amend_merkle_root`] (AV-342), there
+    /// is no `DistributionClaimsStarted` gate: moving the window does
+    /// not touch the nullifier bitmap, `claimed_amount`, or the root,
+    /// so claims may already be underway — the claimed accounting
+    /// stays exactly as it was. Only the `expiry_slot` field moves.
+    /// `root`, `total_amount`, `leaf_count`, `created_slot`, the
+    /// nullifier bitmap, `claimed_count`, and `claimed_amount` are
+    /// untouched.
+    ///
+    /// The new window governs the next evaluation:
+    /// [`MerkleDistributor::claim`] and [`MerkleDistributor::reclaim`]
+    /// both read the live value; an action already executed keeps the
+    /// window it settled under. Extending past expiry revives the
+    /// distribution: once `current_slot >=` the old expiry the maker
+    /// could still `reclaim`, but lengthening the window gives
+    /// unclaimed leaves a second chance to claim. Shortening to a
+    /// still-future slot is likewise allowed — the window only
+    /// narrows, it never dies early. Audit with
+    /// [`MerkleDistributor::expiry_amended_audit_json`], only on an
+    /// actual change.
+    pub fn amend_merkle_expiry_slot(
+        &mut self,
+        maker: [u8; 32],
+        new_expiry_slot: u64,
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if maker != self.maker {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != DistributorState::Active {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        if new_expiry_slot <= current_slot {
+            return Err(EscrowError::InvalidDistribution);
+        }
+        if new_expiry_slot == self.expiry_slot {
+            return Ok(());
+        }
+        self.expiry_slot = new_expiry_slot;
+        Ok(())
+    }
+
     /// Audit-event JSON for a claim (hand-written):
     /// `{"event":"distributor_claimed","root":"<64hex>","leaf_index":<n>,
     /// "amount":<u64>,"claimed_count":<n>}`.
@@ -357,6 +426,25 @@ impl MerkleDistributor {
         s.push_str("\",\"new_root\":\"");
         s.push_str(&hex64(&self.root));
         s.push_str("\",\"leaf_count\":");
+        s.push_str(&self.leaf_count.to_string());
+        s.push_str(",\"total_amount\":");
+        s.push_str(&self.total_amount.to_string());
+        s.push('}');
+        s
+    }
+
+    /// Audit-event JSON for a claim-window amendment (call only on an
+    /// actual change — a same-window no-op emits nothing):
+    /// `{"event":"distributor_expiry_amended","old_expiry_slot":<u64>,
+    /// "new_expiry_slot":<u64>,"leaf_count":<n>,"total_amount":<u64>}`.
+    /// `old_expiry_slot` is the window this call replaced; the new
+    /// window is read off `self`.
+    pub fn expiry_amended_audit_json(&self, old_expiry_slot: u64) -> String {
+        let mut s = String::from("{\"event\":\"distributor_expiry_amended\",\"old_expiry_slot\":");
+        s.push_str(&old_expiry_slot.to_string());
+        s.push_str(",\"new_expiry_slot\":");
+        s.push_str(&self.expiry_slot.to_string());
+        s.push_str(",\"leaf_count\":");
         s.push_str(&self.leaf_count.to_string());
         s.push_str(",\"total_amount\":");
         s.push_str(&self.total_amount.to_string());
@@ -853,5 +941,232 @@ mod tests {
         // error before the pristine error (window precedes claimed).
         let err = d.amend_merkle_root(key(0xAA), new_root, 5000).unwrap_err();
         assert_eq!(err, EscrowError::DistributionExpired);
+    }
+
+    // ----- AV-345: amend_merkle_expiry_slot -----
+
+    #[test]
+    fn amend_expiry_by_stranger_is_rejected_and_window_unchanged() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        let err = d.amend_merkle_expiry_slot(key(0xBB), 2000, 500).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(d.expiry_slot(), 1000);
+        assert_eq!(d.state(), DistributorState::Active);
+    }
+
+    #[test]
+    fn amend_expiry_on_reclaimed_distribution_is_rejected() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        d.reclaim(key(0xAA), 1000).unwrap();
+        assert_eq!(d.state(), DistributorState::Reclaimed);
+        let err = d.amend_merkle_expiry_slot(key(0xAA), 2000, 1001).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        assert_eq!(err.code(), 101);
+        // State check precedes the value check: even a window in the
+        // past is refused on state, not on value.
+        assert_eq!(d.expiry_slot(), 1000);
+    }
+
+    #[test]
+    fn amend_expiry_to_past_or_current_slot_is_rejected_and_window_unchanged() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        // New window at the current slot: empty window.
+        let err = d.amend_merkle_expiry_slot(key(0xAA), 500, 500).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidDistribution);
+        assert_eq!(err.code(), 258);
+        // New window in the past.
+        let err = d.amend_merkle_expiry_slot(key(0xAA), 400, 500).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidDistribution);
+        assert_eq!(d.expiry_slot(), 1000);
+
+        // Re-affirming an already-lapsed window fails the value gate
+        // rather than silently succeeding (value precedes no-op, as
+        // in AV-339): at slot 1000 the 1000 window is already dead.
+        let err = d.amend_merkle_expiry_slot(key(0xAA), 1000, 1000).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidDistribution);
+        assert_eq!(d.expiry_slot(), 1000);
+    }
+
+    #[test]
+    fn amend_expiry_to_same_window_is_noop() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        d.amend_merkle_expiry_slot(key(0xAA), 1000, 500).unwrap();
+        assert_eq!(d.expiry_slot(), 1000);
+        assert_eq!(d.state(), DistributorState::Active);
+        assert_eq!(d.claimed_count(), 0);
+        assert_eq!(d.unclaimed_amount(), 350);
+        // The distribution still works exactly as before.
+        d.claim(0, key(1), 100, &proofs[0], 500).unwrap();
+    }
+
+    #[test]
+    fn amend_expiry_extension_lets_unclaimed_leaves_claim_and_delays_reclaim() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        d.amend_merkle_expiry_slot(key(0xAA), 2000, 500).unwrap();
+        assert_eq!(d.expiry_slot(), 2000);
+
+        // A leaf that would have expired at 1000 now claims at 1500.
+        let got = d.claim(1, key(2), 250, &proofs[1], 1500).unwrap();
+        assert_eq!(got, 250);
+        // ...and reclaim is pushed out with the window.
+        let err = d.reclaim(key(0xAA), 1500).unwrap_err();
+        assert_eq!(err, EscrowError::DistributionNotExpired);
+        assert_eq!(d.reclaim(key(0xAA), 2000).unwrap(), 100);
+    }
+
+    #[test]
+    fn amend_expiry_shortening_still_allows_claims_inside_the_new_window() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        d.amend_merkle_expiry_slot(key(0xAA), 700, 500).unwrap();
+        assert_eq!(d.expiry_slot(), 700);
+
+        // Inside the narrowed window claims still work.
+        let got = d.claim(0, key(1), 100, &proofs[0], 699).unwrap();
+        assert_eq!(got, 100);
+        // At the new expiry the window is closed (and reclaim opens).
+        let err = d.claim(1, key(2), 250, &proofs[1], 700).unwrap_err();
+        assert_eq!(err, EscrowError::DistributionExpired);
+        assert_eq!(d.reclaim(key(0xAA), 700).unwrap(), 250);
+    }
+
+    #[test]
+    fn expired_distribution_refuses_claims_but_allows_reclaim() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        // At the original expiry the claim window is closed...
+        let err = d.claim(0, key(1), 100, &proofs[0], 1000).unwrap_err();
+        assert_eq!(err, EscrowError::DistributionExpired);
+        // ...but the maker can still sweep the remainder.
+        assert_eq!(d.reclaim(key(0xAA), 1000).unwrap(), 350);
+        assert_eq!(d.state(), DistributorState::Reclaimed);
+    }
+
+    #[test]
+    fn amend_expiry_after_expiry_revives_unclaimed_leaves() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        // Past the original expiry: claims are dead...
+        let err = d.claim(0, key(1), 100, &proofs[0], 1200).unwrap_err();
+        assert_eq!(err, EscrowError::DistributionExpired);
+        // ...until the maker lengthens the window: the distribution
+        // is live again and the unclaimed leaf claims under it.
+        d.amend_merkle_expiry_slot(key(0xAA), 2000, 1200).unwrap();
+        assert_eq!(d.expiry_slot(), 2000);
+        let got = d.claim(0, key(1), 100, &proofs[0], 1500).unwrap();
+        assert_eq!(got, 100);
+        // The revived window still closes at its new end.
+        let err = d.claim(1, key(2), 250, &proofs[1], 2000).unwrap_err();
+        assert_eq!(err, EscrowError::DistributionExpired);
+        assert_eq!(d.reclaim(key(0xAA), 2000).unwrap(), 250);
+    }
+
+    #[test]
+    fn amend_expiry_after_claims_keeps_claimed_accounting() {
+        let leaves = [(key(1), 100u64), (key(2), 250), (key(3), 50)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        d.claim(0, key(1), 100, &proofs[0], 500).unwrap();
+        assert_eq!(d.claimed_count(), 1);
+        assert_eq!(d.claimed_amount(), 100);
+
+        // Unlike amend_merkle_root (AV-342), there is no
+        // DistributionClaimsStarted gate: the window moves after
+        // claims have started.
+        d.amend_merkle_expiry_slot(key(0xAA), 2000, 500).unwrap();
+        assert_eq!(d.expiry_slot(), 2000);
+        // Claimed accounting is exactly as it was.
+        assert_eq!(d.claimed_count(), 1);
+        assert_eq!(d.claimed_amount(), 100);
+        assert!(d.is_claimed(0));
+        assert!(!d.is_claimed(1));
+        assert_eq!(d.unclaimed_amount(), 300);
+        // The remaining leaves still claim under the old root.
+        let got = d.claim(1, key(2), 250, &proofs[1], 1500).unwrap();
+        assert_eq!(got, 250);
+        assert_eq!(d.claimed_count(), 2);
+        assert_eq!(d.claimed_amount(), 350);
+    }
+
+    #[test]
+    fn amend_expiry_leaves_root_totals_and_bitmap_untouched() {
+        let leaves = [(key(1), 100u64), (key(2), 250), (key(3), 50)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        d.claim(0, key(1), 100, &proofs[0], 500).unwrap();
+        let root = d.root();
+        d.amend_merkle_expiry_slot(key(0xAA), 2000, 500).unwrap();
+
+        assert_eq!(d.root(), root);
+        assert_eq!(d.leaf_count(), 3);
+        assert_eq!(d.unclaimed_amount(), 300);
+        assert_eq!(d.claimed_count(), 1);
+        assert_eq!(d.claimed_amount(), 100);
+        assert!(d.is_claimed(0));
+        assert!(!d.is_claimed(1));
+        assert!(!d.is_claimed(2));
+        // The old root still governs: the remaining leaves claim
+        // under it, in the extended window.
+        let got = d.claim(2, key(3), 50, &proofs[2], 1500).unwrap();
+        assert_eq!(got, 50);
+    }
+
+    #[test]
+    fn expiry_amended_audit_json_is_pinned() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        d.amend_merkle_expiry_slot(key(0xAA), 2000, 500).unwrap();
+        let j = d.expiry_amended_audit_json(1000);
+        assert_eq!(
+            j,
+            "{\"event\":\"distributor_expiry_amended\",\"old_expiry_slot\":1000,\"new_expiry_slot\":2000,\"leaf_count\":2,\"total_amount\":350}"
+        );
+    }
+
+    #[test]
+    fn failed_amend_expiry_calls_leave_no_state_change() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        d.claim(0, key(1), 100, &proofs[0], 500).unwrap();
+        let root = d.root();
+
+        // Stranger, past/current window, and (on a reclaimed copy)
+        // state — all fail. The value gate precedes the no-op check,
+        // so re-affirming the live window at a slot past it fails
+        // rather than no-op-ing.
+        assert_eq!(
+            d.amend_merkle_expiry_slot(key(0xBB), 2000, 500).unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(
+            d.amend_merkle_expiry_slot(key(0xAA), 500, 500).unwrap_err(),
+            EscrowError::InvalidDistribution
+        );
+        assert_eq!(
+            d.amend_merkle_expiry_slot(key(0xAA), 1000, 1000).unwrap_err(),
+            EscrowError::InvalidDistribution
+        );
+        assert_eq!(d.expiry_slot(), 1000);
+        assert_eq!(d.root(), root);
+        assert_eq!(d.state(), DistributorState::Active);
+        assert_eq!(d.claimed_count(), 1);
+        assert_eq!(d.claimed_amount(), 100);
+        assert_eq!(d.unclaimed_amount(), 250);
+        assert!(d.is_claimed(0));
+        assert!(!d.is_claimed(1));
+
+        // A reclaimed distribution refuses on state even for a
+        // future window.
+        let (mut r, _) = open_distribution(&leaves);
+        r.reclaim(key(0xAA), 1000).unwrap();
+        assert_eq!(
+            r.amend_merkle_expiry_slot(key(0xAA), 2000, 1001).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        assert_eq!(r.expiry_slot(), 1000);
     }
 }

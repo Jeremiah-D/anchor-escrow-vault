@@ -7949,6 +7949,24 @@ root, not N accounts.
   the window, and the bitmap are untouched. `root_amended_audit_json`
   records the old and new roots (string event name
   `distributor_root_amended`, no new event code).
+- **Revising the claim window** (AV-345): the maker may move the
+  expiry slot with `amend_merkle_expiry_slot` — maker-only
+  (`Unauthorized`, code 100), `Active` only (`InvalidStateTransition`,
+  code 101, once `Reclaimed`), and the new window must be non-empty
+  (`InvalidDistribution`, code 258, at `new_expiry_slot <=
+  current_slot` — the value gate runs before the no-op check, so
+  re-affirming an already-lapsed window fails rather than silently
+  succeeding, mirroring `HtlcLock::amend_htlc_expiry_slot`, AV-339).
+  Re-affirming the current window in a live window is a no-op. Unlike
+  the root revision, claims may already be underway — moving the window
+  touches neither the nullifier bitmap nor `claimed_amount`, so there is
+  no `DistributionClaimsStarted` gate. Only `expiry_slot` moves; the
+  root, totals, leaf count, and bitmap are untouched. Extending past
+  expiry revives unclaimed leaves (the maker could still `reclaim`, but
+  the extension gives them a second chance); shortening to a
+  still-future slot only narrows the window. `expiry_amended_audit_json`
+  records the old and new windows (string event name
+  `distributor_expiry_amended`, no new event code).
 
 New error codes (never renumbered): `InvalidDistribution` (258),
 `InvalidMerkleProof` (259), `AlreadyClaimed` (260),
