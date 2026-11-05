@@ -7215,6 +7215,25 @@ this module *detects dead operators and reassigns their work*.
   and no audit event fires (the module has no audit ring). The new
   switch governs the next `push_report` / `pump`; there is no revision
   entry mid-pump. `is_enabled()` reads the switch currently in force.
+- **Rotating the notify signing secret (AV-351)**: `NotifyDispatcher::rotate_notify_secret(new_secret, new_key_id)`
+  swaps the AV-118 keeper push HMAC secret live, atomically with its
+  key-id label — check order empty → same → replace: an empty secret
+  is refused with `NotifyConfigError::EmptySecret` and leaves the live
+  state untouched, an empty-string key id normalizes to `None`
+  (clearing the label), rotating to the pair already in force is a
+  no-op returning `false`, and any other pair replaces `secret` and
+  `key_id` together and returns `true`. Only those two fields move —
+  `enabled`, the retry policy, the queue, and the stats are untouched,
+  and the new secret governs the next `push_report` enqueue. Queued
+  payloads are never re-signed: they keep their old signature and old
+  key id, and the receiver picks the right secret by key id — so
+  pre-provision the new secret on the receiver (accepting the new key
+  id) *before* rotating, and retire the old secret only after the
+  queue has drained. `notify_key_id()` reads the live label and
+  `secret_fingerprint()` returns the live secret's SHA-256 hex
+  fingerprint (never the secret bytes); rotation is not persisted, so
+  the operator must update the secret store for it to survive a
+  restart.
 
 Honest scope: the registry is off-chain fleet state, not an on-chain
 account — the caller feeds `current_slot` / `now` (the crate has no

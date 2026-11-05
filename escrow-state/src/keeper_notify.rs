@@ -798,6 +798,77 @@ impl NotifyDispatcher {
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
     }
+
+    /// Rotate the notify signing secret live (AV-351). Check order
+    /// empty → same → replace, following
+    /// [`amend_retry_policy`](Self::amend_retry_policy) and
+    /// [`amend_enabled`](Self::amend_enabled): an empty `new_secret`
+    /// is refused with [`NotifyConfigError::EmptySecret`] (the same
+    /// guard as [`NotifyConfig::new`]: an unsigned push would be a
+    /// forgery vector) and leaves the live state exactly as it was;
+    /// an empty-string `new_key_id` normalizes to `None`, clearing
+    /// the key-id label; rotating to the (secret, key_id) pair
+    /// already in force (after normalization) is a no-op returning
+    /// `Ok(false)` — nothing moves and no audit event fires; any
+    /// other pair atomically replaces `config.secret` and
+    /// `config.key_id` together and returns `Ok(true)` — the two are
+    /// written in one step and can never drift apart, because the
+    /// key id is the secret's label.
+    ///
+    /// Only `secret` and `key_id` move: `enabled` and the retry
+    /// policy are untouched, the queue keeps its already-signed
+    /// payloads as-is (never re-signed), and the stats keep
+    /// accumulating. The new secret governs the next
+    /// [`push_report`](Self::push_report) — every enqueue reads the
+    /// live config — but there is no revision entry mid-pump: `pump`
+    /// takes `&mut self` and runs single-threaded, so no outside
+    /// caller can rotate while a pump is in flight.
+    ///
+    /// Operator ordering: pre-provision the new secret on the
+    /// receiver (accepting the new key id) *before* rotating, then
+    /// retire the old secret on the receiver only after the queue
+    /// has drained — queued payloads keep their old signature and
+    /// old key id, and the receiver picks the right secret by key
+    /// id. The dispatcher itself holds exactly one live secret and
+    /// keeps no grace table; rotation is not persisted — a restart
+    /// restores the construction-time secret, so the operator must
+    /// update the secret store for the rotation to survive.
+    pub fn rotate_notify_secret(
+        &mut self,
+        new_secret: Vec<u8>,
+        new_key_id: impl Into<String>,
+    ) -> Result<bool, NotifyConfigError> {
+        if new_secret.is_empty() {
+            return Err(NotifyConfigError::EmptySecret);
+        }
+        let new_key_id = new_key_id.into();
+        let new_key_id = if new_key_id.is_empty() {
+            None
+        } else {
+            Some(new_key_id)
+        };
+        if self.config.secret == new_secret && self.config.key_id == new_key_id {
+            return Ok(false);
+        }
+        self.config.secret = new_secret;
+        self.config.key_id = new_key_id;
+        Ok(true)
+    }
+
+    /// The key id currently annotating signed pushes, if any.
+    pub fn notify_key_id(&self) -> Option<&str> {
+        self.config.key_id.as_deref()
+    }
+
+    /// SHA-256 hex fingerprint of the live signing secret — for
+    /// telling keys apart in logs and dashboards without ever
+    /// exposing the secret itself. The fingerprint is returned only
+    /// in-process: it is never persisted or logged by this module,
+    /// and there is deliberately no getter returning the secret
+    /// bytes.
+    pub fn secret_fingerprint(&self) -> String {
+        hex_encode(&sha256(&self.config.secret))
+    }
 }
 
 #[cfg(test)]
@@ -1735,5 +1806,315 @@ mod keeper_notify_tests {
         assert_eq!(dispatcher.stats().delivered, 0);
         assert_eq!(dispatcher.stats().retries, 0);
         assert_eq!(dispatcher.stats().dropped, 0);
+    }
+
+    // -- rotate_notify_secret (AV-351) -----------------------------------
+
+    const OLD_SECRET: &[u8] = b"test-secret-32-bytes-long-key!!";
+    const NEW_SECRET: &[u8] = b"rotated-secret-32-bytes-long-k!";
+
+    fn claim_report() -> KeeperReport {
+        report_with(vec![action(
+            KeeperActionKind::Claim,
+            0x01,
+            "taker",
+            "vesting_unlocked",
+        )])
+    }
+
+    fn pump_all(dispatcher: &mut NotifyDispatcher) -> RecordingNotifier {
+        let mut notifier = RecordingNotifier::new();
+        dispatcher.pump(&mut notifier, &mut |_| {});
+        notifier
+    }
+
+    #[test]
+    fn rotate_notify_secret_empty_secret_rejected_and_live_state_untouched() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let fingerprint_before = dispatcher.secret_fingerprint();
+        assert_eq!(
+            dispatcher.rotate_notify_secret(Vec::new(), "keeper-02"),
+            Err(NotifyConfigError::EmptySecret)
+        );
+        // Live state untouched: same key id, same fingerprint, and
+        // new pushes still verify under the old secret.
+        assert_eq!(dispatcher.notify_key_id(), Some("keeper-01"));
+        assert_eq!(dispatcher.secret_fingerprint(), fingerprint_before);
+        dispatcher.push_report(&claim_report(), None, None);
+        let notifier = pump_all(&mut dispatcher);
+        assert_eq!(notifier.delivered.len(), 1);
+        let delivery = &notifier.delivered[0];
+        assert!(verify_delivery(
+            &delivery.payload_json,
+            &delivery.signature,
+            OLD_SECRET
+        ));
+        assert!(delivery.signature_header.starts_with("key-id=keeper-01,"));
+    }
+
+    #[test]
+    fn rotate_notify_secret_same_value_is_a_noop() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let fingerprint_before = dispatcher.secret_fingerprint();
+        assert_eq!(
+            dispatcher.rotate_notify_secret(OLD_SECRET.to_vec(), "keeper-01"),
+            Ok(false)
+        );
+        assert_eq!(dispatcher.notify_key_id(), Some("keeper-01"));
+        assert_eq!(dispatcher.secret_fingerprint(), fingerprint_before);
+    }
+
+    #[test]
+    fn rotate_notify_secret_new_pushes_verify_with_new_secret_only() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        assert_eq!(
+            dispatcher.rotate_notify_secret(NEW_SECRET.to_vec(), "keeper-02"),
+            Ok(true)
+        );
+        assert_eq!(dispatcher.notify_key_id(), Some("keeper-02"));
+        dispatcher.push_report(&claim_report(), None, None);
+        let notifier = pump_all(&mut dispatcher);
+        assert_eq!(notifier.delivered.len(), 1);
+        let delivery = &notifier.delivered[0];
+        assert!(verify_delivery(
+            &delivery.payload_json,
+            &delivery.signature,
+            NEW_SECRET
+        ));
+        assert!(!verify_delivery(
+            &delivery.payload_json,
+            &delivery.signature,
+            OLD_SECRET
+        ));
+    }
+
+    #[test]
+    fn rotate_notify_secret_new_payload_carries_new_key_id() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        assert_eq!(
+            dispatcher.rotate_notify_secret(NEW_SECRET.to_vec(), "keeper-02"),
+            Ok(true)
+        );
+        dispatcher.push_report(&claim_report(), None, None);
+        let notifier = pump_all(&mut dispatcher);
+        let delivery = &notifier.delivered[0];
+        assert!(delivery
+            .signature_header
+            .starts_with("key-id=keeper-02,hmac-sha256="));
+        assert!(delivery.payload_json.contains("\"key_id\":\"keeper-02\""));
+        let (_, parsed_id) = parse_signature_header(&delivery.signature_header).expect("parses");
+        assert_eq!(parsed_id.as_deref(), Some("keeper-02"));
+    }
+
+    #[test]
+    fn rotate_notify_secret_keeps_queued_payloads_signed_with_old_secret() {
+        // Two dispatchers, same config, same report: the rotated one
+        // must deliver byte-identical payloads for the pre-rotation
+        // queue — rotation neither re-signs nor drops anything.
+        let mut rotated = NotifyDispatcher::new(enabled_config());
+        let mut control = NotifyDispatcher::new(enabled_config());
+        rotated.push_report(&claim_report(), None, None);
+        control.push_report(&claim_report(), None, None);
+        assert_eq!(rotated.pending(), 1);
+
+        assert_eq!(
+            rotated.rotate_notify_secret(NEW_SECRET.to_vec(), "keeper-02"),
+            Ok(true)
+        );
+        assert_eq!(rotated.pending(), 1);
+
+        let rotated_notifier = pump_all(&mut rotated);
+        let control_notifier = pump_all(&mut control);
+        assert_eq!(rotated_notifier.delivered, control_notifier.delivered);
+        let delivery = &rotated_notifier.delivered[0];
+        // Old signature, old key id — still verifies under the old
+        // secret, not the new one.
+        assert!(verify_delivery(
+            &delivery.payload_json,
+            &delivery.signature,
+            OLD_SECRET
+        ));
+        assert!(!verify_delivery(
+            &delivery.payload_json,
+            &delivery.signature,
+            NEW_SECRET
+        ));
+        assert!(delivery.signature_header.starts_with("key-id=keeper-01,"));
+        assert!(delivery.payload_json.contains("\"key_id\":\"keeper-01\""));
+    }
+
+    #[test]
+    fn rotate_notify_secret_keeps_queue_and_stats() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let report = report_with(vec![
+            action(
+                KeeperActionKind::CancelExpired,
+                0x01,
+                "initializer",
+                "expired",
+            ),
+            action(KeeperActionKind::Claim, 0x02, "taker", "vesting_unlocked"),
+        ]);
+        dispatcher.push_report(&report, None, None);
+        let before = dispatcher.stats();
+        assert_eq!(before.enqueued, 2);
+        assert_eq!(dispatcher.pending(), 2);
+
+        // Rotate with a non-empty queue and non-zero stats: neither
+        // moves.
+        assert_eq!(
+            dispatcher.rotate_notify_secret(NEW_SECRET.to_vec(), "keeper-02"),
+            Ok(true)
+        );
+        assert_eq!(dispatcher.stats(), before);
+        assert_eq!(dispatcher.pending(), 2);
+
+        // Pump through a failing notifier so retries accumulate, then
+        // rotate again: the counters are still untouched by the
+        // rotation itself.
+        let mut notifier = RecordingNotifier::failing(1);
+        dispatcher.pump(&mut notifier, &mut |_| {});
+        let mid = dispatcher.stats();
+        assert_eq!(mid.enqueued, 2);
+        assert_eq!(mid.delivered, 2);
+        assert_eq!(mid.retries, 1);
+        assert_eq!(mid.dropped, 0);
+        assert_eq!(
+            dispatcher.rotate_notify_secret(OLD_SECRET.to_vec(), "keeper-01"),
+            Ok(true)
+        );
+        assert_eq!(dispatcher.stats(), mid);
+
+        // Counters keep accumulating across the rotations.
+        dispatcher.push_report(&claim_report(), None, None);
+        let notifier = pump_all(&mut dispatcher);
+        assert_eq!(notifier.delivered.len(), 1);
+        let after = dispatcher.stats();
+        assert_eq!(after.enqueued, 3);
+        assert_eq!(after.delivered, 3);
+        assert_eq!(after.retries, 1);
+        assert_eq!(after.dropped, 0);
+    }
+
+    #[test]
+    fn rotate_notify_secret_keeps_enabled_and_retry_policy() {
+        let config = NotifyConfig::new(OLD_SECRET.to_vec())
+            .unwrap()
+            .with_key_id("keeper-01")
+            .with_retry(RetryPolicy::new(2, 100, 400));
+        let mut dispatcher = NotifyDispatcher::new(config);
+        assert!(dispatcher.is_enabled());
+        assert_eq!(dispatcher.retry_policy(), RetryPolicy::new(2, 100, 400));
+
+        assert_eq!(
+            dispatcher.rotate_notify_secret(NEW_SECRET.to_vec(), "keeper-02"),
+            Ok(true)
+        );
+        assert!(dispatcher.is_enabled());
+        assert_eq!(dispatcher.retry_policy(), RetryPolicy::new(2, 100, 400));
+        assert_eq!(dispatcher.notify_key_id(), Some("keeper-02"));
+    }
+
+    #[test]
+    fn rotate_notify_secret_on_disabled_dispatcher() {
+        // The default (disabled, empty-secret) dispatcher can still
+        // take a rotation — the write is allowed, the push/pump
+        // gates are unchanged.
+        let mut dispatcher = NotifyDispatcher::new(NotifyConfig::default());
+        assert!(!dispatcher.is_enabled());
+        assert_eq!(
+            dispatcher.rotate_notify_secret(NEW_SECRET.to_vec(), "keeper-02"),
+            Ok(true)
+        );
+        assert_eq!(dispatcher.notify_key_id(), Some("keeper-02"));
+        assert_eq!(
+            dispatcher.secret_fingerprint(),
+            hex_encode(&sha256(NEW_SECRET))
+        );
+        // Still disabled: pushes enqueue nothing.
+        dispatcher.push_report(&claim_report(), None, None);
+        assert_eq!(dispatcher.pending(), 0);
+        // Re-enabling works with the rotated secret in force.
+        assert_eq!(dispatcher.amend_enabled(true), Ok(true));
+        dispatcher.push_report(&claim_report(), None, None);
+        assert_eq!(dispatcher.pending(), 1);
+        let notifier = pump_all(&mut dispatcher);
+        assert!(verify_delivery(
+            &notifier.delivered[0].payload_json,
+            &notifier.delivered[0].signature,
+            NEW_SECRET
+        ));
+    }
+
+    #[test]
+    fn rotate_notify_secret_empty_key_id_clears_label() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        assert_eq!(dispatcher.notify_key_id(), Some("keeper-01"));
+        assert_eq!(
+            dispatcher.rotate_notify_secret(NEW_SECRET.to_vec(), ""),
+            Ok(true)
+        );
+        assert_eq!(dispatcher.notify_key_id(), None);
+        dispatcher.push_report(&claim_report(), None, None);
+        let notifier = pump_all(&mut dispatcher);
+        let delivery = &notifier.delivered[0];
+        assert!(delivery.signature_header.starts_with("hmac-sha256="));
+        assert!(!delivery.signature_header.contains("key-id="));
+        assert!(delivery.payload_json.contains("\"key_id\":null"));
+        assert!(verify_delivery(
+            &delivery.payload_json,
+            &delivery.signature,
+            NEW_SECRET
+        ));
+    }
+
+    #[test]
+    fn secret_fingerprint_follows_live_secret_and_never_equals_secret() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        let fingerprint = dispatcher.secret_fingerprint();
+        assert_eq!(fingerprint, hex_encode(&sha256(OLD_SECRET)));
+        // The fingerprint is a hash, never the secret itself.
+        assert_ne!(fingerprint, String::from_utf8_lossy(OLD_SECRET));
+        assert_eq!(fingerprint.len(), 64);
+
+        assert_eq!(
+            dispatcher.rotate_notify_secret(NEW_SECRET.to_vec(), "keeper-02"),
+            Ok(true)
+        );
+        let rotated = dispatcher.secret_fingerprint();
+        assert_eq!(rotated, hex_encode(&sha256(NEW_SECRET)));
+        assert_ne!(rotated, fingerprint);
+        assert_ne!(rotated, String::from_utf8_lossy(NEW_SECRET));
+    }
+
+    #[test]
+    fn repeated_rotations_back_and_forth_take_effect() {
+        let mut dispatcher = NotifyDispatcher::new(enabled_config());
+        assert_eq!(
+            dispatcher.rotate_notify_secret(NEW_SECRET.to_vec(), "keeper-02"),
+            Ok(true)
+        );
+        assert_eq!(
+            dispatcher.rotate_notify_secret(OLD_SECRET.to_vec(), "keeper-01"),
+            Ok(true)
+        );
+        assert_eq!(dispatcher.notify_key_id(), Some("keeper-01"));
+        assert_eq!(
+            dispatcher.secret_fingerprint(),
+            hex_encode(&sha256(OLD_SECRET))
+        );
+        // Back at the original pair, rotating to it again is a no-op.
+        assert_eq!(
+            dispatcher.rotate_notify_secret(OLD_SECRET.to_vec(), "keeper-01"),
+            Ok(false)
+        );
+        // And a push after the round trip verifies under the old secret.
+        dispatcher.push_report(&claim_report(), None, None);
+        let notifier = pump_all(&mut dispatcher);
+        assert!(verify_delivery(
+            &notifier.delivered[0].payload_json,
+            &notifier.delivered[0].signature,
+            OLD_SECRET
+        ));
     }
 }
