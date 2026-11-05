@@ -1774,7 +1774,7 @@ program error per variant):
 | `KeeperHealthy` | 234 | `HeartbeatRegistry::claim` (AV-165) on a keeper that is not unhealthy — its escrow set is not claimable |
 | `ClaimConflict` | 235 | `HeartbeatRegistry::claim` (AV-165) on an already-claimed escrow set — first-come-first-served, the lost race is audited |
 | `InvalidClaim` | 236 | `HeartbeatRegistry::claim` (AV-165) with a zero standby key, a self-claim, or a claimed set over `MAX_CLAIMED_ESCROWS` |
-| `InvalidElectionConfig` | 237 | `KeeperElection::new` (AV-176) with zero `lease_ttl_secs`, or `acquire` with the zero key |
+| `InvalidElectionConfig` | 237 | `KeeperElection::new` (AV-176) with zero `lease_ttl_secs`, `acquire` with the zero key, or `amend_lease_ttl_secs` (AV-347) with zero `lease_ttl_secs` |
 | `ElectionHeld` | 238 | `KeeperElection::acquire` (AV-176) while another keeper holds a live lease |
 | `NotLeader` | 239 | `KeeperElection::renew` / `step_down` (AV-176) by a caller that is not the recorded leader |
 | `LeaseExpired` | 240 | `KeeperElection::renew` (AV-176) after the lease lapsed — re-acquire for a new term |
@@ -7214,6 +7214,16 @@ decides *who may write*.
   token; a write carrying a stale token belongs to a deposed leader
   and must be rejected downstream — the crate *issues* the token, the
   executor *enforces* it (a token nobody checks is just a number).
+- **Revising the lease TTL (AV-347)**: `amend_lease_ttl_secs(new_ttl)`
+  moves only `config.lease_ttl_secs` — no caller gate (the election is
+  the operator's own off-chain coordination state, AV-316's shape), a
+  zero TTL is refused as `InvalidElectionConfig` (code 237) with the
+  live TTL untouched, and revising to the current TTL is a silent
+  no-op returning `false` (nothing written, nothing audited). The new
+  TTL governs the next `acquire` / `renew` (both read the live value);
+  a lease already in force is never recomputed, and no audit entry is
+  recorded — the revision is pinned by tests. `config()` reads the
+  live config.
 
 Honest scope: off-chain coordination state, not an on-chain account —
 the caller feeds `now` (the crate has no clock). This is a

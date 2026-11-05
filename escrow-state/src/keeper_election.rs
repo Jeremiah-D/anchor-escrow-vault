@@ -184,6 +184,45 @@ impl KeeperElection {
         })
     }
 
+    /// AV-347: revise the lease TTL without rebuilding the election.
+    ///
+    /// Check order is value-only, mirroring AV-316
+    /// [`HeartbeatRegistry::amend_config`]: there is no caller gate —
+    /// the election is the operator's own off-chain coordination
+    /// state (see the module docstring), so there is no authority key
+    /// to verify. A zero TTL fails validation
+    /// ([`EscrowError::InvalidElectionConfig`]) and the live TTL is
+    /// untouched; revising to the current TTL is a silent no-op
+    /// returning `Ok(false)` (nothing written, nothing audited).
+    /// Otherwise only `config.lease_ttl_secs` moves — the term,
+    /// fencing token, leader, lease expiry, and audit ring are
+    /// untouched — and the method returns `Ok(true)`.
+    ///
+    /// The new TTL governs the next [`KeeperElection::acquire`] and
+    /// [`KeeperElection::renew`], both of which read the live value;
+    /// a lease already in force is never recomputed — its expiry is
+    /// the lapse point already promised to the leader.
+    /// No audit event is recorded for a TTL revision:
+    /// [`ElectionAuditKind`] only records leadership events, so the
+    /// revision is pinned by tests, not by the audit ring.
+    pub fn amend_lease_ttl_secs(&mut self, new_lease_ttl_secs: u64) -> Result<bool, EscrowError> {
+        ElectionConfig {
+            lease_ttl_secs: new_lease_ttl_secs,
+        }
+        .validate()?;
+        if self.config.lease_ttl_secs == new_lease_ttl_secs {
+            return Ok(false);
+        }
+        self.config.lease_ttl_secs = new_lease_ttl_secs;
+        Ok(true)
+    }
+
+    /// The election config currently in force (AV-347: the live TTL
+    /// after any [`KeeperElection::amend_lease_ttl_secs`]).
+    pub fn config(&self) -> ElectionConfig {
+        self.config
+    }
+
     fn push_audit(&mut self, entry: ElectionAuditEntry) {
         if self.audit.len() == MAX_ELECTION_AUDIT_ENTRIES {
             self.audit.pop_front();
@@ -586,5 +625,140 @@ mod keeper_election_tests {
         assert_eq!(EscrowError::ElectionHeld.code(), 238);
         assert_eq!(EscrowError::NotLeader.code(), 239);
         assert_eq!(EscrowError::LeaseExpired.code(), 240);
+    }
+
+    // AV-347: lease TTL revision.
+
+    #[test]
+    fn amend_lease_ttl_reports_true_and_config_reads_new_value() {
+        let mut e = election();
+        assert_eq!(e.config().lease_ttl_secs, 30);
+        assert_eq!(e.amend_lease_ttl_secs(90), Ok(true));
+        assert_eq!(e.config().lease_ttl_secs, 90);
+        // Only the TTL moved: the seat is still open, term 0.
+        assert_eq!(e.term(), 0);
+        assert_eq!(e.leader(), None);
+        assert_eq!(e.audit().len(), 0);
+    }
+
+    #[test]
+    fn amend_lease_ttl_rejects_zero_and_keeps_old_value() {
+        let mut e = election();
+        assert_eq!(
+            e.amend_lease_ttl_secs(0),
+            Err(EscrowError::InvalidElectionConfig)
+        );
+        assert_eq!(e.config().lease_ttl_secs, 30);
+        // A failed revision changed nothing else either.
+        assert_eq!(e.term(), 0);
+        assert_eq!(e.audit().len(), 0);
+    }
+
+    #[test]
+    fn amend_lease_ttl_same_value_is_noop_and_moves_nothing() {
+        let mut e = election();
+        e.acquire(KEEPER_A, 1_000).unwrap();
+        let audit_len = e.audit().len();
+        assert_eq!(e.amend_lease_ttl_secs(30), Ok(false));
+        assert_eq!(e.config().lease_ttl_secs, 30);
+        assert_eq!(e.term(), 1);
+        assert_eq!(e.fencing_token(), 1);
+        assert_eq!(e.leader(), Some(KEEPER_A));
+        assert_eq!(e.lease_expires_at(), 1_030);
+        assert_eq!(e.audit().len(), audit_len);
+    }
+
+    #[test]
+    fn next_acquire_uses_new_ttl() {
+        let mut e = election();
+        e.amend_lease_ttl_secs(120).unwrap();
+        let grant = e.acquire(KEEPER_A, 1_000).unwrap();
+        assert_eq!(grant.lease_expires_at, 1_120);
+        assert_eq!(e.lease_expires_at(), 1_120);
+    }
+
+    #[test]
+    fn next_renew_uses_new_ttl() {
+        let mut e = election();
+        e.acquire(KEEPER_A, 1_000).unwrap();
+        e.amend_lease_ttl_secs(120).unwrap();
+        e.renew(KEEPER_A, 1_020).unwrap();
+        assert_eq!(e.lease_expires_at(), 1_140);
+    }
+
+    #[test]
+    fn live_lease_expiry_is_not_recomputed_by_amend() {
+        let mut e = election();
+        e.acquire(KEEPER_A, 1_000).unwrap();
+        assert_eq!(e.lease_expires_at(), 1_030);
+        e.amend_lease_ttl_secs(300).unwrap();
+        // The live lease still lapses at the promised 1030.
+        assert_eq!(e.lease_expires_at(), 1_030);
+        assert!(!e.is_leader(KEEPER_A, 1_030));
+        // But a renew before the lapse already uses the new TTL.
+        let mut e2 = election();
+        e2.acquire(KEEPER_A, 1_000).unwrap();
+        e2.amend_lease_ttl_secs(300).unwrap();
+        e2.renew(KEEPER_A, 1_020).unwrap();
+        assert_eq!(e2.lease_expires_at(), 1_320);
+    }
+
+    #[test]
+    fn amend_while_leader_holds_keeps_term_token_leader() {
+        let mut e = election();
+        e.acquire(KEEPER_A, 1_000).unwrap();
+        assert_eq!(e.amend_lease_ttl_secs(45), Ok(true));
+        assert_eq!(e.term(), 1);
+        assert_eq!(e.fencing_token(), 1);
+        assert_eq!(e.leader(), Some(KEEPER_A));
+        assert_eq!(e.lease_expires_at(), 1_030);
+        // The revision itself appended no audit entry.
+        assert_eq!(e.audit().len(), 1);
+    }
+
+    #[test]
+    fn amend_after_step_down_on_open_seat_works() {
+        let mut e = election();
+        e.acquire(KEEPER_A, 1_000).unwrap();
+        e.step_down(KEEPER_A, 1_010).unwrap();
+        assert_eq!(e.amend_lease_ttl_secs(60), Ok(true));
+        assert_eq!(e.config().lease_ttl_secs, 60);
+        // Term and token are retained across the open seat.
+        assert_eq!(e.term(), 1);
+        assert_eq!(e.fencing_token(), 1);
+        let grant = e.acquire(KEEPER_B, 1_020).unwrap();
+        assert_eq!(grant.term, 2);
+        assert_eq!(grant.lease_expires_at, 1_080);
+    }
+
+    #[test]
+    fn repeated_amends_back_and_forth_all_take_effect() {
+        let mut e = election();
+        assert_eq!(e.amend_lease_ttl_secs(60), Ok(true));
+        assert_eq!(e.amend_lease_ttl_secs(15), Ok(true));
+        assert_eq!(e.amend_lease_ttl_secs(60), Ok(true));
+        assert_eq!(e.config().lease_ttl_secs, 60);
+        let grant = e.acquire(KEEPER_A, 1_000).unwrap();
+        assert_eq!(grant.lease_expires_at, 1_060);
+    }
+
+    #[test]
+    fn amend_to_max_ttl_saturates_next_acquire_expiry() {
+        let mut e = election();
+        assert_eq!(e.amend_lease_ttl_secs(u64::MAX), Ok(true));
+        let grant = e.acquire(KEEPER_A, 1_000).unwrap();
+        assert_eq!(grant.lease_expires_at, u64::MAX);
+    }
+
+    #[test]
+    fn amend_appends_no_audit_entries() {
+        let mut e = election();
+        e.acquire(KEEPER_A, 1_000).unwrap();
+        e.renew(KEEPER_A, 1_010).unwrap();
+        assert_eq!(e.audit().len(), 2);
+        e.amend_lease_ttl_secs(90).unwrap();
+        e.amend_lease_ttl_secs(120).unwrap();
+        assert_eq!(e.audit().len(), 2);
+        assert_eq!(e.audit()[1].kind, ElectionAuditKind::LeaseRenewed);
     }
 }
