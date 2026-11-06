@@ -384,6 +384,78 @@ impl MerkleDistributor {
         Ok(())
     }
 
+    /// Rotate the maker key (AV-353).
+    ///
+    /// The maker is the distribution's sole gatekeeper: only the
+    /// maker may `reclaim` the unclaimed remainder, and only the
+    /// maker may revise the root
+    /// ([`MerkleDistributor::amend_merkle_root`], AV-342) or the
+    /// claim window
+    /// ([`MerkleDistributor::amend_merkle_expiry_slot`], AV-345).
+    /// Before this method the maker was fixed at
+    /// [`MerkleDistributor::new`] — a maker mis-keyed at publish
+    /// time, or a leaked maker key, left only one exit: rebuild the
+    /// distribution. Rebuilding is not equivalent and is dangerous:
+    /// a fresh instance zeroes the nullifier bitmap and
+    /// `claimed_amount`, so re-publishing the same root would let
+    /// already-claimed leaves claim again (double-claim), and
+    /// unclaimed leaves would have to claim all over again. This
+    /// method hands the reclaim key to a new key in place.
+    ///
+    /// Check order: authority → state → value, mirroring
+    /// [`MerkleDistributor::amend_merkle_expiry_slot`]: the caller
+    /// must be the current maker (`Unauthorized`, code 100);
+    /// `Active` only (`InvalidStateTransition`, code 101, once
+    /// `Reclaimed`); the new maker must be non-zero
+    /// (`InvalidDistribution`, code 258, reusing `new()`'s zero-maker
+    /// gate). Re-affirming the current maker is a no-op `Ok(())`:
+    /// no write, no event.
+    ///
+    /// There is no window gate and no `DistributionClaimsStarted`
+    /// gate: rotation touches neither the root, the nullifier
+    /// bitmap, nor the claimed accounting, so it is allowed while
+    /// claims are underway — and even after `expiry_slot` has passed
+    /// but before `reclaim` has run, which is the key use case
+    /// (swap the key on the eve of reclaim). Rotation takes no
+    /// `current_slot`: it is time-independent, unlike the root and
+    /// window revisions. Only the 32-byte maker moves. `root`,
+    /// `total_amount`, `leaf_count`, `created_slot`, `expiry_slot`,
+    /// the nullifier bitmap, `claimed_count`, and `claimed_amount`
+    /// are untouched.
+    ///
+    /// The new maker governs from the next evaluation: `reclaim`,
+    /// `amend_merkle_root`, and `amend_merkle_expiry_slot` all read
+    /// the live maker; the old maker loses all three gates at once,
+    /// while an action already executed keeps the maker it settled
+    /// under. Audit with
+    /// [`MerkleDistributor::maker_rotated_audit_json`], only on an
+    /// actual change.
+    ///
+    /// Honest limitation: rotation must be signed by the current
+    /// maker — a lost maker key cannot be rotated (the same
+    /// limitation as `Escrow::rotate_initializer`). In that case the
+    /// remainder stays un-reclaimable.
+    pub fn rotate_merkle_maker(
+        &mut self,
+        maker: [u8; 32],
+        new_maker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        if maker != self.maker {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != DistributorState::Active {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        if new_maker == [0u8; 32] {
+            return Err(EscrowError::InvalidDistribution);
+        }
+        if new_maker == self.maker {
+            return Ok(());
+        }
+        self.maker = new_maker;
+        Ok(())
+    }
+
     /// Audit-event JSON for a claim (hand-written):
     /// `{"event":"distributor_claimed","root":"<64hex>","leaf_index":<n>,
     /// "amount":<u64>,"claimed_count":<n>}`.
@@ -445,6 +517,25 @@ impl MerkleDistributor {
         s.push_str(",\"new_expiry_slot\":");
         s.push_str(&self.expiry_slot.to_string());
         s.push_str(",\"leaf_count\":");
+        s.push_str(&self.leaf_count.to_string());
+        s.push_str(",\"total_amount\":");
+        s.push_str(&self.total_amount.to_string());
+        s.push('}');
+        s
+    }
+
+    /// Audit-event JSON for a maker rotation (call only on an actual
+    /// change — a same-maker no-op emits nothing):
+    /// `{"event":"distributor_maker_rotated","old_maker":"<64hex>",
+    /// "new_maker":"<64hex>","leaf_count":<n>,"total_amount":<u64>}`.
+    /// `old_maker` is the key this call replaced; the new maker is
+    /// read off `self`.
+    pub fn maker_rotated_audit_json(&self, old_maker: [u8; 32]) -> String {
+        let mut s = String::from("{\"event\":\"distributor_maker_rotated\",\"old_maker\":\"");
+        s.push_str(&hex64(&old_maker));
+        s.push_str("\",\"new_maker\":\"");
+        s.push_str(&hex64(&self.maker));
+        s.push_str("\",\"leaf_count\":");
         s.push_str(&self.leaf_count.to_string());
         s.push_str(",\"total_amount\":");
         s.push_str(&self.total_amount.to_string());
@@ -1168,5 +1259,190 @@ mod tests {
             EscrowError::InvalidStateTransition
         );
         assert_eq!(r.expiry_slot(), 1000);
+    }
+
+    // ----- AV-353: rotate_merkle_maker -----
+
+    #[test]
+    fn rotate_maker_by_stranger_is_rejected_and_maker_unchanged() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        let err = d.rotate_merkle_maker(key(0xBB), key(0xCC)).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(d.maker(), key(0xAA));
+        assert_eq!(d.state(), DistributorState::Active);
+    }
+
+    #[test]
+    fn rotate_maker_to_zero_is_rejected_and_maker_unchanged() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        let err = d
+            .rotate_merkle_maker(key(0xAA), [0u8; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidDistribution);
+        assert_eq!(err.code(), 258);
+        assert_eq!(d.maker(), key(0xAA));
+    }
+
+    #[test]
+    fn rotate_maker_to_same_maker_is_noop() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        d.rotate_merkle_maker(key(0xAA), key(0xAA)).unwrap();
+        // The old maker still holds every gate after a no-op.
+        assert_eq!(d.maker(), key(0xAA));
+        let got = d.reclaim(key(0xAA), 1000).unwrap();
+        assert_eq!(got, 350);
+        assert_eq!(d.state(), DistributorState::Reclaimed);
+    }
+
+    #[test]
+    fn rotate_maker_moves_only_the_maker() {
+        let leaves = [(key(1), 100u64), (key(2), 250), (key(3), 50)];
+        let (mut d, _) = open_distribution(&leaves);
+        let root = d.root();
+        d.rotate_merkle_maker(key(0xAA), key(0xCC)).unwrap();
+        assert_eq!(d.maker(), key(0xCC));
+        assert_eq!(d.root(), root);
+        assert_eq!(d.leaf_count(), 3);
+        assert_eq!(d.expiry_slot(), 1000);
+        assert_eq!(d.state(), DistributorState::Active);
+        assert_eq!(d.claimed_count(), 0);
+        assert_eq!(d.claimed_amount(), 0);
+        assert_eq!(d.unclaimed_amount(), 400);
+    }
+
+    #[test]
+    fn rotate_maker_old_maker_loses_reclaim_new_maker_reclaims() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        d.rotate_merkle_maker(key(0xAA), key(0xCC)).unwrap();
+        let err = d.reclaim(key(0xAA), 1000).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(d.state(), DistributorState::Active);
+        let got = d.reclaim(key(0xCC), 1000).unwrap();
+        assert_eq!(got, 350);
+        assert_eq!(d.state(), DistributorState::Reclaimed);
+    }
+
+    #[test]
+    fn rotate_maker_during_claims_keeps_claimed_accounting() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        d.claim(0, key(1), 100, &proofs[0], 500).unwrap();
+        d.rotate_merkle_maker(key(0xAA), key(0xCC)).unwrap();
+        assert_eq!(d.maker(), key(0xCC));
+        assert_eq!(d.claimed_count(), 1);
+        assert_eq!(d.claimed_amount(), 100);
+        assert_eq!(d.unclaimed_amount(), 250);
+        assert!(d.is_claimed(0));
+        assert!(!d.is_claimed(1));
+    }
+
+    #[test]
+    fn unclaimed_leaf_claims_under_old_root_after_rotation() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        d.rotate_merkle_maker(key(0xAA), key(0xCC)).unwrap();
+        // Claims never read the maker: the old root still governs.
+        let got = d.claim(1, key(2), 250, &proofs[1], 500).unwrap();
+        assert_eq!(got, 250);
+        assert_eq!(d.claimed_amount(), 250);
+    }
+
+    #[test]
+    fn rotate_maker_after_expiry_but_before_reclaim_is_allowed() {
+        // The key use case: the window has lapsed, reclaim has not
+        // run yet, and the maker key must change before the sweep.
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        d.rotate_merkle_maker(key(0xAA), key(0xCC)).unwrap();
+        let got = d.reclaim(key(0xCC), 1000).unwrap();
+        assert_eq!(got, 350);
+        assert_eq!(d.state(), DistributorState::Reclaimed);
+    }
+
+    #[test]
+    fn rotate_maker_on_reclaimed_distribution_is_rejected() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        d.reclaim(key(0xAA), 1000).unwrap();
+        assert_eq!(d.state(), DistributorState::Reclaimed);
+        let err = d.rotate_merkle_maker(key(0xAA), key(0xCC)).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        assert_eq!(err.code(), 101);
+        // State check precedes the value check: a zero new maker on a
+        // reclaimed distribution still refuses on state.
+        let err = d
+            .rotate_merkle_maker(key(0xAA), [0u8; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        assert_eq!(d.maker(), key(0xAA));
+    }
+
+    #[test]
+    fn rotate_maker_new_maker_can_amend_old_maker_cannot() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        d.rotate_merkle_maker(key(0xAA), key(0xCC)).unwrap();
+        // The old maker lost both revision gates at once.
+        let (new_root, _) = build_tree(&[(key(1), 250u64), (key(2), 100)]);
+        assert_eq!(
+            d.amend_merkle_root(key(0xAA), new_root, 500).unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(
+            d.amend_merkle_expiry_slot(key(0xAA), 2000, 500)
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        // The new maker holds them.
+        d.amend_merkle_root(key(0xCC), new_root, 500).unwrap();
+        assert_eq!(d.root(), new_root);
+        d.amend_merkle_expiry_slot(key(0xCC), 2000, 500).unwrap();
+        assert_eq!(d.expiry_slot(), 2000);
+    }
+
+    #[test]
+    fn maker_rotated_audit_json_is_pinned() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, _) = open_distribution(&leaves);
+        d.rotate_merkle_maker(key(0xAA), key(0xCC)).unwrap();
+        let j = d.maker_rotated_audit_json(key(0xAA));
+        let expected = format!(
+            "{{\"event\":\"distributor_maker_rotated\",\"old_maker\":\"{}\",\"new_maker\":\"{}\",\"leaf_count\":2,\"total_amount\":350}}",
+            hex64(&key(0xAA)),
+            hex64(&key(0xCC))
+        );
+        assert_eq!(j, expected);
+    }
+
+    #[test]
+    fn failed_rotate_calls_leave_no_state_change() {
+        let leaves = [(key(1), 100u64), (key(2), 250)];
+        let (mut d, proofs) = open_distribution(&leaves);
+        d.claim(0, key(1), 100, &proofs[0], 500).unwrap();
+        let root = d.root();
+
+        // Stranger and zero new maker — both fail without touching
+        // anything.
+        assert_eq!(
+            d.rotate_merkle_maker(key(0xBB), key(0xCC)).unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(
+            d.rotate_merkle_maker(key(0xAA), [0u8; 32]).unwrap_err(),
+            EscrowError::InvalidDistribution
+        );
+        assert_eq!(d.maker(), key(0xAA));
+        assert_eq!(d.root(), root);
+        assert_eq!(d.state(), DistributorState::Active);
+        assert_eq!(d.claimed_count(), 1);
+        assert_eq!(d.claimed_amount(), 100);
+        assert_eq!(d.unclaimed_amount(), 250);
+        assert!(d.is_claimed(0));
+        assert!(!d.is_claimed(1));
     }
 }

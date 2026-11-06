@@ -8062,6 +8062,27 @@ root, not N accounts.
   still-future slot only narrows the window. `expiry_amended_audit_json`
   records the old and new windows (string event name
   `distributor_expiry_amended`, no new event code).
+- **Rotating the maker** (AV-353): the maker may hand the reclaim key
+  to a new key with `rotate_merkle_maker` — maker-only
+  (`Unauthorized`, code 100), `Active` only (`InvalidStateTransition`,
+  code 101, once `Reclaimed`), and the new maker must be non-zero
+  (`InvalidDistribution`, code 258, reusing `new()`'s zero-maker gate).
+  Re-affirming the current maker is a no-op. There is no window gate
+  and no `DistributionClaimsStarted` gate: rotation touches neither the
+  root, the nullifier bitmap, nor the claimed accounting, so it is
+  allowed while claims are underway — and even after `expiry_slot` has
+  passed but before `reclaim` has run, which is the key use case (swap
+  the key on the eve of reclaim). Only the 32-byte maker moves; the
+  root, totals, leaf count, window, and bitmap are untouched. The new
+  maker governs from the next evaluation: `reclaim`,
+  `amend_merkle_root`, and `amend_merkle_expiry_slot` all read the live
+  maker, so the old maker loses all three gates at once. Honest
+  limitation: rotation must be signed by the current maker — a lost
+  maker key cannot be rotated (same limitation as
+  `Escrow::rotate_initializer`), so in that case the remainder stays
+  un-reclaimable. `maker_rotated_audit_json` records the old and new
+  makers (string event name `distributor_maker_rotated`, no new event
+  code).
 
 New error codes (never renumbered): `InvalidDistribution` (258),
 `InvalidMerkleProof` (259), `AlreadyClaimed` (260),
