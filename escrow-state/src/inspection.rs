@@ -225,6 +225,93 @@ impl InspectionPeriod {
         Ok(InspectionRelease { released_at: now })
     }
 
+    /// Revise the inspection window's length live (AV-359): the
+    /// window is no longer frozen at its construction-time
+    /// `inspection_secs`.
+    ///
+    /// Check order: state → value → deadline → same. A terminal
+    /// window (disputed or auto-released) is refused — a finished
+    /// window must not be revived by amending it, and the only
+    /// other path to a new window is discarding and rebuilding
+    /// with [`InspectionPeriod::new`], which loses the terminal
+    /// state. A zero window, or one whose deadline
+    /// (`confirmed_at + new_inspection_secs`) overflows, is refused
+    /// ([`EscrowError::InspectionInvalidWindow`]), reusing the
+    /// same gates as `new`. The new deadline must be strictly
+    /// later than `now`, otherwise the amendment would silently
+    /// extinguish the taker's dispute right
+    /// ([`EscrowError::InspectionWindowExpired`]) — the deadline
+    /// second belongs to the next phase (AV-206), so a new
+    /// deadline equal to `now` is already expired, and the call
+    /// fails closed. Amending to the current value is a silent
+    /// no-op (`Ok(false)`).
+    ///
+    /// Otherwise only `inspection_secs` and `expires_at` move
+    /// (`expires_at = confirmed_at + new_inspection_secs`);
+    /// `taker`, `confirmed_at`, `state`, `disputed_at` and
+    /// `released_at` are untouched. The new window governs from
+    /// the next evaluation: [`InspectionPeriod::is_releasable`],
+    /// [`InspectionPeriod::dispute`] and
+    /// [`InspectionPeriod::settle`] all read `expires_at` live,
+    /// so an extension revives a nearly-expired window's dispute
+    /// right and a shortening lets the window settle earlier.
+    pub fn amend_inspection_secs(
+        &mut self,
+        new_inspection_secs: u64,
+        now: u64,
+    ) -> Result<bool, EscrowError> {
+        if self.state != InspectionState::Inspecting {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        if new_inspection_secs == 0 {
+            return Err(EscrowError::InspectionInvalidWindow);
+        }
+        let new_expires_at = self
+            .confirmed_at
+            .checked_add(new_inspection_secs)
+            .ok_or(EscrowError::InspectionInvalidWindow)?;
+        if new_expires_at <= now {
+            return Err(EscrowError::InspectionWindowExpired);
+        }
+        if new_inspection_secs == self.inspection_secs {
+            return Ok(false);
+        }
+        self.inspection_secs = new_inspection_secs;
+        self.expires_at = new_expires_at;
+        Ok(true)
+    }
+
+    /// Audit-event JSON for a live window revision (hand-written):
+    /// `{"event":"inspection_window_amended","taker":"<64hex>",
+    /// "previous_inspection_secs":<u64>,"inspection_secs":<u64>,
+    /// "previous_expires_at":<u64>,"expires_at":<u64>}`.
+    /// `previous_inspection_secs` is the window length this call
+    /// replaced; the new values are read off `self`, and
+    /// `previous_expires_at` is `confirmed_at` plus the previous
+    /// length — the anchor the revision preserves, so the event
+    /// pins both the new window and where it started counting
+    /// from. Only call on a real revision: a no-op amendment
+    /// emits no event.
+    pub fn inspection_window_audit_json(&self, previous_inspection_secs: u64) -> String {
+        let mut s = String::from("{\"event\":\"inspection_window_amended\",\"taker\":\"");
+        s.push_str(&hex64(&self.taker));
+        s.push_str("\",\"previous_inspection_secs\":");
+        s.push_str(&previous_inspection_secs.to_string());
+        s.push_str(",\"inspection_secs\":");
+        s.push_str(&self.inspection_secs.to_string());
+        s.push_str(",\"previous_expires_at\":");
+        s.push_str(
+            &self
+                .confirmed_at
+                .saturating_add(previous_inspection_secs)
+                .to_string(),
+        );
+        s.push_str(",\"expires_at\":");
+        s.push_str(&self.expires_at.to_string());
+        s.push('}');
+        s
+    }
+
     /// Audit-event JSON for a taker dispute (hand-written):
     /// `{"event":"inspection_disputed","taker":"<64hex>","at":<u64>}`.
     pub fn disputed_audit_json(&self) -> String {
@@ -384,5 +471,146 @@ mod inspection_tests {
             EscrowError::InvalidStateTransition
         );
         assert_eq!(w.state(), InspectionState::Disputed);
+    }
+
+    #[test]
+    fn amend_terminal_windows_are_refused() {
+        // Disputed: the freeze stands, no revival by amendment.
+        let mut disputed = window();
+        disputed.dispute(key(7), 2000).unwrap();
+        assert_eq!(
+            disputed.amend_inspection_secs(7200, 2000).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        assert_eq!(disputed.inspection_secs(), 3600);
+        assert_eq!(disputed.expires_at(), 4600);
+        assert_eq!(disputed.state(), InspectionState::Disputed);
+        // Auto-released: the decision is made exactly once.
+        let mut released = window();
+        released.settle(4600).unwrap();
+        assert_eq!(
+            released.amend_inspection_secs(7200, 4600).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        assert_eq!(released.inspection_secs(), 3600);
+        assert_eq!(released.expires_at(), 4600);
+        assert_eq!(released.state(), InspectionState::AutoReleased);
+    }
+
+    #[test]
+    fn amend_zero_or_overflowing_window_is_refused() {
+        let mut w = window();
+        assert_eq!(
+            w.amend_inspection_secs(0, 2000).unwrap_err(),
+            EscrowError::InspectionInvalidWindow
+        );
+        assert_eq!(w.inspection_secs(), 3600);
+        assert_eq!(w.expires_at(), 4600);
+        // A deadline past u64::MAX cannot be represented.
+        let mut edge = InspectionPeriod::new(key(7), u64::MAX - 10, 10).unwrap();
+        assert_eq!(edge.expires_at(), u64::MAX);
+        assert_eq!(
+            edge.amend_inspection_secs(u64::MAX, 0).unwrap_err(),
+            EscrowError::InspectionInvalidWindow
+        );
+        assert_eq!(edge.inspection_secs(), 10);
+        assert_eq!(edge.expires_at(), u64::MAX);
+    }
+
+    #[test]
+    fn amend_new_deadline_at_or_before_now_is_refused() {
+        let mut w = window();
+        // A new deadline of 1010 is not strictly later than now.
+        assert_eq!(
+            w.amend_inspection_secs(10, 1010).unwrap_err(),
+            EscrowError::InspectionWindowExpired
+        );
+        assert_eq!(
+            w.amend_inspection_secs(10, 1011).unwrap_err(),
+            EscrowError::InspectionWindowExpired
+        );
+        // A failed revision changed nothing.
+        assert_eq!(w.inspection_secs(), 3600);
+        assert_eq!(w.expires_at(), 4600);
+        assert_eq!(w.state(), InspectionState::Inspecting);
+    }
+
+    #[test]
+    fn amend_same_value_is_a_silent_noop() {
+        let mut w = window();
+        assert_eq!(w.amend_inspection_secs(3600, 2000), Ok(false));
+        assert_eq!(w.inspection_secs(), 3600);
+        assert_eq!(w.expires_at(), 4600);
+        assert_eq!(w.state(), InspectionState::Inspecting);
+        assert_eq!(w.taker(), key(7));
+        assert_eq!(w.confirmed_at(), 1000);
+    }
+
+    #[test]
+    fn amend_same_value_past_deadline_still_fails_closed() {
+        // Check order pins this: the deadline gate runs before the
+        // same-value no-op, so a same-value call at or past the
+        // deadline is an expiry refusal, not a silent no-op.
+        let mut w = window();
+        assert_eq!(
+            w.amend_inspection_secs(3600, 4600).unwrap_err(),
+            EscrowError::InspectionWindowExpired
+        );
+        assert_eq!(w.inspection_secs(), 3600);
+        assert_eq!(w.expires_at(), 4600);
+    }
+
+    #[test]
+    fn amend_extend_revives_a_nearly_expired_window() {
+        let mut w = window();
+        assert_eq!(w.amend_inspection_secs(7200, 4500), Ok(true));
+        assert_eq!(w.inspection_secs(), 7200);
+        assert_eq!(w.expires_at(), 8200);
+        // Past the old deadline, the taker can still dispute.
+        assert!(!w.is_releasable(5000));
+        w.dispute(key(7), 5000).unwrap();
+        assert_eq!(w.state(), InspectionState::Disputed);
+        assert_eq!(w.disputed_at(), Some(5000));
+    }
+
+    #[test]
+    fn amend_shorten_makes_the_window_settleable_earlier() {
+        let mut w = window();
+        assert_eq!(w.amend_inspection_secs(600, 1100), Ok(true));
+        assert_eq!(w.inspection_secs(), 600);
+        assert_eq!(w.expires_at(), 1600);
+        assert!(!w.is_releasable(1599));
+        assert!(w.is_releasable(1600));
+        let receipt = w.settle(1600).unwrap();
+        assert_eq!(receipt.released_at, 1600);
+        assert_eq!(w.state(), InspectionState::AutoReleased);
+    }
+
+    #[test]
+    fn amend_moves_only_the_window_fields() {
+        let mut w = window();
+        assert!(w.amend_inspection_secs(7200, 2000).unwrap());
+        assert_eq!(w.taker(), key(7));
+        assert_eq!(w.confirmed_at(), 1000);
+        assert_eq!(w.state(), InspectionState::Inspecting);
+        assert_eq!(w.disputed_at(), None);
+        assert_eq!(w.released_at(), None);
+        assert_eq!(w.inspection_secs(), 7200);
+        assert_eq!(w.expires_at(), 8200);
+    }
+
+    #[test]
+    fn inspection_window_amended_audit_json_exact() {
+        let mut w = window();
+        assert!(w.amend_inspection_secs(7200, 2000).unwrap());
+        assert_eq!(
+            w.inspection_window_audit_json(3600),
+            format!(
+                "{{\"event\":\"inspection_window_amended\",\"taker\":\"{}\",\
+                 \"previous_inspection_secs\":3600,\"inspection_secs\":7200,\
+                 \"previous_expires_at\":4600,\"expires_at\":8200}}",
+                hex64(&key(7))
+            )
+        );
     }
 }

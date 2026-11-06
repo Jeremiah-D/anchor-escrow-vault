@@ -3745,6 +3745,24 @@ instruction wiring the window to `confirm_delivery` is follow-up
 work — no such instruction is claimed. (Solana: delivery
 inspection.)
 
+Amending the inspection window (AV-359): `amend_inspection_secs`
+revises the live window length in place — the confirmation anchor is
+preserved (`expires_at = confirmed_at + new_inspection_secs`), so the
+taker, `confirmed_at`, `state`, `disputed_at` and `released_at` are
+untouched; `is_releasable`, `dispute` and `settle` all read
+`expires_at` live, so an extension revives a nearly-expired window's
+dispute right and a shortening lets the window settle earlier.
+Terminal windows (`Disputed` / `AutoReleased`) refuse with
+`InvalidStateTransition`; a zero length or an overflowing deadline
+refuses with `InspectionInvalidWindow` (329), and a new deadline at
+or before `now` refuses with `InspectionWindowExpired` (331), so a
+revision can never silently extinguish the taker's dispute right.
+Re-affirming the current length is a silent `Ok(false)` no-op. The
+`inspection_window_amended` audit event carries the previous and new
+lengths and deadlines; no new error code, no authority gate (the
+window is off-chain pure logic, and gating belongs to the Anchor
+instruction that will call it).
+
 ## Referrer revenue share (AV-191)
 
 Escrows can carry an optional referrer: `with_referrer(referrer, bps)`
