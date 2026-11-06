@@ -7057,6 +7057,20 @@ program scope).
   unpausing a running program is `ProgramNotPaused`, code 223) and the
   check order is the same: pauser authority (`InvalidPauser`, code 224)
   first, then toggle state.
+- **Rotating the pauser (AV-355)**: `rotate_pauser(caller, new_pauser,
+  now)` lets the current pauser hand the kill switch to a new key in
+  place — no rebuild, so the 32-entry audit ring and the paused state
+  survive. Check order is authority then config: the caller must be
+  the current pauser and the new key must be non-zero (both failures
+  are `InvalidPauser`, code 224; no new error code). Rotating to the
+  already-bound key is a no-op that writes no audit entry; any other
+  rotation appends a `PauserRotated` entry (actor: the old pauser).
+  There is deliberately no paused-state gate — rotation works while
+  the breaker is engaged, the escape hatch for a lost pause key plus
+  an engaged breaker (rotate, then `unpause` with the fresh key). The
+  old key loses `pause`/`unpause` rights immediately. Honest limit: a
+  lost pauser key cannot be rotated (rotation must be signed by the
+  current pauser); rescuing one needs a separate governance path.
 - **The halt**: `require_running()` is the guard the program calls at
   the top of every state-changing instruction handler except
   `unpause_program` and `close_vault` (rent reclamation must stay
@@ -7065,7 +7079,8 @@ program scope).
 - **Structured audit**: every successful toggle appends a
   `CircuitAuditEntry` (`ProgramPaused` / `ProgramResumed` with the actor
   and the timestamp) to a bounded 32-entry ring — the program-level
-  event log, oldest evicts first.
+  event log, oldest evicts first. A pauser rotation (AV-355) appends a
+  `PauserRotated` entry the same way.
 - **Anchor surface**: `pause_program` / `unpause_program` instructions
   (IDL discriminators `sha256("global:pause_program")[..8]` /
   `sha256("global:unpause_program")[..8]`, pinned by the IDL pipeline),
@@ -7076,9 +7091,9 @@ program scope).
 
 Honest scope: the breaker does not reach into `Escrow` methods —
 per-escrow transitions are unchanged; the program consults the guard at
-the instruction boundary. There is no pauser rotation in this round
-(the AV-47 per-escrow rotation exists; program-level rotation is a
-governance action for a later item).
+the instruction boundary. Pauser rotation exists (AV-355, in place,
+audit-logged); a lost pauser key is still unrecoverable by rotation
+alone.
 
 Layout growth: the vault body grows from 5506 to 5515 bytes (+9:
 1-byte discriminant + 8-byte timestamp), `VAULT_SPACE_NO_QUORUM` from

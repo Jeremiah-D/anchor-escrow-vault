@@ -30,7 +30,8 @@
 //!   [`CircuitAuditEntry`] (`ProgramPaused` / `ProgramResumed` with the
 //!   actor and the timestamp) to a bounded 32-entry ring — the
 //!   program-level event log. Oldest entries evict first; the ring is
-//!   the on-chain account's fixed-size tail.
+//!   the on-chain account's fixed-size tail. A pauser rotation
+//!   (AV-355) appends a `PauserRotated` entry the same way.
 //!
 //! # What is deliberately NOT here (honesty labels)
 //!
@@ -39,9 +40,15 @@
 //!   the guard at the instruction boundary. Wiring the guard into all
 //!   ~150 instruction handlers is a program-deployment change, not a
 //!   state-machine change — the skeleton documents the call site rule.
-//! - **The pauser is bound at construction.** There is no rotation
-//!   instruction in this round (the AV-47 per-escrow rotation exists;
-//!   a program-level rotation is a governance action for a later item).
+//! - **The pauser is bound at construction, and rotates in place.**
+//!   [`ProgramCircuitBreaker::rotate_pauser`] (AV-355) lets the
+//!   current pauser hand the kill switch to a new key without a
+//!   rebuild — the audit ring and the paused state survive. It works
+//!   while the breaker is engaged (the escape hatch: rotate, then
+//!   `unpause` with the fresh key). A lost pauser key cannot be
+//!   rotated — rotation must be signed by the current pauser — so
+//!   rescuing a lost key needs a separate governance path (e.g. the
+//!   upgrade authority).
 //! - **"Independent role" is an operator discipline.** The breaker is
 //!   program-global while initializer/taker are per-escrow, so no
 //!   single check can prove "not an escrow party" — the program binds
@@ -60,15 +67,18 @@ use super::EscrowError;
 /// oldest evicts first).
 pub const MAX_CIRCUIT_AUDIT_ENTRIES: usize = 32;
 
-/// The program-level breaker events: the pause engage and the resume.
-/// These are the "熔断/恢复进事件" leg — each carries the actor and the
-/// timestamp in the audit entry.
+/// The program-level breaker events: the pause engage, the resume,
+/// and the pauser rotation. These are the "熔断/恢复进事件" leg — each
+/// carries the actor and the timestamp in the audit entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitBreakerEventKind {
     /// The breaker engaged: the program halted.
     ProgramPaused,
     /// The breaker released: the program resumed.
     ProgramResumed,
+    /// The pauser key rotated (AV-355): the old pauser handed the
+    /// kill switch to a new key.
+    PauserRotated,
 }
 
 /// One structured audit entry: what happened, when, and who did it.
@@ -157,6 +167,62 @@ impl ProgramCircuitBreaker {
         self.paused = false;
         self.push_audit(CircuitAuditEntry {
             kind: CircuitBreakerEventKind::ProgramResumed,
+            at: now,
+            actor: caller,
+        });
+        Ok(())
+    }
+
+    /// Rotate the pauser (AV-355): the current pauser hands the
+    /// kill switch to a new key, in place — no rebuild, so the 32
+    /// entries of audit history and the paused state survive (a
+    /// rebuild would discard the audit ring and force a re-bind of
+    /// the program-level PDA). The security key must rotate on a
+    /// schedule (key hygiene, suspected leak, multisig membership
+    /// change); before this item the only path was that rebuild.
+    ///
+    /// Check order is authority → config, following the AV-47
+    /// [`Escrow::rotate_pause_authority`](crate::Escrow::rotate_pause_authority)
+    /// and AV-353 `rotate_merkle_maker` precedents: the caller must
+    /// be the current pauser ([`EscrowError::InvalidPauser`]
+    /// otherwise), then the zero key is rejected (same error, reusing
+    /// [`new`](Self::new)'s gate — no new error code). Rotating to
+    /// the already-bound key is an `Ok(())` no-op that writes no
+    /// audit entry. Any other rotation swaps the 32-byte pauser in
+    /// place and appends a `PauserRotated` audit entry (actor: the
+    /// old pauser, i.e. the caller).
+    ///
+    /// Deliberately NOT gated on the paused state: rotation must
+    /// work while the breaker is engaged — a lost pause key plus an
+    /// engaged breaker is exactly the situation rotation exists for
+    /// (rotate, then `unpause` with the fresh key), the AV-47 escape
+    /// hatch at program scope. The old key loses `pause`/`unpause`
+    /// rights immediately; the new key governs from the next call,
+    /// both of which always read the live pauser.
+    ///
+    /// Honest limitation: rotation must be signed by the current
+    /// pauser — a lost pauser key cannot be rotated (the same
+    /// limitation as AV-353's lost maker key). Rescuing a lost key
+    /// needs a separate governance path (e.g. the upgrade authority),
+    /// not this method.
+    pub fn rotate_pauser(
+        &mut self,
+        caller: [u8; 32],
+        new_pauser: [u8; 32],
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        if caller != self.pauser {
+            return Err(EscrowError::InvalidPauser);
+        }
+        if new_pauser == [0u8; 32] {
+            return Err(EscrowError::InvalidPauser);
+        }
+        if new_pauser == self.pauser {
+            return Ok(());
+        }
+        self.pauser = new_pauser;
+        self.push_audit(CircuitAuditEntry {
+            kind: CircuitBreakerEventKind::PauserRotated,
             at: now,
             actor: caller,
         });
@@ -327,6 +393,133 @@ mod circuit_breaker_tests {
         let _ = b.pause(PAUSER, 5);
         let _ = b.pause(STRANGER, 6);
         assert_eq!(b.audit_log().len(), 1);
+    }
+
+    #[test]
+    fn rotate_pauser_hands_over_and_audits() {
+        let mut b = ProgramCircuitBreaker::new(PAUSER).unwrap();
+        let new_pauser = [0xD4; 32];
+        b.rotate_pauser(PAUSER, new_pauser, 1_000).unwrap();
+        assert_eq!(b.pauser(), new_pauser);
+        // Paused state untouched (was running, still running).
+        assert!(!b.is_paused());
+        let log = b.audit_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].kind, CircuitBreakerEventKind::PauserRotated);
+        assert_eq!(log[0].at, 1_000);
+        // Actor is the old pauser, i.e. the caller.
+        assert_eq!(log[0].actor, PAUSER);
+    }
+
+    #[test]
+    fn rotate_pauser_rejects_a_stranger_and_changes_nothing() {
+        let mut b = ProgramCircuitBreaker::new(PAUSER).unwrap();
+        let new_pauser = [0xD4; 32];
+        assert_eq!(
+            b.rotate_pauser(STRANGER, new_pauser, 1_000),
+            Err(EscrowError::InvalidPauser)
+        );
+        assert_eq!(b.pauser(), PAUSER);
+        assert!(b.audit_log().is_empty());
+    }
+
+    #[test]
+    fn rotate_pauser_rejects_the_zero_key_and_keeps_live() {
+        let mut b = ProgramCircuitBreaker::new(PAUSER).unwrap();
+        assert_eq!(
+            b.rotate_pauser(PAUSER, [0u8; 32], 1_000),
+            Err(EscrowError::InvalidPauser)
+        );
+        assert_eq!(b.pauser(), PAUSER);
+        assert!(b.audit_log().is_empty());
+        // The live pauser still works.
+        b.pause(PAUSER, 2_000).unwrap();
+        assert!(b.is_paused());
+    }
+
+    #[test]
+    fn rotate_pauser_to_same_key_is_noop_without_audit() {
+        let mut b = ProgramCircuitBreaker::new(PAUSER).unwrap();
+        b.pause(PAUSER, 1_000).unwrap();
+        b.rotate_pauser(PAUSER, PAUSER, 2_000).unwrap();
+        assert_eq!(b.pauser(), PAUSER);
+        assert!(b.is_paused());
+        // Only the pause is audited; the no-op rotation writes nothing.
+        let log = b.audit_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].kind, CircuitBreakerEventKind::ProgramPaused);
+    }
+
+    #[test]
+    fn old_pauser_loses_toggle_rights_new_pauser_gains_them() {
+        let mut b = ProgramCircuitBreaker::new(PAUSER).unwrap();
+        let new_pauser = [0xD4; 32];
+        b.rotate_pauser(PAUSER, new_pauser, 1_000).unwrap();
+        // The old key is dead at once.
+        assert_eq!(b.pause(PAUSER, 2_000), Err(EscrowError::InvalidPauser));
+        assert_eq!(b.unpause(PAUSER, 2_000), Err(EscrowError::InvalidPauser));
+        assert!(!b.is_paused());
+        // The new key governs from the next call.
+        b.pause(new_pauser, 3_000).unwrap();
+        assert!(b.is_paused());
+        b.unpause(new_pauser, 4_000).unwrap();
+        assert!(!b.is_paused());
+    }
+
+    #[test]
+    fn rotate_pauser_works_while_paused_then_unpause_with_fresh_key() {
+        let mut b = ProgramCircuitBreaker::new(PAUSER).unwrap();
+        let new_pauser = [0xD4; 32];
+        b.pause(PAUSER, 1_000).unwrap();
+        // No paused-state gate: the escape hatch works while engaged.
+        b.rotate_pauser(PAUSER, new_pauser, 2_000).unwrap();
+        assert!(b.is_paused());
+        // The old key can no longer release the breaker.
+        assert_eq!(b.unpause(PAUSER, 3_000), Err(EscrowError::InvalidPauser));
+        assert!(b.is_paused());
+        // The fresh key releases it.
+        b.unpause(new_pauser, 4_000).unwrap();
+        assert!(!b.is_paused());
+        let log = b.audit_log();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0].kind, CircuitBreakerEventKind::ProgramPaused);
+        assert_eq!(log[1].kind, CircuitBreakerEventKind::PauserRotated);
+        assert_eq!(log[1].actor, PAUSER);
+        assert_eq!(log[2].kind, CircuitBreakerEventKind::ProgramResumed);
+        assert_eq!(log[2].actor, new_pauser);
+    }
+
+    #[test]
+    fn failed_rotations_audit_nothing() {
+        let mut b = ProgramCircuitBreaker::new(PAUSER).unwrap();
+        let _ = b.rotate_pauser(STRANGER, [0xD4; 32], 1);
+        let _ = b.rotate_pauser(PAUSER, [0u8; 32], 2);
+        let _ = b.rotate_pauser(STRANGER, [0u8; 32], 3);
+        assert!(b.audit_log().is_empty());
+        // A later real rotation still audits exactly once.
+        b.rotate_pauser(PAUSER, [0xD4; 32], 4).unwrap();
+        assert_eq!(b.audit_log().len(), 1);
+    }
+
+    #[test]
+    fn rotation_keeps_audit_history_across_the_ring() {
+        let mut b = ProgramCircuitBreaker::new(PAUSER).unwrap();
+        // Fill the ring with 30 toggles, then rotate: the rotation
+        // entry joins the surviving history instead of discarding it.
+        for i in 0..30u64 {
+            if i % 2 == 0 {
+                b.pause(PAUSER, i).unwrap();
+            } else {
+                b.unpause(PAUSER, i).unwrap();
+            }
+        }
+        assert_eq!(b.audit_log().len(), 30);
+        b.rotate_pauser(PAUSER, [0xD4; 32], 100).unwrap();
+        let log = b.audit_log();
+        assert_eq!(log.len(), 31);
+        assert_eq!(log[0].at, 0);
+        assert_eq!(log[30].kind, CircuitBreakerEventKind::PauserRotated);
+        assert_eq!(log[30].at, 100);
     }
 
     #[test]
