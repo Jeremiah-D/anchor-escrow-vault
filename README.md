@@ -3125,6 +3125,22 @@ refund, not forfeit, them) and to AV-189 English (open ascending bids:
 the winner is public and the next bid is known without a ranking
 walk). (Solana: auction settlement assurance.)
 
+Amending the payment window (AV-358): `amend_window_slots` revises
+the live window length in place — the window start is preserved
+(`new_deadline = window_start + new_window_slots`), so the ranking,
+the current winner, the forfeited list, and any paid winner are
+untouched; `mark_paid` judges against the new deadline and `expire`
+opens the successor's fresh window from the new length. Terminal
+windows (`Paid` / `Exhausted`) refuse with `InvalidStateTransition`
+(101); a zero length or a recomputed deadline at or before the
+current slot refuses with `WinnerPaymentInvalidWindow` (322), so a
+revision can never kill a window early — ending one is `expire`'s
+job. Re-affirming the current length is a silent `Ok(false)` no-op.
+A lapsed but not yet expired window can be revived by widening it.
+The `window_slots_amended` audit event carries the previous and new
+lengths and deadlines; no new error code, no authority gate (gating
+belongs to the Anchor instruction that will call it).
+
 ## Settlement-mint conversion (AV-217)
 
 An escrow locks one mint (AV-16) but may settle in another.

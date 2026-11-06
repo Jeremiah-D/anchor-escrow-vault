@@ -187,6 +187,15 @@ impl WinnerPaymentWindow {
         self.deadline_slot
     }
 
+    /// The live payment-window length, in slots.
+    ///
+    /// Follows [`WinnerPaymentWindow::amend_window_slots`]: the
+    /// construction-time value until the window is revised, the
+    /// revised value after.
+    pub fn window_slots(&self) -> u64 {
+        self.window_slots
+    }
+
     /// The window's lifecycle state.
     pub fn state(&self) -> WinnerPaymentState {
         self.state
@@ -277,6 +286,78 @@ impl WinnerPaymentWindow {
         })
     }
 
+    /// Revise the live payment-window length, in slots (AV-358).
+    ///
+    /// A winner dragging their feet can have the window tightened so
+    /// the sale falls through to the runner-up sooner; a winner held
+    /// up by chain congestion can have it widened so the sale is not
+    /// lost. Before this method the only remedy was rebuilding the
+    /// window — which discarded the `current` successor, the
+    /// `forfeited` list, and any `paid_winner`, and required
+    /// re-ranking every revealed bid. This revises the window in
+    /// place: the ranking, the current winner, the forfeited list,
+    /// and the paid state are untouched.
+    ///
+    /// The window's start is preserved and the elapsed time is kept:
+    /// `window_start = deadline_slot - old window_slots` and the new
+    /// deadline is `window_start + new_window_slots`. The new window
+    /// governs from the next evaluation on: [`WinnerPaymentWindow::mark_paid`]
+    /// judges against the new deadline, and
+    /// [`WinnerPaymentWindow::expire`] opens the successor's fresh
+    /// window from the new length.
+    ///
+    /// Check order: state → value → deadline → same, mirroring
+    /// AV-345's [`MerkleDistributor::amend_merkle_expiry_slot`] and
+    /// AV-339's `amend_htlc_expiry_slot`:
+    ///
+    /// 1. terminal window (`Paid` / `Exhausted`) → [`EscrowError::InvalidStateTransition`]
+    ///    — a terminal window has no live clock left to move, so
+    ///    revising it is meaningless;
+    /// 2. `new_window_slots == 0` → [`EscrowError::WinnerPaymentInvalidWindow`],
+    ///    reusing [`WinnerPaymentWindow::new`]'s zero-window gate, live
+    ///    values untouched;
+    /// 3. the recomputed deadline is at or before `current_slot` →
+    ///    [`EscrowError::WinnerPaymentInvalidWindow`], live values
+    ///    untouched — a revision only narrows or widens the window,
+    ///    never kills it early; ending a window is [`WinnerPaymentWindow::expire`]'s
+    ///    job;
+    /// 4. re-affirming the current length → `Ok(false)`, a silent
+    ///    no-op: nothing is written and no audit event is emitted.
+    ///
+    /// Otherwise `window_slots` and `deadline_slot` are replaced as a
+    /// pair and the method returns `Ok(true)`. A window that has
+    /// lapsed but not yet been expired can be revived by widening it
+    /// (`new_deadline > current_slot`): the current winner may still
+    /// pay until `expire` is called, the same revival AV-345 allows.
+    ///
+    /// There is no authority gate: the struct holds no authority key,
+    /// so gating belongs to the Anchor instruction that will call this
+    /// method, not to the pure-logic sidecar (same as `SponsorPolicy`
+    /// and `PriorityFeeOracle`).
+    pub fn amend_window_slots(
+        &mut self,
+        new_window_slots: u64,
+        current_slot: u64,
+    ) -> Result<bool, EscrowError> {
+        if self.state != WinnerPaymentState::AwaitingPayment {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        if new_window_slots == 0 {
+            return Err(EscrowError::WinnerPaymentInvalidWindow);
+        }
+        let window_start = self.deadline_slot.saturating_sub(self.window_slots);
+        let new_deadline = window_start.saturating_add(new_window_slots);
+        if new_deadline <= current_slot {
+            return Err(EscrowError::WinnerPaymentInvalidWindow);
+        }
+        if new_window_slots == self.window_slots {
+            return Ok(false);
+        }
+        self.window_slots = new_window_slots;
+        self.deadline_slot = new_deadline;
+        Ok(true)
+    }
+
     /// Confiscate every recorded defaulter's deposit through AV-194.
     ///
     /// Validation first, mutation second: the deposit book must be
@@ -343,6 +424,42 @@ impl WinnerPaymentWindow {
         }
         s.push_str(",\"forfeited_count\":");
         s.push_str(&self.forfeited.len().to_string());
+        s.push('}');
+        s
+    }
+
+    /// Audit-event JSON for a window-length revision (call only on an
+    /// actual change — a same-length no-op emits nothing):
+    /// `{"event":"winner_payment_window_amended",
+    /// "previous_window_slots":<u64>,"window_slots":<u64>,
+    /// "previous_deadline":<u64>,"deadline":<u64>,"slot":<u64>}`.
+    /// `previous_window_slots` / `previous_deadline` are the values
+    /// this call replaced; the new values are read off `self`.
+    /// `"slot"` is the window's start slot
+    /// (`deadline_slot - window_slots`) — the anchor the revision
+    /// preserves, so the event pins both the new window and where it
+    /// started counting from.
+    pub fn window_slots_amended_audit_json(
+        &self,
+        previous_window_slots: u64,
+        previous_deadline_slot: u64,
+    ) -> String {
+        let mut s =
+            String::from("{\"event\":\"winner_payment_window_amended\",\"previous_window_slots\":");
+        s.push_str(&previous_window_slots.to_string());
+        s.push_str(",\"window_slots\":");
+        s.push_str(&self.window_slots.to_string());
+        s.push_str(",\"previous_deadline\":");
+        s.push_str(&previous_deadline_slot.to_string());
+        s.push_str(",\"deadline\":");
+        s.push_str(&self.deadline_slot.to_string());
+        s.push_str(",\"slot\":");
+        s.push_str(
+            &self
+                .deadline_slot
+                .saturating_sub(self.window_slots)
+                .to_string(),
+        );
         s.push('}');
         s
     }
@@ -525,5 +642,150 @@ mod winner_payment_tests {
             EscrowError::Unauthorized
         );
         assert_eq!(book2.state_of(key(3)).unwrap(), DepositState::Locked);
+    }
+
+    #[test]
+    fn window_slots_getter_follows_live_value() {
+        let mut w = WinnerPaymentWindow::new(&reveals(), 10, 100).unwrap();
+        assert_eq!(w.window_slots(), 10);
+        assert!(w.amend_window_slots(25, 102).unwrap());
+        assert_eq!(w.window_slots(), 25);
+    }
+
+    #[test]
+    fn amend_window_slots_tightens_and_governs_next_evaluation() {
+        let mut w = WinnerPaymentWindow::new(&reveals(), 10, 100).unwrap();
+        // Window start 100 is preserved: new deadline 100 + 4.
+        assert!(w.amend_window_slots(4, 102).unwrap());
+        assert_eq!(w.window_slots(), 4);
+        assert_eq!(w.deadline_slot(), 104);
+        // mark_paid judges against the new deadline.
+        assert_eq!(
+            w.mark_paid(key(3), 104).unwrap_err(),
+            EscrowError::WinnerPaymentWindowExpired
+        );
+        let receipt = w.mark_paid(key(3), 103).unwrap();
+        assert_eq!(receipt.winner, key(3));
+        assert_eq!(w.state(), WinnerPaymentState::Paid);
+    }
+
+    #[test]
+    fn amend_window_slots_successor_window_uses_new_length() {
+        let mut w = WinnerPaymentWindow::new(&reveals(), 10, 100).unwrap();
+        assert!(w.amend_window_slots(4, 102).unwrap());
+        let e = w.expire(104).unwrap();
+        assert_eq!(e.forfeited_winner, key(3));
+        assert_eq!(e.next_winner, Some(key(2)));
+        // Successor window: expire slot + NEW length, not the old 10.
+        assert_eq!(e.next_deadline_slot, Some(108));
+        assert_eq!(w.deadline_slot(), 108);
+        assert_eq!(w.window_slots(), 4);
+    }
+
+    #[test]
+    fn amend_window_slots_widens_and_revives_lapsed_window() {
+        let mut w = WinnerPaymentWindow::new(&reveals(), 10, 100).unwrap();
+        // Deadline 110 has passed at slot 115, but expire has not run.
+        assert_eq!(
+            w.mark_paid(key(3), 115).unwrap_err(),
+            EscrowError::WinnerPaymentWindowExpired
+        );
+        assert!(w.amend_window_slots(20, 115).unwrap());
+        assert_eq!(w.deadline_slot(), 120);
+        // Revived: the winner may still pay until expire is called.
+        let receipt = w.mark_paid(key(3), 115).unwrap();
+        assert_eq!(receipt.winner, key(3));
+        assert_eq!(w.state(), WinnerPaymentState::Paid);
+    }
+
+    #[test]
+    fn amend_window_slots_rejects_zero_and_killing_deadline() {
+        let mut w = WinnerPaymentWindow::new(&reveals(), 10, 100).unwrap();
+        assert_eq!(
+            w.amend_window_slots(0, 102).unwrap_err(),
+            EscrowError::WinnerPaymentInvalidWindow
+        );
+        assert_eq!(w.window_slots(), 10);
+        assert_eq!(w.deadline_slot(), 110);
+        // Shrink to 5 at slot 105: new deadline 100 + 5 = 105, at the
+        // current slot — the revision would kill the window now.
+        assert_eq!(
+            w.amend_window_slots(5, 105).unwrap_err(),
+            EscrowError::WinnerPaymentInvalidWindow
+        );
+        assert_eq!(w.window_slots(), 10);
+        assert_eq!(w.deadline_slot(), 110);
+        // Same shrink one slot earlier is fine: deadline 105 > 104.
+        assert!(w.amend_window_slots(5, 104).unwrap());
+        assert_eq!(w.deadline_slot(), 105);
+    }
+
+    #[test]
+    fn amend_window_slots_same_length_is_silent_noop() {
+        let mut w = WinnerPaymentWindow::new(&reveals(), 10, 100).unwrap();
+        assert!(!w.amend_window_slots(10, 105).unwrap());
+        assert_eq!(w.window_slots(), 10);
+        assert_eq!(w.deadline_slot(), 110);
+        // The deadline gate runs before the no-op check: re-affirming
+        // the length of an already-lapsed window still fails.
+        assert_eq!(
+            w.amend_window_slots(10, 115).unwrap_err(),
+            EscrowError::WinnerPaymentInvalidWindow
+        );
+        assert_eq!(w.window_slots(), 10);
+        assert_eq!(w.deadline_slot(), 110);
+    }
+
+    #[test]
+    fn amend_window_slots_refused_on_terminal_windows() {
+        let mut paid = WinnerPaymentWindow::new(&reveals(), 10, 100).unwrap();
+        paid.mark_paid(key(3), 105).unwrap();
+        assert_eq!(
+            paid.amend_window_slots(20, 106).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        // State gate runs before the value gate: zero on a Paid window
+        // reports the terminal state, not the zero window.
+        assert_eq!(
+            paid.amend_window_slots(0, 106).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        let mut exhausted = WinnerPaymentWindow::new(&[], 10, 100).unwrap();
+        assert_eq!(exhausted.state(), WinnerPaymentState::Exhausted);
+        assert_eq!(
+            exhausted.amend_window_slots(20, 101).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+    }
+
+    #[test]
+    fn amend_window_slots_preserves_ranking_and_forfeits() {
+        let mut w = WinnerPaymentWindow::new(&reveals(), 10, 100).unwrap();
+        w.expire(110).unwrap();
+        assert_eq!(w.forfeited_winners(), &[key(3)]);
+        assert_eq!(w.current_winner(), Some(key(2)));
+        // Successor window started at 110 (deadline 120, length 10).
+        assert!(w.amend_window_slots(5, 112).unwrap());
+        assert_eq!(w.window_slots(), 5);
+        assert_eq!(w.deadline_slot(), 115);
+        assert_eq!(w.current_winner(), Some(key(2)));
+        assert_eq!(w.forfeited_winners(), &[key(3)]);
+        assert_eq!(w.remaining_ranking(), &[key(1), key(4)]);
+        assert_eq!(w.paid_winner(), None);
+        // The next successor's window opens from the new length too.
+        let e = w.expire(115).unwrap();
+        assert_eq!(e.next_winner, Some(key(1)));
+        assert_eq!(e.next_deadline_slot, Some(120));
+    }
+
+    #[test]
+    fn window_slots_amended_audit_json_exact() {
+        let mut w = WinnerPaymentWindow::new(&reveals(), 10, 100).unwrap();
+        assert!(w.amend_window_slots(20, 105).unwrap());
+        assert_eq!(
+            w.window_slots_amended_audit_json(10, 110),
+            "{\"event\":\"winner_payment_window_amended\",\"previous_window_slots\":10,\
+             \"window_slots\":20,\"previous_deadline\":110,\"deadline\":120,\"slot\":100}"
+        );
     }
 }
