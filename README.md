@@ -8497,10 +8497,25 @@ on-chain record explains who moved the authority or why.
   (`confirm_handover`). The current authority can never silently hand
   the program to a key nobody controls — the recipient opts in (the
   Ownable2Step shape, adapted to program governance).
-- **Delay**: `handover_delay_secs` (bound at construction) forces a
-  cooling period between proposal and acceptance; a rushed or coerced
-  handover cannot complete inside the window. The clock is injected
-  (`now: u64`), so the policy is fully testable off-chain.
+- **Delay**: `handover_delay_secs` forces a cooling period between
+  proposal and acceptance; a rushed or coerced handover cannot
+  complete inside the window. The clock is injected (`now: u64`), so
+  the policy is fully testable off-chain.
+- **Amending the handover delay (AV-356)**:
+  `amend_handover_delay_secs(caller, new_delay_secs, now)` lets the
+  current authority revise the cooling period in place — no rebuild,
+  so the 32-entry audit ring and any in-flight proposal survive. Any
+  `u64` is accepted (`0` removes the cooling); re-affirming the
+  current delay is a no-op that writes no audit entry. Any other
+  revision appends a `HandoverDelayAmended` entry (actor: the caller;
+  the successor slot records the acting authority itself, since a
+  delay revision has no successor key) and governs the next
+  `confirm_handover`, which reads the live value — raising the delay
+  can hold a proposed handover, lowering it can release one. A
+  stranger is refused with `Unauthorized` (no new error code); the
+  authority and the pending proposal are untouched, and the drift
+  scan compares only the authority, so a delay revision never reads
+  as drift.
 - **Structured audit**: propose / confirm / cancel append an
   `UpgradeAuditEntry` (kind, timestamp, actor, successor) to a bounded
   32-entry ring — the AV-163 circuit-breaker convention (fixed-size

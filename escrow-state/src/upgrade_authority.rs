@@ -40,10 +40,13 @@
 //!   custody check; this module is the off-chain executable spec both
 //!   the program and the keeper tooling pin against (the same honesty
 //!   contract as AV-163's circuit breaker).
-//! - **The delay is a deployment policy, not a consensus.** 
-//!   `handover_delay_secs` is bound at construction; changing it is a
-//!   new instance, not a rotation — the program binds the delay at
-//!   deployment alongside the initial authority.
+//! - **The delay is a live-revisable deployment policy, not a
+//!   consensus.** `handover_delay_secs` is bound at construction and
+//!   may be revised in place by the current authority via
+//!   [`amend_handover_delay_secs`](UpgradeAuthority::amend_handover_delay_secs)
+//!   (AV-356) — no rebuild, so the audit ring and any in-flight
+//!   proposal survive; the new delay governs the next
+//!   [`confirm_handover`](UpgradeAuthority::confirm_handover).
 //! - **Acceptance cannot be forced.** If the proposed key never
 //!   accepts, the current authority cancels the proposal via
 //!   [`cancel_handover`](UpgradeAuthority::cancel_handover); there is
@@ -68,13 +71,15 @@ pub enum UpgradeAuthorityEventKind {
     HandoverConfirmed,
     /// The live proposal was cancelled by the current authority.
     HandoverCancelled,
+    /// The handover delay was revised by the current authority.
+    HandoverDelayAmended,
 }
 
 /// One structured audit entry: what happened, when, who acted, and
 /// which successor key the event concerned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpgradeAuditEntry {
-    /// Propose, confirm, or cancel.
+    /// Propose, confirm, cancel, or delay amendment.
     pub kind: UpgradeAuthorityEventKind,
     /// Unix timestamp of the event (clock sysvar on-chain).
     pub at: u64,
@@ -135,9 +140,47 @@ impl UpgradeAuthority {
         self.current
     }
 
-    /// The handover delay bound at construction, in seconds.
+    /// The live handover delay, in seconds (AV-356 revisable).
     pub fn handover_delay_secs(&self) -> u64 {
         self.handover_delay_secs
+    }
+
+    /// Revise the handover delay in place (AV-356). Only the current
+    /// authority; any `u64` is accepted (`new()` never validated the
+    /// delay, and `0` — no cooling — is the operator's explicit
+    /// choice). Re-affirming the current delay is an `Ok(false)`
+    /// no-op that writes no audit entry. Any other value replaces the
+    /// delay atomically, returns `Ok(true)`, and appends a
+    /// `HandoverDelayAmended` entry (actor: the caller; the delay
+    /// revision has no successor key, so the successor slot records
+    /// the acting authority itself, by documented convention). The
+    /// new delay governs the next `confirm_handover` — which reads
+    /// the live value — so an in-flight proposal is re-measured
+    /// against it: raising the delay can hold a proposed handover,
+    /// lowering it can release one. `current` / `pending` are
+    /// untouched, and `scan_upgrade_authority_drift` compares only
+    /// the authority, so a delay revision never reads as drift.
+    /// Check order: authority, then same-value.
+    pub fn amend_handover_delay_secs(
+        &mut self,
+        caller: [u8; 32],
+        new_delay_secs: u64,
+        now: u64,
+    ) -> Result<bool, EscrowError> {
+        if caller != self.current {
+            return Err(EscrowError::Unauthorized);
+        }
+        if new_delay_secs == self.handover_delay_secs {
+            return Ok(false);
+        }
+        self.handover_delay_secs = new_delay_secs;
+        self.push_audit(UpgradeAuditEntry {
+            kind: UpgradeAuthorityEventKind::HandoverDelayAmended,
+            at: now,
+            actor: caller,
+            successor: self.current,
+        });
+        Ok(true)
     }
 
     /// The live proposal as `(proposed successor, proposed_at)`, if any.
@@ -488,6 +531,123 @@ mod upgrade_authority_tests {
         let drift = scan_upgrade_authority_drift(&b, STRANGER).unwrap();
         assert_eq!(drift.actual, CURRENT);
         assert_eq!(drift.pending_proposal, Some(SUCCESSOR));
+    }
+
+    #[test]
+    fn amend_handover_delay_revises_and_audits() {
+        let mut a = authority();
+        assert_eq!(
+            a.amend_handover_delay_secs(CURRENT, 7_200, 1_000),
+            Ok(true)
+        );
+        assert_eq!(a.handover_delay_secs(), 7_200);
+        // Nothing else moves: the authority and the (absent) proposal
+        // are untouched, and the drift scan stays quiet.
+        assert_eq!(a.current(), CURRENT);
+        assert_eq!(a.pending_proposal(), None);
+        assert_eq!(scan_upgrade_authority_drift(&a, CURRENT), None);
+        let log = a.audit_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            log[0].kind,
+            UpgradeAuthorityEventKind::HandoverDelayAmended
+        );
+        assert_eq!(log[0].at, 1_000);
+        assert_eq!(log[0].actor, CURRENT);
+        // A delay revision has no successor key: the successor slot
+        // records the acting authority itself, by convention.
+        assert_eq!(log[0].successor, CURRENT);
+    }
+
+    #[test]
+    fn amend_handover_delay_rejects_a_stranger_and_changes_nothing() {
+        let mut a = authority();
+        assert_eq!(
+            a.amend_handover_delay_secs(STRANGER, 7_200, 1_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(a.handover_delay_secs(), DELAY);
+        assert!(a.audit_log().is_empty());
+    }
+
+    #[test]
+    fn amend_handover_delay_same_value_is_a_noop() {
+        let mut a = authority();
+        assert_eq!(
+            a.amend_handover_delay_secs(CURRENT, DELAY, 1_000),
+            Ok(false)
+        );
+        assert_eq!(a.handover_delay_secs(), DELAY);
+        assert!(a.audit_log().is_empty());
+    }
+
+    #[test]
+    fn amend_handover_delay_to_zero_removes_the_cooling() {
+        let mut a = authority();
+        assert_eq!(a.amend_handover_delay_secs(CURRENT, 0, 1_000), Ok(true));
+        assert_eq!(a.handover_delay_secs(), 0);
+        // A proposal may now be accepted in the same instant.
+        a.propose_handover(CURRENT, SUCCESSOR, 2_000).unwrap();
+        a.confirm_handover(SUCCESSOR, 2_000).unwrap();
+        assert_eq!(a.current(), SUCCESSOR);
+    }
+
+    #[test]
+    fn amend_handover_delay_remeasures_an_in_flight_proposal() {
+        let mut a = authority();
+        a.propose_handover(CURRENT, SUCCESSOR, 1_000).unwrap();
+        // Raising the delay holds the proposed handover: the original
+        // deadline no longer suffices.
+        assert_eq!(
+            a.amend_handover_delay_secs(CURRENT, 7_200, 1_500),
+            Ok(true)
+        );
+        assert_eq!(
+            a.confirm_handover(SUCCESSOR, 1_000 + DELAY),
+            Err(EscrowError::UpgradeHandoverDelayNotElapsed)
+        );
+        assert_eq!(a.current(), CURRENT);
+        assert_eq!(a.pending_proposal(), Some((SUCCESSOR, 1_000)));
+        // Lowering it releases the same proposal early.
+        assert_eq!(
+            a.amend_handover_delay_secs(CURRENT, 100, 1_600),
+            Ok(true)
+        );
+        a.confirm_handover(SUCCESSOR, 1_000 + 100).unwrap();
+        assert_eq!(a.current(), SUCCESSOR);
+        // The amendment entries sit in the audit trail in order.
+        let kinds: Vec<_> = a
+            .audit_log()
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                UpgradeAuthorityEventKind::HandoverProposed,
+                UpgradeAuthorityEventKind::HandoverDelayAmended,
+                UpgradeAuthorityEventKind::HandoverDelayAmended,
+                UpgradeAuthorityEventKind::HandoverConfirmed,
+            ]
+        );
+    }
+
+    #[test]
+    fn amend_handover_delay_follows_the_live_authority() {
+        let mut a = authority();
+        a.propose_handover(CURRENT, SUCCESSOR, 1_000).unwrap();
+        a.confirm_handover(SUCCESSOR, 1_000 + DELAY).unwrap();
+        // The old authority lost the right the moment the handover
+        // completed; the new authority holds it.
+        assert_eq!(
+            a.amend_handover_delay_secs(CURRENT, 7_200, 5_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            a.amend_handover_delay_secs(SUCCESSOR, 7_200, 5_000),
+            Ok(true)
+        );
+        assert_eq!(a.handover_delay_secs(), 7_200);
     }
 
     #[test]
