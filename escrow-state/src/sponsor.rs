@@ -259,6 +259,93 @@ impl SponsorPolicy {
         Ok(true)
     }
 
+    /// Add a sponsor to the allowlist live (AV-357), without
+    /// rebuilding the policy. The allowlist was fixed at
+    /// construction: an operator who wanted to onboard a new keeper
+    /// fee payer (expansion) or cut off a sponsor gone dark or
+    /// suspected of abuse had only `new()` — and a rebuild zeroes
+    /// `used`, silently forgiving already-booked spend, exactly the
+    /// forgiveness [`amend_spend_caps`](Self::amend_spend_caps)
+    /// exists to avoid. This revision adds one member in place;
+    /// every other member's `used` is NEVER touched.
+    ///
+    /// Check order follows the AV-354 convention (validate → same
+    /// value → replace): a zero key fails with
+    /// [`EscrowError::InvalidSponsorPolicy`] and the live allowlist
+    /// is untouched; a key already allowlisted is an `Ok(false)`
+    /// no-op; a full allowlist (`MAX_SPONSORS` members) fails with
+    /// [`EscrowError::InvalidSponsorPolicy`] and the live allowlist
+    /// is untouched; otherwise the key is pushed with a fresh
+    /// `used` entry of `0` (the new member starts booked from zero)
+    /// and `Ok(true)` is returned. The new member is usable from
+    /// the next [`authorize`](Self::authorize), which always reads
+    /// the live allowlist. The caps and the window are untouched.
+    ///
+    /// No audit event fires — this module has no amend audit surface
+    /// (the only audit surface is [`SponsorBudget`]'s 64-entry ring,
+    /// which this revision does not touch) — so the revision
+    /// behaviour is pinned by tests, as in AV-352/AV-354.
+    pub fn add_sponsor(&mut self, sponsor: [u8; 32]) -> Result<bool, EscrowError> {
+        if sponsor == [0u8; 32] {
+            return Err(EscrowError::InvalidSponsorPolicy);
+        }
+        if self.allowed.iter().any(|k| *k == sponsor) {
+            return Ok(false);
+        }
+        if self.allowed.len() >= MAX_SPONSORS {
+            return Err(EscrowError::InvalidSponsorPolicy);
+        }
+        self.allowed.push(sponsor);
+        self.used.push(0);
+        Ok(true)
+    }
+
+    /// Remove a sponsor from the allowlist live (AV-357), without
+    /// rebuilding the policy. The counterpart of
+    /// [`add_sponsor`](Self::add_sponsor): cutting off a sponsor
+    /// gone dark or suspected of abuse must take effect at once
+    /// (fail-closed — the next [`authorize`](Self::authorize) for
+    /// that sponsor returns
+    /// [`EscrowError::SponsorNotAllowed`]), and must not forgive
+    /// the other sponsors' already-booked spend the way a `new()`
+    /// rebuild would.
+    ///
+    /// Check order follows the AV-354 convention (validate → same
+    /// value → replace): a key not allowlisted is an `Ok(false)`
+    /// no-op; removing the last member fails with
+    /// [`EscrowError::InvalidSponsorPolicy`] — guarding `new()`'s
+    /// non-empty invariant — and the live allowlist is untouched;
+    /// otherwise the member and its parallel `used` entry are
+    /// removed together (the removed member's booked spend leaves
+    /// with its entry; its audit trail still lives in
+    /// [`SponsorBudget`]'s ring, a separate object, untouched) and
+    /// `Ok(true)` is returned. Every other member's `used` is
+    /// NEVER touched. The caps and the window are untouched.
+    ///
+    /// No audit event fires — this module has no amend audit surface
+    /// — so the revision behaviour is pinned by tests, as in
+    /// AV-352/AV-354.
+    pub fn remove_sponsor(&mut self, sponsor: &[u8; 32]) -> Result<bool, EscrowError> {
+        let idx = match self.allowed.iter().position(|k| k == sponsor) {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+        if self.allowed.len() == 1 {
+            return Err(EscrowError::InvalidSponsorPolicy);
+        }
+        self.allowed.remove(idx);
+        self.used.remove(idx);
+        Ok(true)
+    }
+
+    /// The allowlisted sponsor keys currently in force, in
+    /// insertion order. Follows the live allowlist — members added
+    /// by [`add_sponsor`](Self::add_sponsor) appear, members
+    /// removed by [`remove_sponsor`](Self::remove_sponsor) do not.
+    pub fn allowed_sponsors(&self) -> &[[u8; 32]] {
+        &self.allowed
+    }
+
     /// The per-transaction lamport cap currently in force (`0` =
     /// unlimited).
     pub fn per_tx_cap(&self) -> u64 {
@@ -917,6 +1004,159 @@ mod sponsor_tests {
             Err(EscrowError::SponsorCumulativeCapExceeded)
         );
         assert_eq!(p.used_by(&SPONSOR_A), Some(9_000));
+    }
+
+    const SPONSOR_C: [u8; 32] = [0xC3; 32];
+
+    #[test]
+    fn add_sponsor_adds_new_member_usable_from_next_authorize() {
+        let mut p = policy();
+        assert_eq!(p.add_sponsor(SPONSOR_C), Ok(true));
+        assert_eq!(p.allowed_sponsors(), &[SPONSOR_A, SPONSOR_B, SPONSOR_C]);
+        // The new member starts booked from zero.
+        assert_eq!(p.used_by(&SPONSOR_C), Some(0));
+        assert!(p.authorize(&SPONSOR_C, 100, 1_500).is_ok());
+        assert_eq!(p.used_by(&SPONSOR_C), Some(100));
+    }
+
+    #[test]
+    fn add_sponsor_duplicate_is_noop() {
+        let mut p = policy();
+        assert_eq!(p.add_sponsor(SPONSOR_A), Ok(false));
+        assert_eq!(p.allowed_sponsors(), &[SPONSOR_A, SPONSOR_B]);
+        assert!(p.authorize(&SPONSOR_A, 100, 1_500).is_ok());
+    }
+
+    #[test]
+    fn add_sponsor_rejects_zero_key_and_keeps_live() {
+        let mut p = policy();
+        assert!(p.authorize(&SPONSOR_A, 10_000, 1_500).is_ok());
+        assert_eq!(
+            p.add_sponsor([0u8; 32]),
+            Err(EscrowError::InvalidSponsorPolicy)
+        );
+        // The live allowlist is untouched.
+        assert_eq!(p.allowed_sponsors(), &[SPONSOR_A, SPONSOR_B]);
+        assert_eq!(p.used_by(&SPONSOR_A), Some(10_000));
+        assert_eq!(p.used_by(&SPONSOR_B), Some(0));
+    }
+
+    #[test]
+    fn add_sponsor_rejects_full_allowlist_and_keeps_live() {
+        let mut keys = vec![SPONSOR_A];
+        for i in 1..MAX_SPONSORS {
+            keys.push([i as u8; 32]);
+        }
+        let mut p = SponsorPolicy::new(&keys, 10_000, 25_000, 0, 0).unwrap();
+        assert_eq!(p.allowed_sponsors().len(), MAX_SPONSORS);
+        assert_eq!(
+            p.add_sponsor(SPONSOR_C),
+            Err(EscrowError::InvalidSponsorPolicy)
+        );
+        assert_eq!(p.allowed_sponsors().len(), MAX_SPONSORS);
+        assert!(!p.is_allowed(&SPONSOR_C));
+    }
+
+    #[test]
+    fn add_sponsor_does_not_touch_used_caps_or_window() {
+        let mut p = policy();
+        assert!(p.authorize(&SPONSOR_A, 10_000, 1_500).is_ok());
+        assert_eq!(p.add_sponsor(SPONSOR_C), Ok(true));
+        // Unlike a `new()` rebuild, revision keeps the books.
+        assert_eq!(p.used_by(&SPONSOR_A), Some(10_000));
+        assert_eq!(p.used_by(&SPONSOR_B), Some(0));
+        // The caps and the window are untouched.
+        assert_eq!(p.per_tx_cap(), 10_000);
+        assert_eq!(p.cumulative_cap(), 25_000);
+        assert_eq!(p.window_start(), 1_000);
+        assert_eq!(p.window_end(), 2_000);
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 100, 999),
+            Err(EscrowError::SponsorWindowInactive)
+        );
+    }
+
+    #[test]
+    fn remove_sponsor_removes_member_and_its_used_entry() {
+        let mut p = policy();
+        assert!(p.authorize(&SPONSOR_A, 10_000, 1_500).is_ok());
+        assert!(p.authorize(&SPONSOR_B, 5_000, 1_500).is_ok());
+        assert_eq!(p.remove_sponsor(&SPONSOR_A), Ok(true));
+        assert_eq!(p.allowed_sponsors(), &[SPONSOR_B]);
+        // The removed member's booked spend leaves with its entry;
+        // the survivor's books are untouched.
+        assert_eq!(p.used_by(&SPONSOR_A), None);
+        assert_eq!(p.used_by(&SPONSOR_B), Some(5_000));
+        // Fail-closed: the next authorize refuses the removed member.
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 100, 1_500),
+            Err(EscrowError::SponsorNotAllowed)
+        );
+        assert_eq!(p.used_by(&SPONSOR_A), None);
+        // The survivor still authorizes and books normally.
+        assert!(p.authorize(&SPONSOR_B, 100, 1_500).is_ok());
+        assert_eq!(p.used_by(&SPONSOR_B), Some(5_100));
+    }
+
+    #[test]
+    fn remove_sponsor_unknown_is_noop() {
+        let mut p = policy();
+        assert_eq!(p.remove_sponsor(&[0xCC; 32]), Ok(false));
+        assert_eq!(p.allowed_sponsors(), &[SPONSOR_A, SPONSOR_B]);
+        assert!(p.authorize(&SPONSOR_A, 100, 1_500).is_ok());
+    }
+
+    #[test]
+    fn remove_sponsor_rejects_emptying_allowlist_and_keeps_live() {
+        let mut p = SponsorPolicy::new(&[SPONSOR_A], 10_000, 25_000, 1_000, 2_000).unwrap();
+        assert_eq!(
+            p.remove_sponsor(&SPONSOR_A),
+            Err(EscrowError::InvalidSponsorPolicy)
+        );
+        // The live allowlist is untouched.
+        assert_eq!(p.allowed_sponsors(), &[SPONSOR_A]);
+        assert!(p.authorize(&SPONSOR_A, 100, 1_500).is_ok());
+    }
+
+    #[test]
+    fn remove_sponsor_does_not_touch_caps_window_or_budget() {
+        let mut p = policy();
+        let mut b = SponsorBudget::new();
+        b.fund(5_000);
+        b.deduct(2_000, SPONSOR_A, ESCROW_X, 123).unwrap();
+        assert!(p.authorize(&SPONSOR_A, 10_000, 1_500).is_ok());
+        assert_eq!(p.remove_sponsor(&SPONSOR_B), Ok(true));
+        assert_eq!(p.used_by(&SPONSOR_A), Some(10_000));
+        assert_eq!(p.per_tx_cap(), 10_000);
+        assert_eq!(p.cumulative_cap(), 25_000);
+        assert_eq!(p.window_start(), 1_000);
+        assert_eq!(p.window_end(), 2_000);
+        assert_eq!(b.balance(), 3_000);
+        assert_eq!(b.total_spent(), 2_000);
+        assert_eq!(b.audit().len(), 1);
+    }
+
+    #[test]
+    fn repeated_add_remove_each_take_effect() {
+        let mut p = policy();
+        assert_eq!(p.add_sponsor(SPONSOR_C), Ok(true));
+        assert!(p.authorize(&SPONSOR_C, 100, 1_500).is_ok());
+        assert_eq!(p.remove_sponsor(&SPONSOR_C), Ok(true));
+        assert_eq!(
+            p.authorize(&SPONSOR_C, 100, 1_500),
+            Err(EscrowError::SponsorNotAllowed)
+        );
+        // Re-adding starts the member booked from zero again.
+        assert_eq!(p.add_sponsor(SPONSOR_C), Ok(true));
+        assert_eq!(p.used_by(&SPONSOR_C), Some(0));
+        assert!(p.authorize(&SPONSOR_C, 100, 1_500).is_ok());
+        assert_eq!(p.used_by(&SPONSOR_C), Some(100));
+    }
+
+    #[test]
+    fn allowed_sponsors_getter_follows_live_value() {
+        let p = policy();
+        assert_eq!(p.allowed_sponsors(), &[SPONSOR_A, SPONSOR_B]);
     }
 
     #[test]

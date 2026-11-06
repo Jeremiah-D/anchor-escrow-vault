@@ -7157,6 +7157,26 @@ much*.
   getters `window_start()` / `window_end()` follow the current
   window. No audit event fires — this module has no amend audit
   surface — and no new error code is added.
+- **Adding and removing sponsors (AV-357)**: `add_sponsor(sponsor) ->
+  Result<bool, EscrowError>` and `remove_sponsor(sponsor) ->
+  Result<bool, EscrowError>` revise the allowlist live, with live
+  getter `allowed_sponsors() -> &[[u8; 32]]` — no `new()` rebuild, so
+  booked `used` is never reset (a rebuild would silently forgive
+  spent allowance). Adding a zero key or adding to a full (16-member)
+  allowlist fails with `InvalidSponsorPolicy` (code 225) and the live
+  allowlist is untouched; adding a key already allowlisted is an
+  `Ok(false)` no-op; otherwise the key is pushed with a fresh `used`
+  entry of `0` and returns `Ok(true)`, usable from the next
+  `authorize`. Removing a key not allowlisted is an `Ok(false)`
+  no-op; removing the last member fails with `InvalidSponsorPolicy`
+  (code 225), guarding the non-empty invariant; otherwise the member
+  and its parallel `used` entry are removed together and return
+  `Ok(true)` — the removed member's booked spend leaves with its
+  entry (its audit trail still lives in the budget's ring), and the
+  next `authorize` for it returns `SponsorNotAllowed` (code 226),
+  fail-closed. Every other member's `used`, both caps, and the window
+  are untouched. No audit event fires — this module has no amend audit
+  surface — and no new error code is added.
 - **The budget**: `SponsorBudget` is the keeper's fee-budget
   accounting. `fund` tops it up; `deduct(amount, sponsor, escrow,
   at)` spends it — a short deduct fails with `SponsorBudgetExhausted`
