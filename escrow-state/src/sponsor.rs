@@ -215,6 +215,50 @@ impl SponsorPolicy {
         true
     }
 
+    /// Revise the effective window live (AV-354), without rebuilding
+    /// the policy. The window was fixed at construction: an operator
+    /// who wanted to extend an expired sponsorship window (a
+    /// campaign running long) or close one early (a sponsor gone dark
+    /// or suspected of abuse) had only `new()` — and a rebuild zeroes
+    /// `used`, silently forgiving already-booked spend, exactly the
+    /// forgiveness [`amend_spend_caps`](Self::amend_spend_caps)
+    /// exists to avoid. This revision swaps the window pair in
+    /// place; `used` is NEVER touched.
+    ///
+    /// Validation reuses [`new`](Self::new)'s gate: an inverted
+    /// window (`window_end != 0 && window_start > window_end`) fails
+    /// with [`EscrowError::InvalidSponsorPolicy`] and the live window
+    /// is untouched. Amending to the pair already in force is an
+    /// `Ok(false)` no-op; any other pair atomically swaps BOTH
+    /// bounds and returns `Ok(true)`. The new window governs the
+    /// next [`authorize`](Self::authorize), which always reads the
+    /// live values — tightening can shut sponsorship off at once
+    /// (fail-closed: the next `authorize` returns
+    /// [`EscrowError::SponsorWindowInactive`], `used` untouched) and
+    /// loosening reopens it. Sentinel semantics are unchanged:
+    /// `(0, 0)` means always active, `window_end == 0` means
+    /// open-ended from `window_start`.
+    ///
+    /// No audit event fires — this module has no amend audit surface
+    /// (the only audit surface is [`SponsorBudget`]'s 64-entry ring,
+    /// which this revision does not touch) — so the revision
+    /// behaviour is pinned by tests, as in AV-352.
+    pub fn amend_sponsor_window(
+        &mut self,
+        new_window_start: u64,
+        new_window_end: u64,
+    ) -> Result<bool, EscrowError> {
+        if new_window_end != 0 && new_window_start > new_window_end {
+            return Err(EscrowError::InvalidSponsorPolicy);
+        }
+        if self.window_start == new_window_start && self.window_end == new_window_end {
+            return Ok(false);
+        }
+        self.window_start = new_window_start;
+        self.window_end = new_window_end;
+        Ok(true)
+    }
+
     /// The per-transaction lamport cap currently in force (`0` =
     /// unlimited).
     pub fn per_tx_cap(&self) -> u64 {
@@ -225,6 +269,18 @@ impl SponsorPolicy {
     /// (`0` = unlimited).
     pub fn cumulative_cap(&self) -> u64 {
         self.cumulative_cap
+    }
+
+    /// The effective window start currently in force (unix seconds;
+    /// `0` = no start bound).
+    pub fn window_start(&self) -> u64 {
+        self.window_start
+    }
+
+    /// The effective window end currently in force (unix seconds,
+    /// inclusive; `0` = no end bound).
+    pub fn window_end(&self) -> u64 {
+        self.window_end
     }
 
     /// The pre-submit gate: authorize `sponsor` to pay
@@ -670,6 +726,165 @@ mod sponsor_tests {
             p.authorize(&SPONSOR_A, 100, 999),
             Err(EscrowError::SponsorWindowInactive)
         );
+    }
+
+    #[test]
+    fn window_getters_read_construction_values() {
+        let p = policy();
+        assert_eq!(p.window_start(), 1_000);
+        assert_eq!(p.window_end(), 2_000);
+    }
+
+    #[test]
+    fn amend_sponsor_window_revises_both_bounds() {
+        let mut p = policy();
+        assert_eq!(p.amend_sponsor_window(3_000, 4_000), Ok(true));
+        assert_eq!(p.window_start(), 3_000);
+        assert_eq!(p.window_end(), 4_000);
+        // The new window governs the next authorize.
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 100, 1_500),
+            Err(EscrowError::SponsorWindowInactive)
+        );
+        assert!(p.authorize(&SPONSOR_A, 100, 3_000).is_ok());
+        assert!(p.authorize(&SPONSOR_A, 100, 4_000).is_ok());
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 100, 4_001),
+            Err(EscrowError::SponsorWindowInactive)
+        );
+    }
+
+    #[test]
+    fn amend_sponsor_window_same_pair_is_noop() {
+        let mut p = policy();
+        assert_eq!(p.amend_sponsor_window(1_000, 2_000), Ok(false));
+        assert_eq!(p.window_start(), 1_000);
+        assert_eq!(p.window_end(), 2_000);
+        assert!(p.authorize(&SPONSOR_A, 100, 1_500).is_ok());
+    }
+
+    #[test]
+    fn amend_sponsor_window_single_bound_change() {
+        let mut p = policy();
+        // Only the end moves; the start stays put — still true.
+        assert_eq!(p.amend_sponsor_window(1_000, 3_000), Ok(true));
+        assert_eq!(p.window_start(), 1_000);
+        assert_eq!(p.window_end(), 3_000);
+        assert!(p.authorize(&SPONSOR_A, 100, 2_500).is_ok());
+        // Only the start moves this time.
+        assert_eq!(p.amend_sponsor_window(2_000, 3_000), Ok(true));
+        assert_eq!(p.window_start(), 2_000);
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 100, 1_500),
+            Err(EscrowError::SponsorWindowInactive)
+        );
+    }
+
+    #[test]
+    fn amend_sponsor_window_rejects_inverted_window_and_keeps_live() {
+        let mut p = policy();
+        assert_eq!(
+            p.amend_sponsor_window(2_000, 1_000),
+            Err(EscrowError::InvalidSponsorPolicy)
+        );
+        // The live window is untouched: the old bounds still govern.
+        assert_eq!(p.window_start(), 1_000);
+        assert_eq!(p.window_end(), 2_000);
+        assert!(p.authorize(&SPONSOR_A, 100, 1_500).is_ok());
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 100, 999),
+            Err(EscrowError::SponsorWindowInactive)
+        );
+    }
+
+    #[test]
+    fn amend_sponsor_window_sentinels_still_hold() {
+        let mut p = policy();
+        // (0, 0) = always active.
+        assert_eq!(p.amend_sponsor_window(0, 0), Ok(true));
+        assert!(p.authorize(&SPONSOR_A, 100, 0).is_ok());
+        assert!(p.authorize(&SPONSOR_A, 100, u64::MAX).is_ok());
+        // Open-ended: active from the start, no end bound.
+        assert_eq!(p.amend_sponsor_window(5_000, 0), Ok(true));
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 100, 4_999),
+            Err(EscrowError::SponsorWindowInactive)
+        );
+        assert!(p.authorize(&SPONSOR_A, 100, u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn tighten_window_closes_authorize_immediately_and_keeps_used() {
+        let mut p = policy();
+        assert!(p.authorize(&SPONSOR_A, 10_000, 1_500).is_ok());
+        assert_eq!(p.used_by(&SPONSOR_A), Some(10_000));
+        // Close the window at once: the next authorize is refused
+        // fail-closed, and the books are untouched.
+        assert_eq!(p.amend_sponsor_window(3_000, 4_000), Ok(true));
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 100, 1_500),
+            Err(EscrowError::SponsorWindowInactive)
+        );
+        assert_eq!(p.used_by(&SPONSOR_A), Some(10_000));
+    }
+
+    #[test]
+    fn loosen_window_reopens_authorize() {
+        let mut p = policy();
+        assert!(p.authorize(&SPONSOR_A, 10_000, 1_500).is_ok());
+        assert_eq!(p.amend_sponsor_window(3_000, 4_000), Ok(true));
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 100, 1_500),
+            Err(EscrowError::SponsorWindowInactive)
+        );
+        // Loosening is the only way back in.
+        assert_eq!(p.amend_sponsor_window(1_000, 2_000), Ok(true));
+        assert!(p.authorize(&SPONSOR_A, 5_000, 1_500).is_ok());
+        assert_eq!(p.used_by(&SPONSOR_A), Some(15_000));
+    }
+
+    #[test]
+    fn amend_sponsor_window_does_not_touch_caps_allowlist_or_used() {
+        let mut p = policy();
+        assert!(p.authorize(&SPONSOR_A, 10_000, 1_500).is_ok());
+        assert_eq!(p.amend_sponsor_window(3_000, 4_000), Ok(true));
+        // Unlike a `new()` rebuild, revision keeps the books.
+        assert_eq!(p.used_by(&SPONSOR_A), Some(10_000));
+        // The caps are untouched.
+        assert_eq!(p.per_tx_cap(), 10_000);
+        assert_eq!(p.cumulative_cap(), 25_000);
+        // Non-allowlisted sponsors are still refused first.
+        assert_eq!(
+            p.authorize(&[0xCC; 32], 100, 3_500),
+            Err(EscrowError::SponsorNotAllowed)
+        );
+    }
+
+    #[test]
+    fn amend_sponsor_window_does_not_touch_budget() {
+        let mut p = policy();
+        let mut b = SponsorBudget::new();
+        b.fund(5_000);
+        b.deduct(2_000, SPONSOR_A, ESCROW_X, 123).unwrap();
+        assert_eq!(p.amend_sponsor_window(3_000, 4_000), Ok(true));
+        assert_eq!(b.balance(), 3_000);
+        assert_eq!(b.total_funded(), 5_000);
+        assert_eq!(b.total_spent(), 2_000);
+        assert_eq!(b.audit().len(), 1);
+    }
+
+    #[test]
+    fn repeated_window_revisions_each_take_effect() {
+        let mut p = policy();
+        assert_eq!(p.amend_sponsor_window(1_500, 2_500), Ok(true));
+        assert_eq!(
+            p.authorize(&SPONSOR_A, 100, 1_000),
+            Err(EscrowError::SponsorWindowInactive)
+        );
+        assert!(p.authorize(&SPONSOR_A, 100, 2_000).is_ok());
+        assert_eq!(p.amend_sponsor_window(0, 0), Ok(true));
+        assert!(p.authorize(&SPONSOR_A, 100, 1_000).is_ok());
+        assert_eq!(p.used_by(&SPONSOR_A), Some(200));
     }
 
     #[test]

@@ -7126,6 +7126,22 @@ much*.
   Solana keeper-ops / payments-fintech governance: the operator
   revises spend authority live without touching the allowlist, the
   window, or the budget audit ring.
+- **Revising the effective window (AV-354)**: `amend_sponsor_window(new_window_start,
+  new_window_end) -> Result<bool, EscrowError>` swaps both window
+  bounds atomically in place — no `new()` rebuild, so booked `used`
+  is never reset (a rebuild would silently forgive spent allowance).
+  An inverted window (`window_end != 0 && window_start >
+  window_end`) fails with `InvalidSponsorPolicy` (code 225) and the
+  live window is untouched; amending to the pair already in force is
+  an `Ok(false)` no-op; any other pair returns `Ok(true)` and governs
+  the next `authorize`. Tightening can shut sponsorship off at once
+  (fail-closed: the next `authorize` returns `SponsorWindowInactive`,
+  code 227, `used` untouched) and loosening reopens it. Sentinel
+  semantics are unchanged: `(0, 0)` means always active,
+  `window_end == 0` means open-ended from `window_start`. Live
+  getters `window_start()` / `window_end()` follow the current
+  window. No audit event fires — this module has no amend audit
+  surface — and no new error code is added.
 - **The budget**: `SponsorBudget` is the keeper's fee-budget
   accounting. `fund` tops it up; `deduct(amount, sponsor, escrow,
   at)` spends it — a short deduct fails with `SponsorBudgetExhausted`
