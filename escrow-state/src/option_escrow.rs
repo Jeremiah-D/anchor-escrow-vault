@@ -98,14 +98,15 @@ pub struct OptionExpiry {
 /// A fixed-strike call option over a locked underlying amount.
 ///
 /// Fixed-size and `Copy`, like the other pure-logic sidecars: the
-/// option's terms are set once at construction — with three
-/// governed exceptions, the strike, the expiry, and the seller,
-/// which the two parties may revise together while the option is
-/// `Active` ([`OptionEscrow::amend_option_strike`], AV-294;
-/// [`OptionEscrow::amend_option_expiry`], AV-299;
-/// [`OptionEscrow::amend_option_seller`], AV-366). A unilateral
+/// option's terms are set once at construction — with four
+/// governed exceptions, the strike, the expiry, the seller, and
+/// the buyer, which the two parties may revise together while the
+/// option is `Active` ([`OptionEscrow::amend_option_strike`],
+/// AV-294; [`OptionEscrow::amend_option_expiry`], AV-299;
+/// [`OptionEscrow::amend_option_seller`], AV-366;
+/// [`OptionEscrow::amend_option_buyer`], AV-367). A unilateral
 /// move of any of them would let one side rewrite the deal alone, so
-/// all three revisions need seller + buyer together.
+/// all four revisions need seller + buyer together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OptionEscrow {
     seller: [u8; 32],
@@ -165,7 +166,9 @@ impl OptionEscrow {
     }
 
     /// The buyer: the option holder, the only party who may
-    /// exercise.
+    /// exercise — fixed at construction, revisable only by the
+    /// dual-signed [`OptionEscrow::amend_option_buyer`] while
+    /// `Active`.
     pub fn buyer(&self) -> [u8; 32] {
         self.buyer
     }
@@ -507,6 +510,89 @@ impl OptionEscrow {
         self.seller = new_seller;
         Ok(())
     }
+
+    /// Rotate the buyer on an `Active` option (AV-367 — Solana
+    /// option governance): both parties authorize the change
+    /// (the buyer is the sole holder of the exercise right — a
+    /// unilateral rewrite would let one side redirect that right
+    /// alone, handing the option to a stranger or stranding it).
+    /// Check order is authority → state → value, mirroring
+    /// [`OptionEscrow::amend_option_seller`] and
+    /// [`OptionEscrow::exercise`], so a stranger learns nothing
+    /// about the option's state from the error alone.
+    ///
+    /// Why: the buyer is fixed at construction
+    /// ([`OptionEscrow::new`]), but the buyer's key may be
+    /// compromised, or the buyer may assign the position to
+    /// another wallet (an option assignment: the holder hands
+    /// the exercise right to a new wallet or sells the
+    /// position) — with no rotation path the only exits are
+    /// `exercise` (only the live buyer may call it) and `expire`
+    /// (anyone may call it, and the premium stays with the
+    /// seller), so a stolen key sits and collects nothing while
+    /// the position's value drains to zero at expiry. Only an
+    /// `Active` option may rotate: an exercised option has
+    /// already settled ([`EscrowError::OptionAlreadySettled`]),
+    /// and an expired option's window has lapsed
+    /// ([`EscrowError::OptionExpired`]). The revision is judged
+    /// by state, not by the clock, like `amend_option_strike`:
+    /// an `Active` option whose expiry instant has passed but
+    /// which has not yet been expired may still rotate — the
+    /// rotation never revives the exercise window, which still
+    /// closes at `expiry`. The new buyer reuses the `new` gate
+    /// (it must be non-zero and distinct from the live seller,
+    /// [`EscrowError::InvalidOptionTerms`] otherwise, and the
+    /// current buyer is untouched). Only `buyer` changes —
+    /// seller, underlying, premium, strike, expiry and state are
+    /// untouched — and re-affirming the current buyer is a
+    /// no-op. [`OptionEscrow::exercise`] reads the live buyer,
+    /// so the new buyer is the sole exerciser from the next
+    /// exercise (the old buyer gets
+    /// [`EscrowError::OptionNotBuyer`]), and `expire` is
+    /// unaffected (anyone may call it, and the legs still pay
+    /// the seller). There is no event layer on `OptionEscrow`,
+    /// so no event is emitted for the rotation. A buyer who has
+    /// lost their key cannot rotate: the current buyer must
+    /// co-sign, exactly like the seller rotation (AV-366) and
+    /// the pauser rotation (AV-355) — key loss is not
+    /// recoverable here. Orthogonal to
+    /// [`OptionEscrow::new`] (that installs the buyer at build
+    /// time, this rotates it while `Active`) and to
+    /// `amend_option_seller` (that rotates the settlement
+    /// counterparty, this rotates the exercise-right holder).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller pair that is not exactly seller + buyer,
+    /// ([`EscrowError::OptionAlreadySettled`], code 343) once
+    /// the option has been exercised,
+    /// ([`EscrowError::OptionExpired`], code 341) once the
+    /// option has expired, and
+    /// ([`EscrowError::InvalidOptionTerms`], code 339) for a
+    /// zero new buyer or one equal to the live seller — either
+    /// way the current buyer is untouched.
+    pub fn amend_option_buyer(
+        &mut self,
+        seller: [u8; 32],
+        buyer: [u8; 32],
+        new_buyer: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        if seller != self.seller || buyer != self.buyer {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            OptionState::Active => {}
+            OptionState::Exercised => return Err(EscrowError::OptionAlreadySettled),
+            OptionState::Expired => return Err(EscrowError::OptionExpired),
+        }
+        if new_buyer == [0u8; 32] || new_buyer == self.seller {
+            return Err(EscrowError::InvalidOptionTerms);
+        }
+        if new_buyer == self.buyer {
+            return Ok(());
+        }
+        self.buyer = new_buyer;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -518,6 +604,8 @@ mod tests {
     const STRANGER: [u8; 32] = [0x33; 32];
     const NEW_SELLER: [u8; 32] = [0x44; 32];
     const NEW_SELLER_2: [u8; 32] = [0x55; 32];
+    const NEW_BUYER: [u8; 32] = [0x66; 32];
+    const NEW_BUYER_2: [u8; 32] = [0x77; 32];
     const UNDERLYING: u64 = 1_000_000;
     const PREMIUM: u64 = 50_000;
     const STRIKE: u64 = 900_000;
@@ -1071,5 +1159,217 @@ mod tests {
         let legs = o.expire(EXPIRY).unwrap();
         assert_eq!(legs.underlying_to_seller, UNDERLYING);
         assert_eq!(legs.premium_to_seller, PREMIUM);
+    }
+
+    #[test]
+    fn amend_option_buyer_moves_the_live_buyer() {
+        // AV-367: the revised buyer governs the next exercise,
+        // and nothing else moves.
+        let mut o = option();
+        o.amend_option_buyer(SELLER, BUYER, NEW_BUYER).unwrap();
+        assert_eq!(o.buyer(), NEW_BUYER);
+        assert_eq!(o.seller(), SELLER);
+        assert_eq!(o.underlying(), UNDERLYING);
+        assert_eq!(o.premium(), PREMIUM);
+        assert_eq!(o.strike(), STRIKE);
+        assert_eq!(o.expiry(), EXPIRY);
+        assert_eq!(o.state(), OptionState::Active);
+        // The old buyer is refused at the exercise gate, the new
+        // buyer exercises at the same strike with the same legs.
+        assert_eq!(
+            o.exercise(BUYER, EXPIRY - 1, STRIKE),
+            Err(EscrowError::OptionNotBuyer)
+        );
+        let legs = o.exercise(NEW_BUYER, EXPIRY - 1, STRIKE).unwrap();
+        assert_eq!(legs.underlying_to_buyer, UNDERLYING);
+        assert_eq!(legs.strike_to_seller, STRIKE);
+        assert_eq!(legs.premium_to_seller, PREMIUM);
+    }
+
+    #[test]
+    fn amend_option_buyer_can_rotate_again() {
+        // AV-367: rotations are not one-shot — each rotation
+        // supersedes the last, and the new buyer is the authority
+        // for the next one.
+        let mut o = option();
+        o.amend_option_buyer(SELLER, BUYER, NEW_BUYER).unwrap();
+        o.amend_option_buyer(SELLER, NEW_BUYER, NEW_BUYER_2)
+            .unwrap();
+        assert_eq!(o.buyer(), NEW_BUYER_2);
+        // The first buyer can no longer rotate: it is a stranger
+        // now.
+        let err = o
+            .amend_option_buyer(SELLER, BUYER, NEW_BUYER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(o.buyer(), NEW_BUYER_2);
+    }
+
+    #[test]
+    fn amend_option_buyer_rejects_zero_seller_equal_and_reaffirmation_is_noop() {
+        // AV-367: a zero buyer or one equal to the live seller
+        // reuses the `new` gate and leaves the current buyer
+        // untouched; re-affirming the current buyer succeeds and
+        // changes nothing.
+        let mut o = option();
+        let err = o
+            .amend_option_buyer(SELLER, BUYER, [0u8; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidOptionTerms);
+        assert_eq!(err.code(), 339);
+        assert_eq!(o.buyer(), BUYER);
+        let err = o
+            .amend_option_buyer(SELLER, BUYER, SELLER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidOptionTerms);
+        assert_eq!(o.buyer(), BUYER);
+        o.amend_option_buyer(SELLER, BUYER, BUYER).unwrap();
+        assert_eq!(o.buyer(), BUYER);
+        // Still exercisable with the affirmed buyer in place.
+        o.exercise(BUYER, EXPIRY - 1, STRIKE).unwrap();
+    }
+
+    #[test]
+    fn amend_option_buyer_is_dual_signed_and_active_only() {
+        // AV-367: a stranger, either party alone, or the parties
+        // swapped is refused, and the buyer is untouched.
+        let mut o = option();
+        let err = o
+            .amend_option_buyer(STRANGER, BUYER, NEW_BUYER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = o
+            .amend_option_buyer(SELLER, STRANGER, NEW_BUYER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        let err = o
+            .amend_option_buyer(BUYER, SELLER, NEW_BUYER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(o.buyer(), BUYER);
+        // Authority is checked before state: a stranger on a
+        // settled option still gets Unauthorized.
+        let mut exercised = option();
+        exercised.exercise(BUYER, EXPIRY - 1, STRIKE).unwrap();
+        let err = exercised
+            .amend_option_buyer(STRANGER, BUYER, NEW_BUYER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(exercised.buyer(), BUYER);
+        // The parties on an exercised option get AlreadySettled.
+        let err = exercised
+            .amend_option_buyer(SELLER, BUYER, NEW_BUYER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::OptionAlreadySettled);
+        assert_eq!(err.code(), 343);
+        assert_eq!(exercised.buyer(), BUYER);
+        // The parties on an expired option get OptionExpired.
+        let mut expired = option();
+        expired.expire(EXPIRY).unwrap();
+        let err = expired
+            .amend_option_buyer(SELLER, BUYER, NEW_BUYER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::OptionExpired);
+        assert_eq!(err.code(), 341);
+        assert_eq!(expired.buyer(), BUYER);
+    }
+
+    #[test]
+    fn amend_option_buyer_old_buyer_loses_exercise() {
+        // AV-367: rotation revokes the old buyer's exercise right
+        // — the old buyer is refused at the exercise gate, and
+        // the old buyer plus the seller can no longer rotate the
+        // buyer back.
+        let mut o = option();
+        o.amend_option_buyer(SELLER, BUYER, NEW_BUYER).unwrap();
+        assert_eq!(
+            o.exercise(BUYER, EXPIRY - 1, STRIKE),
+            Err(EscrowError::OptionNotBuyer)
+        );
+        let err = o
+            .amend_option_buyer(SELLER, BUYER, BUYER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(o.buyer(), NEW_BUYER);
+    }
+
+    #[test]
+    fn amend_option_buyer_new_buyer_can_exercise_in_window() {
+        // AV-367: the new buyer exercises inside the window at
+        // the live strike, and the settlement legs are unchanged
+        // — only the recipient of the underlying moved.
+        let mut o = option();
+        o.amend_option_buyer(SELLER, BUYER, NEW_BUYER).unwrap();
+        let legs = o.exercise(NEW_BUYER, EXPIRY - 1, STRIKE).unwrap();
+        assert_eq!(legs.underlying_to_buyer, UNDERLYING);
+        assert_eq!(legs.strike_to_seller, STRIKE);
+        assert_eq!(legs.premium_to_seller, PREMIUM);
+        assert_eq!(o.state(), OptionState::Exercised);
+    }
+
+    #[test]
+    fn amend_option_buyer_lapsed_window_still_rotates() {
+        // AV-367: like the seller rotation, buyer rotation is
+        // judged by state, not by the clock — an `Active` option
+        // whose expiry instant has passed but which has not yet
+        // been expired may still rotate, and the rotation never
+        // revives the exercise window.
+        let mut o = option();
+        assert_eq!(
+            o.exercise(BUYER, EXPIRY, STRIKE),
+            Err(EscrowError::OptionExpired)
+        );
+        o.amend_option_buyer(SELLER, BUYER, NEW_BUYER).unwrap();
+        assert_eq!(o.buyer(), NEW_BUYER);
+        assert!(!o.exercise_window_open(EXPIRY));
+        assert_eq!(
+            o.exercise(NEW_BUYER, EXPIRY, STRIKE),
+            Err(EscrowError::OptionExpired)
+        );
+        let legs = o.expire(EXPIRY).unwrap();
+        assert_eq!(legs.underlying_to_seller, UNDERLYING);
+        assert_eq!(legs.premium_to_seller, PREMIUM);
+    }
+
+    #[test]
+    fn amend_option_buyer_old_buyer_loses_governance() {
+        // AV-367: rotation revokes the old buyer's governance —
+        // the old buyer plus the seller can no longer revise the
+        // strike, the expiry, or the seller.
+        let mut o = option();
+        o.amend_option_buyer(SELLER, BUYER, NEW_BUYER).unwrap();
+        let err = o
+            .amend_option_strike(SELLER, BUYER, 1_100_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = o
+            .amend_option_expiry(SELLER, BUYER, EXPIRY + 1_000, EXPIRY - 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = o
+            .amend_option_seller(SELLER, BUYER, NEW_SELLER)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(o.strike(), STRIKE);
+        assert_eq!(o.expiry(), EXPIRY);
+        assert_eq!(o.seller(), SELLER);
+    }
+
+    #[test]
+    fn amend_option_buyer_expiry_still_settles_after_rotation() {
+        // AV-367: rotation disturbs nothing about expiry — an
+        // unexercised option still expires at the same instant
+        // with the same legs, and the new buyer cannot stop it.
+        let mut o = option();
+        o.amend_option_buyer(SELLER, BUYER, NEW_BUYER).unwrap();
+        assert_eq!(
+            o.expire(EXPIRY - 1),
+            Err(EscrowError::OptionNotExpired)
+        );
+        let legs = o.expire(EXPIRY).unwrap();
+        assert_eq!(legs.underlying_to_seller, UNDERLYING);
+        assert_eq!(legs.premium_to_seller, PREMIUM);
+        assert_eq!(o.state(), OptionState::Expired);
     }
 }

@@ -3720,6 +3720,24 @@ error they get.
   A seller who has lost their key cannot rotate: the current
   seller must co-sign. No event is emitted — `OptionEscrow`
   has no event layer. (Solana: option governance.)
+- **Rotating the buyer (AV-367)**: `amend_option_buyer`
+  rotates the buyer on an `Active` option, authorized by
+  seller + buyer together — the buyer is the sole holder of
+  the exercise right, so a unilateral rewrite would let one
+  side redirect that right alone. The new buyer reuses the
+  construction gate (a zero buyer or one equal to the live
+  seller fails closed with `InvalidOptionTerms`, code 339,
+  and the current buyer is untouched); an exercised option is
+  `OptionAlreadySettled` (code 343) and an expired option is
+  `OptionExpired` (code 341). Re-affirming the current buyer
+  is a no-op. Only `buyer` changes, and `exercise` reads the
+  live buyer, so the new buyer is the sole exerciser from the
+  next exercise — the old buyer gets `OptionNotBuyer` (code
+  340) — while `expire` is unaffected (anyone may call it,
+  and the legs still pay the seller). A buyer who has lost
+  their key cannot rotate: the current buyer must co-sign.
+  No event is emitted — `OptionEscrow` has no event layer.
+  (Solana: option governance.)
 
 New error codes (never renumbered): `InvalidOptionTerms`
 (339), `OptionNotBuyer` (340), `OptionExpired` (341),
