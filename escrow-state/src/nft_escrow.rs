@@ -477,6 +477,137 @@ impl NftEscrow {
         s
     }
 
+    /// Revise the observed collection on a `Created` escrow (AV-370 —
+    /// Solana NFT-escrow custody): the current initializer alone
+    /// authorizes the change (the single-party authority precedent
+    /// of `release`/`cancel` — `NftEscrow` has no taker
+    /// dual-signature). Check order is authority → state → value
+    /// → no-op, mirroring [`NftEscrow::amend_nft_initializer`], so a
+    /// stranger learns nothing about the escrow's state from the
+    /// error alone.
+    ///
+    /// Why: the collection is fixed at construction
+    /// ([`NftEscrow::new`] observes it from the mint descriptor),
+    /// but an NFT can migrate collections on-chain (Metaplex
+    /// `set_and_verify_collection`, or the collection authority
+    /// re-verifying under a new collection) — with no revision path
+    /// the escrow keeps the stale collection, so `release` either
+    /// passes on a dead collection (if the old one is still in the
+    /// allowlist, the gate is checking a fact that no longer holds)
+    /// or refuses a legitimate release (if the new collection was
+    /// never recorded, code 257), and the only exit is `cancel`
+    /// (which abandons the whole escrow and forces a rebuild with a
+    /// fresh custody transfer). Only a `Created` escrow may revise:
+    /// a `Released`/`Cancelled` escrow is terminal, so revising it
+    /// could never govern a future release
+    /// ([`EscrowError::InvalidStateTransition`], code 101). A zero
+    /// collection key (`Some([0u8; 32])`) fails closed with
+    /// [`EscrowError::InvalidNftMint`] (code 256) — a zero key is not
+    /// a real collection. Re-affirming the current collection
+    /// (including `None` over `None`) is a no-op that writes
+    /// nothing. Only `collection` changes — the initializer, the
+    /// mint, the gate, and the state are untouched — and the new
+    /// collection governs from the next `release`, which reads the
+    /// live value; `cancel` stays ungated throughout (the standing
+    /// invariant that gating must never trap the piece).
+    ///
+    /// The gate check is fail-closed *at revision time*, not at
+    /// release time: with a gate installed, the new `Some(c)` must
+    /// be a gate member, and `None` (unverified) is likewise
+    /// refused — otherwise the revision would push the next
+    /// `release` straight into [`EscrowError::CollectionNotAllowlisted`]
+    /// (code 257). A refused revision leaves the original collection
+    /// untouched; to clear the collection, first clear or swap the
+    /// gate with [`NftEscrow::update_collection_allowlist`]. A
+    /// successful revision is recorded for the indexer as
+    /// [`Self::collection_audit_json`] (a string event name, no
+    /// numeric event ID — `NftEscrow` has no `EscrowEventKind`
+    /// layer); a failed revision and a no-op write no audit. The
+    /// revision takes the caller's value as observed — re-verifying
+    /// it on-chain is the caller's job, this escrow is an off-chain
+    /// state machine. Orthogonal to [`NftEscrow::new`] (that
+    /// observes the collection at build time, this revises it while
+    /// `Created`), to `update_collection_allowlist` (that revises
+    /// the gate table, this revises the fact the gate checks — the
+    /// table and the checked fact are the two halves of one gate),
+    /// and to `amend_nft_initializer` (same file, different field).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller who is not the current initializer,
+    /// ([`EscrowError::InvalidStateTransition`], code 101) once
+    /// the escrow is `Released` or `Cancelled`,
+    /// ([`EscrowError::InvalidNftMint`], code 256) for a zero new
+    /// collection key, and
+    /// ([`EscrowError::CollectionNotAllowlisted`], code 257) when
+    /// a gate is installed and the new collection is not in it
+    /// (or is `None`) — either way the current collection is
+    /// untouched.
+    pub fn amend_nft_collection(
+        &mut self,
+        authority: [u8; 32],
+        new_collection: Option<[u8; 32]>,
+    ) -> Result<(), EscrowError> {
+        if authority != self.initializer {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != NftEscrowState::Created {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        if let Some(c) = new_collection {
+            if c == [0u8; 32] {
+                return Err(EscrowError::InvalidNftMint);
+            }
+        }
+        // Fail-closed at revision time: a gated escrow must keep a
+        // collection the gate will accept, or the next release is
+        // doomed to 257. Checked before the no-op so re-affirming a
+        // collection the gate no longer holds is refused, not
+        // silently kept.
+        if let Some(gate) = &self.collection_gate {
+            match new_collection {
+                Some(c) if gate.contains(&c) => {}
+                _ => return Err(EscrowError::CollectionNotAllowlisted),
+            }
+        }
+        if new_collection == self.collection {
+            return Ok(());
+        }
+        self.collection = new_collection;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a collection revision (hand-written,
+    /// no serde — same convention as [`Self::initializer_audit_json`]):
+    /// `{"event":"nft_collection_amended","previous_collection":
+    /// "<64hex>"|null,"collection":"<64hex>"|null}` — `None` renders
+    /// as bare `null`. NFT audit events carry string event names,
+    /// not numeric event IDs, so no new event number is registered
+    /// for the revision — the event name is the identity. Call only
+    /// after a successful revision; a failed revision or a no-op
+    /// writes no audit.
+    pub fn collection_audit_json(&self, previous_collection: Option<[u8; 32]>) -> String {
+        let mut s = String::from("{\"event\":\"nft_collection_amended\",\"previous_collection\":");
+        match previous_collection {
+            Some(c) => {
+                s.push('"');
+                s.push_str(&hex64(&c));
+                s.push('"');
+            }
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"collection\":");
+        match self.collection {
+            Some(c) => {
+                s.push('"');
+                s.push_str(&hex64(&c));
+                s.push('"');
+            }
+            None => s.push_str("null"),
+        }
+        s.push('}');
+        s
+    }
+
     /// Cancel the escrow before release. Check order: authority →
     /// state. The collection gate never blocks a cancel — gating must
     /// never trap the piece.
@@ -1075,6 +1206,266 @@ mod tests {
                 "{{\"event\":\"nft_initializer_amended\",\"previous_initializer\":\"{}\",\"initializer\":\"{}\"}}",
                 "a1".repeat(32),
                 "a1".repeat(32)
+            )
+        );
+    }
+
+    // --- AV-370: amend_nft_collection --------------------------------
+
+    #[test]
+    fn amend_nft_collection_moves_the_observed_collection() {
+        // AV-370: the revised collection governs the next call,
+        // and nothing else moves.
+        let mut e = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        e.amend_nft_collection(alice(), Some([0xDD; 32])).unwrap();
+        assert_eq!(e.collection(), Some([0xDD; 32]));
+        assert_eq!(e.initializer(), alice());
+        assert_eq!(e.mint(), [0x11; 32]);
+        assert_eq!(e.state(), NftEscrowState::Created);
+        assert_eq!(e.collection_gate(), None);
+        // Ungated: release still passes under the new collection.
+        assert_eq!(e.release(alice()).unwrap(), NFT_PIECE_AMOUNT);
+        assert_eq!(e.state(), NftEscrowState::Released);
+    }
+
+    #[test]
+    fn amend_nft_collection_rejects_stranger_and_terminal_states() {
+        // AV-370: authority is checked before state — a stranger
+        // on a terminal escrow still gets Unauthorized, not a
+        // state error — and the collection is untouched either way.
+        let mut e = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        let err = e
+            .amend_nft_collection(bob(), Some([0xDD; 32]))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(e.collection(), Some([0xCC; 32]));
+        e.release(alice()).unwrap();
+        assert_eq!(
+            e.amend_nft_collection(bob(), Some([0xDD; 32]))
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(
+            e.amend_nft_collection(alice(), Some([0xDD; 32]))
+                .unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        assert_eq!(e.collection(), Some([0xCC; 32]));
+        let mut c = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        c.cancel(alice()).unwrap();
+        assert_eq!(
+            c.amend_nft_collection(alice(), Some([0xDD; 32]))
+                .unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        assert_eq!(c.collection(), Some([0xCC; 32]));
+    }
+
+    #[test]
+    fn amend_nft_collection_rejects_zero_collection() {
+        // AV-370: a zero collection key fails closed with
+        // InvalidNftMint (256) — a zero key is not a real
+        // collection — and the current collection is untouched.
+        let mut e = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        let err = e
+            .amend_nft_collection(alice(), Some([0u8; 32]))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidNftMint);
+        assert_eq!(err.code(), 256);
+        assert_eq!(e.collection(), Some([0xCC; 32]));
+        // Still releasable under the affirmed collection.
+        e.release(alice()).unwrap();
+    }
+
+    #[test]
+    fn amend_nft_collection_reaffirmation_is_noop() {
+        // AV-370: re-affirming the current collection succeeds and
+        // changes nothing — including `None` over `None`.
+        let mut e = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        e.amend_nft_collection(alice(), Some([0xCC; 32])).unwrap();
+        assert_eq!(e.collection(), Some([0xCC; 32]));
+        assert_eq!(
+            e.collection_audit_json(Some([0xCC; 32])),
+            format!(
+                "{{\"event\":\"nft_collection_amended\",\"previous_collection\":\"{}\",\"collection\":\"{}\"}}",
+                "cc".repeat(32),
+                "cc".repeat(32)
+            )
+        );
+        e.release(alice()).unwrap();
+
+        let mut desc = nft_desc();
+        desc.collection = None;
+        let mut u = NftEscrow::new(alice(), &desc).unwrap();
+        assert_eq!(u.collection(), None);
+        u.amend_nft_collection(alice(), None).unwrap();
+        assert_eq!(u.collection(), None);
+        u.cancel(alice()).unwrap();
+    }
+
+    #[test]
+    fn amend_nft_collection_gated_revision_inside_gate_releases() {
+        // AV-370: with a gate installed, a revision into the gate
+        // succeeds, and the next release passes under the new
+        // collection.
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xCC; 32]);
+        gate.add([0xDD; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        e.amend_nft_collection(alice(), Some([0xDD; 32])).unwrap();
+        assert_eq!(e.collection(), Some([0xDD; 32]));
+        assert_eq!(e.release(alice()).unwrap(), NFT_PIECE_AMOUNT);
+        assert_eq!(e.state(), NftEscrowState::Released);
+    }
+
+    #[test]
+    fn amend_nft_collection_gated_revision_outside_gate_is_refused() {
+        // AV-370: fail-closed at revision time — a new collection
+        // outside the gate is refused with 257 and the original
+        // collection is untouched, so the next release still
+        // passes under it.
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xCC; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        let err = e
+            .amend_nft_collection(alice(), Some([0xDD; 32]))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::CollectionNotAllowlisted);
+        assert_eq!(err.code(), 257);
+        assert_eq!(e.collection(), Some([0xCC; 32]));
+        e.release(alice()).unwrap();
+    }
+
+    #[test]
+    fn amend_nft_collection_gated_none_is_refused() {
+        // AV-370: with a gate installed, clearing the collection
+        // to `None` (unverified) is refused with 257 — otherwise
+        // the revision would push the next release straight into
+        // 257. To clear the collection, clear or swap the gate
+        // first (AV-284).
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xCC; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        let err = e.amend_nft_collection(alice(), None).unwrap_err();
+        assert_eq!(err, EscrowError::CollectionNotAllowlisted);
+        assert_eq!(err.code(), 257);
+        assert_eq!(e.collection(), Some([0xCC; 32]));
+        e.release(alice()).unwrap();
+    }
+
+    #[test]
+    fn amend_nft_collection_release_judges_new_collection() {
+        // AV-370: `release` reads the live collection — after the
+        // revision the old collection no longer governs. Gate
+        // {CC, DD}, collection CC → revise to DD → shrink the gate
+        // to {CC}: the release is refused even though the *old*
+        // collection would have passed.
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xCC; 32]);
+        gate.add([0xDD; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        e.amend_nft_collection(alice(), Some([0xDD; 32])).unwrap();
+        e.update_collection_allowlist(alice(), &[[0xCC; 32]])
+            .unwrap();
+        assert_eq!(
+            e.release(alice()).unwrap_err(),
+            EscrowError::CollectionNotAllowlisted
+        );
+        assert_eq!(e.state(), NftEscrowState::Created);
+    }
+
+    #[test]
+    fn amend_nft_collection_does_not_gate_cancel() {
+        // AV-370: the revision never traps the piece — `cancel`
+        // stays ungated after a revision, gated or not.
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xCC; 32]);
+        gate.add([0xDD; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        e.amend_nft_collection(alice(), Some([0xDD; 32])).unwrap();
+        e.cancel(alice()).unwrap();
+        assert_eq!(e.state(), NftEscrowState::Cancelled);
+    }
+
+    #[test]
+    fn amend_nft_collection_audit_json() {
+        // AV-370: the audit JSON names the event and both
+        // collections in hex, exactly — `None` renders as bare
+        // `null`. The event name is the identity, no numeric
+        // event ID is registered.
+        let mut e = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        e.amend_nft_collection(alice(), Some([0xDD; 32])).unwrap();
+        assert_eq!(
+            e.collection_audit_json(Some([0xCC; 32])),
+            format!(
+                "{{\"event\":\"nft_collection_amended\",\"previous_collection\":\"{}\",\"collection\":\"{}\"}}",
+                "cc".repeat(32),
+                "dd".repeat(32)
+            )
+        );
+        // `None` as the previous collection renders as bare null.
+        let mut desc = nft_desc();
+        desc.collection = None;
+        let mut u = NftEscrow::new(alice(), &desc).unwrap();
+        u.amend_nft_collection(alice(), Some([0xDD; 32])).unwrap();
+        assert_eq!(
+            u.collection_audit_json(None),
+            format!(
+                "{{\"event\":\"nft_collection_amended\",\"previous_collection\":null,\"collection\":\"{}\"}}",
+                "dd".repeat(32)
+            )
+        );
+        // Revising back to `None` (ungated) audits the hex
+        // previous against a null current.
+        u.amend_nft_collection(alice(), None).unwrap();
+        assert_eq!(
+            u.collection_audit_json(Some([0xDD; 32])),
+            format!(
+                "{{\"event\":\"nft_collection_amended\",\"previous_collection\":\"{}\",\"collection\":null}}",
+                "dd".repeat(32)
+            )
+        );
+    }
+
+    #[test]
+    fn amend_nft_collection_failed_revision_writes_no_audit() {
+        // AV-370: a failed revision leaves the collection
+        // untouched, so an audit rendered against it records no
+        // revision — previous and current are the same key.
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xCC; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        let _ = e.amend_nft_collection(alice(), Some([0xDD; 32]));
+        assert_eq!(e.collection(), Some([0xCC; 32]));
+        assert_eq!(
+            e.collection_audit_json(Some([0xCC; 32])),
+            format!(
+                "{{\"event\":\"nft_collection_amended\",\"previous_collection\":\"{}\",\"collection\":\"{}\"}}",
+                "cc".repeat(32),
+                "cc".repeat(32)
+            )
+        );
+        let _ = e.amend_nft_collection(bob(), Some([0xDD; 32]));
+        assert_eq!(e.collection(), Some([0xCC; 32]));
+        assert_eq!(
+            e.collection_audit_json(Some([0xCC; 32])),
+            format!(
+                "{{\"event\":\"nft_collection_amended\",\"previous_collection\":\"{}\",\"collection\":\"{}\"}}",
+                "cc".repeat(32),
+                "cc".repeat(32)
             )
         );
     }

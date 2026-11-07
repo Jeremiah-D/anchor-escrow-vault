@@ -8224,6 +8224,31 @@ audit-JSON vocabulary, none of the amount machinery).
   numeric event ID; a failed rotation or a no-op writes no
   audit. An initializer who has lost their key cannot rotate:
   the current initializer must sign. (Solana: NFT custody.)
+- **Revising the observed collection (AV-370)**:
+  `amend_nft_collection` revises the observed collection on a
+  `Created` escrow, authorized by the current initializer alone
+  (the single-party precedent of `release`/`cancel` — there is
+  no taker dual-signature on `NftEscrow`). An NFT can migrate
+  collections on-chain (Metaplex `set_and_verify_collection`),
+  and without a revision path the escrow keeps the stale
+  collection — `release` then passes on a dead collection or
+  refuses a legitimate release (code 257), with `cancel` as the
+  only exit. A zero new collection key fails closed with
+  `InvalidNftMint` (code 256); a `Released`/`Cancelled` escrow
+  is `InvalidStateTransition` (code 101). The gate check is
+  fail-closed *at revision time*: with a gate installed, the new
+  `Some(c)` must be a gate member and `None` is likewise refused
+  (`CollectionNotAllowlisted`, code 257) — otherwise the revision
+  would push the next `release` straight into 257; to clear the
+  collection, clear or swap the gate first (AV-284).
+  Re-affirming the current collection (including `None` over
+  `None`) is a no-op. Only `collection` changes, and `release`
+  reads the live value from the next call; `cancel` stays
+  ungated. A successful revision is recorded by
+  `collection_audit_json` as
+  `{"event":"nft_collection_amended","previous_collection":"<64hex>"|null,"collection":"<64hex>"|null}`
+  — a string event name, no numeric event ID; a failed revision
+  or a no-op writes no audit. (Solana: NFT custody.)
 
 New error codes (never renumbered): `InvalidNftMint` (256),
 `CollectionNotAllowlisted` (257), `InvalidCollectionAllowlist`
