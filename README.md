@@ -2961,6 +2961,21 @@ pricing rule is what changes.
   a no-op. The revision is audited as `multi_unit_min_bid_amended`
   (hand-written JSON, same convention as the commit/reveal/settle
   audit events — string event names, no numeric event ID).
+- **End-slot revision** (AV-361): `amend_multi_unit_end_slot()` lets
+  the seller move the reveal window's closing slot before the reveal
+  starts (`current_slot < reveal_start_slot`) — earlier shortens the
+  reveal window (settlement opens sooner), later extends it. The new
+  end reuses the `new()` window gate (`reveal_start_slot <
+  new_end_slot`); otherwise `InvalidMultiUnit`. The liveness gate
+  already guarantees the new end is after `current_slot`, so a reveal
+  window always remains. Commitments are hashes and revealed bids are
+  plaintext amounts, so no bidder's position is invalidated; the new
+  end governs from the next `phase()` / `settle` evaluation.
+  Seller-only (`Unauthorized` for anyone else); refused with
+  `MultiUnitNotLive` once the reveal has started or the auction is
+  terminal; amending to the current end is a no-op. Only `end_slot`
+  changes. The revision is audited as `multi_unit_end_slot_amended`
+  (hand-written JSON, string event name, no numeric event ID).
 
 New error codes (never renumbered): `InvalidMultiUnit` (309),
 `MultiUnitNotLive` (310), `MultiUnitDuplicateCommit` (311),

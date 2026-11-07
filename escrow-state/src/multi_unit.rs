@@ -501,6 +501,71 @@ impl MultiUnitAuction {
         s
     }
 
+    /// Move the reveal window's closing slot (AV-361).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the schedule is the seller's public timetable)
+    /// and only before the reveal window opens (`current_slot <
+    /// reveal_start_slot`) on a live auction — refused with
+    /// [`EscrowError::MultiUnitNotLive`] (code 310) once the reveal
+    /// has started or the auction is terminal. Revising the end after
+    /// the reveal starts would retime the settlement of already
+    /// revealed bids, so the end stays put. The new end reuses the
+    /// `new()` window gate (`reveal_start_slot < new_end_slot`) —
+    /// refused with [`EscrowError::InvalidMultiUnit`] (code 309),
+    /// the original end untouched; the liveness gate already
+    /// guarantees the new end is after `current_slot`, so a reveal
+    /// window always remains after the revision.
+    ///
+    /// Only `end_slot` changes: seller, units, `min_bid`, the two
+    /// start slots, slots, counts, and state are untouched. The new
+    /// end governs from the next [`Self::phase`] / [`Self::settle`]
+    /// evaluation — shortening opens settlement earlier, extending
+    /// delays it — and already revealed bids are unaffected
+    /// (commitment hashes and reveal records do not move). Amending
+    /// to the current end is a no-op.
+    ///
+    /// Check order is authority → liveness → no-op → value,
+    /// mirroring [`Self::amend_multi_unit_min_bid`]: a stranger is
+    /// refused even on a terminal auction, and a lapsed auction
+    /// refuses even the seller.
+    pub fn amend_multi_unit_end_slot(
+        &mut self,
+        caller: [u8; 32],
+        new_end_slot: u64,
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != MultiUnitState::Active || current_slot >= self.reveal_start_slot {
+            return Err(EscrowError::MultiUnitNotLive);
+        }
+        if new_end_slot == self.end_slot {
+            return Ok(());
+        }
+        if new_end_slot <= self.reveal_start_slot {
+            return Err(EscrowError::InvalidMultiUnit);
+        }
+        self.end_slot = new_end_slot;
+        Ok(())
+    }
+
+    /// Audit-event JSON for an end-slot revision (hand-written, no
+    /// serde — same convention as [`Self::commit_audit_json`]):
+    /// `{"event":"multi_unit_end_slot_amended","previous_end_slot":
+    /// <u64>,"end_slot":<u64>}`. Multi-unit audit events carry string
+    /// event names, not numeric event IDs, so no new event number is
+    /// registered for the revision — the event name is the identity.
+    pub fn end_slot_audit_json(&self, previous_end_slot: u64) -> String {
+        let mut s = String::from("{\"event\":\"multi_unit_end_slot_amended\",\"previous_end_slot\":");
+        s.push_str(&previous_end_slot.to_string());
+        s.push_str(",\"end_slot\":");
+        s.push_str(&self.end_slot.to_string());
+        s.push('}');
+        s
+    }
+
     /// Audit-event JSON for a commitment (hand-written):
     /// `{"event":"multi_unit_commit","bidder":"<64hex>","commitment":
     /// "<64hex>","units":<u64>,"reveal_start_slot":<u64>}`.
@@ -579,6 +644,11 @@ impl MultiUnitAuction {
     /// The public minimum per-unit bid (`0` = no floor).
     pub fn min_bid(&self) -> u64 {
         self.min_bid
+    }
+
+    /// The reveal window's closing slot.
+    pub fn end_slot(&self) -> u64 {
+        self.end_slot
     }
 
     /// Lifecycle state.
@@ -1100,6 +1170,192 @@ mod multi_unit_tests {
         assert_eq!(
             j,
             "{\"event\":\"multi_unit_min_bid_amended\",\"previous_min_bid\":10,\"min_bid\":25}"
+        );
+    }
+
+    #[test]
+    fn amend_end_slot_is_seller_only_and_pre_reveal() {
+        let mut a = open_auction(); // seller key(0xAA), end 300, reveal at 200
+        // A stranger or a bidder cannot move the seller's clock.
+        assert_eq!(
+            a.amend_multi_unit_end_slot(key(9), 400, 100).unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(a.end_slot(), 300);
+        // Before the commit window opens the end still moves: no
+        // bid is visible yet, so nothing is invalidated.
+        a.amend_multi_unit_end_slot(key(0xAA), 400, 99).unwrap();
+        assert_eq!(a.end_slot(), 400);
+        // After commitments land but before the reveal, the seller
+        // may still move the end — commitments are hashes.
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        a.amend_multi_unit_end_slot(key(0xAA), 350, 150).unwrap();
+        assert_eq!(a.end_slot(), 350);
+        assert_eq!(a.commit_count(), 1);
+        // Once the reveal window opens the end is locked.
+        let err = a
+            .amend_multi_unit_end_slot(key(0xAA), 450, 200)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(err.code(), 310);
+        assert_eq!(a.end_slot(), 350);
+        // A stranger is refused even on a terminal auction (authority
+        // first, mirroring cancel).
+        reveal(&mut a, key(1), 50, nonce(1), 200);
+        a.settle(350).unwrap();
+        assert_eq!(a.state(), MultiUnitState::Settled);
+        let err = a
+            .amend_multi_unit_end_slot(key(9), 450, 350)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        // Terminal auctions refuse even the seller.
+        let err = a
+            .amend_multi_unit_end_slot(key(0xAA), 450, 350)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(a.end_slot(), 350);
+        // A cancelled auction is terminal too.
+        let mut b = open_auction();
+        b.cancel(key(0xAA), 100).unwrap();
+        let err = b
+            .amend_multi_unit_end_slot(key(0xAA), 400, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+    }
+
+    #[test]
+    fn amend_end_slot_rejects_bad_window() {
+        let mut a = open_auction(); // reveal at 200, end 300
+        // The new end must stay after the reveal start — the
+        // constructor's window gate, reused.
+        let err = a
+            .amend_multi_unit_end_slot(key(0xAA), 200, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMultiUnit);
+        assert_eq!(err.code(), 309);
+        assert_eq!(a.end_slot(), 300);
+        // Earlier than the reveal start is refused too.
+        let err = a
+            .amend_multi_unit_end_slot(key(0xAA), 150, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMultiUnit);
+        assert_eq!(a.end_slot(), 300);
+        // Just past the reveal start is the smallest legal end.
+        a.amend_multi_unit_end_slot(key(0xAA), 201, 100).unwrap();
+        assert_eq!(a.end_slot(), 201);
+    }
+
+    #[test]
+    fn amend_end_slot_noop_on_same_value() {
+        let mut a = open_auction();
+        a.amend_multi_unit_end_slot(key(0xAA), 300, 100).unwrap();
+        assert_eq!(a.end_slot(), 300);
+        assert_eq!(a.state(), MultiUnitState::Active);
+        // No-op after a real revision too: the end stays put and
+        // nothing is recorded (the audit is only emitted on a real
+        // revision, and a no-op writes nothing to audit).
+        a.amend_multi_unit_end_slot(key(0xAA), 250, 110).unwrap();
+        a.amend_multi_unit_end_slot(key(0xAA), 250, 120).unwrap();
+        assert_eq!(a.end_slot(), 250);
+    }
+
+    #[test]
+    fn amend_end_slot_moves_phase_boundary() {
+        let mut a = open_auction();
+        assert_eq!(a.phase(300), MultiUnitPhase::Closed);
+        a.amend_multi_unit_end_slot(key(0xAA), 400, 100).unwrap();
+        assert_eq!(a.phase(300), MultiUnitPhase::Reveal);
+        assert_eq!(a.phase(400), MultiUnitPhase::Closed);
+        // Shortening closes the window earlier.
+        a.amend_multi_unit_end_slot(key(0xAA), 250, 150).unwrap();
+        assert_eq!(a.phase(250), MultiUnitPhase::Closed);
+        assert_eq!(a.phase(249), MultiUnitPhase::Reveal);
+    }
+
+    #[test]
+    fn amend_end_slot_governs_next_settle() {
+        // Shortening the end opens settlement earlier: settle at the
+        // new end succeeds where it refused before, and the revealed
+        // bid still clears at the same price.
+        let mut a = open_auction();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        assert_eq!(
+            a.settle(250).unwrap_err(),
+            EscrowError::MultiUnitNotLive
+        );
+        a.amend_multi_unit_end_slot(key(0xAA), 250, 150).unwrap();
+        reveal(&mut a, key(1), 50, nonce(1), 200);
+        let s = a.settle(250).unwrap();
+        match s {
+            MultiUnitSettlement::Cleared {
+                clearing_price,
+                unsold_units,
+                ..
+            } => {
+                assert_eq!(clearing_price, 50);
+                assert_eq!(unsold_units, 3);
+            }
+            MultiUnitSettlement::NoSale => panic!("expected Cleared"),
+        }
+        assert_eq!(a.state(), MultiUnitState::Settled);
+
+        // Extending the end delays settlement: settle at the old end
+        // still refuses, and the reveal window runs longer.
+        let mut b = open_auction();
+        commit(&mut b, key(1), 50, nonce(1), 100);
+        b.amend_multi_unit_end_slot(key(0xAA), 400, 150).unwrap();
+        assert_eq!(b.phase(300), MultiUnitPhase::Reveal);
+        assert_eq!(
+            b.settle(300).unwrap_err(),
+            EscrowError::MultiUnitNotLive
+        );
+        reveal(&mut b, key(1), 50, nonce(1), 300);
+        let s = b.settle(400).unwrap();
+        match s {
+            MultiUnitSettlement::Cleared {
+                clearing_price,
+                unsold_units,
+                ..
+            } => {
+                assert_eq!(clearing_price, 50);
+                assert_eq!(unsold_units, 3);
+            }
+            MultiUnitSettlement::NoSale => panic!("expected Cleared"),
+        }
+    }
+
+    #[test]
+    fn amend_end_slot_leaves_everything_else_untouched() {
+        let mut a = open_auction();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        a.amend_multi_unit_end_slot(key(0xAA), 400, 150).unwrap();
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.units(), 4);
+        assert_eq!(a.min_bid(), 10);
+        assert_eq!(a.end_slot(), 400);
+        assert_eq!(a.commit_count(), 1);
+        assert_eq!(a.reveal_count(), 0);
+        assert_eq!(a.state(), MultiUnitState::Active);
+        // The commit/reveal starts are unchanged: commits still land
+        // before 200, reveals still land from 200.
+        assert_eq!(a.phase(99), MultiUnitPhase::Closed);
+        assert_eq!(a.phase(100), MultiUnitPhase::Commit);
+        assert_eq!(a.phase(200), MultiUnitPhase::Reveal);
+        reveal(&mut a, key(1), 50, nonce(1), 200);
+        assert_eq!(a.reveal_count(), 1);
+    }
+
+    #[test]
+    fn amend_end_slot_audit_json() {
+        let mut a = open_auction();
+        a.amend_multi_unit_end_slot(key(0xAA), 400, 100).unwrap();
+        let j = a.end_slot_audit_json(300);
+        assert!(j.contains("\"event\":\"multi_unit_end_slot_amended\""));
+        assert!(j.contains("\"previous_end_slot\":300"));
+        assert!(j.contains("\"end_slot\":400"));
+        assert_eq!(
+            j,
+            "{\"event\":\"multi_unit_end_slot_amended\",\"previous_end_slot\":300,\"end_slot\":400}"
         );
     }
 }
