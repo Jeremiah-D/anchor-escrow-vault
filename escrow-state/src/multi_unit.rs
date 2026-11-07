@@ -439,6 +439,68 @@ impl MultiUnitAuction {
         Ok(())
     }
 
+    /// Move the public minimum per-unit bid (AV-360).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the floor is the seller's public price) and only
+    /// before the reveal window opens (`current_slot <
+    /// reveal_start_slot`) on a live auction — refused with
+    /// [`EscrowError::MultiUnitNotLive`] (code 310) once the reveal
+    /// has started or the auction is terminal, the original floor
+    /// untouched. Revising the floor after the reveal starts would
+    /// retroactively disqualify already-revealed bids, so the floor
+    /// stays put. The floor may move in either direction, including
+    /// to `0` (which cancels the floor, as at [`Self::new`]): any
+    /// `u64` is legal, so there is no value validation to reuse from
+    /// `new` — the constructor never validated `min_bid` either.
+    ///
+    /// The revision is safe even after commitments have landed:
+    /// commitments are hashes, so no bidder's position is invalidated
+    /// — a commitment binds a bid the seller has not seen yet, and
+    /// the floor is only read at [`Self::settle`]. Only `min_bid`
+    /// changes: seller, units, windows, slots, counts, and state
+    /// are untouched. The new floor governs from the next `settle`:
+    /// reveals below it are recorded but cannot win; with no valid
+    /// reveal the outcome is `NoSale`. Amending to the current floor
+    /// is a no-op.
+    ///
+    /// Check order is authority → liveness → no-op, mirroring
+    /// [`Self::cancel`]: a stranger is refused even on a terminal
+    /// auction, and a lapsed auction refuses even the seller.
+    pub fn amend_multi_unit_min_bid(
+        &mut self,
+        caller: [u8; 32],
+        new_min_bid: u64,
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != MultiUnitState::Active || current_slot >= self.reveal_start_slot {
+            return Err(EscrowError::MultiUnitNotLive);
+        }
+        if new_min_bid == self.min_bid {
+            return Ok(());
+        }
+        self.min_bid = new_min_bid;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a minimum-bid revision (hand-written, no
+    /// serde — same convention as [`Self::commit_audit_json`]):
+    /// `{"event":"multi_unit_min_bid_amended","previous_min_bid":
+    /// <u64>,"min_bid":<u64>}`. Multi-unit audit events carry string
+    /// event names, not numeric event IDs, so no new event number is
+    /// registered for the revision — the event name is the identity.
+    pub fn min_bid_audit_json(&self, previous_min_bid: u64) -> String {
+        let mut s = String::from("{\"event\":\"multi_unit_min_bid_amended\",\"previous_min_bid\":");
+        s.push_str(&previous_min_bid.to_string());
+        s.push_str(",\"min_bid\":");
+        s.push_str(&self.min_bid.to_string());
+        s.push('}');
+        s
+    }
+
     /// Audit-event JSON for a commitment (hand-written):
     /// `{"event":"multi_unit_commit","bidder":"<64hex>","commitment":
     /// "<64hex>","units":<u64>,"reveal_start_slot":<u64>}`.
@@ -882,5 +944,162 @@ mod multi_unit_tests {
         assert_eq!(EscrowError::MultiUnitNotLive.code(), 310);
         assert_eq!(EscrowError::MultiUnitDuplicateCommit.code(), 311);
         assert_eq!(EscrowError::MultiUnitRevealMismatch.code(), 312);
+    }
+
+    #[test]
+    fn amend_min_bid_is_seller_only_and_pre_reveal() {
+        let mut a = open_auction(); // seller key(0xAA), min_bid 10, reveal at 200
+        // A stranger or a bidder cannot move the seller's floor.
+        assert_eq!(
+            a.amend_multi_unit_min_bid(key(9), 50, 100).unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(a.min_bid(), 10);
+        // Before the commit window opens the floor still moves: no
+        // bid is visible yet, so nothing is invalidated.
+        a.amend_multi_unit_min_bid(key(0xAA), 20, 99).unwrap();
+        assert_eq!(a.min_bid(), 20);
+        // After commitments land but before the reveal, the seller
+        // may still move the floor — commitments are hashes.
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        a.amend_multi_unit_min_bid(key(0xAA), 30, 150).unwrap();
+        assert_eq!(a.min_bid(), 30);
+        assert_eq!(a.commit_count(), 1);
+        // Once the reveal window opens the floor is locked.
+        let err = a
+            .amend_multi_unit_min_bid(key(0xAA), 40, 200)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(err.code(), 310);
+        assert_eq!(a.min_bid(), 30);
+        // A stranger is refused even on a terminal auction (authority
+        // first, mirroring cancel).
+        reveal(&mut a, key(1), 50, nonce(1), 200);
+        a.settle(300).unwrap();
+        assert_eq!(a.state(), MultiUnitState::Settled);
+        let err = a
+            .amend_multi_unit_min_bid(key(9), 40, 300)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        // Terminal auctions refuse even the seller.
+        let err = a
+            .amend_multi_unit_min_bid(key(0xAA), 40, 300)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(a.min_bid(), 30);
+        // A cancelled auction is terminal too.
+        let mut b = open_auction();
+        b.cancel(key(0xAA), 100).unwrap();
+        let err = b
+            .amend_multi_unit_min_bid(key(0xAA), 40, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+    }
+
+    #[test]
+    fn amend_min_bid_noop_on_same_value() {
+        let mut a = open_auction();
+        a.amend_multi_unit_min_bid(key(0xAA), 10, 100).unwrap();
+        assert_eq!(a.min_bid(), 10);
+        assert_eq!(a.state(), MultiUnitState::Active);
+        // No-op after a real revision too: the floor stays put and
+        // nothing is recorded (the audit is only emitted on a real
+        // revision, and a no-op writes nothing to audit).
+        a.amend_multi_unit_min_bid(key(0xAA), 25, 110).unwrap();
+        a.amend_multi_unit_min_bid(key(0xAA), 25, 120).unwrap();
+        assert_eq!(a.min_bid(), 25);
+    }
+
+    #[test]
+    fn amend_min_bid_governs_next_settle() {
+        // Raising the floor above every revealed bid turns a sale
+        // into a no-sale: the sub-floor reveals stay on the books
+        // but cannot win.
+        let mut a = open_auction();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        commit(&mut a, key(2), 90, nonce(2), 120);
+        a.amend_multi_unit_min_bid(key(0xAA), 100, 150).unwrap();
+        // The committed bids still reveal: the floor change does not
+        // invalidate any commitment.
+        reveal(&mut a, key(1), 50, nonce(1), 200);
+        reveal(&mut a, key(2), 90, nonce(2), 210);
+        assert_eq!(a.reveal_count(), 2);
+        assert_eq!(a.settle(300).unwrap(), MultiUnitSettlement::NoSale);
+        assert_eq!(a.state(), MultiUnitState::NoSale);
+
+        // Raising the floor part-way excludes only the cheap reveals:
+        // 100 and 90 stay valid, 80 drops out.
+        let mut b = open_auction();
+        commit(&mut b, key(1), 100, nonce(1), 100);
+        commit(&mut b, key(2), 90, nonce(2), 110);
+        commit(&mut b, key(3), 80, nonce(3), 120);
+        b.amend_multi_unit_min_bid(key(0xAA), 85, 150).unwrap();
+        reveal(&mut b, key(1), 100, nonce(1), 200);
+        reveal(&mut b, key(2), 90, nonce(2), 201);
+        reveal(&mut b, key(3), 80, nonce(3), 202);
+        let (price, allocs, unsold) = cleared(&mut b);
+        // Undersubscribed on the valid book: clearing price is the
+        // lowest winning bid (90); bidder 3 gets nothing.
+        assert_eq!(price, 90);
+        assert_eq!(allocs, vec![(key(1), 1, 1), (key(2), 1, 1)]);
+        assert_eq!(unsold, 2);
+
+        // Lowering the floor lets a previously sub-floor bid win.
+        let mut c = open_auction(); // floor 10
+        commit(&mut c, key(1), 5, nonce(1), 100);
+        commit(&mut c, key(2), 50, nonce(2), 110);
+        c.amend_multi_unit_min_bid(key(0xAA), 5, 150).unwrap();
+        reveal(&mut c, key(1), 5, nonce(1), 200);
+        reveal(&mut c, key(2), 50, nonce(2), 201);
+        let (price, allocs, unsold) = cleared(&mut c);
+        assert_eq!(price, 5);
+        assert_eq!(allocs, vec![(key(2), 1, 1), (key(1), 1, 1)]);
+        assert_eq!(unsold, 2);
+    }
+
+    #[test]
+    fn amend_min_bid_zero_cancels_floor() {
+        let mut a = open_auction(); // floor 10
+        commit(&mut a, key(1), 5, nonce(1), 100);
+        a.amend_multi_unit_min_bid(key(0xAA), 0, 150).unwrap();
+        assert_eq!(a.min_bid(), 0);
+        reveal(&mut a, key(1), 5, nonce(1), 200);
+        let (price, allocs, unsold) = cleared(&mut a);
+        assert_eq!(price, 5);
+        assert_eq!(allocs, vec![(key(1), 1, 1)]);
+        assert_eq!(unsold, 3);
+    }
+
+    #[test]
+    fn amend_min_bid_leaves_everything_else_untouched() {
+        let mut a = open_auction();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        a.amend_multi_unit_min_bid(key(0xAA), 25, 150).unwrap();
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.units(), 4);
+        assert_eq!(a.min_bid(), 25);
+        assert_eq!(a.commit_count(), 1);
+        assert_eq!(a.reveal_count(), 0);
+        assert_eq!(a.state(), MultiUnitState::Active);
+        // The windows are unchanged: commits still land before 200,
+        // reveals still land from 200.
+        assert_eq!(a.phase(150), MultiUnitPhase::Commit);
+        assert_eq!(a.phase(200), MultiUnitPhase::Reveal);
+        reveal(&mut a, key(1), 50, nonce(1), 200);
+        assert_eq!(a.reveal_count(), 1);
+    }
+
+    #[test]
+    fn amend_min_bid_audit_json() {
+        let mut a = open_auction();
+        a.amend_multi_unit_min_bid(key(0xAA), 25, 100).unwrap();
+        let j = a.min_bid_audit_json(10);
+        assert!(j.contains("\"event\":\"multi_unit_min_bid_amended\""));
+        assert!(j.contains("\"previous_min_bid\":10"));
+        assert!(j.contains("\"min_bid\":25"));
+        assert_eq!(
+            j,
+            "{\"event\":\"multi_unit_min_bid_amended\",\"previous_min_bid\":10,\"min_bid\":25}"
+        );
     }
 }

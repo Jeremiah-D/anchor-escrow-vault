@@ -2949,6 +2949,18 @@ pricing rule is what changes.
   it). Valid reveals below it are recorded but cannot win; with no
   valid bid the outcome is `NoSale`. One commitment per bidder, max 64
   commitments (a full book is not live for new commitments).
+- **Minimum-bid revision** (AV-360): `amend_multi_unit_min_bid()` lets
+  the seller move the public floor before the reveal window opens
+  (`current_slot < reveal_start_slot`) — including to `0`, which cancels
+  the floor. Commitments are hashes, so no bidder's position is
+  invalidated by the change; the new floor governs from the next
+  `settle` (reveals below it are recorded but cannot win, and with no
+  valid reveal the outcome is `NoSale`). Seller-only (`Unauthorized` for
+  anyone else); refused with `MultiUnitNotLive` once the reveal has
+  started or the auction is terminal; amending to the current floor is
+  a no-op. The revision is audited as `multi_unit_min_bid_amended`
+  (hand-written JSON, same convention as the commit/reveal/settle
+  audit events — string event names, no numeric event ID).
 
 New error codes (never renumbered): `InvalidMultiUnit` (309),
 `MultiUnitNotLive` (310), `MultiUnitDuplicateCommit` (311),
