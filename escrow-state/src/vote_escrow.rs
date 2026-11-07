@@ -21,6 +21,10 @@
 //!   end. Extension only: a new end at or before the current end (or
 //!   at or before `now`) is refused, so a lock can never be shortened
 //!   into more power or out of its commitment early.
+//! - [`VoteEscrowLock::top_up`] — adds principal to a live,
+//!   unmatured lock. Only the amount moves, so voting power scales
+//!   in proportion immediately and [`VoteEscrowLock::early_exit`]
+//!   prices its penalty on the new amount.
 //! - [`VoteEscrowLock::early_exit`] — closes the lock before maturity
 //!   and splits the amount into a refund and a penalty proportional
 //!   to the remaining time (`penalty = amount * remaining / duration`,
@@ -124,6 +128,35 @@ impl VoteEscrowLock {
             return Err(EscrowError::InvalidVoteLock);
         }
         self.duration_secs = new_end - self.start;
+        Ok(())
+    }
+
+    /// Add `additional` to the locked amount (AV-372 — Solana
+    /// governance: adding principal to a vote-escrow lock is the
+    /// standard `increase_amount` operation). Only the amount
+    /// moves: the start, the duration and the exited flag are
+    /// untouched, so the voting-power curve re-bases over the same
+    /// window — power is `amount * remaining / duration`, and
+    /// `remaining` and `duration` do not change, so power scales
+    /// in proportion to the new amount immediately. An exited lock
+    /// is [`EscrowError::InvalidVoteLock`], as is a mature lock
+    /// (`now >= end` — topping up a mature lock would buy voting
+    /// power that no longer exists), a zero top-up (the
+    /// [`VoteEscrowLock::lock`] `amount == 0` gate), and an amount
+    /// that would overflow `u64` (`checked_add`). A failed top-up
+    /// leaves the amount untouched. [`VoteEscrowLock::early_exit`]
+    /// after a top-up prices the penalty on the new amount, and
+    /// the end never moves — a top-up is not an extension, so it
+    /// cannot stretch the lock's commitment the way
+    /// [`VoteEscrowLock::extend_to`] does.
+    pub fn top_up(&mut self, additional: u64, now: u64) -> Result<(), EscrowError> {
+        if self.exited || now >= self.end() || additional == 0 {
+            return Err(EscrowError::InvalidVoteLock);
+        }
+        self.amount = match self.amount.checked_add(additional) {
+            Some(amount) => amount,
+            None => return Err(EscrowError::InvalidVoteLock),
+        };
         Ok(())
     }
 
@@ -235,5 +268,88 @@ mod tests {
             lock.extend_to(1_300, 1_100),
             Err(EscrowError::InvalidVoteLock)
         );
+    }
+
+    #[test]
+    fn top_up_scales_voting_power_and_keeps_end() {
+        // AV-372: only the amount moves — power scales in
+        // proportion immediately, and start, duration and end are
+        // untouched.
+        let mut lock = VoteEscrowLock::lock(1_000, 1_000, 100).unwrap();
+        assert_eq!(lock.voting_power_at(1_025), 750);
+        lock.top_up(1_000, 1_025).unwrap();
+        assert_eq!(lock.amount(), 2_000);
+        assert_eq!(lock.start(), 1_000);
+        assert_eq!(lock.duration_secs(), 100);
+        assert_eq!(lock.end(), 1_100);
+        assert!(!lock.exited());
+        // 2000 * 75 / 100 = 1500: exactly double the old power.
+        assert_eq!(lock.voting_power_at(1_025), 1_500);
+        assert_eq!(lock.remaining_at(1_025), 75);
+        // Power still decays to zero at the same end.
+        assert_eq!(lock.voting_power_at(1_100), 0);
+    }
+
+    #[test]
+    fn top_up_accumulates_across_calls() {
+        // AV-372: top-ups are not one-shot — each one adds to the
+        // live amount, and power always reads the live amount.
+        let mut lock = VoteEscrowLock::lock(1_000, 0, 100).unwrap();
+        lock.top_up(500, 0).unwrap();
+        lock.top_up(500, 50).unwrap();
+        assert_eq!(lock.amount(), 2_000);
+        assert_eq!(lock.end(), 100);
+        // 2000 * 50 / 100 = 1000 at the halfway point.
+        assert_eq!(lock.voting_power_at(50), 1_000);
+    }
+
+    #[test]
+    fn top_up_rejects_zero_overflow_exited_and_mature() {
+        // AV-372: a zero top-up, an overflow, an exited lock and a
+        // mature lock all fail closed, and a failed top-up leaves
+        // the amount untouched.
+        let mut lock = VoteEscrowLock::lock(1_000, 1_000, 100).unwrap();
+        let err = lock.top_up(0, 1_025).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidVoteLock);
+        assert_eq!(err.code(), 317);
+        assert_eq!(lock.amount(), 1_000);
+        // Overflow: u64::MAX cannot take one more lamport.
+        let mut big = VoteEscrowLock::lock(u64::MAX, 0, 2).unwrap();
+        assert_eq!(
+            big.top_up(1, 0),
+            Err(EscrowError::InvalidVoteLock)
+        );
+        assert_eq!(big.amount(), u64::MAX);
+        // A mature lock (now >= end) buys no voting power.
+        assert_eq!(
+            lock.top_up(100, 1_100),
+            Err(EscrowError::InvalidVoteLock)
+        );
+        assert_eq!(
+            lock.top_up(100, 1_500),
+            Err(EscrowError::InvalidVoteLock)
+        );
+        assert_eq!(lock.amount(), 1_000);
+        // An exited lock holds nothing to top up.
+        let mut exited = VoteEscrowLock::lock(1_000, 1_000, 100).unwrap();
+        exited.early_exit(1_025).unwrap();
+        assert_eq!(
+            exited.top_up(100, 1_025),
+            Err(EscrowError::InvalidVoteLock)
+        );
+        assert_eq!(exited.amount(), 1_000);
+    }
+
+    #[test]
+    fn top_up_reprices_early_exit_penalty() {
+        // AV-372: early exit after a top-up prices the penalty on
+        // the new amount — the added principal is at risk too.
+        let mut lock = VoteEscrowLock::lock(1_000, 1_000, 100).unwrap();
+        lock.top_up(1_000, 1_025).unwrap();
+        // 75 of 100 seconds remain on 2000: penalty 1500, refund
+        // 500.
+        assert_eq!(lock.early_exit(1_025), Ok((500, 1_500)));
+        assert!(lock.exited());
+        assert_eq!(lock.voting_power_at(1_025), 0);
     }
 }

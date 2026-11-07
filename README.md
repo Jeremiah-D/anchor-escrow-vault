@@ -1213,9 +1213,14 @@ at or before the current end, or at or before `now`, is
 of its commitment. `early_exit(now)` closes a live lock early and
 prices the exit as `(refund, penalty)` with `penalty = floor(amount
 * remaining / duration)`; a mature lock exits penalty-free, and a
-second exit is refused. The penalty is returned for the caller to
-route to the AV-106 insurance pool — the module moves no lamports,
-it only prices the exit. Orthogonal to AV-170 staking (yield, not
+second exit is refused. `top_up(additional, now)` (AV-372) adds
+principal to a live, unmatured lock — only `amount` moves, so voting
+power scales in proportion immediately and `early_exit` prices its
+penalty on the new amount; a zero top-up, an overflow, an exited lock,
+or a mature lock is `InvalidVoteLock` (code 317), and the end never
+moves — a top-up is not an extension. The penalty is returned for the
+caller to route to the AV-106 insurance pool — the module moves no
+lamports, it only prices the exit. Orthogonal to AV-170 staking (yield, not
 votes) and AV-183 frozen snapshots (a snapshot reads weights at a
 slot; this lock generates a decaying weight over time).
 
