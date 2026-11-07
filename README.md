@@ -2976,6 +2976,18 @@ pricing rule is what changes.
   terminal; amending to the current end is a no-op. Only `end_slot`
   changes. The revision is audited as `multi_unit_end_slot_amended`
   (hand-written JSON, string event name, no numeric event ID).
+- **Seller rotation** (AV-362): `amend_multi_unit_seller()` lets the
+  current seller hand the auction to a new seller before the first
+  commitment lands (`commit_count == 0`) — seller-only, refused with
+  `MultiUnitNotLive` once a commitment has landed or the auction is
+  terminal; a zero new seller is refused with `InvalidMultiUnit`.
+  No slot gate: with zero commitments no bidder has entered, so the
+  rotation works even with a window already open. Only `seller`
+  changes; the new seller is the sole authority from the next call
+  (every `amend_*` and `cancel` read the live seller). Amending to
+  the current seller is a no-op. The rotation is audited as
+  `multi_unit_seller_amended` (hand-written JSON, string event name,
+  no numeric event ID).
 
 New error codes (never renumbered): `InvalidMultiUnit` (309),
 `MultiUnitNotLive` (310), `MultiUnitDuplicateCommit` (311),

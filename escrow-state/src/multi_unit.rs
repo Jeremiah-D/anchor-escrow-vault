@@ -566,6 +566,77 @@ impl MultiUnitAuction {
         s
     }
 
+    /// Rotate the seller key before the first commitment lands
+    /// (AV-362).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the seller key is the auction's authority) and
+    /// only while the auction is live and no commitment has landed
+    /// (`state == Active` and `commit_count == 0`) — refused with
+    /// [`EscrowError::MultiUnitNotLive`] (code 310) once a commitment
+    /// has landed or the auction is terminal, the original seller
+    /// untouched. No slot gate: with zero commitments no bidder has
+    /// entered, so the window may already be open — commitments are
+    /// hashes and the seller has not seen any bid yet, so nothing
+    /// entered is rewritten. A zero new seller reuses the [`Self::new`]
+    /// gate ([`EscrowError::InvalidMultiUnit`], code 309), the
+    /// original seller untouched.
+    ///
+    /// Only `seller` changes: `units`, `min_bid`, the three windows,
+    /// slots, counts, and state are untouched. The new seller is the
+    /// sole authority from the next call: every `amend_*`,
+    /// [`Self::cancel`], and the settle payout read the live seller.
+    /// Rotating to the current seller is a no-op.
+    ///
+    /// Check order is authority → liveness → no-op → value,
+    /// mirroring AV-323 (`SealedBidAuction::amend_sealed_bid_seller`):
+    /// a stranger is refused even on a terminal auction, and a lapsed
+    /// auction refuses even the seller.
+    ///
+    /// Pure logic: this method changes state only. The rotation is
+    /// recorded for the indexer as [`Self::seller_audit_json`] (a
+    /// string event name, no numeric event ID — the multi-unit audit
+    /// convention); a failed rotation and a no-op re-affirmation
+    /// record nothing. There is no Anchor instruction surface in
+    /// this round — the program drives this method and emits the
+    /// event — and no new error code: the gates reuse 100/309/310.
+    pub fn amend_multi_unit_seller(
+        &mut self,
+        caller: [u8; 32],
+        new_seller: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != MultiUnitState::Active || self.commit_count > 0 {
+            return Err(EscrowError::MultiUnitNotLive);
+        }
+        if new_seller == self.seller {
+            return Ok(());
+        }
+        if new_seller == [0u8; 32] {
+            return Err(EscrowError::InvalidMultiUnit);
+        }
+        self.seller = new_seller;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a seller rotation (hand-written, no
+    /// serde — same convention as [`Self::commit_audit_json`]):
+    /// `{"event":"multi_unit_seller_amended","previous_seller":
+    /// "<64hex>","seller":"<64hex>"}`. Multi-unit audit events carry
+    /// string event names, not numeric event IDs, so no new event
+    /// number is registered for the rotation — the event name is the
+    /// identity.
+    pub fn seller_audit_json(&self, previous_seller: [u8; 32]) -> String {
+        let mut s = String::from("{\"event\":\"multi_unit_seller_amended\",\"previous_seller\":\"");
+        s.push_str(&hex64(&previous_seller));
+        s.push_str("\",\"seller\":\"");
+        s.push_str(&hex64(&self.seller));
+        s.push_str("\"}");
+        s
+    }
+
     /// Audit-event JSON for a commitment (hand-written):
     /// `{"event":"multi_unit_commit","bidder":"<64hex>","commitment":
     /// "<64hex>","units":<u64>,"reveal_start_slot":<u64>}`.
@@ -1357,5 +1428,217 @@ mod multi_unit_tests {
             j,
             "{\"event\":\"multi_unit_end_slot_amended\",\"previous_end_slot\":300,\"end_slot\":400}"
         );
+    }
+
+    #[test]
+    fn amend_seller_rotates_before_first_commit() {
+        let mut a = open_auction(); // seller key(0xAA), 4 units, floor 10
+        a.amend_multi_unit_seller(key(0xAA), key(0xBB)).unwrap();
+        assert_eq!(a.seller(), key(0xBB));
+        // Everything else is untouched.
+        assert_eq!(a.units(), 4);
+        assert_eq!(a.min_bid(), 10);
+        assert_eq!(a.end_slot(), 300);
+        assert_eq!(a.commit_count(), 0);
+        assert_eq!(a.reveal_count(), 0);
+        assert_eq!(a.state(), MultiUnitState::Active);
+        // The windows are unchanged: commits still land before 200,
+        // reveals still land from 200.
+        assert_eq!(a.phase(150), MultiUnitPhase::Commit);
+        assert_eq!(a.phase(200), MultiUnitPhase::Reveal);
+        // The auction still runs to a sale under the new seller.
+        commit(&mut a, key(1), 50, nonce(1), 150);
+        reveal(&mut a, key(1), 50, nonce(1), 200);
+        let (price, allocs, unsold) = cleared(&mut a);
+        assert_eq!(price, 50);
+        assert_eq!(allocs, vec![(key(1), 1, 1)]);
+        assert_eq!(unsold, 3);
+    }
+
+    #[test]
+    fn amend_seller_is_current_seller_only() {
+        let mut a = open_auction();
+        // A stranger is refused, even on a live auction.
+        let err = a
+            .amend_multi_unit_seller(key(9), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(a.seller(), key(0xAA));
+        // A bidder is refused too — authority is checked first,
+        // before the post-commit liveness gate.
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        let err = a
+            .amend_multi_unit_seller(key(1), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.seller(), key(0xAA));
+    }
+
+    #[test]
+    fn amend_seller_locks_after_first_commit() {
+        let mut a = open_auction();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        let err = a
+            .amend_multi_unit_seller(key(0xAA), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(err.code(), 310);
+        assert_eq!(a.seller(), key(0xAA));
+        // The commitment still stands: reveal and settle run under
+        // the original seller.
+        reveal(&mut a, key(1), 50, nonce(1), 200);
+        let (price, allocs, unsold) = cleared(&mut a);
+        assert_eq!(price, 50);
+        assert_eq!(allocs, vec![(key(1), 1, 1)]);
+        assert_eq!(unsold, 3);
+    }
+
+    #[test]
+    fn amend_seller_refused_in_terminal_states() {
+        // Settled.
+        let mut a = open_auction();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        reveal(&mut a, key(1), 50, nonce(1), 200);
+        a.settle(300).unwrap();
+        assert_eq!(a.state(), MultiUnitState::Settled);
+        let err = a
+            .amend_multi_unit_seller(key(0xAA), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(a.seller(), key(0xAA));
+        // NoSale after settling with no bids.
+        let mut b = open_auction();
+        b.settle(300).unwrap();
+        assert_eq!(b.state(), MultiUnitState::NoSale);
+        let err = b
+            .amend_multi_unit_seller(key(0xAA), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(b.seller(), key(0xAA));
+        // Cancelled.
+        let mut c = open_auction();
+        c.cancel(key(0xAA), 100).unwrap();
+        assert_eq!(c.state(), MultiUnitState::Cancelled);
+        let err = c
+            .amend_multi_unit_seller(key(0xAA), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(c.seller(), key(0xAA));
+        // Authority still wins on a terminal auction: a stranger is
+        // Unauthorized, not MultiUnitNotLive.
+        let err = c
+            .amend_multi_unit_seller(key(9), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_seller_rejects_zero_seller() {
+        let mut a = open_auction();
+        let err = a
+            .amend_multi_unit_seller(key(0xAA), [0u8; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMultiUnit);
+        assert_eq!(err.code(), 309);
+        assert_eq!(a.seller(), key(0xAA));
+        // The original seller still governs.
+        a.amend_multi_unit_min_bid(key(0xAA), 20, 100).unwrap();
+        assert_eq!(a.min_bid(), 20);
+    }
+
+    #[test]
+    fn amend_seller_same_value_is_noop() {
+        let mut a = open_auction();
+        // Re-affirming the current seller succeeds and changes
+        // nothing — the pure-logic method emits no event, so there
+        // is no event to assert here; the state pin is the seller.
+        a.amend_multi_unit_seller(key(0xAA), key(0xAA)).unwrap();
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.min_bid(), 10);
+        assert_eq!(a.units(), 4);
+        assert_eq!(a.state(), MultiUnitState::Active);
+    }
+
+    #[test]
+    fn amend_seller_old_seller_loses_authority() {
+        let mut a = open_auction();
+        a.amend_multi_unit_seller(key(0xAA), key(0xBB)).unwrap();
+        // The old seller can no longer amend or cancel.
+        let err = a
+            .amend_multi_unit_min_bid(key(0xAA), 20, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        let err = a.cancel(key(0xAA), 100).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.state(), MultiUnitState::Active);
+        assert_eq!(a.min_bid(), 10);
+    }
+
+    #[test]
+    fn amend_seller_new_seller_can_govern() {
+        let mut a = open_auction();
+        a.amend_multi_unit_seller(key(0xAA), key(0xBB)).unwrap();
+        // The new seller can amend the terms, rotate again, and
+        // cancel — it is the sole authority from the next call.
+        a.amend_multi_unit_min_bid(key(0xBB), 20, 100).unwrap();
+        assert_eq!(a.min_bid(), 20);
+        a.amend_multi_unit_seller(key(0xBB), key(0xCC)).unwrap();
+        assert_eq!(a.seller(), key(0xCC));
+        a.cancel(key(0xCC), 100).unwrap();
+        assert_eq!(a.state(), MultiUnitState::Cancelled);
+    }
+
+    #[test]
+    fn amend_seller_has_no_slot_gate() {
+        // The method takes no slot: no window gates it. Pin the
+        // window state with phase() first, then rotate — the commit
+        // window open with zero commitments, and the reveal window
+        // open with zero commitments, both rotate fine.
+        let mut a = open_auction();
+        assert_eq!(a.phase(150), MultiUnitPhase::Commit);
+        a.amend_multi_unit_seller(key(0xAA), key(0xBB)).unwrap();
+        assert_eq!(a.seller(), key(0xBB));
+        let mut b = open_auction();
+        assert_eq!(b.phase(200), MultiUnitPhase::Reveal);
+        b.amend_multi_unit_seller(key(0xAA), key(0xBB)).unwrap();
+        assert_eq!(b.seller(), key(0xBB));
+        // Even past the end slot, with zero commitments the seller
+        // may still rotate: nobody has entered, so nothing entered
+        // is rewritten.
+        let mut c = open_auction();
+        assert_eq!(c.phase(300), MultiUnitPhase::Closed);
+        c.amend_multi_unit_seller(key(0xAA), key(0xBB)).unwrap();
+        assert_eq!(c.seller(), key(0xBB));
+    }
+
+    #[test]
+    fn amend_seller_audit_json() {
+        let mut a = open_auction();
+        a.amend_multi_unit_seller(key(0xAA), key(0xBB)).unwrap();
+        let j = a.seller_audit_json(key(0xAA));
+        assert!(j.contains("\"event\":\"multi_unit_seller_amended\""));
+        assert!(j.contains("\"previous_seller\":\""));
+        assert!(j.contains("\"seller\":\""));
+        assert_eq!(
+            j,
+            format!(
+                "{{\"event\":\"multi_unit_seller_amended\",\"previous_seller\":\"{}\",\"seller\":\"{}\"}}",
+                "aa".repeat(32),
+                "bb".repeat(32)
+            )
+        );
+        // A failed rotation records nothing: the seller is unchanged,
+        // so there is no rotation event to emit — the audit JSON is
+        // only built by the caller on a real rotation.
+        let mut b = open_auction();
+        let err = b
+            .amend_multi_unit_seller(key(9), key(0xBB))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(b.seller(), key(0xAA));
+        let j = b.seller_audit_json(key(0xAA));
+        assert!(j.contains("\"seller\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
     }
 }
