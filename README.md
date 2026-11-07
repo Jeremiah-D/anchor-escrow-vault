@@ -8952,6 +8952,24 @@ intervals are tracked and permanently excluded from accrual.
   no-op. Emits the `stream_recipient_transferred` audit event
   (`PaymentStream::transfer_audit_json`, hand-written JSON, no new
   error codes — 304–308 unchanged).
+- Initializer transfer (AV-369): the *current* initializer may hand
+  the funder key to a new initializer with `transfer_initializer
+  (caller, new_initializer)` — the compromised-funder-key scenario
+  (hot wallet moving to cold storage, funder service rotating keys).
+  The stream survives: rate, schedule, recipient, withdrawn total,
+  paused intervals and state are untouched, and `earned(now)` is
+  identical immediately before and after. The new initializer
+  inherits the funder powers from the next call — `stream_cancel`
+  (the unearned remainder returns to the *live* initializer) and
+  `pause`/`resume` — so the old key loses all three at once, and a
+  stolen funder key can no longer cancel the stream or freeze its
+  accrual. The recipient may withdraw but may *not* reassign the
+  funder. Check order is authority → state → config: a zero
+  `new_initializer` is `InvalidStream` (code 304); transferring to
+  the current initializer is an idempotent no-op. Emits the
+  `stream_initializer_transferred` audit event
+  (`PaymentStream::initializer_transfer_audit_json`, hand-written
+  JSON, no new error codes — 304–308 unchanged).
 - Rate renegotiation (AV-204): `update_stream_rate(initializer,
   recipient, new_rate, now)` reprices the stream mid-flight, but only
   when *both* parties sign — either party absent, or a stranger in

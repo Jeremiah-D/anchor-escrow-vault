@@ -344,6 +344,51 @@ impl PaymentStream {
         Ok(())
     }
 
+    /// Transfers the stream's initializer to `new_initializer` — the
+    /// funder-key-rotation scenario (compromised funder key, hot
+    /// wallet moving to cold storage). Initializer-only: only the
+    /// *current* initializer may call; a stranger (including the
+    /// recipient) gets [`EscrowError::StreamUnauthorized`] (code
+    /// 305), checked before state so strangers learn nothing.
+    ///
+    /// The stream *survives*: `recipient`, `rate_per_sec`,
+    /// `start_ts`, `duration_secs`, `cliff_secs`, `total_funded`,
+    /// `withdrawn`, `paused_at`/`paused_total`, the checkpoint pair
+    /// and `state` are all untouched — only the funder key changes.
+    /// The new initializer inherits the funder powers from the next
+    /// call: `stream_cancel` (the unearned remainder returns to the
+    /// *live* initializer) and `pause`/`resume` all read the live
+    /// `initializer`, so the old key loses all three at once. The
+    /// earned-but-unwithdrawn balance still belongs to the
+    /// recipient — a transfer never touches it — and `earned(now)`
+    /// is identical immediately before and after.
+    ///
+    /// Check order is authority → state → config: a zero
+    /// `new_initializer` is [`EscrowError::InvalidStream`] (code
+    /// 304). Transferring to the current initializer is an idempotent
+    /// no-op (`Ok(())`, no state change).
+    ///
+    /// The program / indexer records the transfer with
+    /// [`PaymentStream::initializer_transfer_audit_json`].
+    pub fn transfer_initializer(
+        &mut self,
+        caller: [u8; 32],
+        new_initializer: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        if caller != self.initializer {
+            return Err(EscrowError::StreamUnauthorized);
+        }
+        self.require_active()?;
+        if new_initializer == [0u8; 32] {
+            return Err(EscrowError::InvalidStream);
+        }
+        if new_initializer == self.initializer {
+            return Ok(());
+        }
+        self.initializer = new_initializer;
+        Ok(())
+    }
+
     /// Audit-event JSON for a recipient transfer (hand-written, no
     /// serde — same convention as the auction modules):
     /// `{"event":"stream_recipient_transferred","old_recipient":
@@ -356,6 +401,25 @@ impl PaymentStream {
         s.push_str(&hex64(&old_recipient));
         s.push_str("\",\"new_recipient\":\"");
         s.push_str(&hex64(&new_recipient));
+        s.push_str("\"}");
+        s
+    }
+
+    /// Audit-event JSON for an initializer transfer (hand-written, no
+    /// serde — same convention as [`Self::transfer_audit_json`]):
+    /// `{"event":"stream_initializer_transferred","old_initializer":
+    /// "<64hex>","new_initializer":"<64hex>"}`. Standalone (no `&self`):
+    /// the old key is only known to the caller at call time — by the
+    /// time `transfer_initializer` returns, the stream already carries
+    /// the new initializer.
+    pub fn initializer_transfer_audit_json(
+        old_initializer: [u8; 32],
+        new_initializer: [u8; 32],
+    ) -> String {
+        let mut s = String::from("{\"event\":\"stream_initializer_transferred\",\"old_initializer\":\"");
+        s.push_str(&hex64(&old_initializer));
+        s.push_str("\",\"new_initializer\":\"");
+        s.push_str(&hex64(&new_initializer));
         s.push_str("\"}");
         s
     }
