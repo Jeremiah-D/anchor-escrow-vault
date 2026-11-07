@@ -3703,6 +3703,23 @@ error they get.
   `now` moves the window too, never below it. No event is
   emitted — `OptionEscrow` has no event layer.
   (Solana: option governance.)
+- **Rotating the seller (AV-366)**: `amend_option_seller`
+  rotates the seller on an `Active` option, authorized by
+  seller + buyer together — the seller is the bilateral
+  settlement counterparty, so a unilateral rewrite would let
+  one side redirect both settlement legs alone. The new
+  seller reuses the construction gate (a zero seller or one
+  equal to the live buyer fails closed with
+  `InvalidOptionTerms`, code 339, and the current seller is
+  untouched); an exercised option is `OptionAlreadySettled`
+  (code 343) and an expired option is `OptionExpired` (code
+  341). Re-affirming the current seller is a no-op. Only
+  `seller` changes, and `exercise` / `expire` read the live
+  seller, so the new seller governs the next settlement — a
+  settlement already made keeps the seller it settled under.
+  A seller who has lost their key cannot rotate: the current
+  seller must co-sign. No event is emitted — `OptionEscrow`
+  has no event layer. (Solana: option governance.)
 
 New error codes (never renumbered): `InvalidOptionTerms`
 (339), `OptionNotBuyer` (340), `OptionExpired` (341),
