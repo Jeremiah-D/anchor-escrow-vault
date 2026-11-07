@@ -3738,6 +3738,21 @@ error they get.
   their key cannot rotate: the current buyer must co-sign.
   No event is emitted — `OptionEscrow` has no event layer.
   (Solana: option governance.)
+- **Revising the premium (AV-371)**: `amend_option_premium`
+  revises the premium on an `Active` option, authorized by
+  seller + buyer together — the premium is a bilateral price
+  term, so a unilateral rewrite would let one side reprice
+  the other's bargain alone. The new premium reuses the
+  construction gate (a zero premium fails closed with
+  `InvalidOptionTerms`, code 339, and the current premium is
+  untouched); an exercised option is `OptionAlreadySettled`
+  (code 343) and an expired option is `OptionExpired` (code
+  341). Re-affirming the current premium is a no-op. Only
+  `premium` changes, and `exercise` / `expire` read the live
+  premium, so the new premium governs the next settlement — a
+  settlement already made keeps the premium it settled under.
+  No event is emitted — `OptionEscrow` has no event layer.
+  (Solana: option governance.)
 
 New error codes (never renumbered): `InvalidOptionTerms`
 (339), `OptionNotBuyer` (340), `OptionExpired` (341),

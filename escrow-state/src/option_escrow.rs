@@ -98,15 +98,17 @@ pub struct OptionExpiry {
 /// A fixed-strike call option over a locked underlying amount.
 ///
 /// Fixed-size and `Copy`, like the other pure-logic sidecars: the
-/// option's terms are set once at construction — with four
-/// governed exceptions, the strike, the expiry, the seller, and
-/// the buyer, which the two parties may revise together while the
-/// option is `Active` ([`OptionEscrow::amend_option_strike`],
-/// AV-294; [`OptionEscrow::amend_option_expiry`], AV-299;
+/// option's terms are set once at construction — with five
+/// governed exceptions, the strike, the expiry, the seller, the
+/// buyer, and the premium, which the two parties may revise
+/// together while the option is `Active`
+/// ([`OptionEscrow::amend_option_strike`], AV-294;
+/// [`OptionEscrow::amend_option_expiry`], AV-299;
 /// [`OptionEscrow::amend_option_seller`], AV-366;
-/// [`OptionEscrow::amend_option_buyer`], AV-367). A unilateral
+/// [`OptionEscrow::amend_option_buyer`], AV-367;
+/// [`OptionEscrow::amend_option_premium`], AV-371). A unilateral
 /// move of any of them would let one side rewrite the deal alone, so
-/// all four revisions need seller + buyer together.
+/// all five revisions need seller + buyer together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OptionEscrow {
     seller: [u8; 32],
@@ -178,7 +180,9 @@ impl OptionEscrow {
         self.underlying
     }
 
-    /// The up-front premium (non-refundable in every outcome).
+    /// The up-front premium (non-refundable in every outcome) —
+    /// fixed at construction, revisable only by the dual-signed
+    /// [`OptionEscrow::amend_option_premium`] while `Active`.
     pub fn premium(&self) -> u64 {
         self.premium
     }
@@ -591,6 +595,83 @@ impl OptionEscrow {
             return Ok(());
         }
         self.buyer = new_buyer;
+        Ok(())
+    }
+
+    /// Revise the premium on an `Active` option (AV-371 — Solana
+    /// option governance): both parties authorize the change
+    /// (the premium is a bilateral price term — a unilateral
+    /// rewrite would let one side reprice the other's bargain
+    /// alone). Check order is authority → state → value,
+    /// mirroring [`OptionEscrow::amend_option_strike`] and
+    /// [`OptionEscrow::exercise`], so a stranger learns nothing
+    /// about the option's state from the error alone.
+    ///
+    /// Why: the premium is fixed at construction
+    /// ([`OptionEscrow::new`]), but the parties may agree the
+    /// bargained price no longer reflects the deal — volatility
+    /// moved, or the strike was revised (AV-294) and the premium
+    /// never followed it, so the option is mispriced against its
+    /// own strike. A premium that cannot move would force a
+    /// fresh option (and a fresh custody) for a legitimate
+    /// repricing, discarding the `Active` state. Only an `Active`
+    /// option may revise: an exercised option has already
+    /// settled ([`EscrowError::OptionAlreadySettled`]), and an
+    /// expired option's window has lapsed
+    /// ([`EscrowError::OptionExpired`] — the lapsed-window
+    /// error `exercise` returns once the window closes, since
+    /// expiry settlement is then the only remaining path).
+    /// The revision takes no timestamp: like `amend_option_strike`,
+    /// the settlement boundary is the explicit state transition,
+    /// not the wall clock, so an `Active` option whose expiry
+    /// instant has passed but which has not yet been expired
+    /// may still revise — the revision never revives the
+    /// exercise window, which still closes at `expiry`. The
+    /// new premium reuses the `new` gate (it must be positive,
+    /// [`EscrowError::InvalidOptionTerms`] otherwise, and the
+    /// current premium is untouched). Only `premium` changes —
+    /// seller, buyer, underlying, strike, expiry and state are
+    /// untouched — and re-affirming the current premium is a
+    /// no-op. [`OptionEscrow::exercise`] and
+    /// [`OptionEscrow::expire`] read the live premium, so the new
+    /// premium governs the next settlement (a settlement already
+    /// made keeps the premium it settled under). There is no
+    /// event layer on `OptionEscrow`, so no event is emitted for
+    /// the revision. Orthogonal to [`OptionEscrow::new`] (that
+    /// installs the premium at build time, this revises it while
+    /// `Active`) and to `exercise` / `expire` (those settle at
+    /// the premium, this reprices it).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller pair that is not exactly seller + buyer,
+    /// ([`EscrowError::OptionAlreadySettled`], code 343) once
+    /// the option has been exercised,
+    /// ([`EscrowError::OptionExpired`], code 341) once the
+    /// option has expired, and
+    /// ([`EscrowError::InvalidOptionTerms`], code 339) for a
+    /// zero new premium — either way the current premium is
+    /// untouched.
+    pub fn amend_option_premium(
+        &mut self,
+        seller: [u8; 32],
+        buyer: [u8; 32],
+        new_premium: u64,
+    ) -> Result<(), EscrowError> {
+        if seller != self.seller || buyer != self.buyer {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            OptionState::Active => {}
+            OptionState::Exercised => return Err(EscrowError::OptionAlreadySettled),
+            OptionState::Expired => return Err(EscrowError::OptionExpired),
+        }
+        if new_premium == 0 {
+            return Err(EscrowError::InvalidOptionTerms);
+        }
+        if new_premium == self.premium {
+            return Ok(());
+        }
+        self.premium = new_premium;
         Ok(())
     }
 }
@@ -1371,5 +1452,140 @@ mod tests {
         assert_eq!(legs.underlying_to_seller, UNDERLYING);
         assert_eq!(legs.premium_to_seller, PREMIUM);
         assert_eq!(o.state(), OptionState::Expired);
+    }
+
+    #[test]
+    fn amend_option_premium_moves_the_live_premium() {
+        // AV-371: the revised premium governs the next exercise,
+        // and nothing else moves.
+        let mut o = option();
+        o.amend_option_premium(SELLER, BUYER, 80_000).unwrap();
+        assert_eq!(o.premium(), 80_000);
+        assert_eq!(o.seller(), SELLER);
+        assert_eq!(o.buyer(), BUYER);
+        assert_eq!(o.underlying(), UNDERLYING);
+        assert_eq!(o.strike(), STRIKE);
+        assert_eq!(o.expiry(), EXPIRY);
+        assert_eq!(o.state(), OptionState::Active);
+        // Exercise settles at the new premium: the seller's take
+        // is the strike plus the revised premium.
+        let legs = o.exercise(BUYER, EXPIRY - 1, STRIKE).unwrap();
+        assert_eq!(legs.underlying_to_buyer, UNDERLYING);
+        assert_eq!(legs.strike_to_seller, STRIKE);
+        assert_eq!(legs.premium_to_seller, 80_000);
+    }
+
+    #[test]
+    fn amend_option_premium_can_reprice_again() {
+        // AV-371: revisions are not one-shot — each amendment
+        // supersedes the last, and exercise always reads live.
+        let mut o = option();
+        o.amend_option_premium(SELLER, BUYER, 30_000).unwrap();
+        o.amend_option_premium(SELLER, BUYER, 120_000).unwrap();
+        assert_eq!(o.premium(), 120_000);
+        let legs = o.exercise(BUYER, EXPIRY - 1, STRIKE).unwrap();
+        assert_eq!(legs.premium_to_seller, 120_000);
+        assert_eq!(legs.strike_to_seller, STRIKE);
+    }
+
+    #[test]
+    fn amend_option_premium_rejects_zero_and_reaffirmation_is_noop() {
+        // AV-371: a zero premium reuses the `new` gate and leaves
+        // the current premium untouched; re-affirming the current
+        // premium succeeds and changes nothing.
+        let mut o = option();
+        let err = o
+            .amend_option_premium(SELLER, BUYER, 0)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidOptionTerms);
+        assert_eq!(err.code(), 339);
+        assert_eq!(o.premium(), PREMIUM);
+        o.amend_option_premium(SELLER, BUYER, PREMIUM).unwrap();
+        assert_eq!(o.premium(), PREMIUM);
+        // Still exercisable, settling at the affirmed premium.
+        let legs = o.exercise(BUYER, EXPIRY - 1, STRIKE).unwrap();
+        assert_eq!(legs.premium_to_seller, PREMIUM);
+    }
+
+    #[test]
+    fn amend_option_premium_is_dual_signed_and_active_only() {
+        // AV-371: a stranger, either party alone, or the parties
+        // swapped is refused, and the premium is untouched.
+        let mut o = option();
+        let err = o
+            .amend_option_premium(STRANGER, BUYER, 80_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = o
+            .amend_option_premium(SELLER, STRANGER, 80_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        let err = o
+            .amend_option_premium(BUYER, SELLER, 80_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(o.premium(), PREMIUM);
+        // Authority is checked before state: a stranger on a
+        // settled option still gets Unauthorized.
+        let mut exercised = option();
+        exercised.exercise(BUYER, EXPIRY - 1, STRIKE).unwrap();
+        let err = exercised
+            .amend_option_premium(STRANGER, BUYER, 80_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(exercised.premium(), PREMIUM);
+        // The parties on an exercised option get AlreadySettled.
+        let err = exercised
+            .amend_option_premium(SELLER, BUYER, 80_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::OptionAlreadySettled);
+        assert_eq!(err.code(), 343);
+        assert_eq!(exercised.premium(), PREMIUM);
+        // The parties on an expired option get OptionExpired.
+        let mut expired = option();
+        expired.expire(EXPIRY).unwrap();
+        let err = expired
+            .amend_option_premium(SELLER, BUYER, 80_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::OptionExpired);
+        assert_eq!(err.code(), 341);
+        assert_eq!(expired.premium(), PREMIUM);
+    }
+
+    #[test]
+    fn amend_option_premium_expiry_settles_at_new_premium() {
+        // AV-371: the expiry leg reads the live premium too — a
+        // repriced option that dies unexercised leaves the new
+        // premium with the seller, and the old premium is gone.
+        let mut o = option();
+        o.amend_option_premium(SELLER, BUYER, 80_000).unwrap();
+        let legs = o.expire(EXPIRY).unwrap();
+        assert_eq!(legs.underlying_to_seller, UNDERLYING);
+        assert_eq!(legs.premium_to_seller, 80_000);
+        assert_eq!(o.state(), OptionState::Expired);
+    }
+
+    #[test]
+    fn amend_option_premium_lapsed_window_still_revises() {
+        // AV-371: like the strike revision, the premium revision
+        // is judged by state, not by the clock — an `Active`
+        // option whose expiry instant has passed but which has
+        // not yet been expired may still revise, and the revision
+        // never revives the exercise window.
+        let mut o = option();
+        assert_eq!(
+            o.exercise(BUYER, EXPIRY, STRIKE),
+            Err(EscrowError::OptionExpired)
+        );
+        o.amend_option_premium(SELLER, BUYER, 80_000).unwrap();
+        assert_eq!(o.premium(), 80_000);
+        assert!(!o.exercise_window_open(EXPIRY));
+        assert_eq!(
+            o.exercise(BUYER, EXPIRY, STRIKE),
+            Err(EscrowError::OptionExpired)
+        );
+        let legs = o.expire(EXPIRY).unwrap();
+        assert_eq!(legs.premium_to_seller, 80_000);
     }
 }
