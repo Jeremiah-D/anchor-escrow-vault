@@ -3002,6 +3002,24 @@ pricing rule is what changes.
   current supply is a no-op. The revision is audited as
   `multi_unit_units_amended` (hand-written JSON, string event name,
   no numeric event ID).
+- **Commit-start-slot revision** (AV-364):
+  `amend_multi_unit_commit_start_slot()` lets the seller move the
+  commit window's opening slot before it opens — seller-only,
+  refused with `MultiUnitNotLive` once the window has opened
+  (`current_slot >= commit_start_slot`) or the auction is terminal;
+  the new start must keep a non-empty commit window
+  (`new_commit_start_slot >= reveal_start_slot` → `InvalidMultiUnit`)
+  and leave a future window (`new_commit_start_slot <= current_slot`
+  → `InvalidMultiUnit`). The liveness gate also guarantees no
+  commitment has landed yet (`commit_bid` requires the commit
+  phase), so revising the start never rewrites rules a commitment
+  was made under. Only `commit_start_slot` changes — the new start
+  governs from the next `phase()` evaluation (earlier opens the
+  window sooner, later delays it), and commitments are hashes, so
+  already-landed commitments are unaffected. Amending to the current
+  start is a no-op; `commit_start_slot()` reads the live value. The
+  revision is audited as `multi_unit_commit_start_slot_amended`
+  (hand-written JSON, string event name, no numeric event ID).
 
 New error codes (never renumbered): `InvalidMultiUnit` (309),
 `MultiUnitNotLive` (310), `MultiUnitDuplicateCommit` (311),
