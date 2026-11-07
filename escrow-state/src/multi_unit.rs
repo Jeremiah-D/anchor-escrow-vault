@@ -799,6 +799,93 @@ impl MultiUnitAuction {
         s
     }
 
+    /// Revise the reveal window's opening slot before it opens (AV-365).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the schedule is the seller's public timetable)
+    /// and only before the reveal window opens (`current_slot <
+    /// reveal_start_slot`) on a live auction — refused with
+    /// [`EscrowError::MultiUnitNotLive`] (code 310) once the reveal
+    /// has started or the auction is terminal, the original start
+    /// untouched. Revising the start after the reveal opens would
+    /// flip the phase back to Commit and let bidders commit after
+    /// seeing revealed bids, breaking sealed-bid secrecy — so the
+    /// start stays put. The new start reuses the [`Self::new`]
+    /// window gate (`commit_start_slot < new_reveal_start_slot <
+    /// end_slot`) and must also be after `current_slot`, so a commit
+    /// window remains after the revision — otherwise
+    /// [`EscrowError::InvalidMultiUnit`] (code 309).
+    ///
+    /// The revision is safe even after commitments have landed:
+    /// commitments are hashes, so no bidder's position is
+    /// invalidated — moving the start earlier shortens the commit
+    /// window, moving it later extends it, and `reveal_bid` still
+    /// requires `phase() == Reveal`. Only `reveal_start_slot`
+    /// changes: seller, units, `min_bid`, `commit_start_slot`,
+    /// `end_slot`, slots, counts, and state are untouched. The new
+    /// start governs from the next [`Self::phase`] evaluation, which
+    /// reads the live slot — and [`Self::cancel`]'s slot gate and
+    /// [`Self::commit_audit_json`]'s `reveal_start_slot` field read
+    /// it live too. Amending to the current start is a no-op.
+    ///
+    /// Check order is authority → liveness → no-op → value,
+    /// mirroring [`Self::amend_multi_unit_commit_start_slot`] and
+    /// the AV-303 twin
+    /// (`SealedBidAuction::amend_sealed_bid_reveal_start_slot`): a
+    /// stranger is refused even on a terminal auction, and a lapsed
+    /// auction refuses even the seller.
+    ///
+    /// Pure logic: this method changes state only. The revision is
+    /// recorded for the indexer as
+    /// [`Self::reveal_start_slot_audit_json`] (a string event name,
+    /// no numeric event ID — the multi-unit audit convention); a
+    /// failed revision and a no-op re-affirmation record nothing.
+    /// There is no Anchor instruction surface in this round — the
+    /// program drives this method and emits the event — and no new
+    /// error code: the gates reuse 100/309/310.
+    pub fn amend_multi_unit_reveal_start_slot(
+        &mut self,
+        caller: [u8; 32],
+        new_reveal_start_slot: u64,
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != MultiUnitState::Active || current_slot >= self.reveal_start_slot {
+            return Err(EscrowError::MultiUnitNotLive);
+        }
+        if new_reveal_start_slot == self.reveal_start_slot {
+            return Ok(());
+        }
+        if self.commit_start_slot >= new_reveal_start_slot
+            || new_reveal_start_slot >= self.end_slot
+            || new_reveal_start_slot <= current_slot
+        {
+            return Err(EscrowError::InvalidMultiUnit);
+        }
+        self.reveal_start_slot = new_reveal_start_slot;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a reveal-start-slot revision (hand-written,
+    /// no serde — same convention as [`Self::commit_audit_json`]):
+    /// `{"event":"multi_unit_reveal_start_slot_amended",
+    /// "previous_reveal_start_slot":<u64>,"reveal_start_slot":<u64>}`.
+    /// Multi-unit audit events carry string event names, not numeric
+    /// event IDs, so no new event number is registered for the
+    /// revision — the event name is the identity.
+    pub fn reveal_start_slot_audit_json(&self, previous_reveal_start_slot: u64) -> String {
+        let mut s = String::from(
+            "{\"event\":\"multi_unit_reveal_start_slot_amended\",\"previous_reveal_start_slot\":",
+        );
+        s.push_str(&previous_reveal_start_slot.to_string());
+        s.push_str(",\"reveal_start_slot\":");
+        s.push_str(&self.reveal_start_slot.to_string());
+        s.push('}');
+        s
+    }
+
     /// Audit-event JSON for a commitment (hand-written):
     /// `{"event":"multi_unit_commit","bidder":"<64hex>","commitment":
     /// "<64hex>","units":<u64>,"reveal_start_slot":<u64>}`.
@@ -883,6 +970,12 @@ impl MultiUnitAuction {
     /// [`Self::amend_multi_unit_commit_start_slot`]).
     pub fn commit_start_slot(&self) -> u64 {
         self.commit_start_slot
+    }
+
+    /// The reveal window's opening slot (live — see
+    /// [`Self::amend_multi_unit_reveal_start_slot`]).
+    pub fn reveal_start_slot(&self) -> u64 {
+        self.reveal_start_slot
     }
 
     /// The reveal window's closing slot.
@@ -2241,5 +2334,271 @@ mod multi_unit_tests {
             .unwrap_err();
         assert_eq!(err, EscrowError::InvalidMultiUnit);
         assert_eq!(a.commit_start_slot(), 50);
+    }
+
+    #[test]
+    fn amend_reveal_start_slot_is_seller_only() {
+        let mut a = open_auction(); // seller key(0xAA), reveal at 200
+        // A stranger or a bidder cannot move the seller's window.
+        let err = a
+            .amend_multi_unit_reveal_start_slot(key(9), 150, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(a.reveal_start_slot(), 200);
+        // A bidder is refused too — authority is checked first,
+        // before the liveness gate.
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        let err = a
+            .amend_multi_unit_reveal_start_slot(key(1), 150, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.reveal_start_slot(), 200);
+    }
+
+    #[test]
+    fn amend_reveal_start_slot_refused_in_terminal_states() {
+        // Settled.
+        let mut a = open_auction();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        reveal(&mut a, key(1), 50, nonce(1), 200);
+        a.settle(300).unwrap();
+        assert_eq!(a.state(), MultiUnitState::Settled);
+        let err = a
+            .amend_multi_unit_reveal_start_slot(key(0xAA), 150, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(err.code(), 310);
+        assert_eq!(a.reveal_start_slot(), 200);
+        // NoSale after settling with no bids.
+        let mut b = open_auction();
+        b.settle(300).unwrap();
+        assert_eq!(b.state(), MultiUnitState::NoSale);
+        let err = b
+            .amend_multi_unit_reveal_start_slot(key(0xAA), 150, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(b.reveal_start_slot(), 200);
+        // Cancelled.
+        let mut c = open_auction();
+        c.cancel(key(0xAA), 100).unwrap();
+        assert_eq!(c.state(), MultiUnitState::Cancelled);
+        let err = c
+            .amend_multi_unit_reveal_start_slot(key(0xAA), 150, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(c.reveal_start_slot(), 200);
+        // Authority still wins on a terminal auction: a stranger is
+        // Unauthorized, not MultiUnitNotLive.
+        let err = c
+            .amend_multi_unit_reveal_start_slot(key(9), 150, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_reveal_start_slot_refused_once_reveal_open() {
+        // At the opening slot the reveal is open: the seller is too
+        // late, and the start stays put.
+        let mut a = open_auction();
+        let err = a
+            .amend_multi_unit_reveal_start_slot(key(0xAA), 150, 200)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(a.reveal_start_slot(), 200);
+        // Even later, with a reveal already landed, the start stays
+        // put — moving it would flip the phase back to Commit and
+        // let bidders commit after seeing revealed bids.
+        let mut b = open_auction();
+        commit(&mut b, key(1), 50, nonce(1), 100);
+        reveal(&mut b, key(1), 50, nonce(1), 200);
+        let err = b
+            .amend_multi_unit_reveal_start_slot(key(0xAA), 250, 210)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(b.reveal_start_slot(), 200);
+    }
+
+    #[test]
+    fn amend_reveal_start_slot_rejects_empty_commit_window() {
+        let mut a = open_auction(); // commit 100, reveal 200, end 300
+        // At the commit start the commit window would be empty.
+        let err = a
+            .amend_multi_unit_reveal_start_slot(key(0xAA), 100, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMultiUnit);
+        assert_eq!(err.code(), 309);
+        assert_eq!(a.reveal_start_slot(), 200);
+        // Before the commit start is the same refusal.
+        let err = a
+            .amend_multi_unit_reveal_start_slot(key(0xAA), 99, 50)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMultiUnit);
+        assert_eq!(a.reveal_start_slot(), 200);
+    }
+
+    #[test]
+    fn amend_reveal_start_slot_rejects_empty_reveal_window() {
+        let mut a = open_auction(); // commit 100, reveal 200, end 300
+        // At the end slot the reveal window would be empty.
+        let err = a
+            .amend_multi_unit_reveal_start_slot(key(0xAA), 300, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMultiUnit);
+        assert_eq!(err.code(), 309);
+        assert_eq!(a.reveal_start_slot(), 200);
+        // Past the end slot is the same refusal.
+        let err = a
+            .amend_multi_unit_reveal_start_slot(key(0xAA), 301, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMultiUnit);
+        assert_eq!(a.reveal_start_slot(), 200);
+    }
+
+    #[test]
+    fn amend_reveal_start_slot_must_leave_future_window() {
+        let mut a = open_auction();
+        // At the current slot: no commit window would remain after
+        // the revision, even though the value sits inside the new()
+        // window.
+        let err = a
+            .amend_multi_unit_reveal_start_slot(key(0xAA), 150, 150)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMultiUnit);
+        assert_eq!(a.reveal_start_slot(), 200);
+        // Behind the current slot: the same refusal.
+        let err = a
+            .amend_multi_unit_reveal_start_slot(key(0xAA), 140, 150)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMultiUnit);
+        assert_eq!(a.reveal_start_slot(), 200);
+        // Just after the current slot is fine.
+        a.amend_multi_unit_reveal_start_slot(key(0xAA), 151, 150)
+            .unwrap();
+        assert_eq!(a.reveal_start_slot(), 151);
+    }
+
+    #[test]
+    fn amend_reveal_start_slot_same_value_is_noop() {
+        let mut a = open_auction();
+        a.amend_multi_unit_reveal_start_slot(key(0xAA), 200, 100)
+            .unwrap();
+        assert_eq!(a.reveal_start_slot(), 200);
+        assert_eq!(a.phase(200), MultiUnitPhase::Reveal);
+        assert_eq!(a.state(), MultiUnitState::Active);
+        // No-op after a real revision too: the start stays put and
+        // nothing is recorded (the audit is only emitted on a real
+        // revision, and a no-op writes nothing to audit).
+        a.amend_multi_unit_reveal_start_slot(key(0xAA), 150, 100)
+            .unwrap();
+        a.amend_multi_unit_reveal_start_slot(key(0xAA), 150, 110)
+            .unwrap();
+        assert_eq!(a.reveal_start_slot(), 150);
+    }
+
+    #[test]
+    fn amend_reveal_start_slot_revision_changes_start_only() {
+        let mut a = open_auction(); // 4 units, seller key(0xAA), floor 10
+        a.amend_multi_unit_reveal_start_slot(key(0xAA), 150, 100)
+            .unwrap();
+        assert_eq!(a.reveal_start_slot(), 150);
+        // Everything else is untouched.
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.units(), 4);
+        assert_eq!(a.min_bid(), 10);
+        assert_eq!(a.commit_start_slot(), 100);
+        assert_eq!(a.end_slot(), 300);
+        assert_eq!(a.commit_count(), 0);
+        assert_eq!(a.reveal_count(), 0);
+        assert_eq!(a.state(), MultiUnitState::Active);
+        // The commit start and end are unchanged: commits still open
+        // at 100, settlement still needs slot 300.
+        assert_eq!(a.phase(99), MultiUnitPhase::Closed);
+        assert_eq!(a.phase(100), MultiUnitPhase::Commit);
+        assert_eq!(a.phase(149), MultiUnitPhase::Commit);
+        assert_eq!(a.phase(150), MultiUnitPhase::Reveal);
+        assert_eq!(a.phase(300), MultiUnitPhase::Closed);
+    }
+
+    #[test]
+    fn amend_reveal_start_slot_governs_phase() {
+        // Earlier: slot 175 was Commit, now it is Reveal — the
+        // commitment reveals at the new start, and no new commit
+        // lands there.
+        let mut a = open_auction();
+        assert_eq!(a.phase(175), MultiUnitPhase::Commit);
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        a.amend_multi_unit_reveal_start_slot(key(0xAA), 150, 100)
+            .unwrap();
+        assert_eq!(a.phase(175), MultiUnitPhase::Reveal);
+        reveal(&mut a, key(1), 50, nonce(1), 175);
+        assert_eq!(a.reveal_count(), 1);
+        let c = sealed_bid_commitment(&key(2), 60, &nonce(2));
+        let err = a.commit_bid(key(2), c, 175).unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(a.commit_count(), 1);
+
+        // Later: slot 225 was Reveal, now it is Commit — a second
+        // commitment still lands in the extended window.
+        let mut b = open_auction();
+        assert_eq!(b.phase(225), MultiUnitPhase::Reveal);
+        commit(&mut b, key(1), 50, nonce(1), 100);
+        b.amend_multi_unit_reveal_start_slot(key(0xAA), 250, 120)
+            .unwrap();
+        assert_eq!(b.phase(225), MultiUnitPhase::Commit);
+        assert_eq!(b.phase(250), MultiUnitPhase::Reveal);
+        commit(&mut b, key(2), 90, nonce(2), 225);
+        reveal(&mut b, key(1), 50, nonce(1), 250);
+        reveal(&mut b, key(2), 90, nonce(2), 260);
+        let (price, allocs, unsold) = cleared(&mut b);
+        assert_eq!(price, 50);
+        assert_eq!(allocs, vec![(key(2), 1, 1), (key(1), 1, 1)]);
+        assert_eq!(unsold, 2);
+    }
+
+    #[test]
+    fn amend_reveal_start_slot_audit_json() {
+        let mut a = open_auction();
+        a.amend_multi_unit_reveal_start_slot(key(0xAA), 150, 100)
+            .unwrap();
+        let j = a.reveal_start_slot_audit_json(200);
+        assert!(j.contains("\"event\":\"multi_unit_reveal_start_slot_amended\""));
+        assert!(j.contains("\"previous_reveal_start_slot\":200"));
+        assert!(j.contains("\"reveal_start_slot\":150"));
+        assert_eq!(
+            j,
+            "{\"event\":\"multi_unit_reveal_start_slot_amended\",\"previous_reveal_start_slot\":200,\"reveal_start_slot\":150}"
+        );
+        // The commit audit follows the live start automatically.
+        let c = commit(&mut a, key(7), 60, nonce(7), 100).commitment;
+        let j = a.commit_audit_json(key(7), c);
+        assert!(j.contains("\"reveal_start_slot\":150"));
+        // A failed revision records nothing: the start is unchanged,
+        // so there is no revision event to emit.
+        let err = a
+            .amend_multi_unit_reveal_start_slot(key(0xAA), 300, 100)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMultiUnit);
+        assert_eq!(a.reveal_start_slot(), 150);
+    }
+
+    #[test]
+    fn amend_reveal_start_slot_governs_cancel() {
+        // Delaying the start extends the cancel window: cancel at
+        // 225 still succeeds, where the old start (200) would have
+        // refused it.
+        let mut a = open_auction();
+        a.amend_multi_unit_reveal_start_slot(key(0xAA), 250, 120)
+            .unwrap();
+        a.cancel(key(0xAA), 225).unwrap();
+        assert_eq!(a.state(), MultiUnitState::Cancelled);
+        // Bringing the start forward shortens it: cancel at 175 is
+        // refused once the reveal has opened at 150.
+        let mut b = open_auction();
+        b.amend_multi_unit_reveal_start_slot(key(0xAA), 150, 100)
+            .unwrap();
+        let err = b.cancel(key(0xAA), 175).unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(b.state(), MultiUnitState::Active);
     }
 }

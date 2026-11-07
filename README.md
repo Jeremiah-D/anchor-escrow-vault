@@ -3020,6 +3020,24 @@ pricing rule is what changes.
   start is a no-op; `commit_start_slot()` reads the live value. The
   revision is audited as `multi_unit_commit_start_slot_amended`
   (hand-written JSON, string event name, no numeric event ID).
+- **Reveal-start-slot revision** (AV-365):
+  `amend_multi_unit_reveal_start_slot()` lets the seller move the
+  reveal window's opening slot before the reveal starts
+  (`current_slot < reveal_start_slot`) — earlier shortens the commit
+  window (reveals open sooner), later extends it. The new start
+  reuses the `new()` window gate (`commit_start_slot <
+  new_reveal_start_slot < end_slot`) and must be after
+  `current_slot`, so a commit window remains after the revision;
+  otherwise `InvalidMultiUnit`. Commitments are hashes, so no
+  bidder's position is invalidated; the new start governs from the
+  next `phase()` evaluation (`reveal_bid` still requires `phase()
+  == Reveal`), and `cancel()`'s slot gate and `commit_audit_json`'s
+  `reveal_start_slot` field read it live too. Seller-only
+  (`Unauthorized` for anyone else); refused with `MultiUnitNotLive`
+  once the reveal has started or the auction is terminal; amending
+  to the current start is a no-op. Only `reveal_start_slot` changes.
+  The revision is audited as `multi_unit_reveal_start_slot_amended`
+  (hand-written JSON, string event name, no numeric event ID).
 
 New error codes (never renumbered): `InvalidMultiUnit` (309),
 `MultiUnitNotLive` (310), `MultiUnitDuplicateCommit` (311),
