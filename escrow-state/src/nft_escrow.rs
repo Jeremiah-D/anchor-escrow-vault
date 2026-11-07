@@ -251,7 +251,8 @@ impl NftEscrow {
         self
     }
 
-    /// The initializer.
+    /// The initializer — fixed at construction, revisable only
+    /// by [`NftEscrow::amend_nft_initializer`] while `Created`.
     pub fn initializer(&self) -> [u8; 32] {
         self.initializer
     }
@@ -380,6 +381,102 @@ impl NftEscrow {
         Ok(())
     }
 
+    /// Rotate the initializer on a `Created` escrow (AV-368 —
+    /// Solana NFT-escrow custody): the current initializer alone
+    /// authorizes the change (the single-party authority
+    /// precedent of `release`/`cancel` — `NftEscrow` has no
+    /// taker dual-signature). Check order is authority → state
+    /// → value, mirroring
+    /// [`NftEscrow::update_collection_allowlist`], so a stranger
+    /// learns nothing about the escrow's state from the error
+    /// alone.
+    ///
+    /// Why: the initializer is fixed at construction
+    /// ([`NftEscrow::new`]), but the initializer's key may be
+    /// compromised, or the custodian may move from a hot wallet
+    /// to cold storage — with no rotation path the only exits
+    /// are `release` and `cancel`, both of which only the live
+    /// initializer may call, so a stolen key can release the
+    /// piece to itself or cancel the escrow, and a lost key
+    /// strands the piece permanently (no in-module rescue, only
+    /// a fresh escrow and a fresh custody transfer). Only a
+    /// `Created` escrow may rotate: a `Released`/`Cancelled`
+    /// escrow is terminal, so rotating it could never govern a
+    /// future release ([`EscrowError::InvalidStateTransition`],
+    /// code 101). The new initializer fails closed on a zero
+    /// address ([`EscrowError::InvalidNftMint`], code 256, and
+    /// the current initializer is untouched) — a deliberate
+    /// asymmetry with `new`, which does not validate the
+    /// initializer: a rotation must never empty custody into
+    /// "nobody can release or cancel" while the piece stays
+    /// locked. Re-affirming the current initializer is a no-op
+    /// that writes nothing. Only `initializer` changes — the
+    /// mint, the observed collection, the gate, and the state
+    /// are untouched — and the new initializer governs from the
+    /// next call: `release` / `cancel` /
+    /// `update_collection_allowlist` all read the live
+    /// initializer, so the old initializer loses all three
+    /// powers at once. A piece already released or cancelled is
+    /// unaffected (the terminal-state gate). A successful
+    /// rotation is recorded for the indexer as
+    /// [`Self::initializer_audit_json`] (a string event name,
+    /// no numeric event ID — `NftEscrow` has no
+    /// `EscrowEventKind` layer); a failed rotation and a no-op
+    /// write no audit. An initializer who has lost their key
+    /// cannot rotate: the current initializer must sign,
+    /// exactly like the pauser rotation (AV-355) — key loss is
+    /// not recoverable here. Orthogonal to
+    /// [`NftEscrow::new`] (that installs the initializer at
+    /// build time, this rotates it while `Created`) and to
+    /// `update_collection_allowlist` (that revises the gate,
+    /// this rotates the custodian).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller who is not the current initializer,
+    /// ([`EscrowError::InvalidStateTransition`], code 101) once
+    /// the escrow is `Released` or `Cancelled`, and
+    /// ([`EscrowError::InvalidNftMint`], code 256) for a zero
+    /// new initializer — either way the current initializer is
+    /// untouched.
+    pub fn amend_nft_initializer(
+        &mut self,
+        authority: [u8; 32],
+        new_initializer: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        if authority != self.initializer {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != NftEscrowState::Created {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        if new_initializer == [0u8; 32] {
+            return Err(EscrowError::InvalidNftMint);
+        }
+        if new_initializer == self.initializer {
+            return Ok(());
+        }
+        self.initializer = new_initializer;
+        Ok(())
+    }
+
+    /// Audit-event JSON for an initializer rotation (hand-written,
+    /// no serde — same convention as the sealed-bid / multi-unit
+    /// `seller_audit_json`): `{"event":"nft_initializer_amended",
+    /// "previous_initializer":"<64hex>","initializer":"<64hex>"}`.
+    /// NFT audit events carry string event names, not numeric
+    /// event IDs, so no new event number is registered for the
+    /// rotation — the event name is the identity. Call only after
+    /// a successful rotation; a failed rotation or a no-op writes
+    /// no audit.
+    pub fn initializer_audit_json(&self, previous_initializer: [u8; 32]) -> String {
+        let mut s = String::from("{\"event\":\"nft_initializer_amended\",\"previous_initializer\":\"");
+        s.push_str(&hex64(&previous_initializer));
+        s.push_str("\",\"initializer\":\"");
+        s.push_str(&hex64(&self.initializer));
+        s.push_str("\"}");
+        s
+    }
+
     /// Cancel the escrow before release. Check order: authority →
     /// state. The collection gate never blocks a cancel — gating must
     /// never trap the piece.
@@ -428,6 +525,12 @@ mod tests {
     }
     fn bob() -> [u8; 32] {
         [0xB0; 32]
+    }
+    fn carol() -> [u8; 32] {
+        [0xC4; 32]
+    }
+    fn dave() -> [u8; 32] {
+        [0xD4; 32]
     }
     fn nft_desc() -> NftMintDescriptor {
         NftMintDescriptor {
@@ -771,5 +874,208 @@ mod tests {
         // Cancel stays ungated after a revision.
         e.cancel(alice()).unwrap();
         assert_eq!(e.state(), NftEscrowState::Cancelled);
+    }
+
+    #[test]
+    fn amend_nft_initializer_moves_the_live_initializer() {
+        // AV-368: the revised initializer governs the next call,
+        // and nothing else moves.
+        let mut e = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        e.amend_nft_initializer(alice(), carol()).unwrap();
+        assert_eq!(e.initializer(), carol());
+        assert_eq!(e.mint(), [0x11; 32]);
+        assert_eq!(e.collection(), Some([0xCC; 32]));
+        assert_eq!(e.state(), NftEscrowState::Created);
+        assert_eq!(e.collection_gate(), None);
+        // The old initializer is refused at the release gate, the
+        // new initializer releases the whole piece.
+        assert_eq!(
+            e.release(alice()).unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(e.release(carol()).unwrap(), NFT_PIECE_AMOUNT);
+        assert_eq!(e.state(), NftEscrowState::Released);
+    }
+
+    #[test]
+    fn amend_nft_initializer_old_initializer_loses_governance() {
+        // AV-368: rotation revokes the old initializer's three
+        // powers at once — release, cancel, and gate revision.
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xCC; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        e.amend_nft_initializer(alice(), carol()).unwrap();
+        assert_eq!(
+            e.release(alice()).unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(
+            e.cancel(alice()).unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(
+            e.update_collection_allowlist(alice(), &[[0xDD; 32]])
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(e.initializer(), carol());
+        assert_eq!(e.state(), NftEscrowState::Created);
+    }
+
+    #[test]
+    fn amend_nft_initializer_new_initializer_can_govern() {
+        // AV-368: the new initializer keeps governing — a gate
+        // revision succeeds under it, and the revised gate governs
+        // the next release; a second escrow cancels under it.
+        let mut gate = CollectionAllowlist::new();
+        gate.add([0xCC; 32]);
+        let mut e = NftEscrow::new(alice(), &nft_desc())
+            .unwrap()
+            .with_collection_allowlist(gate);
+        e.amend_nft_initializer(alice(), carol()).unwrap();
+        e.update_collection_allowlist(carol(), &[[0xDD; 32]])
+            .unwrap();
+        assert_eq!(
+            e.release(carol()).unwrap_err(),
+            EscrowError::CollectionNotAllowlisted
+        );
+        e.update_collection_allowlist(carol(), &[[0xCC; 32]])
+            .unwrap();
+        e.release(carol()).unwrap();
+        assert_eq!(e.state(), NftEscrowState::Released);
+
+        let mut c = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        c.amend_nft_initializer(alice(), carol()).unwrap();
+        c.cancel(carol()).unwrap();
+        assert_eq!(c.state(), NftEscrowState::Cancelled);
+    }
+
+    #[test]
+    fn amend_nft_initializer_rejects_stranger_and_terminal_states() {
+        // AV-368: authority is checked before state — a stranger
+        // on a terminal escrow still gets Unauthorized, not a
+        // state error — and the initializer is untouched either
+        // way.
+        let mut e = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        let err = e
+            .amend_nft_initializer(bob(), carol())
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(e.initializer(), alice());
+        e.release(alice()).unwrap();
+        assert_eq!(
+            e.amend_nft_initializer(bob(), carol()).unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(
+            e.amend_nft_initializer(alice(), carol()).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        assert_eq!(e.initializer(), alice());
+        let mut c = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        c.cancel(alice()).unwrap();
+        assert_eq!(
+            c.amend_nft_initializer(alice(), carol()).unwrap_err(),
+            EscrowError::InvalidStateTransition
+        );
+        assert_eq!(c.initializer(), alice());
+    }
+
+    #[test]
+    fn amend_nft_initializer_rejects_zero_initializer() {
+        // AV-368: a zero new initializer fails closed with
+        // InvalidNftMint (256) — custody must never be emptied
+        // while the piece stays locked — and the current
+        // initializer is untouched.
+        let mut e = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        let err = e
+            .amend_nft_initializer(alice(), [0u8; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidNftMint);
+        assert_eq!(err.code(), 256);
+        assert_eq!(e.initializer(), alice());
+        // Still releasable by the affirmed initializer.
+        e.release(alice()).unwrap();
+    }
+
+    #[test]
+    fn amend_nft_initializer_reaffirmation_is_noop() {
+        // AV-368: re-affirming the current initializer succeeds
+        // and changes nothing — and it writes no audit (the
+        // audit JSON below records previous == initializer).
+        let mut e = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        e.amend_nft_initializer(alice(), alice()).unwrap();
+        assert_eq!(e.initializer(), alice());
+        assert_eq!(
+            e.initializer_audit_json(alice()),
+            format!(
+                "{{\"event\":\"nft_initializer_amended\",\"previous_initializer\":\"{}\",\"initializer\":\"{}\"}}",
+                "a1".repeat(32),
+                "a1".repeat(32)
+            )
+        );
+        e.release(alice()).unwrap();
+    }
+
+    #[test]
+    fn amend_nft_initializer_audit_json() {
+        // AV-368: the audit JSON names the event and both keys in
+        // hex, exactly — the event name is the identity, no
+        // numeric event ID is registered.
+        let mut e = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        e.amend_nft_initializer(alice(), carol()).unwrap();
+        let j = e.initializer_audit_json(alice());
+        assert!(j.contains("\"event\":\"nft_initializer_amended\""));
+        assert!(j.contains("\"previous_initializer\":\""));
+        assert!(j.contains("\"initializer\":\""));
+        assert_eq!(
+            j,
+            format!(
+                "{{\"event\":\"nft_initializer_amended\",\"previous_initializer\":\"{}\",\"initializer\":\"{}\"}}",
+                "a1".repeat(32),
+                "c4".repeat(32)
+            )
+        );
+        // A second rotation audits the new previous key.
+        e.amend_nft_initializer(carol(), dave()).unwrap();
+        assert_eq!(
+            e.initializer_audit_json(carol()),
+            format!(
+                "{{\"event\":\"nft_initializer_amended\",\"previous_initializer\":\"{}\",\"initializer\":\"{}\"}}",
+                "c4".repeat(32),
+                "d4".repeat(32)
+            )
+        );
+    }
+
+    #[test]
+    fn amend_nft_initializer_failed_rotation_writes_no_audit() {
+        // AV-368: a failed rotation leaves the initializer
+        // untouched, so an audit rendered against it records no
+        // rotation — previous and current are the same key.
+        let mut e = NftEscrow::new(alice(), &nft_desc()).unwrap();
+        let _ = e.amend_nft_initializer(alice(), [0u8; 32]);
+        assert_eq!(e.initializer(), alice());
+        assert_eq!(
+            e.initializer_audit_json(alice()),
+            format!(
+                "{{\"event\":\"nft_initializer_amended\",\"previous_initializer\":\"{}\",\"initializer\":\"{}\"}}",
+                "a1".repeat(32),
+                "a1".repeat(32)
+            )
+        );
+        let _ = e.amend_nft_initializer(bob(), carol());
+        assert_eq!(e.initializer(), alice());
+        assert_eq!(
+            e.initializer_audit_json(alice()),
+            format!(
+                "{{\"event\":\"nft_initializer_amended\",\"previous_initializer\":\"{}\",\"initializer\":\"{}\"}}",
+                "a1".repeat(32),
+                "a1".repeat(32)
+            )
+        );
     }
 }

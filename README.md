@@ -8206,6 +8206,24 @@ audit-JSON vocabulary, none of the amount machinery).
   untouched), `cancel` stays ungated, and the new table governs
   from the next `release`. No event is emitted — `NftEscrow` has no
   event layer.
+- **Rotating the initializer (AV-368)**: `amend_nft_initializer`
+  rotates the initializer on a `Created` escrow, authorized by
+  the current initializer alone (the single-party precedent of
+  `release`/`cancel` — there is no taker dual-signature on
+  `NftEscrow`). A zero new initializer fails closed with
+  `InvalidNftMint` (code 256) — custody must never be emptied
+  while the piece stays locked; a `Released`/`Cancelled` escrow
+  is `InvalidStateTransition` (code 101). Re-affirming the
+  current initializer is a no-op. Only `initializer` changes,
+  and `release` / `cancel` / `update_collection_allowlist` all
+  read the live initializer, so the new initializer governs
+  from the next call and the old one loses all three powers at
+  once. A successful rotation is recorded by
+  `initializer_audit_json` as
+  `{"event":"nft_initializer_amended","previous_initializer":"<64hex>","initializer":"<64hex>"}` — a string event name, no
+  numeric event ID; a failed rotation or a no-op writes no
+  audit. An initializer who has lost their key cannot rotate:
+  the current initializer must sign. (Solana: NFT custody.)
 
 New error codes (never renumbered): `InvalidNftMint` (256),
 `CollectionNotAllowlisted` (257), `InvalidCollectionAllowlist`
