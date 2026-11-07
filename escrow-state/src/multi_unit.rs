@@ -637,6 +637,83 @@ impl MultiUnitAuction {
         s
     }
 
+    /// Revise the share supply before the first commitment lands
+    /// (AV-363).
+    ///
+    /// Seller-only ([`EscrowError::Unauthorized`], code 100, for
+    /// anyone else — the supply is the seller's public game) and
+    /// only while the auction is live and no commitment has landed
+    /// (`state == Active` and `commit_count == 0`) — refused with
+    /// [`EscrowError::MultiUnitNotLive`] (code 310) once a commitment
+    /// has landed or the auction is terminal, the original supply
+    /// untouched. No slot gate: with zero commitments no bidder has
+    /// entered, so the window may already be open — the supply is
+    /// only read at [`Self::settle`], and no bidder has relied on
+    /// the announced quantity yet. A zero new supply reuses the
+    /// [`Self::new`] gate ([`EscrowError::InvalidMultiUnit`], code
+    /// 309), the original supply untouched; any other `u64` is
+    /// legal — `new()` sets no upper bound, and a huge supply is
+    /// always undersubscribed (`take = min(units, valid)`), so it
+    /// cannot overflow: `units - valid` only runs where
+    /// `units > valid`, and `units - full` only where
+    /// `units >= full`.
+    ///
+    /// Only `units` changes: `seller`, `min_bid`, the three windows,
+    /// slots, counts, and state are untouched. The new supply
+    /// governs from the next [`Self::settle`] — it is the "Nth bid"
+    /// quantile itself: shrinking it raises the clearing price and
+    /// drops marginal winners, growing it lowers the clearing price
+    /// and adds unsold shares. Amending to the current supply is a
+    /// no-op.
+    ///
+    /// Check order is authority → liveness → no-op → value,
+    /// mirroring AV-324 (`BidDepositAuction::amend_bid_deposit_amount`)
+    /// and AV-323: a stranger is refused even on a terminal auction,
+    /// and a committed auction refuses even the seller.
+    ///
+    /// Pure logic: this method changes state only. The revision is
+    /// recorded for the indexer as [`Self::units_audit_json`] (a
+    /// string event name, no numeric event ID — the multi-unit audit
+    /// convention); a failed revision and a no-op re-affirmation
+    /// record nothing. There is no Anchor instruction surface in
+    /// this round — the program drives this method and emits the
+    /// event — and no new error code: the gates reuse 100/309/310.
+    pub fn amend_multi_unit_units(
+        &mut self,
+        caller: [u8; 32],
+        new_units: u64,
+    ) -> Result<(), EscrowError> {
+        if caller != self.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != MultiUnitState::Active || self.commit_count > 0 {
+            return Err(EscrowError::MultiUnitNotLive);
+        }
+        if new_units == self.units {
+            return Ok(());
+        }
+        if new_units == 0 {
+            return Err(EscrowError::InvalidMultiUnit);
+        }
+        self.units = new_units;
+        Ok(())
+    }
+
+    /// Audit-event JSON for a supply revision (hand-written, no
+    /// serde — same convention as [`Self::commit_audit_json`]):
+    /// `{"event":"multi_unit_units_amended","previous_units":<u64>,
+    /// "units":<u64>}`. Multi-unit audit events carry string event
+    /// names, not numeric event IDs, so no new event number is
+    /// registered for the revision — the event name is the identity.
+    pub fn units_audit_json(&self, previous_units: u64) -> String {
+        let mut s = String::from("{\"event\":\"multi_unit_units_amended\",\"previous_units\":");
+        s.push_str(&previous_units.to_string());
+        s.push_str(",\"units\":");
+        s.push_str(&self.units.to_string());
+        s.push('}');
+        s
+    }
+
     /// Audit-event JSON for a commitment (hand-written):
     /// `{"event":"multi_unit_commit","bidder":"<64hex>","commitment":
     /// "<64hex>","units":<u64>,"reveal_start_slot":<u64>}`.
@@ -1640,5 +1717,248 @@ mod multi_unit_tests {
         assert_eq!(b.seller(), key(0xAA));
         let j = b.seller_audit_json(key(0xAA));
         assert!(j.contains("\"seller\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
+    }
+
+    #[test]
+    fn amend_units_revision_changes_supply_only() {
+        let mut a = open_auction(); // 4 units, seller key(0xAA), floor 10
+        a.amend_multi_unit_units(key(0xAA), 2).unwrap();
+        assert_eq!(a.units(), 2);
+        // Everything else is untouched.
+        assert_eq!(a.seller(), key(0xAA));
+        assert_eq!(a.min_bid(), 10);
+        assert_eq!(a.end_slot(), 300);
+        assert_eq!(a.commit_count(), 0);
+        assert_eq!(a.reveal_count(), 0);
+        assert_eq!(a.state(), MultiUnitState::Active);
+        // The windows are unchanged: commits still land before 200,
+        // reveals still land from 200.
+        assert_eq!(a.phase(150), MultiUnitPhase::Commit);
+        assert_eq!(a.phase(200), MultiUnitPhase::Reveal);
+    }
+
+    #[test]
+    fn amend_units_is_seller_only() {
+        let mut a = open_auction();
+        // A stranger is refused, even on a live auction.
+        let err = a.amend_multi_unit_units(key(9), 2).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(a.units(), 4);
+        // A bidder is refused too — authority is checked first,
+        // before the post-commit liveness gate.
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        let err = a.amend_multi_unit_units(key(1), 2).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.units(), 4);
+    }
+
+    #[test]
+    fn amend_units_locks_after_first_commit() {
+        let mut a = open_auction();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        let err = a.amend_multi_unit_units(key(0xAA), 2).unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(err.code(), 310);
+        assert_eq!(a.units(), 4);
+        // The commitment still stands: reveal and settle run under
+        // the original supply.
+        reveal(&mut a, key(1), 50, nonce(1), 200);
+        let (price, allocs, unsold) = cleared(&mut a);
+        assert_eq!(price, 50);
+        assert_eq!(allocs, vec![(key(1), 1, 1)]);
+        assert_eq!(unsold, 3);
+    }
+
+    #[test]
+    fn amend_units_refused_in_terminal_states() {
+        // Settled.
+        let mut a = open_auction();
+        commit(&mut a, key(1), 50, nonce(1), 100);
+        reveal(&mut a, key(1), 50, nonce(1), 200);
+        a.settle(300).unwrap();
+        assert_eq!(a.state(), MultiUnitState::Settled);
+        let err = a.amend_multi_unit_units(key(0xAA), 2).unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(a.units(), 4);
+        // NoSale after settling with no bids.
+        let mut b = open_auction();
+        b.settle(300).unwrap();
+        assert_eq!(b.state(), MultiUnitState::NoSale);
+        let err = b.amend_multi_unit_units(key(0xAA), 2).unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(b.units(), 4);
+        // Cancelled.
+        let mut c = open_auction();
+        c.cancel(key(0xAA), 100).unwrap();
+        assert_eq!(c.state(), MultiUnitState::Cancelled);
+        let err = c.amend_multi_unit_units(key(0xAA), 2).unwrap_err();
+        assert_eq!(err, EscrowError::MultiUnitNotLive);
+        assert_eq!(c.units(), 4);
+        // Authority still wins on a terminal auction: a stranger is
+        // Unauthorized, not MultiUnitNotLive.
+        let err = c.amend_multi_unit_units(key(9), 2).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+    }
+
+    #[test]
+    fn amend_units_rejects_zero_units() {
+        let mut a = open_auction();
+        let err = a.amend_multi_unit_units(key(0xAA), 0).unwrap_err();
+        assert_eq!(err, EscrowError::InvalidMultiUnit);
+        assert_eq!(err.code(), 309);
+        assert_eq!(a.units(), 4);
+        // The original supply still governs.
+        a.amend_multi_unit_min_bid(key(0xAA), 20, 100).unwrap();
+        assert_eq!(a.min_bid(), 20);
+        assert_eq!(a.units(), 4);
+    }
+
+    #[test]
+    fn amend_units_same_value_is_noop() {
+        let mut a = open_auction();
+        // Re-affirming the current supply succeeds and changes
+        // nothing — the pure-logic method emits no event, so there
+        // is no event to assert here; the state pin is the supply.
+        a.amend_multi_unit_units(key(0xAA), 4).unwrap();
+        assert_eq!(a.units(), 4);
+        assert_eq!(a.min_bid(), 10);
+        assert_eq!(a.state(), MultiUnitState::Active);
+    }
+
+    #[test]
+    fn amend_units_shrink_governs_next_settle() {
+        // 4 -> 2 shares with five valid reveals: the clearing price
+        // rises to the 2nd bid (90), only the top two win, nothing
+        // is unsold.
+        let mut a = open_auction();
+        a.amend_multi_unit_units(key(0xAA), 2).unwrap();
+        commit(&mut a, key(1), 100, nonce(1), 100);
+        commit(&mut a, key(2), 90, nonce(2), 110);
+        commit(&mut a, key(3), 80, nonce(3), 120);
+        commit(&mut a, key(4), 70, nonce(4), 130);
+        commit(&mut a, key(5), 60, nonce(5), 140);
+        for (i, b) in [1u8, 2, 3, 4, 5].iter().enumerate() {
+            reveal(&mut a, key(*b), [100, 90, 80, 70, 60][i], nonce(*b), 200 + i as u64);
+        }
+        let (price, allocs, unsold) = cleared(&mut a);
+        assert_eq!(price, 90);
+        assert_eq!(allocs, vec![(key(1), 1, 1), (key(2), 1, 1)]);
+        assert_eq!(unsold, 0);
+    }
+
+    #[test]
+    fn amend_units_grow_governs_next_settle() {
+        // 4 -> 3 shares with a marginal tie: the clearing price is
+        // 80, the 100-bidder takes one full share, and the three
+        // 80-bidders split the remaining 2 shares pro-rata (2/3
+        // each). The 70-bidder gets nothing.
+        let mut a = open_auction();
+        a.amend_multi_unit_units(key(0xAA), 3).unwrap();
+        commit(&mut a, key(1), 100, nonce(1), 100);
+        commit(&mut a, key(2), 80, nonce(2), 110);
+        commit(&mut a, key(3), 80, nonce(3), 120);
+        commit(&mut a, key(4), 80, nonce(4), 130);
+        commit(&mut a, key(5), 70, nonce(5), 140);
+        reveal(&mut a, key(1), 100, nonce(1), 200);
+        reveal(&mut a, key(2), 80, nonce(2), 201);
+        reveal(&mut a, key(3), 80, nonce(3), 202);
+        reveal(&mut a, key(4), 80, nonce(4), 203);
+        reveal(&mut a, key(5), 70, nonce(5), 204);
+        let (price, allocs, unsold) = cleared(&mut a);
+        assert_eq!(price, 80);
+        assert_eq!(unsold, 0);
+        assert_eq!(allocs.len(), 4);
+        assert!(allocs.contains(&(key(1), 1, 1)));
+        for b in [key(2), key(3), key(4)] {
+            assert!(allocs.contains(&(b, 2, 3)), "missing {:?}", &b[..2]);
+        }
+
+        // Growing past demand turns the sale undersubscribed: all
+        // five win a full share and one share returns to the seller.
+        let mut b = open_auction();
+        b.amend_multi_unit_units(key(0xAA), 6).unwrap();
+        commit(&mut b, key(1), 100, nonce(1), 100);
+        commit(&mut b, key(2), 90, nonce(2), 110);
+        commit(&mut b, key(3), 80, nonce(3), 120);
+        commit(&mut b, key(4), 70, nonce(4), 130);
+        commit(&mut b, key(5), 60, nonce(5), 140);
+        for (i, bid) in [1u8, 2, 3, 4, 5].iter().enumerate() {
+            reveal(&mut b, key(*bid), [100, 90, 80, 70, 60][i], nonce(*bid), 200 + i as u64);
+        }
+        let (price, allocs, unsold) = cleared(&mut b);
+        assert_eq!(price, 60);
+        assert_eq!(allocs.len(), 5);
+        for (bidder, num, den) in allocs {
+            assert!([key(1), key(2), key(3), key(4), key(5)].contains(&bidder));
+            assert_eq!((num, den), (1, 1));
+        }
+        assert_eq!(unsold, 1);
+    }
+
+    #[test]
+    fn amend_units_accepts_huge_supply() {
+        // No upper bound: u64::MAX is legal, the sale is
+        // undersubscribed, every bidder wins, and the unsold count
+        // is u64::MAX - valid with no overflow.
+        let mut a = open_auction();
+        a.amend_multi_unit_units(key(0xAA), u64::MAX).unwrap();
+        assert_eq!(a.units(), u64::MAX);
+        commit(&mut a, key(1), 100, nonce(1), 100);
+        commit(&mut a, key(2), 60, nonce(2), 110);
+        reveal(&mut a, key(1), 100, nonce(1), 200);
+        reveal(&mut a, key(2), 60, nonce(2), 201);
+        let (price, allocs, unsold) = cleared(&mut a);
+        assert_eq!(price, 60);
+        assert_eq!(allocs, vec![(key(1), 1, 1), (key(2), 1, 1)]);
+        assert_eq!(unsold, u64::MAX - 2);
+    }
+
+    #[test]
+    fn amend_units_audit_json() {
+        let mut a = open_auction();
+        a.amend_multi_unit_units(key(0xAA), 6).unwrap();
+        let j = a.units_audit_json(4);
+        assert!(j.contains("\"event\":\"multi_unit_units_amended\""));
+        assert!(j.contains("\"previous_units\":4"));
+        assert!(j.contains("\"units\":6"));
+        assert_eq!(
+            j,
+            "{\"event\":\"multi_unit_units_amended\",\"previous_units\":4,\"units\":6}"
+        );
+        // The commit audit follows the live supply automatically.
+        let c = commit(&mut a, key(7), 60, nonce(7), 100).commitment;
+        let j = a.commit_audit_json(key(7), c);
+        assert!(j.contains("\"units\":6"));
+        // A failed revision records nothing: the supply is unchanged,
+        // so there is no revision event to emit.
+        let err = a.amend_multi_unit_units(key(9), 2).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(a.units(), 6);
+        let j = a.commit_audit_json(key(7), c);
+        assert!(j.contains("\"units\":6"));
+    }
+
+    #[test]
+    fn amend_units_has_no_slot_gate() {
+        // The method takes no slot: no window gates it. Pin the
+        // window state with phase() first, then revise — the commit
+        // window open with zero commitments, and the reveal window
+        // open with zero commitments, both revise fine.
+        let mut a = open_auction();
+        assert_eq!(a.phase(150), MultiUnitPhase::Commit);
+        a.amend_multi_unit_units(key(0xAA), 2).unwrap();
+        assert_eq!(a.units(), 2);
+        let mut b = open_auction();
+        assert_eq!(b.phase(200), MultiUnitPhase::Reveal);
+        b.amend_multi_unit_units(key(0xAA), 2).unwrap();
+        assert_eq!(b.units(), 2);
+        // Even past the end slot, with zero commitments the seller
+        // may still revise: nobody has entered, so nothing entered
+        // is rewritten.
+        let mut c = open_auction();
+        assert_eq!(c.phase(300), MultiUnitPhase::Closed);
+        c.amend_multi_unit_units(key(0xAA), 2).unwrap();
+        assert_eq!(c.units(), 2);
     }
 }

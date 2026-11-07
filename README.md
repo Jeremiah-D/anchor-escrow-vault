@@ -2988,6 +2988,20 @@ pricing rule is what changes.
   the current seller is a no-op. The rotation is audited as
   `multi_unit_seller_amended` (hand-written JSON, string event name,
   no numeric event ID).
+- **Units revision** (AV-363): `amend_multi_unit_units()` lets the
+  seller revise the share supply before the first commitment lands
+  (`commit_count == 0`) — seller-only, refused with
+  `MultiUnitNotLive` once a commitment has landed or the auction is
+  terminal; zero is refused with `InvalidMultiUnit`, and any other
+  `u64` is legal (a huge supply is always undersubscribed, so it
+  cannot overflow). No slot gate: with zero commitments no bidder
+  has relied on the announced quantity. Only `units` changes — the
+  supply is the clearing-price quantile itself, so the new supply
+  governs from the next `settle` (shrinking raises the clearing
+  price, growing lowers it and adds unsold shares). Amending to the
+  current supply is a no-op. The revision is audited as
+  `multi_unit_units_amended` (hand-written JSON, string event name,
+  no numeric event ID).
 
 New error codes (never renumbered): `InvalidMultiUnit` (309),
 `MultiUnitNotLive` (310), `MultiUnitDuplicateCommit` (311),
