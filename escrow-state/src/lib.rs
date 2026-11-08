@@ -39867,6 +39867,23 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "no params; heir <- accounts.heir (signer) — heir-only (a stranger, the initializer or the taker is Unauthorized unless they are the configured heir; the heir is not required to be either party — the orthogonality point with `cancel_expired`); a paused escrow fails fast (Paused); unconfigured switch is InvalidDeadmanConfig (code 168); Funded only (InvalidStateTransition otherwise); a live swap link refuses the single-side move (SwapLinkActive, AV-105); the inactivity gate `now - deadman_last_activity >= inactivity_secs` (saturating, exactly-equal counts as elapsed) is DeadmanNotElapsed (code 169) before it lapses; now <- clock sysvar (NOT an instruction param); the outstanding unsettled interest claim is voided like `cancel` (no yield owed on funds that never settled); Funded -> Cancelled; returns the remaining locked amount so the real build can size the heir's transfer; `released` is untouched (refund-family unwind, not a taker payout); emits the DeadmanClaimed indexer event (from == Funded, to == Cancelled; amounts follow the Cancelled shape — refund = the heir's payout)",
         },
         InstructionSpec {
+            // AV-380: the dead-man's switch heir rotation — the
+            // program-level entry point for the AV-271 pure-logic
+            // rotation. IDL: discriminator =
+            // sha256("global:rotate_deadman_heir")[..8] = [4, 156, 195,
+            // 195, 58, 126, 14, 94] — the Anchor instruction
+            // discriminator for the rotate_deadman_heir handler
+            // (pinned by the discriminator test below).
+            name: "rotate_deadman_heir",
+            params: &[(
+                "new_heir",
+                "Pubkey",
+                "instruction param; the replacement heir — the old key stops being the claim_deadman caller immediately; the zero address is InvalidDeadmanConfig (code 168)",
+            )],
+            method: "Escrow::rotate_deadman_heir",
+            input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign, one alone (or a stranger pair) is Unauthorized; the heir itself does not sign (a lost heir key must not block its own replacement, the rotate_arbiter reasoning); new_heir <- param (Pubkey -> [u8; 32] conversion); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); only an escrow whose dead-man's switch is already configured may rotate (InvalidDeadmanConfig, code 168, fail-closed — post-funding installation would add a recovery path the taker never funded under); the zero address is InvalidDeadmanConfig (code 168); a paused escrow fails fast (Paused); rotating to the current heir is an idempotent no-op; emits the DeadmanHeirRotated indexer event only on an actual change (from == to == the current state); only deadman_heir changes — deadman_inactivity_secs and deadman_last_activity are untouched (the rotation takes no clock parameter and never resets the inactivity timer); no clock/sysvar input to the method; the 33-byte heir region is rewritten in place — no layout / rent change",
+        },
+        InstructionSpec {
             // AV-110: the permissionless rent top-up. IDL:
             // discriminator = sha256("global:top_up_rent")[..8] =
             // [228, 107, 203, 188, 137, 169, 152, 122] — the Anchor
@@ -40643,6 +40660,9 @@ pub(crate) mod anchor_idl_tests {
             // lapses.
             "Escrow::with_deadman_switch",
             "Escrow::claim_deadman",
+            // AV-380: the program-level heir rotation (the AV-271
+            // pure-logic rotation wired to the chain).
+            "Escrow::rotate_deadman_heir",
             // AV-110: permissionless rent top-up — anyone tops up the
             // vault's lamport balance in any non-Closed state; pure
             // counter bookkeeping, no state change.
@@ -40910,6 +40930,9 @@ pub(crate) mod anchor_idl_tests {
                 // claim is param-less (the config pins everything,
                 // `now` comes from the clock sysvar).
                 &"initialize_deadman_switch",
+                // AV-380: the heir-rotation target (Pubkey) — the
+                // replacement dead-man's switch heir.
+                &"rotate_deadman_heir",
                 // AV-110: the rent top-up carries the lamport amount
                 // (u64) — the only input besides the permissionless
                 // caller signer.
@@ -41953,6 +41976,49 @@ pub(crate) mod anchor_idl_tests {
             Err(EscrowError::InvalidTaker)
         );
         assert_eq!(e.taker(), CAROL, "failed calls change nothing");
+    }
+
+    #[test]
+    fn rotate_deadman_heir_maps_param_to_heir_field() {
+        // IDL: rotate_deadman_heir(new_heir: Pubkey) — new_heir <- param;
+        // initializer <- accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints, not the state machine. The param rewrites the
+        // vault's deadman_heir field in place (see PARAM_FIELD_MAP) —
+        // no layout change.
+        const HEIR: [u8; 32] = [0xA0; 32];
+        const NEW_HEIR: [u8; 32] = [0xA9; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_deadman_switch(7 * 24 * 3600, HEIR)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.rotate_deadman_heir(ALICE, BOB, NEW_HEIR).unwrap();
+        assert_eq!(e.deadman_heir(), Some(NEW_HEIR));
+        // Documented failure modes: one party alone is Unauthorized,
+        // the zero address can never be the heir, and re-affirming the
+        // current heir is a no-op that writes nothing.
+        assert_eq!(
+            e.rotate_deadman_heir(ALICE, MALLORY, NEW_HEIR),
+            Err(EscrowError::Unauthorized),
+            "initializer alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_deadman_heir(MALLORY, BOB, NEW_HEIR),
+            Err(EscrowError::Unauthorized),
+            "taker alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_deadman_heir(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert_eq!(
+            e.deadman_heir(),
+            Some(NEW_HEIR),
+            "failed calls change nothing"
+        );
+        e.rotate_deadman_heir(ALICE, BOB, NEW_HEIR).unwrap();
+        assert_eq!(e.deadman_heir(), Some(NEW_HEIR));
     }
 
     #[test]
@@ -43190,6 +43256,12 @@ pub(crate) mod anchor_idl_tests {
         // transition-written — see FIELD_SOURCES.
         ("initialize_deadman_switch", "inactivity_secs", "deadman_inactivity_secs"),
         ("initialize_deadman_switch", "heir", "deadman_heir"),
+        // AV-380: the rotation param rewrites the same field in place —
+        // a second param source for `deadman_heir`, like
+        // `rotate_pause_authority`'s new_authority. The field's initial
+        // value comes from the `initialize_deadman_switch` heir param
+        // (Uninitialized only); this entry documents the rotation source.
+        ("rotate_deadman_heir", "new_heir", "deadman_heir"),
         // AV-110: the rent top-up accumulates its `lamports` param
         // into the `rent_topped_up_total` tail counter (any state but
         // Closed); the counter is zeroed by `initialize`.
@@ -77843,13 +77915,19 @@ mod arbiter_panel_tests {
             instruction_discriminator("claim_deadman"),
             [0xb3, 0x7c, 0x2e, 0x36, 0x22, 0xe8, 0x50, 0x4d]
         );
-        // And the INSTRUCTIONS table carries both specs.
+        // AV-380: the heir rotation's discriminator, pinned the same way.
+        assert_eq!(
+            instruction_discriminator("rotate_deadman_heir"),
+            [0x04, 0x9c, 0xc3, 0xc3, 0x3a, 0x7e, 0x0e, 0x5e]
+        );
+        // And the INSTRUCTIONS table carries all three specs.
         let names: Vec<&&str> = crate::anchor_idl_tests::INSTRUCTIONS
             .iter()
             .map(|s| &s.name)
             .collect();
         assert!(names.contains(&&"initialize_deadman_switch"));
         assert!(names.contains(&&"claim_deadman"));
+        assert!(names.contains(&&"rotate_deadman_heir"));
     }
 }
 

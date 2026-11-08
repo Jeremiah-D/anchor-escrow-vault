@@ -1934,6 +1934,66 @@ pub mod escrow_vault {
         Ok(heir_payout)
     }
 
+    /// Rotate the dead-man's switch heir by dual-signed governance
+    /// (AV-380; mirrors `Escrow::rotate_deadman_heir`). Both the
+    /// initializer and the taker must sign — the heir itself does not
+    /// sign, so a lost heir key cannot block its own replacement (the
+    /// `rotate_arbiter` reasoning). Only `Funded`: the terminal states
+    /// and `Disputed` are `InvalidStateTransition` (no live recovery
+    /// left to redirect, and arbitration in flight adjudicates the
+    /// heir's claim). Only an escrow whose switch is already configured
+    /// may rotate (`InvalidDeadmanConfig`, code 168, fail-closed —
+    /// post-funding installation would add a recovery path the taker
+    /// never funded under). The zero address is `InvalidDeadmanConfig`
+    /// (code 168). A paused escrow fails fast (`Paused`) — rotation is
+    /// a config transition, not the pause key-loss escape hatch. Only
+    /// `deadman_heir` changes (the inactivity threshold and the
+    /// last-activity clock are untouched — the rotation takes no clock
+    /// parameter and never resets the inactivity timer, so the elapsed
+    /// time since the last real activity is preserved and simply
+    /// re-judged against the same threshold under the new heir). The
+    /// new heir governs from the next `claim_deadman`: that path reads
+    /// the live `configured_heir` on every call, so the old heir is
+    /// `Unauthorized` from the moment the rotation lands while the new
+    /// heir may claim once the inactivity period has elapsed. Rotating
+    /// to the current heir is an idempotent no-op. Emits
+    /// `DeadmanHeirRotated` only on an actual change (from == to ==
+    /// the current state), mirroring `IndexedEscrow::rotate_deadman_heir`.
+    pub fn rotate_deadman_heir(ctx: Context<RotateDeadmanHeir>, new_heir: Pubkey) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.deadman_heir();
+        escrow
+            .rotate_deadman_heir(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_heir.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.deadman_heir` in place in the real build (33
+        // bytes, the Option<Pubkey> heir region) — no realloc, no rent
+        // change.
+        if escrow.deadman_heir() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::DeadmanHeirRotated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Top up the vault account's lamport balance so it stays
     /// rent-exempt (AV-110; mirrors `Escrow::top_up_rent`).
     /// Permissionless: the initializer, the taker, the keeper bot or a
@@ -8033,6 +8093,10 @@ pub enum EscrowVaultEventKind {
     /// AV-260/AV-266 precedent — the on-chain event stream still
     /// names the kind so the indexer can follow the revised memo).
     ReferenceAmended,
+    /// AV-380: the dead-man's switch heir was rotated by dual-signed
+    /// governance (`Escrow::rotate_deadman_heir`). Mirrors
+    /// `escrow_state::EscrowEventKind::DeadmanHeirRotated`.
+    DeadmanHeirRotated,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -8203,6 +8267,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::ReferenceAmended => {
             EscrowVaultEventKind::ReferenceAmended
+        }
+        escrow_state::EscrowEventKind::DeadmanHeirRotated => {
+            EscrowVaultEventKind::DeadmanHeirRotated
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -9247,6 +9314,23 @@ pub struct ClaimDeadman<'info> {
     /// build funds the heir's transfer from the vault's holdings;
     /// unused on the native-SOL path.
     pub vault_token_account: AccountInfo<'info>,
+}
+
+/// AV-380: accounts for `rotate_deadman_heir` — the heir rotation is
+/// dual-signed governance by the two parties; the heir itself does not
+/// sign (a lost heir key must not block its own replacement).
+#[derive(Accounts)]
+pub struct RotateDeadmanHeir<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to redirecting the inactivity recovery on the
+    /// funds they stand to receive.
+    pub taker: Signer<'info>,
 }
 
 /// AV-110: accounts for `top_up_rent` — anyone tops up the vault's

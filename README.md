@@ -6153,7 +6153,13 @@ The Anchor skeleton gains `initialize_deadman_switch(inactivity_secs,
 heir)` and `claim_deadman` (the latter reads `now` from the clock
 sysvar, never an instruction param), the two `ClaimDeadman` /
 `InitializeDeadmanSwitch` account structs, the three `Vault` tail
-fields, and the two `ErrorCode` mappings (168/169). The event kind
+fields, and the two `ErrorCode` mappings (168/169). AV-380 adds the
+program-level `rotate_deadman_heir(new_heir)` — dual-signed by
+initializer + taker (the heir itself does not sign, so a lost heir key
+never blocks its own replacement), `Funded`-only, configured-switch-only,
+zero heir refused, same-value no-op; it emits `DeadmanHeirRotated`
+(discriminant 134) only on an actual change, and rewrites the 33-byte
+heir region in place — no layout change. The event kind
 `DeadmanClaimed` is 56 (appended after `SwapLinked`, 0–55 stable);
 the event-sourced fold books the reclaim like `Cancelled` (`refund`
 = the heir's payout); the keeper lists one `claim_deadman` action
