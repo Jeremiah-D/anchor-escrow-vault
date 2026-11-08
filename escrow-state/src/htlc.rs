@@ -446,6 +446,89 @@ impl HtlcLock {
         Ok(())
     }
 
+    /// Revise the maker (AV-375).
+    ///
+    /// The maker is the refund right itself: the lock's funder is
+    /// the only party who may refund after `expiry_slot`, so a
+    /// maker key rotation — a custody change, a rotated hot wallet,
+    /// a funder handover — leaves the old maker holding the refund
+    /// right and the new maker with no way to take it over. Before
+    /// this method the only remedy was abandoning the lock and
+    /// rebuilding it with a new hashlock and fresh funding, which
+    /// drops the atomic swap's already-locked counterparty leg.
+    ///
+    /// Check order is authority → state → timelock → value, mirroring
+    /// [`HtlcLock::amend_htlc_taker`] (AV-344):
+    ///
+    /// 1. `maker` + `taker` must both match the lock, else
+    ///    [`EscrowError::Unauthorized`] — the maker is the refund
+    ///    right itself, so the taker alone could re-point the refund
+    ///    to their own address and, after expiry, collect both the
+    ///    claim (never taken) and the refund; the maker alone could
+    ///    hand the refund right to a stranger without the
+    ///    counterparty's consent. The *new* maker does not co-sign,
+    ///    mirroring [`Escrow::rotate_taker`] (AV-52): only the
+    ///    current parties authorize;
+    /// 2. `state == Locked`, else
+    ///    [`EscrowError::InvalidStateTransition`] (`Claimed` /
+    ///    `Refunded` are terminal — there is no refund right left to
+    ///    move);
+    /// 3. `current_slot < expiry_slot`, else
+    ///    [`EscrowError::HtlcClaimExpired`] — once the window closes
+    ///    only the refund path remains, and the refund right is
+    ///    already exercisable by the current maker; revising it
+    ///    cannot revive a claim. Revival needs
+    ///    [`HtlcLock::amend_htlc_expiry_slot`] first (also
+    ///    dual-signed);
+    /// 4. `new_maker` must be non-zero, else
+    ///    [`EscrowError::InvalidHtlcLock`] — reusing
+    ///    [`HtlcLock::new`]'s threshold for an unownable endpoint.
+    ///    The value gate runs before the no-op check, so a zero
+    ///    address fails rather than silently succeeding (a zero
+    ///    address can never equal the current maker, which `new()`
+    ///    already guarantees non-zero).
+    ///
+    /// Re-affirming the current maker is `Ok(())` and changes
+    /// nothing. `new_maker == taker` is not separately gated: dual
+    /// signature is both parties' consent, and a taker who is also
+    /// the maker after expiry can only collect what the claim would
+    /// already have paid them — mirroring `amend_htlc_taker`'s
+    /// `new_taker == maker` treatment.
+    ///
+    /// Only the 32 `maker` bytes move — taker, hashlock, amount,
+    /// `expiry_slot`, and state are untouched. The claim path reads
+    /// only the taker and is unaffected; the refund path reads the
+    /// live maker, so the new maker gains the post-expiry refund
+    /// right from the revision onward and the old maker loses it
+    /// immediately; an action already executed keeps the maker it
+    /// settled under. There is no event layer on `HtlcLock` (like
+    /// `OptionEscrow`), so no event is emitted.
+    pub fn amend_htlc_maker(
+        &mut self,
+        maker: [u8; 32],
+        taker: [u8; 32],
+        new_maker: [u8; 32],
+        current_slot: u64,
+    ) -> Result<(), EscrowError> {
+        if maker != self.maker || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != HtlcState::Locked {
+            return Err(EscrowError::InvalidStateTransition);
+        }
+        if current_slot >= self.expiry_slot {
+            return Err(EscrowError::HtlcClaimExpired);
+        }
+        if new_maker == [0u8; 32] {
+            return Err(EscrowError::InvalidHtlcLock);
+        }
+        if new_maker == self.maker {
+            return Ok(());
+        }
+        self.maker = new_maker;
+        Ok(())
+    }
+
     /// Whether the taker's claim window is still open at
     /// `current_slot` (`current_slot < expiry_slot`), independent of
     /// state — a convenience for keeper scans.
@@ -739,6 +822,20 @@ mod htlc_tests {
         assert_eq!(lock.expiry_slot, expiry_slot);
         assert_eq!(lock.maker, MAKER);
         assert_eq!(lock.taker, taker);
+        assert_eq!(lock.hashlock, hashlock);
+        assert_eq!(lock.amount, AMOUNT);
+        assert_eq!(lock.state, state);
+    }
+    fn assert_lock_intact_maker(
+        lock: &HtlcLock,
+        maker: [u8; 32],
+        expiry_slot: u64,
+        hashlock: [u8; 32],
+        state: HtlcState,
+    ) {
+        assert_eq!(lock.expiry_slot, expiry_slot);
+        assert_eq!(lock.maker, maker);
+        assert_eq!(lock.taker, TAKER);
         assert_eq!(lock.hashlock, hashlock);
         assert_eq!(lock.amount, AMOUNT);
         assert_eq!(lock.state, state);
@@ -1326,6 +1423,188 @@ mod htlc_tests {
         );
         assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
         // And the lock is still fully usable afterwards.
+        assert_eq!(lock.claim(TAKER, &preimage(), CURRENT_SLOT).unwrap(), AMOUNT);
+    }
+
+    // AV-375: amend_htlc_maker.
+
+    const NEW_MAKER: [u8; 32] = [0x55; 32];
+
+    #[test]
+    fn amend_maker_rejects_stranger_and_single_sided_pairs() {
+        let mut lock = lock();
+        // Stranger pair: neither side matches.
+        let err = lock
+            .amend_htlc_maker(STRANGER, STRANGER, NEW_MAKER, CURRENT_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // Maker alone: the taker slot is a stranger.
+        let err = lock
+            .amend_htlc_maker(MAKER, STRANGER, NEW_MAKER, CURRENT_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // Taker alone: the maker slot is a stranger.
+        let err = lock
+            .amend_htlc_maker(STRANGER, TAKER, NEW_MAKER, CURRENT_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // Swapped roles are not the maker/taker pair either.
+        let err = lock
+            .amend_htlc_maker(TAKER, MAKER, NEW_MAKER, CURRENT_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+    }
+
+    #[test]
+    fn amend_maker_rejects_claimed_lock() {
+        let mut lock = lock();
+        lock.claim(TAKER, &preimage(), CURRENT_SLOT).unwrap();
+        let err = lock
+            .amend_htlc_maker(MAKER, TAKER, NEW_MAKER, CURRENT_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        assert_eq!(err.code(), 101);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Claimed);
+    }
+
+    #[test]
+    fn amend_maker_rejects_refunded_lock() {
+        let mut lock = lock();
+        lock.refund(MAKER, EXPIRY_SLOT).unwrap();
+        let err = lock
+            .amend_htlc_maker(MAKER, TAKER, NEW_MAKER, EXPIRY_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Refunded);
+    }
+
+    #[test]
+    fn amend_maker_rejects_expired_window() {
+        // The window has closed (slot == expiry) but nobody refunded
+        // yet, so the lock is still Locked — and still unrevisable:
+        // the refund right is already exercisable by the current
+        // maker, and revising it cannot revive a claim.
+        let mut lock = lock();
+        let err = lock
+            .amend_htlc_maker(MAKER, TAKER, NEW_MAKER, EXPIRY_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::HtlcClaimExpired);
+        assert_eq!(err.code(), 254);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // Past expiry: same error, and the maker is still the old one.
+        let err = lock
+            .amend_htlc_maker(MAKER, TAKER, NEW_MAKER, EXPIRY_SLOT + 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::HtlcClaimExpired);
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // The timelock gate runs before the no-op check: re-affirming
+        // the current maker in an expired window still fails.
+        let err = lock
+            .amend_htlc_maker(MAKER, TAKER, MAKER, EXPIRY_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::HtlcClaimExpired);
+    }
+
+    #[test]
+    fn amend_maker_rejects_zero_address() {
+        let mut lock = lock();
+        let err = lock
+            .amend_htlc_maker(MAKER, TAKER, [0u8; 32], CURRENT_SLOT)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidHtlcLock);
+        assert_eq!(err.code(), 251);
+        // The original maker is untouched.
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // A zero-address amendment attempt never locks the maker out:
+        // the original maker still refunds after expiry.
+        assert_eq!(lock.refund(MAKER, EXPIRY_SLOT).unwrap(), AMOUNT);
+    }
+
+    #[test]
+    fn amend_maker_equal_value_is_noop() {
+        let mut lock = lock();
+        assert!(lock
+            .amend_htlc_maker(MAKER, TAKER, MAKER, CURRENT_SLOT)
+            .is_ok());
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // The original maker still refunds under the re-affirmed value.
+        assert_eq!(lock.refund(MAKER, EXPIRY_SLOT).unwrap(), AMOUNT);
+    }
+
+    #[test]
+    fn amend_maker_retargets_refund() {
+        let mut lock = lock();
+        lock.amend_htlc_maker(MAKER, TAKER, NEW_MAKER, CURRENT_SLOT)
+            .unwrap();
+        assert_eq!(lock.maker, NEW_MAKER);
+        // The old maker no longer satisfies the refund authority check.
+        let err = lock.refund(MAKER, EXPIRY_SLOT).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(lock.state, HtlcState::Locked);
+        // The new maker refunds after expiry and returns the amount.
+        assert_eq!(lock.refund(NEW_MAKER, EXPIRY_SLOT).unwrap(), AMOUNT);
+        assert_eq!(lock.state, HtlcState::Refunded);
+    }
+
+    #[test]
+    fn amend_maker_moves_only_the_maker() {
+        let mut lock = lock();
+        lock.amend_htlc_maker(MAKER, TAKER, NEW_MAKER, CURRENT_SLOT)
+            .unwrap();
+        assert_lock_intact_maker(
+            &lock,
+            NEW_MAKER,
+            EXPIRY_SLOT,
+            sha256(&preimage()),
+            HtlcState::Locked,
+        );
+        // The claim path is untouched: the taker still claims with the
+        // same preimage before expiry, under the new maker.
+        assert_eq!(lock.claim(TAKER, &preimage(), CURRENT_SLOT).unwrap(), AMOUNT);
+        assert_eq!(lock.state, HtlcState::Claimed);
+    }
+
+    #[test]
+    fn amend_maker_is_reversible_with_new_maker_cosigning() {
+        let mut lock = lock();
+        lock.amend_htlc_maker(MAKER, TAKER, NEW_MAKER, CURRENT_SLOT)
+            .unwrap();
+        // The revised maker is itself revisable, back to the original
+        // — with the *new* maker co-signing as the current maker.
+        lock.amend_htlc_maker(NEW_MAKER, TAKER, MAKER, CURRENT_SLOT)
+            .unwrap();
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // And the restored maker refunds after expiry.
+        assert_eq!(lock.refund(MAKER, EXPIRY_SLOT).unwrap(), AMOUNT);
+    }
+
+    #[test]
+    fn amend_maker_failed_calls_leave_no_state_change() {
+        // Every failure mode on one lock, then a single intact check.
+        let mut lock = lock();
+        assert_eq!(
+            lock.amend_htlc_maker(STRANGER, TAKER, NEW_MAKER, CURRENT_SLOT)
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(
+            lock.amend_htlc_maker(MAKER, TAKER, [0u8; 32], CURRENT_SLOT)
+                .unwrap_err(),
+            EscrowError::InvalidHtlcLock
+        );
+        assert_eq!(
+            lock.amend_htlc_maker(MAKER, TAKER, NEW_MAKER, EXPIRY_SLOT)
+                .unwrap_err(),
+            EscrowError::HtlcClaimExpired
+        );
+        assert_lock_intact(&lock, EXPIRY_SLOT, sha256(&preimage()), HtlcState::Locked);
+        // And the lock is still fully usable afterwards: the taker
+        // claims before expiry, the maker would refund after it.
         assert_eq!(lock.claim(TAKER, &preimage(), CURRENT_SLOT).unwrap(), AMOUNT);
     }
 
