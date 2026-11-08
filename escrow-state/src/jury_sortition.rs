@@ -120,6 +120,33 @@ impl JurorRegistry {
         Ok(())
     }
 
+    /// Revise a registered juror's stake bond in place (AV-374):
+    /// top up (more skin in the game) or draw down (less
+    /// exposure) without unregistering — registration order,
+    /// count, and every other juror are untouched, so no
+    /// in-flight or future draw is re-seated: the draw is uniform
+    /// over registration order and never reads stake, so a revision
+    /// changes only the bond ledger. Fail-closed: an unknown key or
+    /// a zero new stake is
+    /// [`EscrowError::InvalidJurorRegistry`]. Revising to the
+    /// current stake is an `Ok(())` no-op. The new stake is the
+    /// juror's slashable bond from the next call; a full registry
+    /// still accepts revisions (no new slot is taken).
+    pub fn update_stake(&mut self, key: [u8; 32], new_stake: u64) -> Result<(), EscrowError> {
+        let pos = self.jurors[..self.count as usize]
+            .iter()
+            .position(|j| j.key == key)
+            .ok_or(EscrowError::InvalidJurorRegistry)?;
+        if new_stake == 0 {
+            return Err(EscrowError::InvalidJurorRegistry);
+        }
+        if self.jurors[pos].stake == new_stake {
+            return Ok(());
+        }
+        self.jurors[pos].stake = new_stake;
+        Ok(())
+    }
+
     /// Registered juror count.
     pub fn len(&self) -> usize {
         self.count as usize
@@ -478,6 +505,121 @@ mod jury_sortition_tests {
         r.unregister(juror_key(1)).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r.juror(0).unwrap().key, juror_key(2));
+    }
+
+    #[test]
+    fn update_stake_rejects_unknown_key_and_zero_stake() {
+        let mut r = registry_with(3);
+        // Unknown key: refused, registry untouched.
+        assert_eq!(
+            r.update_stake([0xEE; 32], 5_000),
+            Err(EscrowError::InvalidJurorRegistry)
+        );
+        assert_eq!(r.len(), 3);
+        // Zero new stake: refused, the live bond is untouched.
+        assert_eq!(
+            r.update_stake(juror_key(2), 0),
+            Err(EscrowError::InvalidJurorRegistry)
+        );
+        assert_eq!(r.juror(1).unwrap().stake, 2_000);
+        // Check order: an unknown key beats a zero stake.
+        assert_eq!(
+            r.update_stake([0xEE; 32], 0),
+            Err(EscrowError::InvalidJurorRegistry)
+        );
+    }
+
+    #[test]
+    fn update_stake_to_same_value_is_noop() {
+        let mut r = registry_with(3);
+        assert!(r.update_stake(juror_key(2), 2_000).is_ok());
+        assert_eq!(r.len(), 3);
+        assert_eq!(r.juror(1).unwrap(), Juror { key: juror_key(2), stake: 2_000 });
+        assert_eq!(r.juror(0).unwrap().stake, 1_000);
+        assert_eq!(r.juror(2).unwrap().stake, 3_000);
+    }
+
+    #[test]
+    fn update_stake_top_up_only_moves_the_target_stake() {
+        let mut r = registry_with(5);
+        let before: Vec<Juror> = (0..5).map(|i| r.juror(i).unwrap()).collect();
+        r.update_stake(juror_key(3), 9_000).unwrap();
+        // Only the target's stake moved; order, count, and every other
+        // juror are untouched.
+        assert_eq!(r.len(), 5);
+        assert_eq!(r.juror(2).unwrap().stake, 9_000);
+        assert_eq!(r.juror(2).unwrap().key, juror_key(3));
+        for (i, juror) in before.iter().enumerate() {
+            if i != 2 {
+                assert_eq!(r.juror(i).unwrap(), *juror);
+            }
+        }
+    }
+
+    #[test]
+    fn update_stake_draw_down_only_moves_the_target_stake() {
+        let mut r = registry_with(5);
+        r.update_stake(juror_key(1), 100).unwrap();
+        assert_eq!(r.len(), 5);
+        assert_eq!(r.juror(0).unwrap(), Juror { key: juror_key(1), stake: 100 });
+        assert_eq!(r.juror(1).unwrap().stake, 2_000);
+        assert_eq!(r.juror(4).unwrap().stake, 5_000);
+    }
+
+    #[test]
+    fn update_stake_works_on_a_full_registry() {
+        // A full book takes no new slot — but revising a live bond is
+        // not a registration, so it still goes through.
+        let mut full = JurorRegistry::new();
+        for i in 1..=MAX_JURORS as u8 {
+            full.register(juror_key(i), 1).unwrap();
+        }
+        assert_eq!(full.len(), MAX_JURORS);
+        full.update_stake(juror_key(64), 77_000).unwrap();
+        assert_eq!(full.len(), MAX_JURORS);
+        assert_eq!(full.juror(63).unwrap().stake, 77_000);
+        assert_eq!(full.juror(0).unwrap().stake, 1);
+    }
+
+    #[test]
+    fn update_stake_is_live_for_juror_reads() {
+        let mut r = registry_with(3);
+        r.update_stake(juror_key(2), 42_000).unwrap();
+        assert_eq!(r.juror(1).unwrap().stake, 42_000);
+        // A second revision reads the first: the bond is live, not a
+        // snapshot.
+        r.update_stake(juror_key(2), 7).unwrap();
+        assert_eq!(r.juror(1).unwrap().stake, 7);
+    }
+
+    #[test]
+    fn update_stake_after_unregister_is_rejected() {
+        let mut r = registry_with(3);
+        r.unregister(juror_key(2)).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(
+            r.update_stake(juror_key(2), 5_000),
+            Err(EscrowError::InvalidJurorRegistry)
+        );
+        // The remaining jurors are still revisable.
+        r.update_stake(juror_key(1), 8_000).unwrap();
+        assert_eq!(r.juror(0).unwrap().stake, 8_000);
+    }
+
+    #[test]
+    fn update_stake_does_not_reseat_any_draw() {
+        // The draw is uniform over registration order and never reads
+        // stake: revising every bond leaves the panel identical.
+        let mut r = registry_with(10);
+        let live = disputed_escrow();
+        let before = r.draw_panel(&live, ESCROW_ID, SLOT_HASH).unwrap();
+        for i in 1..=10u8 {
+            r.update_stake(juror_key(i), 100_000 + i as u64).unwrap();
+        }
+        let after = r.draw_panel(&live, ESCROW_ID, SLOT_HASH).unwrap();
+        assert_eq!(before.members(), after.members());
+        assert_eq!(before.seed, after.seed);
+        assert!(after.verify(&r, &live, SLOT_HASH));
     }
 
     #[test]

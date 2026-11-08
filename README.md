@@ -8865,7 +8865,13 @@ verifiable sortition into dispute panels (Solana / DAO governance).
 
 The program (or DAO) maintains a `JurorRegistry` of staked jurors
 (`register_juror`: non-zero stake, live key; duplicate or zero-stake
-is `InvalidJuror`, code 293). When an escrow escalates with jury mode
+is `InvalidJuror`, code 293). A registered juror's bond can be revised
+in place (`JurorRegistry::update_stake`, AV-374) — top up for more skin
+in the game or draw down for less exposure, without unregistering, so
+registration order, the count, and every other juror are untouched and
+no draw is re-seated (the draw is uniform over registration order and
+never reads stake); an unknown key or a zero stake is refused (same
+code 293), and re-affirming the current stake is a no-op. When an escrow escalates with jury mode
 enabled (`configure_jury`: panel size 1–8, odd sizes recommended for
 clean majorities; `InvalidJuryPanelSize`, code 294), the panel is drawn
 by deterministic sortition: `seed = SHA-256(slot_hash || escrow_id)`,

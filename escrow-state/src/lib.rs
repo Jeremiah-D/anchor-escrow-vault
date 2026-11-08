@@ -4247,9 +4247,10 @@ pub enum EscrowError {
     /// renumbered (see [`EscrowError::code`]).
     RecoveryTimelockNotElapsed,
     /// AV-196: [`JurorRegistry::register`](crate::JurorRegistry::register) /
-    /// [`JurorRegistry::unregister`](crate::JurorRegistry::unregister)
+    /// [`JurorRegistry::unregister`](crate::JurorRegistry::unregister) /
+    /// [`JurorRegistry::update_stake`](crate::JurorRegistry::update_stake)
     /// refused — a zero juror key, a zero stake, a duplicate key, a
-    /// full book, or unregistering an unknown key. Never renumbered
+    /// full book, or unregistering / revising an unknown key. Never renumbered
     /// (see [`EscrowError::code`]).
     InvalidJurorRegistry,
     /// AV-196: [`JurorRegistry::draw_panel`](crate::JurorRegistry::draw_panel)
