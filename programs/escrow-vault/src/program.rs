@@ -7318,6 +7318,9 @@ pub enum GovernanceAction {
         amounts: [u64; 8],
         count: u8,
     },
+    /// Revise the arbiter panel's judgment threshold after funding
+    /// (AV-378).
+    AmendPanelThreshold { new_threshold: u8 },
 }
 
 /// Skeleton mirror of `escrow_state::Tier` (AV-335): one amount tier
@@ -10961,6 +10964,9 @@ fn convert_governance_action(
                 .collect();
             escrow_state::GovernanceAction::amend_payout_split_shares_second(&shares)
                 .ok_or_else(|| escrow_error(escrow_state::EscrowError::InvalidPayoutSplit))
+        }
+        GovernanceAction::AmendPanelThreshold { new_threshold } => {
+            Ok(escrow_state::GovernanceAction::AmendPanelThreshold { new_threshold })
         }
     }
 }

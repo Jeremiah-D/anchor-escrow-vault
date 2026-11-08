@@ -5622,9 +5622,9 @@ impl MintAllowlist {
 
 // ---------- AV-158: delayed dual-signed governance ----------
 //
-// The seventeen dual-signed config changes (the four AV-158 actions
-// plus the eleven AV-335 actions and the two AV-336 split-shares
-// halves) can opt in to a two-phase propose → delay → execute/cancel
+// The eighteen dual-signed config changes (the four AV-158 actions
+// plus the eleven AV-335 actions, the two AV-336 split-shares
+// halves, and the one AV-378 action) can opt in to a two-phase propose → delay → execute/cancel
 // propose → delay → execute/cancel protocol via
 // `Escrow::with_governance_delay`. The delay is the anti-flash-
 // governance rule: a malicious threshold change proposed while an
@@ -5648,7 +5648,7 @@ impl MintAllowlist {
 //   AmendSubscriptionPeriodSecs, 11 = AmendDefaultJudgment, 12 =
 //   UpdateSettlementMintAllowlist, 13 = UpdateTieredQuorum, 14 =
 //   UpdateArbiterPanelMembers, 15 = AmendPayoutSplitSharesFirst, 16
-//   = AmendPayoutSplitSharesSecond) +
+//   = AmendPayoutSplitSharesSecond, 17 = AmendPanelThreshold) +
 //   [`GOVERNANCE_ACTION_PAYLOAD_LEN`]-byte payload. Per-kind layout:
 //   kind 0: payload[0..8] = new_threshold LE;
 //   kind 1: payload[0..256] = 8 attestor keys, payload[256..320] =
@@ -5678,6 +5678,7 @@ impl MintAllowlist {
 //   = 8 first-half amounts LE, payload[320] = live count —
 //   exactly one fixed payload (8 * 32 + 8 * 8 + 1 = 321);
 //   kind 16: same layout for the second half (shares[8..16)).
+//   kind 17: payload[0] = new_threshold.
 // - `GovernanceProposal`: the action + 32-byte proposer +
 //   8-byte `proposed_at` + 8-byte `delay_secs` (the configured delay
 //   snapshotted at propose time, so an in-flight proposal keeps its
@@ -5792,6 +5793,11 @@ pub enum GovernanceAction {
         amounts: [u64; MAX_RELEASE_SPLIT_RECIPIENTS],
         count: u8,
     },
+    /// [`Escrow::amend_panel_threshold`] with this threshold
+    /// (AV-378): the post-funding M-of-N retune — the `Funded`
+    /// sibling of the `Uninitialized`-only
+    /// [`Escrow::update_panel_threshold`].
+    AmendPanelThreshold { new_threshold: u8 },
 }
 
 /// Serialized length of a [`GovernanceAction`]'s fixed payload: the
@@ -5863,7 +5869,7 @@ impl GovernanceAction {
     /// AmendSubscriptionPeriodSecs, 11 = AmendDefaultJudgment, 12 =
     /// UpdateSettlementMintAllowlist, 13 = UpdateTieredQuorum, 14 =
     /// UpdateArbiterPanelMembers, 15 = AmendPayoutSplitSharesFirst,
-    /// 16 = AmendPayoutSplitSharesSecond.
+    /// 16 = AmendPayoutSplitSharesSecond, 17 = AmendPanelThreshold.
     pub(crate) fn kind_byte(&self) -> u8 {
         match self {
             GovernanceAction::UpdateQuorum { .. } => 0,
@@ -5883,6 +5889,7 @@ impl GovernanceAction {
             GovernanceAction::UpdateArbiterPanelMembers { .. } => 14,
             GovernanceAction::AmendPayoutSplitSharesFirst { .. } => 15,
             GovernanceAction::AmendPayoutSplitSharesSecond { .. } => 16,
+            GovernanceAction::AmendPanelThreshold { .. } => 17,
         }
     }
 
@@ -6001,6 +6008,9 @@ impl GovernanceAction {
                         .copy_from_slice(&a.to_le_bytes());
                 }
                 out[320] = *count;
+            }
+            GovernanceAction::AmendPanelThreshold { new_threshold } => {
+                out[0] = *new_threshold;
             }
         }
         out
@@ -6198,6 +6208,12 @@ impl GovernanceAction {
                     })
                 }
             }
+            // AV-378: a single threshold byte — the 1..=N range is
+            // enforced by `validate_governance_action` at propose
+            // time (it needs the live panel's N), not here.
+            17 => Some(GovernanceAction::AmendPanelThreshold {
+                new_threshold: payload[0],
+            }),
             _ => None,
         }
     }
@@ -17683,6 +17699,137 @@ let fee = self.charge_protocol_fee(amount)?;
         Ok(())
     }
 
+    /// Retune the arbiter panel's M-of-N judgment threshold after
+    /// funding (AV-378 — Solana dispute arbitration governance):
+    /// the `Funded` sibling of the `Uninitialized`-only
+    /// [`Escrow::update_panel_threshold`]. Both the initializer and
+    /// the taker must authorize the change (dual-signature
+    /// governance, reusing the AV-12 / AV-25 concept), on an escrow
+    /// that is `Funded`.
+    ///
+    /// Why: the threshold is fixed before funding by
+    /// [`Escrow::update_panel_threshold`], but the parties' risk
+    /// appetite can move once funds are locked — a 3-of-3 panel that
+    /// once looked robust may prove too slow to convene once members
+    /// go dark, or a 1-of-3 panel too thin once the escrow's contents
+    /// grow. One party alone cannot reshape the settlement gate:
+    /// lowering M unilaterally would let a minority settle the
+    /// dispute, so the change needs both parties, exactly like
+    /// AV-283's roster revision.
+    ///
+    /// `Funded`-only ([`EscrowError::InvalidStateTransition`]
+    /// otherwise — `Uninitialized` retunes through
+    /// [`Escrow::update_panel_threshold`], and `Disputed` is
+    /// excluded a fortiori: the threshold must be settled before the
+    /// dispute starts, so an in-flight arbitration tallies under
+    /// stable rules). A panel must be configured
+    /// ([`EscrowError::InvalidArbiterPanel`] otherwise — there is no
+    /// threshold to retune on a single-arbiter or arbiter-less
+    /// escrow, and a panel is never installed after funding). The new
+    /// threshold must satisfy `1 <= M <= N`
+    /// ([`EscrowError::InvalidArbiterPanel`] otherwise — the same
+    /// validation as the [`ArbiterPanel::new`] builder, so the update
+    /// can never produce a panel the builder would reject).
+    ///
+    /// Only the threshold moves: the members, the count, the blind
+    /// mode, and the reveal window are carried over verbatim from
+    /// the live panel — the fresh builder value is never stored
+    /// whole, or blind mode would silently reset to plain voting.
+    /// The vote state is untouched too; `Funded`-only means it is
+    /// necessarily zero (a vote can only be cast while `Disputed`,
+    /// see [`Escrow::submit_panel_judgment`] — pinned by test), so
+    /// preserving it is exactly a no-reset. The new M governs from
+    /// the next dispute: `escalate` then
+    /// [`Escrow::submit_panel_judgment`] tallies under the live
+    /// threshold, so lowering M lets a smaller roster settle and
+    /// raising M demands a wider agreement. Retuning to the current
+    /// threshold is an idempotent no-op (paralleling
+    /// [`Escrow::rotate_fee_recipient`]'s no-op rule); the
+    /// [`EscrowEventKind::PanelThresholdChanged`](crate::EscrowEventKind::PanelThresholdChanged)
+    /// indexer event fires only on an actual change.
+    ///
+    /// Check order is deliberate: pause, then the dual authority
+    /// (one party alone — or a stranger pair — learns nothing), then
+    /// the delayed-routing gate, then state, then panel
+    /// configuration, then the threshold value — mirroring
+    /// [`Escrow::update_arbiter_panel_members`]'s check order.
+    pub fn amend_panel_threshold(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_threshold: u8,
+    ) -> Result<(), EscrowError> {
+        // AV-158: the direct entry always takes `via_delayed = false`
+        // — on a delay-opted-in escrow the threshold moves only
+        // through the propose/execute protocol. Thin by design: one
+        // threshold implementation, zero gate drift (see
+        // `update_quorum_impl`).
+        self.amend_panel_threshold_impl(initializer, taker, new_threshold, false)
+    }
+
+    /// The threshold engine behind
+    /// [`Escrow::amend_panel_threshold`]. The `via_delayed`
+    /// parameter carries the AV-158 routing gate: the direct entry
+    /// always passes `false`, so on a delay-opted-in escrow the
+    /// threshold moves only through the two-step propose/execute
+    /// protocol and a direct call is refused — mirroring
+    /// `update_arbiter_panel_members_impl` (AV-283), which likewise
+    /// stages no new proposal variant and simply refuses the direct
+    /// path on delay-opted escrows.
+    fn amend_panel_threshold_impl(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_threshold: u8,
+        via_delayed: bool,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Both parties must sign: either key alone (or a stranger)
+        // is Unauthorized. Independent `==` checks (not `||`): the
+        // degenerate initializer == taker self-escrow authorizes with
+        // one key passed twice, like AV-12's activation.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        // AV-158: the governance-delay routing gate — on a
+        // delay-opted-in escrow the threshold moves only through the
+        // two-step propose/execute protocol, never a direct call
+        // (see `update_quorum_impl` for the placement rationale).
+        if !via_delayed && self.governance_delay_secs != 0 {
+            return Err(EscrowError::GovernanceActionNotProposed);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: only an escrow with a configured panel may
+        // revise a threshold — post-funding installation would add a
+        // settlement mechanism the taker never funded under.
+        let mut panel = self.arbiter_panel.ok_or(EscrowError::InvalidArbiterPanel)?;
+        // The builder's threshold validation, reused: M in 1..=N.
+        // The new value is validated before any write, so a rejected
+        // M leaves the live threshold untouched.
+        if new_threshold == 0 || new_threshold > panel.n {
+            return Err(EscrowError::InvalidArbiterPanel);
+        }
+        // No-op: retuning to the current threshold writes nothing,
+        // so the event layer emits nothing for it.
+        if new_threshold == panel.threshold {
+            return Ok(());
+        }
+        // Only the threshold moves: the members, the count, the
+        // blind mode, and the reveal window are carried over verbatim
+        // from the live panel — the fresh builder value is never
+        // stored whole, or blind mode would silently reset to plain
+        // voting. The vote state is untouched too; `Funded`-only
+        // means it is necessarily zero (pinned by test), so
+        // preserving it is exactly a no-reset.
+        panel.threshold = new_threshold;
+        self.arbiter_panel = Some(panel);
+        Ok(())
+    }
+
     /// Replace the quorum's attestor set by mutual agreement (AV-39 —
     /// Solana quorum governance, AV-45 weighted): both the initializer
     /// and the taker must authorize the change (dual-signature
@@ -26232,9 +26379,9 @@ let fee = self.charge_protocol_fee(claimable)?;
 
     // ---------- AV-158: delayed dual-signed governance ----------
     //
-    // The seventeen dual-signed config changes (the four AV-158
-    // actions plus the eleven AV-335 actions and the two AV-336
-    // split-shares halves) can opt in to a two-phase propose → delay
+    // The eighteen dual-signed config changes (the four AV-158
+    // actions plus the eleven AV-335 actions, the two AV-336
+    // split-shares halves, and the one AV-378 action) can opt in to a two-phase propose → delay
     // two-phase propose → delay → execute/cancel protocol. The delay
     // is the anti-flash-governance rule: a
     // malicious threshold change proposed while an attestor is dark
@@ -26260,8 +26407,8 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// ([`EscrowError::InvalidGovernanceDelay`] otherwise — a zero
     /// window is not a delay; leave the delay off instead). Once
     /// opted in, the dual-signed config changes (the four AV-158
-    /// actions, the eleven AV-335 actions and the two AV-336
-    /// split-shares halves) refuse direct calls with
+    /// actions, the eleven AV-335 actions, the two AV-336
+    /// split-shares halves, and the one AV-378 action) refuse direct calls with
     /// [`EscrowError::GovernanceActionNotProposed`] and move only
     /// through [`Escrow::propose_governance`] /
     /// [`Escrow::execute_governance`] /
@@ -26343,6 +26490,7 @@ let fee = self.charge_protocol_fee(claimable)?;
     ///    AV-335: `AmendFundingStart` is `Uninitialized` /
     ///    `Activated` only, the other ten new actions are
     ///    `Funded`-only; AV-336: the two split-shares halves are
+    ///    `Funded`-only too; AV-378: `AmendPanelThreshold` is
     ///    `Funded`-only too);
     /// 5. the action params validated against the live escrow (the
     ///    same rules the direct call enforces: threshold range, the
@@ -26408,7 +26556,7 @@ let fee = self.charge_protocol_fee(claimable)?;
     ///    proposal is stale; the failure clears nothing and the exit
     ///    is [`Escrow::cancel_governance`]. The check is variant-
     ///    agnostic: it runs before the action `match`, so all
-    ///    seventeen actions (AV-158 + AV-335 + AV-336) share the
+    ///    eighteen actions (AV-158 + AV-335 + AV-336 + AV-378) share the
     ///    same expiry.
     pub fn execute_governance(
         &mut self,
@@ -26631,6 +26779,14 @@ let fee = self.charge_protocol_fee(claimable)?;
                     true,
                 )?;
             }
+            GovernanceAction::AmendPanelThreshold { new_threshold } => {
+                self.amend_panel_threshold_impl(
+                    self.initializer,
+                    self.taker,
+                    new_threshold,
+                    true,
+                )?;
+            }
         }
         self.governance_proposal = None;
         Ok(())
@@ -26665,7 +26821,8 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// actions, plus `Activated` for `rotate_taker`; AV-335:
     /// `AmendFundingStart` is `Uninitialized` / `Activated` only,
     /// the other ten new actions are `Funded`-only; AV-336: the two
-    /// split-shares halves are `Funded`-only too).
+    /// split-shares halves are `Funded`-only too; AV-378:
+    /// `AmendPanelThreshold` is `Funded`-only too).
     fn governance_action_state_ok(&self, action: &GovernanceAction) -> bool {
         match action {
             GovernanceAction::UpdateQuorum { .. }
@@ -26711,7 +26868,11 @@ let fee = self.charge_protocol_fee(claimable)?;
             // post-funding split table and are `Funded`-only,
             // mirroring `amend_payout_split_shares_impl`.
             | GovernanceAction::AmendPayoutSplitSharesFirst { .. }
-            | GovernanceAction::AmendPayoutSplitSharesSecond { .. } => {
+            | GovernanceAction::AmendPayoutSplitSharesSecond { .. }
+            // AV-378: the panel threshold retune revises post-funding
+            // config and is `Funded`-only, mirroring
+            // `amend_panel_threshold_impl`.
+            | GovernanceAction::AmendPanelThreshold { .. } => {
                 matches!(self.state, EscrowState::Funded)
             }
         }
@@ -26955,6 +27116,21 @@ let fee = self.charge_protocol_fee(claimable)?;
                 amounts,
                 count,
             } => self.validate_split_shares_half(false, keys, amounts, *count),
+            GovernanceAction::AmendPanelThreshold { new_threshold } => {
+                // The threshold fit needs the live panel: a panel
+                // must be configured (fail-closed — no installing a
+                // panel after funding) and M must satisfy 1..=N, the
+                // same `ArbiterPanel::new` gate the direct call
+                // reuses.
+                let panel = self
+                    .arbiter_panel
+                    .as_ref()
+                    .ok_or(EscrowError::InvalidArbiterPanel)?;
+                if *new_threshold == 0 || *new_threshold > panel.n {
+                    return Err(EscrowError::InvalidArbiterPanel);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -54788,9 +54964,20 @@ mod governance_delay_tests {
                 "kind {kind} round-trip"
             );
         }
+        // AV-378: kind 17 is the single-byte threshold retune —
+        // appended after the split-shares halves, kinds 0–16 unmoved.
+        let threshold_action = GovernanceAction::AmendPanelThreshold { new_threshold: 1 };
+        assert_eq!(threshold_action.kind_byte(), 17, "kind 17");
+        let payload = threshold_action.encode_payload();
+        assert_eq!(payload[0], 1, "kind 17 payload is the threshold byte");
+        assert_eq!(
+            GovernanceAction::decode(17, &payload),
+            Some(threshold_action),
+            "kind 17 round-trip"
+        );
         // Unknown kinds fail closed.
         let payload = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
-        assert_eq!(GovernanceAction::decode(17, &payload), None);
+        assert_eq!(GovernanceAction::decode(18, &payload), None);
         assert_eq!(GovernanceAction::decode(255, &payload), None);
         // Out-of-range live counts fail closed.
         let mut bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
@@ -54833,7 +55020,7 @@ mod governance_delay_tests {
 
     #[test]
     fn av335_propose_rejects_wrong_state() {
-        // The ten Funded-only actions cannot be staged pre-funding:
+        // The Funded-only actions cannot be staged pre-funding:
         // propose fails fast with 101 and stages nothing.
         let mut e = delay_escrow();
         assert_eq!(
@@ -55189,7 +55376,7 @@ mod governance_delay_tests {
         }
         // Unknown kinds fail closed.
         let payload = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
-        assert_eq!(GovernanceAction::decode(17, &payload), None);
+        assert_eq!(GovernanceAction::decode(18, &payload), None);
         assert_eq!(GovernanceAction::decode(255, &payload), None);
         // Out-of-range live counts fail closed.
         let mut bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
@@ -64490,6 +64677,320 @@ mod panel_threshold_tests {
         full.extend_from_slice(&bytes);
         let decoded = crate::discriminator::decode_vault_account(&full).unwrap();
         assert_eq!(threshold_of(&decoded), 2);
+    }
+}
+
+// ---------- AV-378: post-funding arbiter panel threshold revision ----------
+//
+// The `Funded`-only sibling of `update_panel_threshold` (AV-69):
+// both parties may re-agree the panel's M-of-N after funds land,
+// under the same dual-signature + delayed-routing discipline as
+// AV-283's roster revision.
+mod amend_panel_threshold_tests {
+    use super::*;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const M1: [u8; 32] = [0xC1; 32];
+    const M2: [u8; 32] = [0xC2; 32];
+    const M3: [u8; 32] = [0xC3; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+    const DELAY: u64 = 86_400; // 1 day
+
+    fn funded_panel_escrow(threshold: u8) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], threshold)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    fn panel_of(e: &Escrow) -> ArbiterPanel {
+        e.arbiter_panel().expect("panel configured")
+    }
+
+    #[test]
+    fn lowered_threshold_lets_one_vote_settle() {
+        // 3-of-3 retuned to 1-of-3 after funding: a single vote
+        // settles once the dispute starts — counting continues under
+        // the new M.
+        let mut e = funded_panel_escrow(3);
+        e.amend_panel_threshold(ALICE, BOB, 1).unwrap();
+        assert_eq!(panel_of(&e).threshold, 1);
+        e.escalate(ALICE, T0 + 10, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        let settled = e
+            .submit_panel_judgment(M1, 600_000, T0 + 10, None, None, BOB)
+            .unwrap();
+        assert!(settled.is_some(), "one vote settles at M=1");
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn lowered_threshold_lets_roster_shrink_to_new_m() {
+        // Lowering M first is what unlocks the shrink: a 1-member
+        // roster is below the old M=3, so it is refused until the
+        // threshold moves — then AV-283's roster gate passes.
+        let mut e = funded_panel_escrow(3);
+        assert_eq!(
+            e.update_arbiter_panel_members(ALICE, BOB, &[M1]),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        e.amend_panel_threshold(ALICE, BOB, 1).unwrap();
+        e.update_arbiter_panel_members(ALICE, BOB, &[M1]).unwrap();
+        let panel = panel_of(&e);
+        assert_eq!((panel.n, panel.threshold), (1, 1));
+        assert_eq!(&panel.members[..1], &[M1]);
+    }
+
+    #[test]
+    fn raised_threshold_keeps_old_list_valid() {
+        // 1-of-3 retuned to 3-of-3: the old 3-member list still
+        // satisfies the new M, and two matching votes no longer
+        // settle; the third does.
+        let mut e = funded_panel_escrow(1);
+        e.amend_panel_threshold(ALICE, BOB, 3).unwrap();
+        assert_eq!(&panel_of(&e).members[..3], &[M1, M2, M3]);
+        e.escalate(ALICE, T0 + 10, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert!(e
+            .submit_panel_judgment(M1, 600_000, T0 + 10, None, None, BOB)
+            .unwrap()
+            .is_none());
+        assert!(e
+            .submit_panel_judgment(M2, 600_000, T0 + 10, None, None, BOB)
+            .unwrap()
+            .is_none());
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert!(e
+            .submit_panel_judgment(M3, 600_000, T0 + 10, None, None, BOB)
+            .unwrap()
+            .is_some());
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn wrong_either_party_is_unauthorized_and_live_untouched() {
+        let mut e = funded_panel_escrow(2);
+        assert_eq!(
+            e.amend_panel_threshold(ALICE, MALLORY, 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_panel_threshold(MALLORY, BOB, 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_panel_threshold(MALLORY, MALLORY, 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(panel_of(&e).threshold, 2, "failed call changes nothing");
+        e.amend_panel_threshold(ALICE, BOB, 1).unwrap();
+        assert_eq!(panel_of(&e).threshold, 1);
+    }
+
+    #[test]
+    fn non_funded_states_rejected() {
+        // `Uninitialized` retunes through `update_panel_threshold`;
+        // terminal states never retune.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        assert_eq!(
+            e.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        let mut e = funded_panel_escrow(2);
+        e.release(ALICE, T0 + 10, 1_000_000, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(panel_of(&e).threshold, 2, "failed call changes nothing");
+    }
+
+    #[test]
+    fn disputed_rejected_so_in_flight_rulings_vote_under_stable_rules() {
+        let mut e = funded_panel_escrow(2);
+        e.escalate(ALICE, T0 + 10, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(
+            e.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(panel_of(&e).threshold, 2, "failed call changes nothing");
+    }
+
+    #[test]
+    fn no_panel_is_invalid_arbiter_panel() {
+        // No panel (single arbiter or arbiter-less): nothing to
+        // retune, and no panel is ever installed after funding.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            e.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            e.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+    }
+
+    #[test]
+    fn zero_and_above_n_rejected_with_live_untouched() {
+        // The builder's validation, reused: M in 1..=N.
+        let mut e = funded_panel_escrow(2);
+        assert_eq!(
+            e.amend_panel_threshold(ALICE, BOB, 0),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(
+            e.amend_panel_threshold(ALICE, BOB, 4),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(panel_of(&e).threshold, 2, "failed call changes nothing");
+    }
+
+    #[test]
+    fn same_value_is_an_idempotent_no_op() {
+        let mut e = funded_panel_escrow(2);
+        e.amend_panel_threshold(ALICE, BOB, 2).unwrap();
+        assert_eq!(panel_of(&e).threshold, 2);
+    }
+
+    #[test]
+    fn amend_rewrites_only_the_threshold() {
+        // Members, count, blind mode, and the reveal window survive
+        // the retune — only `threshold` moves.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_blind_panel(&[M1, M2, M3], 2, 3_600)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.amend_panel_threshold(ALICE, BOB, 3).unwrap();
+        let panel = panel_of(&e);
+        assert_eq!(panel.threshold, 3);
+        assert_eq!(panel.n, 3);
+        assert_eq!(&panel.members[..3], &[M1, M2, M3]);
+        assert!(panel.blind, "blind mode survives the retune");
+        assert_eq!(panel.reveal_window_secs, 3_600);
+    }
+
+    #[test]
+    fn funded_vote_state_is_always_zero() {
+        // The safety pin behind the no-reset preserve: `Funded`-only
+        // means no dispute is in flight, and a vote can only be cast
+        // while `Disputed` — so voted / votes / commitments / reveals
+        // are necessarily zero, and the retune preserves exactly
+        // that zero state.
+        let e = funded_panel_escrow(2);
+        let panel = panel_of(&e);
+        assert_eq!(panel.voted, 0);
+        assert_eq!(panel.revealed, 0);
+        assert!(panel.votes.iter().all(|v| v.taker_amount == 0));
+        assert!(panel.commitments.iter().all(|c| *c == [0u8; 32]));
+        assert!(panel.committed_at.iter().all(|t| *t == 0));
+        assert!(panel.commit_disputed_at.iter().all(|t| *t == 0));
+        // And a judgment cannot even be submitted while `Funded`:
+        // `submit_panel_judgment` only accepts `Disputed`.
+        let mut e = funded_panel_escrow(2);
+        assert_eq!(
+            e.submit_panel_judgment(M1, 600_000, T0 + 10, None, None, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // The retune itself preserves the zero state.
+        e.amend_panel_threshold(ALICE, BOB, 1).unwrap();
+        assert_eq!(panel_of(&e).voted, 0);
+        assert_eq!(panel_of(&e).revealed, 0);
+    }
+
+    #[test]
+    fn paused_escrow_rejects_the_amendment() {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.pause(ALICE, None).unwrap();
+        assert_eq!(
+            e.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::Paused)
+        );
+    }
+
+    #[test]
+    fn delayed_routing_gate_propose_then_execute() {
+        // AV-158: on a delay-opted-in escrow the direct call is
+        // refused with `GovernanceActionNotProposed` (code 219) —
+        // the threshold moves only through propose/execute.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let err = e
+            .amend_panel_threshold(ALICE, BOB, 1)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::GovernanceActionNotProposed);
+        assert_eq!(err.code(), 219);
+        assert_eq!(panel_of(&e).threshold, 2, "failed call changes nothing");
+        // The delayed path: propose kind 17, execute once the delay
+        // elapses — the same threshold lands.
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::AmendPanelThreshold { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + DELAY - 1),
+            Err(EscrowError::GovernanceDelayNotElapsed)
+        );
+        assert_eq!(panel_of(&e).threshold, 2, "early execute changes nothing");
+        e.execute_governance(BOB, T0 + DELAY).unwrap();
+        assert_eq!(panel_of(&e).threshold, 1);
+        assert!(e.governance_proposal().is_none());
+        // A bad threshold is refused at propose time (fail fast),
+        // not after the delay.
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::AmendPanelThreshold { new_threshold: 0 },
+                T0 + DELAY,
+            ),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn amend_persists_through_serialization() {
+        // The threshold lives in the persisted panel region — a
+        // decode carries the amended M.
+        let mut e = funded_panel_escrow(3);
+        e.amend_panel_threshold(ALICE, BOB, 2).unwrap();
+        let bytes = super::account_space_tests::encode_escrow(&e);
+        let mut full = crate::discriminator::vault_account_discriminator().to_vec();
+        full.extend_from_slice(&bytes);
+        let decoded = crate::discriminator::decode_vault_account(&full).unwrap();
+        assert_eq!(decoded.arbiter_panel().unwrap().threshold, 2);
     }
 }
 
