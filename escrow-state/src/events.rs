@@ -8836,9 +8836,11 @@ impl IndexedEscrow {
 
     /// Retune the arbiter panel's judgment threshold by dual-signed
     /// governance (mirrors [`Escrow::update_panel_threshold`], AV-69).
-    /// Emits `PanelThresholdChanged` (`from == to == Uninitialized`)
-    /// only on an actual change — retuning to the current threshold is
-    /// an idempotent no-op that emits nothing (paralleling
+    /// Emits `PanelThresholdChanged` (`from == to ==` the current
+    /// state — `Uninitialized` via `update_panel_threshold`, `Funded`
+    /// via [`Escrow::amend_panel_threshold`] (AV-378)) only on an
+    /// actual change — retuning to the current threshold is an
+    /// idempotent no-op that emits nothing (paralleling
     /// `rotate_fee_recipient`'s no-op rule); `at` is the caller-supplied
     /// event timestamp. Cast votes are untouched by the retune.
     pub fn update_panel_threshold(
@@ -8852,6 +8854,44 @@ impl IndexedEscrow {
         let threshold_before = self.inner.arbiter_panel().map(|p| p.threshold);
         self.inner
             .update_panel_threshold(initializer, taker, new_threshold)?;
+        let threshold_after = self.inner.arbiter_panel().map(|p| p.threshold);
+        if threshold_before != threshold_after {
+            self.push_event(
+                EscrowEventKind::PanelThresholdChanged,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    /// Retune the arbiter panel's judgment threshold after funding
+    /// by dual-signed governance (mirrors
+    /// [`Escrow::amend_panel_threshold`], AV-378). Emits
+    /// `PanelThresholdChanged` (`from == to == Funded`) only on an
+    /// actual change — retuning to the current threshold is an
+    /// idempotent no-op that emits nothing; `at` is the
+    /// caller-supplied event timestamp. Members, blind mode, the
+    /// reveal window, and the (necessarily zero) vote state are
+    /// untouched by the retune.
+    pub fn amend_panel_threshold(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        new_threshold: u8,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let from = self.inner.state();
+        let threshold_before = self.inner.arbiter_panel().map(|p| p.threshold);
+        self.inner
+            .amend_panel_threshold(initializer, taker, new_threshold)?;
         let threshold_after = self.inner.arbiter_panel().map(|p| p.threshold);
         if threshold_before != threshold_after {
             self.push_event(
@@ -15908,6 +15948,57 @@ mod event_tests {
         let before = e.event_count();
         assert_eq!(
             e.update_panel_threshold(ALICE, MALLORY, 1, T0 + 1)
+                .unwrap_err(),
+            EscrowError::Unauthorized
+        );
+        assert_eq!(e.event_count(), before, "failed call emits nothing");
+    }
+
+    // ---------- AV-378: PanelThresholdChanged events (Funded) ----------
+    //
+    // The same event kind, from the post-funding retune: `from == to
+    // == Funded` here, `Uninitialized` for the AV-69 pre-funding
+    // retune — the event is the ordering signal, the vault carries
+    // the new M either way.
+
+    fn funded_panel_indexed(threshold: u8) -> IndexedEscrow {
+        let mut e = panel_indexed(threshold);
+        e.fund(ALICE, T0 + 1).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_panel_threshold_changed_emits_event_on_change() {
+        let mut e = funded_panel_indexed(3);
+        let before = e.event_count();
+        e.amend_panel_threshold(ALICE, BOB, 2, T0 + 1).unwrap();
+        assert_eq!(e.event_count(), before + 1, "one event on change");
+        let ev = e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::PanelThresholdChanged);
+        assert_eq!(ev.from, EscrowState::Funded);
+        assert_eq!(ev.to, EscrowState::Funded);
+        assert_eq!(ev.amounts, EventAmounts::none(), "moves no funds");
+        assert_eq!(
+            e.inner().arbiter_panel().unwrap().threshold,
+            2,
+            "vault carries the amended M"
+        );
+    }
+
+    #[test]
+    fn amend_panel_threshold_no_op_emits_nothing() {
+        let mut e = funded_panel_indexed(2);
+        let before = e.event_count();
+        e.amend_panel_threshold(ALICE, BOB, 2, T0 + 1).unwrap();
+        assert_eq!(e.event_count(), before, "no-op amend emits nothing");
+    }
+
+    #[test]
+    fn amend_panel_threshold_unauthorized_emits_nothing() {
+        let mut e = funded_panel_indexed(2);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_panel_threshold(ALICE, MALLORY, 1, T0 + 1)
                 .unwrap_err(),
             EscrowError::Unauthorized
         );

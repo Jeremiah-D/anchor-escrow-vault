@@ -458,7 +458,8 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
         // = UpdateSettlementMintAllowlist, 13 = UpdateTieredQuorum,
         // 14 = UpdateArbiterPanelMembers, 15 =
         // AmendPayoutSplitSharesFirst, 16 =
-        // AmendPayoutSplitSharesSecond; the 321-byte payload
+        // AmendPayoutSplitSharesSecond, 17 = AmendPanelThreshold
+        // (AV-378); the 321-byte payload
         // carries the kind's params at fixed offsets, zero-padded
         // (kind 0: payload[0..8] = new_threshold LE; kind 1:
         // payload[0..256] = 8 attestor keys, payload[256..320] = 8
@@ -480,7 +481,7 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
         // payload[256] = live count; kind 15: payload[0..256] = 8
         // first-half keys, payload[256..320] = 8 first-half amounts
         // LE, payload[320] = live count; kind 16: same layout for
-        // the second half).
+        // the second half; kind 17: payload[0] = new_threshold).
         "GovernanceAction" => vec![
             ("kind", IdlType::U8),
             ("payload", IdlType::Array(ArrayElem::U8, 321)),

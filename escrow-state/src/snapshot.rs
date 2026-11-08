@@ -1292,6 +1292,11 @@ fn write_governance_action(s: &mut String, action: &GovernanceAction) {
             }
             s.push_str("]}");
         }
+        GovernanceAction::AmendPanelThreshold { new_threshold } => {
+            s.push_str("{\"kind\":\"amend_panel_threshold\",\"new_threshold\":");
+            s.push_str(&new_threshold.to_string());
+            s.push('}');
+        }
     }
 }
 
