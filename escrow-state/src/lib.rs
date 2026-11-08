@@ -1506,7 +1506,9 @@ pub struct Escrow {
     /// native-SOL escrow, or a vault created before this metadata
     /// existed — amounts render as bare integers (backward compatible).
     /// Set once via [`Escrow::with_decimals`] on an `Uninitialized`
-    /// escrow, like the other `with_*` builders. Persisted (1 byte in
+    /// escrow, like the other `with_*` builders. Revisable after
+    /// funding via [`Escrow::amend_decimals`] (AV-376, `Funded`-only,
+    /// dual-signed). Persisted (1 byte in
     /// the vault account) so the precision survives serialization.
     /// Appended last so every earlier field offset stays stable.
     ///
@@ -29212,7 +29214,8 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// Opt in to token decimal metadata (AV-28). Builder-style: only
     /// valid on an `Uninitialized` escrow, so the precision is fixed
     /// before any funds move — mirroring [`Escrow::with_timelock`] and
-    /// the other `with_*` builders. `decimals` is the SPL mint's decimal
+    /// the other `with_*` builders. Post-funding revision is
+    /// [`Escrow::amend_decimals`] (AV-376). `decimals` is the SPL mint's decimal
     /// places (SPL mints declare at most 9); anything above 18 is
     /// [`EscrowError::InvalidDecimals`]. `decimals == 0` is a valid
     /// no-op meaning "no decimal metadata" (the default — native-SOL
@@ -29252,6 +29255,88 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// See [`format_amount`] for the formatting rules.
     pub fn display_amount(&self) -> String {
         format_amount(self.amount, self.decimals)
+    }
+
+    /// Revise the token decimal metadata after funding (AV-376 —
+    /// Solana / payment fintech): the initializer and the taker may
+    /// jointly correct a precision recorded wrong at build time — a
+    /// 6-decimal mint recorded as 9 makes every displayed amount
+    /// wrong by 1000×, in the keeper report and the AV-26 snapshot
+    /// export as well as [`Escrow::display_amount`] — without
+    /// cancelling and rebuilding the escrow (which would drop the
+    /// locked funds and all governance configuration).
+    ///
+    /// Check order mirrors [`Escrow::amend_protocol_fee`] (AV-233):
+    /// pause, then dual-signature authority (both parties must
+    /// authorize — one party alone cannot rewrite the precision the
+    /// other's payouts are displayed under), then `Funded` state,
+    /// then the value gate. Validation completes before any write,
+    /// so a failed amendment leaves the precision untouched
+    /// (fail-closed, zero-write):
+    ///
+    /// - a paused escrow fails fast ([`EscrowError::Paused`]);
+    /// - `initializer` + `taker` must both match the escrow, else
+    ///   [`EscrowError::Unauthorized`];
+    /// - `state == Funded`, else
+    ///   [`EscrowError::InvalidStateTransition`] (the builder owns
+    ///   initial configuration on `Uninitialized`; terminal states
+    ///   have no display left to correct);
+    /// - `decimals > 18` is [`EscrowError::InvalidDecimals`],
+    ///   reusing [`Escrow::with_decimals`]'s gate. `decimals == 0`
+    ///   is allowed: it clears the metadata back to "undeclared",
+    ///   the same convention as `with_decimals`.
+    ///
+    /// Re-affirming the current precision is `Ok(())` and changes
+    /// nothing. Only the `decimals` byte moves — `amount`,
+    /// `released`, `fees_paid`, and `state` are untouched, and
+    /// [`Escrow::display_amount`] renders under the new precision
+    /// from the revision onward; amounts already displayed in past
+    /// reports or snapshots are history and are never rewritten.
+    ///
+    /// CPI note (verified this round, AV-166): the "metadata never
+    /// moves funds" claim holds for the amounts — the revision never
+    /// rescales a base-unit amount — but the AV-166
+    /// `TransferChecked` path *does* read the live precision: the
+    /// settlement builder dispatches Token-2022 mints to
+    /// `token_transfer_checked(..., escrow.decimals())`, so a
+    /// revision changes the decimals asserted by later Token-2022
+    /// settlements (the token program verifies the asserted
+    /// decimals against the mint on-chain, so a precision that
+    /// mismatches the real mint fails the transaction instead of
+    /// moving a mis-scaled amount). The SPL Token plain-`Transfer`
+    /// path asserts no decimals and is unaffected. Orthogonal to
+    /// [`Escrow::with_decimals`] (AV-28, the `Uninitialized`-only
+    /// initial set — this is the `Funded`-only revision path), to
+    /// AV-166's `TransferChecked` assembly (that builds the
+    /// instruction, this revises the metadata it asserts), and to
+    /// AV-233's [`Escrow::amend_protocol_fee`] (same amend shape,
+    /// different field). No new Anchor instruction: pure logic
+    /// layer, like the other `amend_*` revisions.
+    pub fn amend_decimals(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        decimals: u8,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_protocol_fee`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        if decimals > 18 {
+            return Err(EscrowError::InvalidDecimals);
+        }
+        if decimals == self.decimals {
+            return Ok(());
+        }
+        self.decimals = decimals;
+        Ok(())
     }
 
     /// The whitelisted refund address configured via
@@ -40910,6 +40995,154 @@ pub(crate) mod anchor_idl_tests {
             .unwrap();
         assert_eq!(e.decimals(), 0);
         assert_eq!(e.display_amount(), "1000000");
+    }
+
+    // AV-376: amend_decimals.
+
+    fn funded_decimals_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn amend_decimals_rerenders_display_amount() {
+        let mut e = funded_decimals_escrow();
+        assert_eq!(e.display_amount(), "1.000000");
+        e.amend_decimals(ALICE, BOB, 9).unwrap();
+        assert_eq!(e.decimals(), 9);
+        assert_eq!(e.display_amount(), "0.001000000");
+        // Only the precision moved: the locked amount, the released
+        // total, and the state are untouched.
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_decimals_rejects_wrong_party() {
+        let mut e = funded_decimals_escrow();
+        // One party alone cannot rewrite the precision the other's
+        // payouts are displayed under.
+        assert_eq!(
+            e.amend_decimals(ALICE, MALLORY, 9),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_decimals(MALLORY, BOB, 9),
+            Err(EscrowError::Unauthorized)
+        );
+        // Every refusal leaves the precision untouched.
+        assert_eq!(e.decimals(), 6);
+        assert_eq!(e.display_amount(), "1.000000");
+    }
+
+    #[test]
+    fn amend_decimals_rejects_non_funded_states() {
+        // Uninitialized: the builder owns initial configuration.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        assert_eq!(
+            bare.amend_decimals(ALICE, BOB, 9),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.decimals(), 6);
+        // Released: terminal, no display left to correct.
+        let mut e = funded_decimals_escrow();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.amend_decimals(ALICE, BOB, 9),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.decimals(), 6);
+    }
+
+    #[test]
+    fn amend_decimals_rejects_over_ceiling() {
+        let mut e = funded_decimals_escrow();
+        // Beyond the 18-decimal ceiling, reusing with_decimals' gate.
+        assert_eq!(
+            e.amend_decimals(ALICE, BOB, 19),
+            Err(EscrowError::InvalidDecimals)
+        );
+        assert_eq!(e.decimals(), 6);
+        assert_eq!(e.display_amount(), "1.000000");
+    }
+
+    #[test]
+    fn amend_decimals_rejects_paused() {
+        // The pause guard fires before the authority and state gates.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_decimals(6)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause(ALICE, None).unwrap();
+        assert_eq!(
+            e.amend_decimals(ALICE, BOB, 9),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(e.decimals(), 6);
+    }
+
+    #[test]
+    fn amend_decimals_equal_value_is_noop() {
+        let mut e = funded_decimals_escrow();
+        assert!(e.amend_decimals(ALICE, BOB, 6).is_ok());
+        assert_eq!(e.decimals(), 6);
+        assert_eq!(e.display_amount(), "1.000000");
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_decimals_zero_clears_to_bare_integer() {
+        let mut e = funded_decimals_escrow();
+        // 0 clears the metadata back to "undeclared", the same
+        // convention as with_decimals.
+        e.amend_decimals(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.decimals(), 0);
+        assert_eq!(e.display_amount(), "1000000");
+        // And a cleared escrow can declare a precision again.
+        e.amend_decimals(ALICE, BOB, 9).unwrap();
+        assert_eq!(e.decimals(), 9);
+        assert_eq!(e.display_amount(), "0.001000000");
+    }
+
+    #[test]
+    fn amend_decimals_failed_calls_leave_no_state_change() {
+        // Every failure mode on one escrow, then a single intact check.
+        let mut e = funded_decimals_escrow();
+        assert_eq!(
+            e.amend_decimals(MALLORY, BOB, 9),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_decimals(ALICE, BOB, 19),
+            Err(EscrowError::InvalidDecimals)
+        );
+        assert_eq!(e.decimals(), 6);
+        assert_eq!(e.display_amount(), "1.000000");
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        // And the escrow is still fully usable afterwards: the
+        // precision revises, then the full amount releases.
+        e.amend_decimals(ALICE, BOB, 9).unwrap();
+        e.release(ALICE, 1_750_000_000, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
     }
 
     #[test]

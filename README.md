@@ -524,6 +524,17 @@ transition and never moves funds: it only renders human-readable amounts —
 `"1.000000"`), the keeper report's per-action `display_amount`, and the
 state snapshot's `decimals` / `display_*` fields. Raw fields stay untouched,
 so indexers keep diffing numbers while payment operators read whole tokens.
+A precision recorded wrong at build time can be corrected after funding via
+`Escrow::amend_decimals(initializer, taker, decimals)` (AV-376, `Funded`-
+only, both parties must sign, paused escrows fail fast with `Paused`, code
+124; `> 18` is still `InvalidDecimals`; `0` clears back to "undeclared";
+re-affirming the current precision is a no-op) — `display_amount` renders
+under the new precision from the revision onward, while amounts already
+displayed in past reports stay as history. One verified caveat: the
+revision never rescales a base-unit amount, but the AV-166 `TransferChecked`
+path reads the live precision, so later Token-2022 settlements assert the
+new decimals against the mint on-chain (the SPL Token plain-`Transfer` path
+asserts no decimals and is unaffected).
 
 **Partial release (staged payouts).** `release(authority, now, amount)` releases
 in tranches: each call adds to a cumulative `released` counter and leaves
