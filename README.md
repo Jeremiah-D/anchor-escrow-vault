@@ -7249,6 +7249,15 @@ program scope).
   old key loses `pause`/`unpause` rights immediately. Honest limit: a
   lost pauser key cannot be rotated (rotation must be signed by the
   current pauser); rescuing one needs a separate governance path.
+- **The program entry point (AV-373)**: `rotate_pauser_program(new_pauser)`
+  wires the AV-355 pure-logic rotation to the chain — same authority
+  then config check order (`InvalidPauser`, code 224, for a stranger
+  or a zero key), same idempotent no-op on the already-bound key, and
+  the same `PauserRotated` audit entry (actor: the old pauser) and
+  program event. It works while the breaker is engaged, like the
+  pure-logic rotation. The handler still calls the `read_breaker` /
+  `write_breaker` skeleton stubs, exactly like `pause_program` /
+  `unpause_program`.
 - **The halt**: `require_running()` is the guard the program calls at
   the top of every state-changing instruction handler except
   `unpause_program` and `close_vault` (rent reclamation must stay
@@ -7259,9 +7268,11 @@ program scope).
   and the timestamp) to a bounded 32-entry ring — the program-level
   event log, oldest evicts first. A pauser rotation (AV-355) appends a
   `PauserRotated` entry the same way.
-- **Anchor surface**: `pause_program` / `unpause_program` instructions
+- **Anchor surface**: `pause_program` / `unpause_program` /
+  `rotate_pauser_program` instructions
   (IDL discriminators `sha256("global:pause_program")[..8]` /
-  `sha256("global:unpause_program")[..8]`, pinned by the IDL pipeline),
+  `sha256("global:unpause_program")[..8]` /
+  `sha256("global:rotate_pauser_program")[..8]`, pinned by the IDL pipeline),
   the `CircuitBreaker` on-chain account mirror, and the four new error
   codes (221–224) mapped one-per-variant in the skeleton's `ErrorCode`
   enum. Adding instructions + errors is non-breaking under the AV-152

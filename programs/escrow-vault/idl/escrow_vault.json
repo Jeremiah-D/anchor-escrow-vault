@@ -1198,6 +1198,14 @@
       "args": []
     },
     {
+      "name": "rotate_pauser_program",
+      "discriminator": [78, 138, 233, 204, 18, 51, 195, 168],
+      "accounts": [],
+      "args": [
+        {"name": "new_pauser", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "withdraw_protocol_fees",
       "discriminator": [11, 68, 165, 98, 18, 208, 134, 73],
       "accounts": [],

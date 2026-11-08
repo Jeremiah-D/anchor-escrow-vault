@@ -39904,6 +39904,23 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "authority <- accounts.pauser (signer) — the bound pauser only (InvalidPauser, code 224, otherwise); `now` <- clock sysvar (never an instruction param); full check sequence — pauser authority (InvalidPauser) -> toggle (ProgramNotPaused, code 223, when the breaker is not engaged); releases the program halt; appends a ProgramResumed audit entry (actor + timestamp) to the breaker's bounded ring; emits the ProgramResumed program event",
         },
         InstructionSpec {
+            // AV-373: the program-level entry point for the AV-355
+            // pure-logic pauser rotation — the chain can now execute
+            // what was previously an off-chain-only call. IDL:
+            // discriminator = sha256("global:rotate_pauser_program")[..8]
+            // = [78, 138, 233, 204, 18, 51, 195, 168] — the Anchor
+            // instruction discriminator for the rotate_pauser_program
+            // handler (pinned by the discriminator test below).
+            name: "rotate_pauser_program",
+            params: &[(
+                "new_pauser",
+                "Pubkey",
+                "instruction param; the replacement program-level pauser — the old key loses pause/unpause rights immediately",
+            )],
+            method: "ProgramCircuitBreaker::rotate_pauser",
+            input_mapping: "caller <- accounts.pauser (signer) — the bound pauser only (a stranger is InvalidPauser, code 224; the pauser is an independent program-level role, not any escrow's initializer or taker); new_pauser <- instruction param (Pubkey -> [u8; 32] conversion); `now` <- clock sysvar (never an instruction param); full check sequence — pauser authority (InvalidPauser) -> zero new_pauser (InvalidPauser, code 224); rotating to the already-bound key is an Ok(()) no-op that writes no audit entry; deliberately NOT gated by the paused state — rotation works while the breaker is engaged, the key-loss escape hatch (rotate, then unpause_program with the fresh key); swaps the 32-byte pauser in place and appends a PauserRotated audit entry (actor: the old pauser, i.e. the caller) to the breaker's bounded 32-entry ring; emits the PauserRotated program event",
+        },
+        InstructionSpec {
             name: "withdraw_protocol_fees",
             params: &[(
                 "amount",
@@ -40343,6 +40360,9 @@ pub(crate) mod anchor_idl_tests {
             // structured pause/resume audit).
             "ProgramCircuitBreaker::pause",
             "ProgramCircuitBreaker::unpause",
+            // AV-373: the program-level pauser-rotation entry point
+            // (the AV-355 pure-logic rotation wired to the chain).
+            "ProgramCircuitBreaker::rotate_pauser",
             // AV-174: protocol-fee extraction to the protocol side
             // (the accumulated AV-17 fee; the pinned fee recipient or
             // the initializer calls, the destination is the pinned
@@ -40597,6 +40617,9 @@ pub(crate) mod anchor_idl_tests {
                 &"release_many",
                 // AV-174: the protocol-fee extraction amount (u64) —
                 // bounded by fees_paid - fees_withdrawn.
+                // AV-373: the pauser-rotation target (Pubkey) — the
+                // replacement program-level pauser.
+                &"rotate_pauser_program",
                 &"withdraw_protocol_fees",
                 // AV-191: the referrer opt-in carries the referrer key
                 // (Pubkey) + the revenue-share rate (u16, bps).
@@ -42200,6 +42223,12 @@ pub(crate) mod anchor_idl_tests {
         // in) and never persisted — only the replacement key itself
         // persists, into `quorum.attestors` (see PARAM_FIELD_MAP).
         ("replace_attestor", "slot"),
+        // AV-373: the replacement pauser persists into the
+        // `CircuitBreaker` account's `pauser` field — a separate
+        // program-level account, never a field of the vault this
+        // table pins (the split_escrow precedent: params that birth
+        // state in another account are transient here).
+        ("rotate_pauser_program", "new_pauser"),
     ];
     const PARAM_FIELD_MAP: &[(&str, &str, &str)] = &[
         ("initialize", "amount", "amount"),
@@ -69023,6 +69052,17 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("rotate_arbiter"),
             [0xf9, 0x51, 0xa1, 0x8c, 0x56, 0x3c, 0x62, 0x44]
+        );
+    }
+
+    #[test]
+    fn rotate_pauser_program_instruction_discriminator_is_pinned() {
+        // AV-373. IDL: sha256("global:rotate_pauser_program")[..8] —
+        // the Anchor instruction discriminator, pinned here and in the
+        // generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("rotate_pauser_program"),
+            [78, 138, 233, 204, 18, 51, 195, 168]
         );
     }
 

@@ -4701,6 +4701,33 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate the program-level pauser (AV-373; mirrors
+    /// `ProgramCircuitBreaker::rotate_pauser`). Only the current
+    /// pauser may call this (`InvalidPauser`, code 224, otherwise);
+    /// the zero key is rejected (same error). Rotating to the
+    /// already-bound key is an idempotent no-op. Deliberately NOT
+    /// gated by the halt itself — rotation must work while the
+    /// breaker is engaged (rotate, then `unpause_program` with the
+    /// fresh key). Emits the `PauserRotated` program event.
+    pub fn rotate_pauser_program(
+        ctx: Context<RotatePauserProgram>,
+        new_pauser: Pubkey,
+    ) -> Result<()> {
+        let mut breaker = read_breaker(&ctx.accounts.circuit_breaker);
+        let now = Clock::get()?.unix_timestamp as u64;
+        breaker
+            .rotate_pauser(
+                ctx.accounts.pauser.key().to_bytes(),
+                new_pauser.to_bytes(),
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_breaker(&mut ctx.accounts.circuit_breaker, &breaker);
+        // The real build `emit!`s the PauserRotated program event here
+        // (the audit entry's actor + timestamp).
+        Ok(())
+    }
+
     /// Extract accumulated protocol fees to the protocol side (AV-174;
     /// mirrors `Escrow::withdraw_protocol_fees`). The caller must be the
     /// pinned fee_recipient or the initializer. The destination is the
@@ -10065,6 +10092,18 @@ pub struct UnpauseProgram<'info> {
 }
 
 #[derive(Accounts)]
+pub struct RotatePauserProgram<'info> {
+    #[account(mut)]
+    pub circuit_breaker: Account<'info, CircuitBreaker>,
+    /// The bound pauser (same rules as `PauseProgram`); the state
+    /// machine checks it against the program-level pauser role
+    /// (`InvalidPauser`, code 224, for anyone else). The replacement
+    /// pauser rides the `new_pauser` instruction param, not an
+    /// account.
+    pub pauser: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct WithdrawProtocolFees<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
@@ -11838,7 +11877,7 @@ pub enum ErrorCode {
     ProgramAlreadyPaused,
     #[msg("Program not paused (AV-163): unpause_program on a running program (ProgramNotPaused, code 223)")]
     ProgramNotPaused,
-    #[msg("Invalid pauser (AV-163): pause_program / unpause_program by a non-pauser key, or a zero pauser key (InvalidPauser, code 224)")]
+    #[msg("Invalid pauser (AV-163): pause_program / unpause_program / rotate_pauser_program by a non-pauser key, or a zero pauser key (InvalidPauser, code 224)")]
     InvalidPauser,
     // AV-164: the fee-sponsorship policy/budget errors (codes 225-230).
     #[msg("Invalid sponsor policy (AV-164): empty or over-long sponsor allowlist, zero sponsor key, duplicate key, or inverted effective window (InvalidSponsorPolicy, code 225)")]
