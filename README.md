@@ -7164,7 +7164,12 @@ operator picks the executable path. Thresholds are
 caller-configurable via `WatchtowerConfig` with conservative
 defaults (3-day expiry warning / 12-hour critical, 7-day
 arbitration-pending, 14-day rent-unclaimed); `validate()` fail-fasts
-on nonsense before any alert is evaluated. `WatchtowerReport::to_json()`
+on nonsense before any alert is evaluated. `WatchtowerConfig::amend_config`
+revises the four thresholds live — an invalid config is refused with
+the live config untouched, amending to the config already in force is
+a no-op — so a keeper loop holding one config can retune alert
+sensitivity without rebuilding it; the new thresholds govern the next
+scan, and already-emitted alerts are never retracted. `WatchtowerReport::to_json()`
 renders hand-serialized deterministic JSON — alerts sorted by (kind,
 `escrow_id`) — so two scans of the same watch list at the same `now`
 are byte-identical. Dry-run by construction: pure reads, no events,

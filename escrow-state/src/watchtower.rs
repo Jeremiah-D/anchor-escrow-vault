@@ -128,6 +128,31 @@ impl WatchtowerConfig {
         }
         Ok(())
     }
+
+    /// Revise the watchtower's alert thresholds live (AV-379). The
+    /// new config is validated first — an invalid config leaves the
+    /// live one exactly as it was. Amending to the config already in
+    /// force is a no-op returning `Ok(false)`. Any other valid config
+    /// replaces the whole package and returns `Ok(true)`; the new
+    /// thresholds govern the next [`scan_watchtower`] — every scan
+    /// reads the config it is handed — and already-emitted alerts are
+    /// history, never retracted: widening does not re-issue an alert
+    /// that already fired, tightening does not revoke one.
+    ///
+    /// Only the four thresholds move: the watchtower holds no
+    /// per-escrow state (the scan is a pure function over the indexed
+    /// snapshots), so there is nothing else to carry over. No audit
+    /// event is recorded for a config revision, following AV-316
+    /// ([`HeartbeatRegistry::amend_config`]): the revision is pinned
+    /// by tests, not by an audit ring.
+    pub fn amend_config(&mut self, new_config: WatchtowerConfig) -> Result<bool, WatchtowerConfigError> {
+        new_config.validate()?;
+        if *self == new_config {
+            return Ok(false);
+        }
+        *self = new_config;
+        Ok(true)
+    }
 }
 
 /// Which fleet-health condition a [`WatchtowerAlert`] reports.
@@ -647,5 +672,144 @@ mod watchtower_tests {
         assert!(json.contains("\"terminal_at\":null,\"seconds_since_terminal\":null"));
         assert!(json.contains("\"rent_lamports\":null"));
         assert!(json.contains("\"remedy\":\"extend_expiry\""));
+    }
+
+    #[test]
+    fn amend_config_rejects_all_invalid_variants_and_changes_nothing() {
+        // Each of the five validation variants refuses and the live
+        // config stays exactly as it was.
+        let mut cfg = config();
+        let mut bad = config();
+        bad.expiry_warning_secs = 0;
+        assert_eq!(
+            cfg.amend_config(bad),
+            Err(WatchtowerConfigError::ZeroExpiryWarning)
+        );
+        assert_eq!(cfg, config());
+        let mut bad = config();
+        bad.expiry_critical_secs = 0;
+        assert_eq!(
+            cfg.amend_config(bad),
+            Err(WatchtowerConfigError::ZeroExpiryCritical)
+        );
+        assert_eq!(cfg, config());
+        let mut bad = config();
+        bad.expiry_critical_secs = bad.expiry_warning_secs;
+        assert_eq!(
+            cfg.amend_config(bad),
+            Err(WatchtowerConfigError::CriticalNotInsideWarning)
+        );
+        assert_eq!(cfg, config());
+        let mut bad = config();
+        bad.arbitration_pending_secs = 0;
+        assert_eq!(
+            cfg.amend_config(bad),
+            Err(WatchtowerConfigError::ZeroArbitrationPending)
+        );
+        assert_eq!(cfg, config());
+        let mut bad = config();
+        bad.rent_unclaimed_secs = 0;
+        assert_eq!(
+            cfg.amend_config(bad),
+            Err(WatchtowerConfigError::ZeroRentUnclaimed)
+        );
+        assert_eq!(cfg, config());
+    }
+
+    #[test]
+    fn amend_config_same_value_is_a_noop() {
+        let mut cfg = config();
+        assert_eq!(cfg.amend_config(config()), Ok(false));
+        assert_eq!(cfg, config());
+    }
+
+    #[test]
+    fn amend_config_replaces_config_and_returns_true() {
+        let mut cfg = config();
+        let mut wide = config();
+        wide.expiry_warning_secs = 7 * DAY;
+        wide.arbitration_pending_secs = 10 * DAY;
+        assert_eq!(cfg.amend_config(wide), Ok(true));
+        assert_eq!(cfg, wide);
+    }
+
+    #[test]
+    fn amend_config_widening_warning_window_surfaces_new_expiry_soon() {
+        // Deadline 5 days out: outside the 3-day default warning, so
+        // the fleet looks healthy — until the operator widens the
+        // window to 7 days.
+        let vault = with_id(funded(NOW + 5 * DAY, NOW - DAY), id(0x01));
+        let mut cfg = config();
+        assert!(scan_watchtower(&[vault.clone()], NOW, &cfg).unwrap().is_empty());
+        let mut wide = config();
+        wide.expiry_warning_secs = 7 * DAY;
+        assert_eq!(cfg.amend_config(wide), Ok(true));
+        let report = scan_watchtower(&[vault], NOW, &cfg).unwrap();
+        assert_eq!(report.alerts.len(), 1);
+        assert_eq!(report.alerts[0].kind, WatchtowerAlertKind::ExpirySoon);
+        assert_eq!(report.alerts[0].severity, "warning");
+        assert_eq!(report.alerts[0].seconds_left, Some(5 * DAY));
+    }
+
+    #[test]
+    fn amend_config_narrowing_critical_downgrades_severity() {
+        // Deadline 1 hour out: critical inside the 12-hour default —
+        // until the operator narrows the critical tier to 30 minutes.
+        let vault = with_id(funded(NOW + 3600, NOW - DAY), id(0x01));
+        let mut cfg = config();
+        let report = scan_watchtower(&[vault.clone()], NOW, &cfg).unwrap();
+        assert_eq!(report.alerts[0].severity, "critical");
+        let mut narrow = config();
+        narrow.expiry_critical_secs = 1800;
+        assert_eq!(cfg.amend_config(narrow), Ok(true));
+        let report = scan_watchtower(&[vault], NOW, &cfg).unwrap();
+        assert_eq!(report.alerts.len(), 1);
+        assert_eq!(report.alerts[0].kind, WatchtowerAlertKind::ExpirySoon);
+        assert_eq!(report.alerts[0].severity, "warning");
+    }
+
+    #[test]
+    fn amend_config_widening_arbitration_pending_drops_stale_dispute() {
+        // Dispute filed 8 days ago: past the 7-day default — until
+        // the operator widens the pending window to 10 days.
+        let ix = disputed(id(0x01), NOW - 8 * DAY);
+        let mut cfg = config();
+        assert_eq!(scan_watchtower(&[ix.clone()], NOW, &cfg).unwrap().alerts.len(), 1);
+        let mut wide = config();
+        wide.arbitration_pending_secs = 10 * DAY;
+        assert_eq!(cfg.amend_config(wide), Ok(true));
+        assert!(scan_watchtower(&[ix], NOW, &cfg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn amend_config_widening_rent_unclaimed_drops_idle_rent() {
+        // Released 20 days ago: past the 14-day default — until the
+        // operator widens the unclaimed window to 30 days.
+        let mut ix = IndexedEscrow::initialize(ALICE, BOB, AMOUNT, NOW + 30 * DAY, id(0x01), NOW - 30 * DAY)
+            .unwrap();
+        ix.fund(ALICE, NOW - 30 * DAY).unwrap();
+        ix.release(ALICE, AMOUNT, None, BOB, NOW - 20 * DAY).unwrap();
+        let mut cfg = config();
+        assert_eq!(scan_watchtower(&[ix.clone()], NOW, &cfg).unwrap().alerts.len(), 1);
+        let mut wide = config();
+        wide.rent_unclaimed_secs = 30 * DAY;
+        assert_eq!(cfg.amend_config(wide), Ok(true));
+        assert!(scan_watchtower(&[ix], NOW, &cfg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn amend_config_round_trip_applies_both_ways() {
+        // Widen, then tighten back to the default: the scan follows
+        // each revision, and re-amending to the live config is a
+        // no-op.
+        let vault = with_id(funded(NOW + 5 * DAY, NOW - DAY), id(0x01));
+        let mut cfg = config();
+        let mut wide = config();
+        wide.expiry_warning_secs = 7 * DAY;
+        assert_eq!(cfg.amend_config(wide), Ok(true));
+        assert_eq!(scan_watchtower(&[vault.clone()], NOW, &cfg).unwrap().alerts.len(), 1);
+        assert_eq!(cfg.amend_config(config()), Ok(true));
+        assert!(scan_watchtower(&[vault.clone()], NOW, &cfg).unwrap().is_empty());
+        assert_eq!(cfg.amend_config(config()), Ok(false));
     }
 }
