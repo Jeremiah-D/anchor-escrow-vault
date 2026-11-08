@@ -26072,6 +26072,79 @@ let fee = self.charge_protocol_fee(claimable)?;
         self.reference
     }
 
+    /// Revise the off-chain reference memo after funding (AV-377 —
+    /// payments fintech): the initializer and the taker may jointly
+    /// correct a correlation id recorded wrong at build time — an
+    /// order id typo or an invoice hash pasted from the wrong
+    /// record — without cancelling and rebuilding the escrow (which
+    /// would drop the locked funds and all governance
+    /// configuration). The post-funding counterpart to
+    /// [`Escrow::with_reference`] (`Uninitialized`-only initial
+    /// configuration).
+    ///
+    /// Check order mirrors [`Escrow::amend_referrer`] (AV-256):
+    /// pause, then dual-signature authority (both parties must
+    /// authorize — one party alone cannot re-point the off-chain
+    /// record the other's settlement reconciles against), then
+    /// `Funded` state. Any 32 bytes are accepted — there is
+    /// nothing to validate, because the field is read-only
+    /// pass-through (no check gate reads it, no transition clears
+    /// or rewrites it), so no error is returned and no new
+    /// [`EscrowError`] variant is needed, following the builder.
+    /// Validation completes before any write, so a failed
+    /// amendment leaves the memo untouched (fail-closed,
+    /// zero-write):
+    ///
+    /// - a paused escrow fails fast ([`EscrowError::Paused`]);
+    /// - `initializer` + `taker` must both match the escrow, else
+    ///   [`EscrowError::Unauthorized`];
+    /// - `state == Funded`, else
+    ///   [`EscrowError::InvalidStateTransition`] (the builder owns
+    ///   initial configuration on `Uninitialized`; terminal states
+    ///   have no settlement left to reconcile).
+    ///
+    /// Re-affirming the current memo is `Ok(())` and changes
+    /// nothing. Only the `reference` field moves — `amount`,
+    /// `released`, `fees_paid`, and `state` are untouched, and the
+    /// new memo enters indexer events, keeper reports, and the
+    /// AV-26 snapshot export from the revision onward (each reads
+    /// the live field at emit time); memos already exported in
+    /// past reports or snapshots are history and are never
+    /// rewritten. Orthogonal to [`Escrow::with_reference`] (AV-53,
+    /// the `Uninitialized`-only initial set — this is the
+    /// `Funded`-only revision path) and to [`Escrow::amend_decimals`]
+    /// (AV-376, same amend shape, different field). No new Anchor
+    /// instruction: pure logic layer, like the other `amend_*`
+    /// revisions. Emits `ReferenceAmended` on the event layer,
+    /// except for the no-op re-affirmation.
+    pub fn amend_reference(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        reference: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_referrer`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Any 32 bytes are accepted, following the builder: the
+        // memo is read-only pass-through with nothing to validate.
+        // A no-op re-affirmation writes nothing, so the event
+        // layer emits nothing for it, paralleling `amend_referrer`.
+        if Some(reference) == self.reference {
+            return Ok(());
+        }
+        self.reference = Some(reference);
+        Ok(())
+    }
+
     /// Opt in to a refund address whitelist (AV-23 — Solana security /
     /// payment fintech): declare the address every refund on the
     /// unilateral exit paths ([`Escrow::cancel`],
@@ -53104,7 +53177,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
-        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(167), None); // AV-377: 166 is ReferenceAmended
     }
 
     #[test]
@@ -65289,6 +65363,167 @@ mod reference_tests {
         assert_eq!(snap.reference, None);
         assert!(snap.to_json().contains("\"reference\":null"));
     }
+
+    // ---------- AV-377: post-funding reference revision ----------
+
+    const NEW_REF: [u8; 32] = [0x0E; 32]; // corrected order id
+
+    fn funded_referenced() -> Escrow {
+        let mut e = referenced();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn amend_reference_revises_memo_and_leaves_amounts_untouched() {
+        let mut e = funded_referenced();
+        e.amend_reference(ALICE, BOB, NEW_REF).unwrap();
+        assert_eq!(e.reference(), Some(NEW_REF));
+        // Only the memo moved: the locked amount, the released
+        // total, the fees, and the state are untouched.
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        // The new memo enters the snapshot export from the revision
+        // onward.
+        assert_eq!(e.snapshot(1_000_000).reference, Some(NEW_REF));
+        // A release after the amendment still settles exact amounts.
+        let (payout, fee) = e.release(ALICE, 1_000_000, 400_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.reference(), Some(NEW_REF));
+    }
+
+    #[test]
+    fn amend_reference_rejects_wrong_party() {
+        let mut e = funded_referenced();
+        // One party alone cannot re-point the off-chain record the
+        // other's settlement reconciles against.
+        assert_eq!(
+            e.amend_reference(ALICE, MALLORY, NEW_REF),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_reference(MALLORY, BOB, NEW_REF),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_reference(MALLORY, MALLORY, NEW_REF),
+            Err(EscrowError::Unauthorized)
+        );
+        // Every refusal leaves the memo untouched.
+        assert_eq!(e.reference(), Some(ORDER_REF));
+    }
+
+    #[test]
+    fn amend_reference_rejects_non_funded_states() {
+        // Uninitialized: the builder owns initial configuration.
+        let mut bare = referenced();
+        assert_eq!(
+            bare.amend_reference(ALICE, BOB, NEW_REF),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.reference(), Some(ORDER_REF));
+        // Released: no settlement left to reconcile.
+        let mut e = funded_referenced();
+        e.release(ALICE, 1_000_000, 1_000_000, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.amend_reference(ALICE, BOB, NEW_REF),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.reference(), Some(ORDER_REF));
+        // Cancelled: terminal too.
+        let mut e = funded_referenced();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_reference(ALICE, BOB, NEW_REF),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.reference(), Some(ORDER_REF));
+    }
+
+    #[test]
+    fn amend_reference_rejects_paused() {
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_reference(ORDER_REF);
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        // The pause guard fires before the authority and state gates.
+        assert_eq!(
+            paused.amend_reference(ALICE, BOB, NEW_REF),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_reference(MALLORY, BOB, NEW_REF),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.reference(), Some(ORDER_REF));
+    }
+
+    #[test]
+    fn amend_reference_same_value_is_noop() {
+        // Re-affirming the current memo succeeds but changes nothing
+        // observable; the event layer (tested below) emits nothing
+        // for it.
+        let mut e = funded_referenced();
+        e.amend_reference(ALICE, BOB, ORDER_REF).unwrap();
+        assert_eq!(e.reference(), Some(ORDER_REF));
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_reference_accepts_any_32_bytes() {
+        // Any 32 bytes are accepted, following the builder: the memo
+        // is read-only pass-through with nothing to validate — even
+        // the all-zero id binds.
+        let mut e = funded_referenced();
+        e.amend_reference(ALICE, BOB, [0u8; 32]).unwrap();
+        assert_eq!(e.reference(), Some([0u8; 32]));
+        // An escrow that never bound a memo gains its first one on
+        // amendment.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(plain.reference(), None);
+        plain.amend_reference(ALICE, BOB, NEW_REF).unwrap();
+        assert_eq!(plain.reference(), Some(NEW_REF));
+    }
+
+    #[test]
+    fn amend_reference_indexed_emits_event_noop_and_failed_emit_nothing() {
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0x1D; 32], 1_000_000)
+            .unwrap()
+            .with_reference(ORDER_REF);
+        e.fund(ALICE, 1_000_001).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_reference(ALICE, MALLORY, NEW_REF, 1_000_002),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_reference(ALICE, BOB, NEW_REF, 1_000_002).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::ReferenceAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // The event carries the new memo, read live at emit time.
+        assert_eq!(ev.reference, Some(NEW_REF));
+        // Re-affirming the same memo is a no-op: no new event.
+        e.amend_reference(ALICE, BOB, NEW_REF, 1_000_003).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        // A later event carries the revised memo too.
+        e.release(ALICE, 400_000, None, BOB, 1_000_004).unwrap();
+        assert_eq!(e.events().last().copied().expect("event pushed").reference, Some(NEW_REF));
+    }
 }
 
 // ---------- AV-23: refund address whitelist ----------
@@ -72164,7 +72399,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(163), Some(EscrowEventKind::ExpiryShortened)); // AV-338: 163 is ExpiryShortened
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
-        assert_eq!(EscrowEventKind::from_discriminant(166), None); // AV-341: 165 is AppealWithdrawn
+        assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(167), None); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -72412,9 +72648,10 @@ mod event_history_tests {
         // `GovernanceDelayAmended` (AV-334), 163 is
         // `ExpiryShortened` (AV-338), 164 is
         // `BasketAmended` (AV-340), 165 is
-        // `AppealWithdrawn` (AV-341) and 166 is the
+        // `AppealWithdrawn` (AV-341), 166 is
+        // `ReferenceAmended` (AV-377) and 167 is the
         // first still-unknown byte.
-        for bad in [166u8, 255] {
+        for bad in [167u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(

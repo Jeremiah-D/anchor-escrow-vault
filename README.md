@@ -1080,7 +1080,15 @@ persisted in the vault account (appended last, 33 bytes), carried on
 keeper-report action (as lowercase hex in the report JSON), and in the
 snapshot export — so an indexer or keeper bot can join each escrow back
 to the off-chain record it settles without a second account read.
-`None` attaches no memo (backward compatible).
+`None` attaches no memo (backward compatible). A memo recorded wrong at
+build time can be corrected after funding via
+`Escrow::amend_reference(initializer, taker, reference)` (AV-377,
+`Funded`-only, both parties must sign, paused escrows fail fast with
+`Paused`; any 32 bytes accepted, re-affirming the current memo is a
+no-op) — the new memo enters indexer events, keeper reports, and the
+snapshot export from the revision onward (emits `ReferenceAmended`,
+discriminant 166), while memos already exported in past reports stay as
+history.
 
 **Milestone tranche release (staged settlement).** An escrow can declare a
 milestone plan at creation (`MilestonePlan::new(amounts)`, opt-in on

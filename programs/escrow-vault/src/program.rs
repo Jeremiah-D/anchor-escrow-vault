@@ -8023,6 +8023,13 @@ pub enum EscrowVaultEventKind {
     /// names the kind so the indexer can follow the conceded appeal
     /// and the forfeited bond).
     AppealWithdrawn,
+    /// AV-377: the off-chain reference memo was revised after
+    /// funding (`Escrow::amend_reference`). Mirrors
+    /// `escrow_state::EscrowEventKind::ReferenceAmended`. No Anchor
+    /// instruction surface (AV-377 is logic + event layer only, the
+    /// AV-260/AV-266 precedent — the on-chain event stream still
+    /// names the kind so the indexer can follow the revised memo).
+    ReferenceAmended,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -8190,6 +8197,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::AppealWithdrawn => {
             EscrowVaultEventKind::AppealWithdrawn
+        }
+        escrow_state::EscrowEventKind::ReferenceAmended => {
+            EscrowVaultEventKind::ReferenceAmended
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled

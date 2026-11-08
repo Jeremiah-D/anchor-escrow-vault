@@ -604,6 +604,7 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         | EscrowEventKind::DenylistUpdated
         | EscrowEventKind::AppealExpired
         | EscrowEventKind::AppealWithdrawn
+        | EscrowEventKind::ReferenceAmended
         | EscrowEventKind::DelegationGranted
         | EscrowEventKind::DelegationRevoked
         | EscrowEventKind::SwapLinked
@@ -1605,6 +1606,7 @@ mod fee_history_tests {
                 | EscrowEventKind::DenylistUpdated
                 | EscrowEventKind::AppealExpired
                 | EscrowEventKind::AppealWithdrawn
+                | EscrowEventKind::ReferenceAmended
                 | EscrowEventKind::DelegationGranted
                 | EscrowEventKind::DelegationRevoked
                 | EscrowEventKind::SwapLinked
