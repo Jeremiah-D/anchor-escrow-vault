@@ -9058,6 +9058,32 @@ already open keeps the period it was opened with. No new error codes,
 no vault layout change, no Anchor instruction surface. (Solana:
 payment-channel governance.)
 
+**Counterparty rotation (AV-389):**
+`rotate_counterparty(caller, new_party)` replaces the slot opposite
+the caller while the channel is still `Unfunded` — either party may
+rotate the other side, so the method is symmetric with no `side`
+parameter and no `rotate_party_a` / `rotate_party_b` twins. This is
+the lost-key / wrong-counterparty escape hatch for a channel opened
+with the wrong second party: once `fund` commits the split the
+parties are fixed, and a funded, `UnilateralClosePending`, or `Closed`
+channel refuses with `InvalidChannelState` (code 300). Check order is
+authority → state → no-op → value, mirroring the English-auction
+seller rotation (AV-322): a stranger is `Unauthorized` (code 100)
+even on a terminal channel; a zero `new_party` or a `new_party`
+equal to the caller (which would make `party_a == party_b`) is
+`InvalidChannelConfig` (code 299), reusing `open`'s zero-party door;
+rotating to the slot's current occupant is a no-op. Only the opposite
+slot's 32 bytes change — `total`, balances, `nonce`, `state`,
+`challenge_period`, and `challenge_until` are untouched. The new party
+is the sole authority from the next call: the channel identity is
+bound into every signed payload and `verify` reads the live parties,
+so the old counterparty's signature fails verification immediately
+while the new party's co-signature verifies — `apply_update`,
+`close_cooperative`, `close_unilateral`, and `dispute` all follow the
+live parties with no further change. No new error codes, no vault
+layout change, no Anchor instruction surface. (Solana: payment-channel
+governance.)
+
 ## Payment streams (AV-198)
 
 `escrow-state/src/stream.rs` — a Sablier-style per-second payment

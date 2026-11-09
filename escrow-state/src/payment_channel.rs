@@ -449,6 +449,86 @@ impl PaymentChannel {
         Ok(())
     }
 
+    /// Rotate the counterparty before funding (AV-389).
+    ///
+    /// A channel's two parties are fixed at [`PaymentChannel::open`]
+    /// — except here: either party may replace the *other* slot while
+    /// the channel is still [`ChannelState::Unfunded`]. The caller
+    /// rotates the slot opposite their own, so the method is symmetric
+    /// and needs no `side` parameter: `party_a` calling rotates
+    /// `party_b`, `party_b` calling rotates `party_a`. There are no
+    /// `rotate_party_a` / `rotate_party_b` twins — one method covers
+    /// both seats, mirroring the single-seller rotation of
+    /// [`EnglishAuction::amend_english_auction_seller`](crate::EnglishAuction::amend_english_auction_seller)
+    /// (AV-322) and the sealed-bid seller rotation (AV-323).
+    ///
+    /// This is the lost-key / wrong-counterparty escape hatch: the
+    /// channel was opened with the wrong second party, or a party's
+    /// key is compromised before any funds move. It is deliberately
+    /// `Unfunded`-only — once [`PaymentChannel::fund`] commits the
+    /// split, the parties are the ones who co-signed the funding
+    /// state, and rotating them would rewrite the counterparty the
+    /// funder already settled with.
+    ///
+    /// Check order is authority → state → no-op → value, mirroring
+    /// AV-322: a stranger is refused with
+    /// [`EscrowError::Unauthorized`] (code 100) even on a funded or
+    /// terminal channel, so strangers learn nothing about the
+    /// channel's state; a party calling on a funded,
+    /// `UnilateralClosePending`, or `Closed` channel is refused with
+    /// [`EscrowError::InvalidChannelState`] (code 300) and the stored
+    /// parties are untouched. The value gate reuses
+    /// [`PaymentChannel::open`]'s zero-party door:
+    /// `new_party == [0u8; 32]` is [`EscrowError::InvalidChannelConfig`]
+    /// (code 299), and `new_party == caller` is the same error — it
+    /// would make `party_a == party_b`, which `open` forbids.
+    /// Rotating to the slot's current occupant is a no-op.
+    ///
+    /// Only the opposite slot's 32 bytes change — `total`, balances,
+    /// `nonce`, `state`, `challenge_period`, and `challenge_until`
+    /// are untouched. The new party is the sole authority from the
+    /// next call: the channel identity (`party_a || party_b ||
+    /// total`) is bound into every [`ChannelUpdate::canonical_bytes`]
+    /// payload and [`SignedChannelUpdate::verify`] reads the live
+    /// parties, so a signature minted by the old counterparty fails
+    /// verification immediately, while the new party's co-signature
+    /// verifies — `apply_update`, `close_cooperative`,
+    /// `close_unilateral`, and `dispute` all follow the live parties
+    /// with no further change. There is no audit-event JSON layer in
+    /// this module (the whole `PaymentChannel` module has none), so
+    /// the rotation is pinned by tests, like the other channel
+    /// transitions. No vault layout change and no Anchor instruction
+    /// surface (`program.rs` has no payment-channel instructions).
+    /// Orthogonal to AV-197 (the channel mechanism itself) and
+    /// AV-315 (the challenge-period revision — the only other
+    /// pre-funding revision path).
+    pub fn rotate_counterparty(
+        &mut self,
+        caller: [u8; 32],
+        new_party: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // Authority first: the caller must be one of the two parties.
+        self.check_party(&caller)?;
+        // Unfunded-only: funding commits the parties.
+        if self.state != ChannelState::Unfunded {
+            return Err(EscrowError::InvalidChannelState);
+        }
+        // The slot opposite the caller rotates.
+        let slot = if caller == self.party_a {
+            &mut self.party_b
+        } else {
+            &mut self.party_a
+        };
+        if new_party == *slot {
+            return Ok(());
+        }
+        if new_party == [0u8; 32] || new_party == caller {
+            return Err(EscrowError::InvalidChannelConfig);
+        }
+        *slot = new_party;
+        Ok(())
+    }
+
     /// The final `(party_a, party_b)` split — `Some` only once
     /// [`ChannelState::Closed`].
     pub fn settlement(&self) -> Option<(u64, u64)> {
@@ -528,6 +608,8 @@ mod payment_channel_tests {
 
     const ALICE_SEED: [u8; 32] = [0xA1; 32];
     const BOB_SEED: [u8; 32] = [0xB2; 32];
+    const CAROL_SEED: [u8; 32] = [0xCA; 32];
+    const DAVE_SEED: [u8; 32] = [0xDA; 32];
     const MALLORY_SEED: [u8; 32] = [0xCC; 32];
     const TOTAL: u64 = 1_000_000;
     const CHALLENGE_PERIOD: u64 = 3_600;
@@ -537,6 +619,12 @@ mod payment_channel_tests {
     }
     fn bob() -> SigningKey {
         SigningKey::from_seed(BOB_SEED)
+    }
+    fn carol() -> SigningKey {
+        SigningKey::from_seed(CAROL_SEED)
+    }
+    fn dave() -> SigningKey {
+        SigningKey::from_seed(DAVE_SEED)
     }
     fn mallory() -> SigningKey {
         SigningKey::from_seed(MALLORY_SEED)
@@ -1070,5 +1158,199 @@ mod payment_channel_tests {
         // PaymentChannel is Copy: the whole channel is bit-identical.
         assert_eq!(ch, before);
         assert_eq!(ch.challenge_period(), CHALLENGE_PERIOD);
+    }
+
+    #[test]
+    fn rotate_counterparty_before_funding_is_symmetric() {
+        let mut ch = channel();
+        let a = alice().public_key();
+        let b = bob().public_key();
+        let c = carol().public_key();
+        let d = dave().public_key();
+        // Alice rotates the opposite slot: Bob -> Carol.
+        ch.rotate_counterparty(a, c).unwrap();
+        assert_eq!(ch.party_a(), &a);
+        assert_eq!(ch.party_b(), &c);
+        // Carol, now party B, rotates the opposite slot: Alice -> Dave.
+        ch.rotate_counterparty(c, d).unwrap();
+        assert_eq!(ch.party_a(), &d);
+        assert_eq!(ch.party_b(), &c);
+        // Nothing else moved: still unfunded, zero balances/nonce.
+        assert_eq!(ch.state(), ChannelState::Unfunded);
+        assert_eq!(ch.total(), TOTAL);
+        assert_eq!(ch.balances(), (0, 0));
+        assert_eq!(ch.nonce(), 0);
+        assert_eq!(ch.challenge_period(), CHALLENGE_PERIOD);
+        assert_eq!(ch.challenge_until(), 0);
+        assert_eq!(ch.settlement(), None);
+        // The pre-rotation parties are strangers now.
+        assert_eq!(
+            ch.rotate_counterparty(b, a),
+            Err(EscrowError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn rotate_counterparty_rejects_stranger() {
+        let mut ch = channel();
+        let m = mallory().public_key();
+        let c = carol().public_key();
+        assert_eq!(
+            ch.rotate_counterparty(m, c),
+            Err(EscrowError::Unauthorized)
+        );
+        // Authority-first: a stranger is refused even on a closed
+        // channel, and the parties are untouched by the refusal.
+        let mut closed = open_channel();
+        let signed = cosign(&closed, &update(1, 300_000, 700_000));
+        closed.close_cooperative(&signed).unwrap();
+        assert_eq!(
+            closed.rotate_counterparty(m, c),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(closed.party_a(), &alice().public_key());
+        assert_eq!(closed.party_b(), &bob().public_key());
+    }
+
+    #[test]
+    fn rotate_counterparty_rejects_zero_new_party() {
+        let mut ch = channel();
+        let a = alice().public_key();
+        let b = bob().public_key();
+        assert_eq!(
+            ch.rotate_counterparty(a, [0u8; 32]),
+            Err(EscrowError::InvalidChannelConfig)
+        );
+        // The open() zero-party door, reused: the original party stands.
+        assert_eq!(ch.party_a(), &a);
+        assert_eq!(ch.party_b(), &b);
+        assert_eq!(ch.state(), ChannelState::Unfunded);
+    }
+
+    #[test]
+    fn rotate_counterparty_rejects_new_party_equal_to_caller() {
+        let mut ch = channel();
+        let a = alice().public_key();
+        let b = bob().public_key();
+        // Rotating the opposite slot onto the caller would make
+        // party_a == party_b, which open() forbids.
+        assert_eq!(
+            ch.rotate_counterparty(a, a),
+            Err(EscrowError::InvalidChannelConfig)
+        );
+        assert_eq!(
+            ch.rotate_counterparty(b, b),
+            Err(EscrowError::InvalidChannelConfig)
+        );
+        assert_eq!(ch.party_a(), &a);
+        assert_eq!(ch.party_b(), &b);
+    }
+
+    #[test]
+    fn rotate_counterparty_refused_once_funded() {
+        let mut ch = open_channel();
+        let a = alice().public_key();
+        let b = bob().public_key();
+        let c = carol().public_key();
+        // Funding commits the parties: the funder already settled
+        // with the counterparty named at open().
+        assert_eq!(
+            ch.rotate_counterparty(a, c),
+            Err(EscrowError::InvalidChannelState)
+        );
+        assert_eq!(ch.party_a(), &a);
+        assert_eq!(ch.party_b(), &b);
+        assert_eq!(ch.state(), ChannelState::Open);
+        assert_eq!(ch.balances(), (600_000, 400_000));
+    }
+
+    #[test]
+    fn rotate_counterparty_refused_while_pending_and_once_closed() {
+        let mut ch = open_channel();
+        let v1 = cosign(&ch, &update(1, 250_000, 750_000));
+        let alice_key = alice().public_key();
+        ch.close_unilateral(&alice_key, &v1, 1_000_000).unwrap();
+        // A party calling mid-dispute is refused, not unauthorized:
+        // authority passes, the state gate fires.
+        assert_eq!(
+            ch.rotate_counterparty(alice_key, carol().public_key()),
+            Err(EscrowError::InvalidChannelState)
+        );
+        assert_eq!(ch.party_b(), &bob().public_key());
+        assert_eq!(ch.state(), ChannelState::UnilateralClosePending);
+        // And once settled, the parties are terminal.
+        let settlement = ch.finalize(1_000_000 + CHALLENGE_PERIOD).unwrap();
+        assert_eq!(settlement, (250_000, 750_000));
+        assert_eq!(
+            ch.rotate_counterparty(alice_key, carol().public_key()),
+            Err(EscrowError::InvalidChannelState)
+        );
+        assert_eq!(ch.party_b(), &bob().public_key());
+    }
+
+    #[test]
+    fn rotate_counterparty_same_value_is_noop() {
+        let mut ch = channel();
+        let before = ch;
+        // Re-affirming the current occupant of either opposite slot.
+        ch.rotate_counterparty(alice().public_key(), bob().public_key())
+            .unwrap();
+        ch.rotate_counterparty(bob().public_key(), alice().public_key())
+            .unwrap();
+        // PaymentChannel is Copy: the whole channel is bit-identical.
+        assert_eq!(ch, before);
+    }
+
+    #[test]
+    fn rotate_counterparty_old_signature_fails_new_signature_verifies() {
+        let mut ch = channel();
+        let a = alice().public_key();
+        let c = carol().public_key();
+        ch.rotate_counterparty(a, c).unwrap();
+        ch.fund(600_000).unwrap();
+        let u = update(1, 500_000, 500_000);
+        // Bob co-signed before the rotation — his signature is minted
+        // for the old channel identity and fails against the live
+        // parties at once.
+        let stale = cosign(&ch, &u);
+        assert!(!stale.verify(&ch));
+        assert_eq!(
+            ch.apply_update(&stale),
+            Err(EscrowError::InvalidChannelSignature)
+        );
+        // Carol co-signs the same update: the new party verifies.
+        let sig_a = sign_channel_update(&alice(), &u, ch.party_a(), ch.party_b(), ch.total());
+        let sig_c = sign_channel_update(&carol(), &u, ch.party_a(), ch.party_b(), ch.total());
+        let fresh = SignedChannelUpdate::new(u, sig_a, sig_c);
+        assert!(fresh.verify(&ch));
+        ch.apply_update(&fresh).unwrap();
+        assert_eq!(ch.nonce(), 1);
+        assert_eq!(ch.balances(), (500_000, 500_000));
+    }
+
+    #[test]
+    fn rotate_counterparty_full_flow_to_cooperative_close() {
+        let mut ch = channel();
+        let a = alice().public_key();
+        let c = carol().public_key();
+        // Rotate -> fund -> off-chain update -> cooperative close,
+        // all with the new counterparty.
+        ch.rotate_counterparty(a, c).unwrap();
+        ch.fund(600_000).unwrap();
+        let u1 = update(1, 500_000, 500_000);
+        let sig_a = sign_channel_update(&alice(), &u1, ch.party_a(), ch.party_b(), ch.total());
+        let sig_c = sign_channel_update(&carol(), &u1, ch.party_a(), ch.party_b(), ch.total());
+        ch.apply_update(&SignedChannelUpdate::new(u1, sig_a, sig_c))
+            .unwrap();
+        assert_eq!(ch.nonce(), 1);
+        let u2 = update(2, 300_000, 700_000);
+        let sig_a = sign_channel_update(&alice(), &u2, ch.party_a(), ch.party_b(), ch.total());
+        let sig_c = sign_channel_update(&carol(), &u2, ch.party_a(), ch.party_b(), ch.total());
+        let settlement = ch
+            .close_cooperative(&SignedChannelUpdate::new(u2, sig_a, sig_c))
+            .unwrap();
+        assert_eq!(settlement, (300_000, 700_000));
+        assert_eq!(ch.state(), ChannelState::Closed);
+        assert_eq!(ch.settlement(), Some((300_000, 700_000)));
     }
 }
