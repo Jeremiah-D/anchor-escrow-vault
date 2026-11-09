@@ -39901,6 +39901,23 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign, one alone (or a stranger pair) is Unauthorized; the verifier itself does not sign (a lost verifier key must not block its own replacement, the rotate_arbiter reasoning); new_verifier <- param (Pubkey -> [u8; 32] conversion); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); only an escrow whose milestone verifier gate is already bound may rotate (InvalidMilestoneVerifier, code 323, fail-closed — rotation never creates the gate, use with_milestone_verifier before funding for the initial set); the zero address is InvalidMilestoneVerifier (code 323); rotating to the current verifier is rejected with InvalidMilestoneVerifier (code 323) — a no-change rotation is not governance, unlike rotate_arbiter's idempotent no-op; a paused escrow fails fast (Paused); emits the MilestoneVerifierRotated indexer event only on an actual change (from == to == the current state); only milestone_verifier changes — milestone plan, confirmations and settled tranches are untouched; no clock/sysvar input to the method; the 32-byte verifier region is rewritten in place — no layout / rent change",
         },
         InstructionSpec {
+            // AV-382: the credential-gate issuer rotation — the
+            // program-level entry point for the AV-264 pure-logic
+            // rotation. IDL: discriminator =
+            // sha256("global:rotate_credential_issuer")[..8] = [152,
+            // 182, 49, 47, 186, 171, 167, 38] — the Anchor instruction
+            // discriminator for the rotate_credential_issuer handler
+            // (pinned by the discriminator test below).
+            name: "rotate_credential_issuer",
+            params: &[(
+                "new_issuer",
+                "Pubkey",
+                "instruction param; the replacement credential issuer — the old key stops minting valid credentials immediately; the zero address is InvalidCredentialIssuer",
+            )],
+            method: "Escrow::rotate_credential_issuer",
+            input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign, one alone (or a stranger pair) is Unauthorized; the issuer itself does not sign (a lost issuer key must not block its own replacement, the rotate_arbiter reasoning); new_issuer <- param (Pubkey -> [u8; 32] conversion); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); only an escrow whose credential gate is already bound may rotate (CredentialGateNotBound, fail-closed — post-funding installation would add a release qualification the taker never funded under); the zero address is InvalidCredentialIssuer; rotating to the current issuer is an idempotent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); a paused escrow fails fast (Paused); emits the CredentialIssuerRotated indexer event only on an actual change (from == to == the current state); only credential_issuer changes — release state and settled releases are untouched; no clock/sysvar input to the method; the 32-byte issuer region is rewritten in place — no layout / rent change",
+        },
+        InstructionSpec {
             // AV-110: the permissionless rent top-up. IDL:
             // discriminator = sha256("global:top_up_rent")[..8] =
             // [228, 107, 203, 188, 137, 169, 152, 122] — the Anchor
@@ -40683,6 +40700,9 @@ pub(crate) mod anchor_idl_tests {
             // AV-381: the program-level milestone verifier rotation
             // (the AV-234 pure-logic rotation wired to the chain).
             "Escrow::rotate_milestone_verifier",
+            // AV-382: the program-level credential issuer rotation
+            // (the AV-264 pure-logic rotation wired to the chain).
+            "Escrow::rotate_credential_issuer",
             // AV-110: permissionless rent top-up — anyone tops up the
             // vault's lamport balance in any non-Closed state; pure
             // counter bookkeeping, no state change.
@@ -40956,6 +40976,9 @@ pub(crate) mod anchor_idl_tests {
                 // AV-381: the verifier-rotation target (Pubkey) — the
                 // replacement milestone verifier.
                 &"rotate_milestone_verifier",
+                // AV-382: the issuer-rotation target (Pubkey) — the
+                // replacement credential issuer.
+                &"rotate_credential_issuer",
                 // AV-110: the rent top-up carries the lamport amount
                 // (u64) — the only input besides the permissionless
                 // caller signer.
@@ -42045,8 +42068,6 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
-
-    #[test]
     fn rotate_milestone_verifier_maps_param_to_verifier_field() {
         // IDL: rotate_milestone_verifier(new_verifier: Pubkey) —
         // new_verifier <- param; initializer <-
@@ -42103,6 +42124,63 @@ pub(crate) mod anchor_idl_tests {
             unbound.rotate_milestone_verifier(ALICE, BOB, NEW_VERIFIER),
             Err(EscrowError::InvalidMilestoneVerifier),
             "rotation never creates the gate"
+        );
+    }
+
+    #[test]
+    fn rotate_credential_issuer_maps_param_to_issuer_field() {
+        // IDL: rotate_credential_issuer(new_issuer: Pubkey) —
+        // new_issuer <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints, not the state machine. The param rewrites the
+        // vault's credential_issuer field in place (see
+        // PARAM_FIELD_MAP) — no layout change.
+        const OLD_ISSUER: [u8; 32] = [0xA0; 32];
+        const NEW_ISSUER: [u8; 32] = [0xA9; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_credential_gate(OLD_ISSUER)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.rotate_credential_issuer(ALICE, BOB, NEW_ISSUER).unwrap();
+        assert_eq!(e.credential_issuer(), NEW_ISSUER);
+        // Documented failure modes: one party alone is Unauthorized,
+        // the zero address can never be the issuer, an unbound
+        // escrow has nothing to rotate — and, paralleling
+        // `rotate_arbiter`, re-affirming the current issuer is an
+        // idempotent no-op.
+        assert_eq!(
+            e.rotate_credential_issuer(ALICE, MALLORY, NEW_ISSUER),
+            Err(EscrowError::Unauthorized),
+            "initializer alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_credential_issuer(MALLORY, BOB, NEW_ISSUER),
+            Err(EscrowError::Unauthorized),
+            "taker alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_credential_issuer(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::InvalidCredentialIssuer)
+        );
+        e.rotate_credential_issuer(ALICE, BOB, NEW_ISSUER).unwrap();
+        assert_eq!(
+            e.credential_issuer(),
+            NEW_ISSUER,
+            "same-value re-affirmation writes nothing"
+        );
+        assert_eq!(
+            e.credential_issuer(),
+            NEW_ISSUER,
+            "failed calls change nothing"
+        );
+        let mut unbound = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        unbound.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            unbound.rotate_credential_issuer(ALICE, BOB, NEW_ISSUER),
+            Err(EscrowError::CredentialGateNotBound),
+            "rotation never installs the gate"
         );
     }
 
@@ -43353,6 +43431,12 @@ pub(crate) mod anchor_idl_tests {
         // (Uninitialized only, a state-machine method — not an instruction
         // param); this entry documents the rotation source.
         ("rotate_milestone_verifier", "new_verifier", "milestone_verifier"),
+        // AV-382: the rotation param rewrites the same field in place —
+        // the param source for `credential_issuer`. The field's initial
+        // value comes from the `with_credential_gate` builder
+        // (Uninitialized only, a state-machine method — not an instruction
+        // param); this entry documents the rotation source.
+        ("rotate_credential_issuer", "new_issuer", "credential_issuer"),
         // AV-110: the rent top-up accumulates its `lamports` param
         // into the `rent_topped_up_total` tail counter (any state but
         // Closed); the counter is zeroed by `initialize`.
@@ -43973,13 +44057,15 @@ pub(crate) mod anchor_idl_tests {
         // AV-212: the credential issuer pubkey — zeroed by
         // `initialize`; set by `with_credential_gate`
         // (Uninitialized only, non-zero key); read by `release` /
-        // `release_with_credential` as the gate.
-        (
-            "credential_issuer",
-            "zeroed by initialize; set by with_credential_gate \
-             (Uninitialized only, non-zero key); read by \
-             release / release_with_credential as the gate",
-        ),
+        // `release_with_credential` as the gate. AV-382: the field
+        // is populated by the `rotate_credential_issuer`
+        // instruction param (see PARAM_FIELD_MAP), so it is not
+        // listed here — like `taker` / `arbiter`, every field gets
+        // exactly one source kind. The field's *initial* value
+        // comes from the `with_credential_gate` builder (a
+        // state-machine method, not an instruction param, so it
+        // cannot appear in the param table); the param entry
+        // documents the rotation source.
         // AV-215: the delegation expiry — zeroed by `initialize`
         // (no expiry = the AV-104 grant); set together with the
         // grant by `delegate_authority_with_expiry` or alone by
@@ -70208,6 +70294,17 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("rotate_milestone_verifier"),
             [76, 214, 59, 2, 205, 82, 88, 187]
+        );
+    }
+
+    #[test]
+    fn rotate_credential_issuer_instruction_discriminator_is_pinned() {
+        // AV-382. IDL: sha256("global:rotate_credential_issuer")[..8]
+        // — the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("rotate_credential_issuer"),
+            [152, 182, 49, 47, 186, 171, 167, 38]
         );
     }
 

@@ -1044,6 +1044,14 @@
       ]
     },
     {
+      "name": "rotate_credential_issuer",
+      "discriminator": [152, 182, 49, 47, 186, 171, 167, 38],
+      "accounts": [],
+      "args": [
+        {"name": "new_issuer", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "top_up_rent",
       "discriminator": [228, 107, 203, 188, 137, 169, 152, 122],
       "accounts": [],

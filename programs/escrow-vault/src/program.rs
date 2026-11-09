@@ -2056,6 +2056,64 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate the credential-gate issuer by dual-signed governance
+    /// (AV-382; mirrors `Escrow::rotate_credential_issuer`). Both the
+    /// initializer and the taker must sign — the issuer itself does not
+    /// sign, so a lost issuer key cannot block its own replacement (the
+    /// `rotate_arbiter` reasoning). Only `Funded`: the terminal states
+    /// and `Disputed` are `InvalidStateTransition` (no live credentialed
+    /// release left to qualify, and arbitration in flight adjudicates
+    /// the taker's qualification). Only an escrow whose credential gate
+    /// is already bound may rotate (`CredentialGateNotBound`,
+    /// fail-closed — post-funding installation would add a release
+    /// qualification the taker never funded under). The zero address is
+    /// `InvalidCredentialIssuer`. Rotating to the current issuer is an
+    /// idempotent no-op. A paused escrow fails fast (`Paused`) —
+    /// rotation is a config transition, not the pause key-loss escape
+    /// hatch. Only `credential_issuer` changes (release state and
+    /// settled releases are untouched — the rotation takes no clock
+    /// parameter). The new issuer governs from the next
+    /// `release_with_credential`: that path reads the live
+    /// `credential_issuer` on every call, so a credential minted by the
+    /// old issuer stops verifying the moment the rotation lands while a
+    /// credential minted by the new issuer verifies. Emits
+    /// `CredentialIssuerRotated` only on an actual change (from == to ==
+    /// the current state), mirroring
+    /// `IndexedEscrow::rotate_credential_issuer`.
+    pub fn rotate_credential_issuer(ctx: Context<RotateCredentialIssuer>, new_issuer: Pubkey) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.credential_issuer();
+        escrow
+            .rotate_credential_issuer(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_issuer.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.credential_issuer` in place in the real build
+        // (32 bytes, always present) — no realloc, no rent change.
+        if escrow.credential_issuer() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::CredentialIssuerRotated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Top up the vault account's lamport balance so it stays
     /// rent-exempt (AV-110; mirrors `Escrow::top_up_rent`).
     /// Permissionless: the initializer, the taker, the keeper bot or a
@@ -8163,6 +8221,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::rotate_milestone_verifier`). Mirrors
     /// `escrow_state::EscrowEventKind::MilestoneVerifierRotated`.
     MilestoneVerifierRotated,
+    /// AV-382: the credential-gate issuer was rotated by dual-signed
+    /// governance (`Escrow::rotate_credential_issuer`). Mirrors
+    /// `escrow_state::EscrowEventKind::CredentialIssuerRotated`.
+    CredentialIssuerRotated,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -8339,6 +8401,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::MilestoneVerifierRotated => {
             EscrowVaultEventKind::MilestoneVerifierRotated
+        }
+        escrow_state::EscrowEventKind::CredentialIssuerRotated => {
+            EscrowVaultEventKind::CredentialIssuerRotated
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -9417,6 +9482,24 @@ pub struct RotateMilestoneVerifier<'info> {
     /// Second governance signer: must equal the escrow's taker. The
     /// taker consents to re-keying the gate that attests their
     /// milestones.
+    pub taker: Signer<'info>,
+}
+
+/// AV-382: accounts for `rotate_credential_issuer` — the issuer
+/// rotation is dual-signed governance by the two parties; the issuer
+/// itself does not sign (a lost issuer key must not block its own
+/// replacement).
+#[derive(Accounts)]
+pub struct RotateCredentialIssuer<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to re-keying the gate that qualifies their
+    /// release.
     pub taker: Signer<'info>,
 }
 
