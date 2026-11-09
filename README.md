@@ -9448,6 +9448,11 @@ item is the operator identity), to `amend_delegation_spend_cap`
 (that is the volume bound, this item is the identity), to
 `amend_delegation_scopes` (that is the scope bitmap, this item is
 the identity) and to AV-104 (that is the grant mechanism itself,
-this item is the identity rotation). Boundary: the Anchor
-instruction accepting a delegate rotation on chain is follow-up work
-— no such instruction is claimed. (Solana: delegation governance.)
+this item is the identity rotation). AV-388 adds the program-level
+`rotate_delegation_delegate(new_delegate)` — single-party governance
+by initializer or taker alone (the operator being replaced does not
+sign, so a lost operator key never blocks its own replacement),
+`Uninitialized`/`Funded`-only, no-grant/zero-delegate refused with
+`InvalidDelegation` (code 160), same-value re-affirmation a no-op
+that emits nothing; it emits no event, and rewrites the delegate
+field in place — no layout change. (Solana: delegation governance.)

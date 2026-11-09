@@ -12493,7 +12493,9 @@ impl Escrow {
     /// item is the identity), to `amend_delegation_scopes` (that is
     /// the scope bitmap, this item is the identity) and to AV-104
     /// (that is the grant mechanism itself, this item is the identity
-    /// rotation).
+    /// rotation). AV-388 adds the Anchor program-facing
+    /// `rotate_delegation_delegate` instruction (the handler in
+    /// `programs/escrow-vault/src/program.rs` mirrors this logic).
     pub fn rotate_delegation_delegate(
         &mut self,
         caller: [u8; 32],
@@ -40026,6 +40028,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign, one alone (or a stranger pair) is Unauthorized; the guardian being replaced does not sign (a lost guardian key must not block its own replacement, the rotate_arbiter reasoning); old_guardian <- param (Pubkey -> [u8; 32] conversion; selects the slot, never persisted); new_guardian <- param (Pubkey -> [u8; 32] conversion); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); only an escrow with a configured social-recovery policy may rotate (RecoveryNotConfigured, code 287, fail-closed — post-funding installation would add a recovery path the taker never funded under); a pending recovery request refuses the rotation (RecoveryRequestPending, code 289 — the approval bitmap is indexed by slot, so swapping a slot would re-attribute already-cast approval votes); an unknown old_guardian is RecoveryNotGuardian (code 288); a zero new_guardian, or one duplicating another slot, is InvalidSocialRecovery (code 286, the SocialRecovery::new gate) leaving the original guardian untouched; rotating to the current guardian is an idempotent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); a paused escrow fails fast (Paused); emits the SocialRecoveryGuardianRotated indexer event only on an actual change (from == to == the current state); only that one recovery.guardians slot changes — guardian_count, threshold and timelock_secs are untouched and pending stays empty; no clock/sysvar input to the method; the policy region is rewritten in place — no layout / rent change",
         },
         InstructionSpec {
+            // AV-388: the delegation-operator rotation — the
+            // program-level entry point for the AV-301 pure-logic
+            // rotation. IDL: discriminator =
+            // sha256("global:rotate_delegation_delegate")[..8]
+            // = [200, 179, 190, 166, 27, 15, 73, 168] — the Anchor
+            // instruction discriminator for the
+            // rotate_delegation_delegate handler (pinned by
+            // the discriminator test below).
+            name: "rotate_delegation_delegate",
+            params: &[(
+                "new_delegate",
+                "Pubkey",
+                "instruction param; the replacement operator — the old operator stops being able to fund, release or cancel immediately; a zero address is InvalidDelegation (code 160)",
+            )],
+            method: "Escrow::rotate_delegation_delegate",
+            input_mapping: "caller <- accounts.caller (signer) — either the initializer or the taker alone may rotate (the operator being replaced does not sign, so a lost operator key never blocks its own replacement, the rotate_arbiter reasoning); new_delegate <- param (Pubkey -> [u8; 32] conversion); Uninitialized / Funded only (InvalidStateTransition otherwise — terminal states and Disputed); only an escrow with a live grant may rotate (InvalidDelegation, code 160, when there is no grant to rotate); a zero new_delegate is InvalidDelegation (code 160, the fail-closed gate) leaving the original delegate untouched; rotating to the current delegate is an idempotent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); a paused escrow fails fast (Paused); emits no event (the rotation is an in-place identity rewrite of the same grant slot, like renew_delegation); only delegation.delegate changes — scopes, spend_cap, spent and the expiry window are untouched, and spent is never cleared, so the cap keeps binding the grant's cumulative volume, never one operator's personal volume; no clock/sysvar input to the method; the delegate field is rewritten in place — no layout / rent change",
+        },
+        InstructionSpec {
             // AV-110: the permissionless rent top-up. IDL:
             // discriminator = sha256("global:top_up_rent")[..8] =
             // [228, 107, 203, 188, 137, 169, 152, 122] — the Anchor
@@ -40829,6 +40849,9 @@ pub(crate) mod anchor_idl_tests {
             // rotation (the AV-275 pure-logic rotation wired to the
             // chain).
             "Escrow::rotate_social_recovery_guardian",
+            // AV-388: the program-level delegation-operator rotation
+            // (the AV-301 pure-logic rotation wired to the chain).
+            "Escrow::rotate_delegation_delegate",
             // AV-110: permissionless rent top-up — anyone tops up the
             // vault's lamport balance in any non-Closed state; pure
             // counter bookkeeping, no state change.
@@ -41123,6 +41146,10 @@ pub(crate) mod anchor_idl_tests {
                 // replacement guardian; the only dual-Pubkey-param
                 // item in the rotation family.
                 &"rotate_social_recovery_guardian",
+                // AV-388: the delegate-rotation target (Pubkey) — the
+                // replacement operator; the only single-Pubkey-param
+                // item in the rotation family.
+                &"rotate_delegation_delegate",
                 // AV-110: the rent top-up carries the lamport amount
                 // (u64) — the only input besides the permissionless
                 // caller signer.
@@ -43078,6 +43105,169 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn rotate_delegation_delegate_maps_param_to_delegation_field() {
+        // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
+        // new_delegate <- param; caller <-
+        // accounts.caller (signer), enforced by the Anchor account
+        // constraints, not the state machine. The new key rewrites
+        // the delegation region's delegate in place (see
+        // PARAM_FIELD_MAP) — no layout change.
+        const OPERATOR: [u8; 32] = [0x0D; 32];
+        const NEW_OPERATOR: [u8; 32] = [0x0E; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        fn full_scopes() -> u32 {
+            DELEGATION_SCOPE_FUND | DELEGATION_SCOPE_RELEASE | DELEGATION_SCOPE_CANCEL
+        }
+        let configured = || {
+            let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+            e.delegate_authority(ALICE, OPERATOR, full_scopes())
+                .unwrap();
+            e.fund(ALICE, FUND_AT).unwrap();
+            assert_eq!(e.state(), EscrowState::Funded);
+            e
+        };
+        // Only the delegate moves: the scopes, the cap, the settled
+        // spent counter and the expiry window are untouched.
+        let mut e = configured();
+        e.renew_delegation(ALICE, EXPIRES_AT + 1_000).unwrap();
+        e.rotate_delegation_delegate(ALICE, NEW_OPERATOR)
+            .unwrap();
+        let grant = e.delegation().expect("grant survives the rotation");
+        assert_eq!(grant.delegate(), NEW_OPERATOR);
+        assert_eq!(grant.scopes(), full_scopes(), "scopes untouched");
+        assert_eq!(grant.spend_cap(), 0, "uncapped grant stays uncapped");
+        assert_eq!(grant.spent(), 0, "spent untouched");
+        assert_eq!(
+            e.delegation_expires_at(),
+            Some(EXPIRES_AT + 1_000),
+            "expiry untouched"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        // Documented failure modes: a stranger cannot rotate, and
+        // neither can the operator themselves — rotation is a party
+        // power, and a compromised operator must not be able to hand
+        // the grant to an accomplice.
+        assert_eq!(
+            e.rotate_delegation_delegate(MALLORY, OPERATOR),
+            Err(EscrowError::Unauthorized),
+            "stranger cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_delegation_delegate(NEW_OPERATOR, OPERATOR),
+            Err(EscrowError::Unauthorized),
+            "the operator cannot rotate their own grant"
+        );
+        assert_eq!(
+            e.delegation().unwrap().delegate(),
+            NEW_OPERATOR,
+            "failed rotation writes nothing"
+        );
+        // Only Uninitialized / Funded: a terminal escrow refuses.
+        let mut cancelled = configured();
+        cancelled.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(cancelled.state(), EscrowState::Cancelled);
+        assert_eq!(
+            cancelled.rotate_delegation_delegate(ALICE, NEW_OPERATOR),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            cancelled.delegation().unwrap().delegate(),
+            OPERATOR,
+            "failed rotation writes nothing"
+        );
+        // No live grant is InvalidDelegation.
+        let mut plain = configured();
+        plain.revoke_delegation(ALICE).unwrap();
+        assert_eq!(plain.delegation(), None);
+        assert_eq!(
+            plain.rotate_delegation_delegate(ALICE, NEW_OPERATOR),
+            Err(EscrowError::InvalidDelegation)
+        );
+        // A zero new delegate is InvalidDelegation (code 160) and
+        // leaves the original delegate untouched.
+        assert_eq!(EscrowError::InvalidDelegation.code(), 160);
+        let mut e = configured();
+        assert_eq!(
+            e.rotate_delegation_delegate(ALICE, [0u8; 32]),
+            Err(EscrowError::InvalidDelegation)
+        );
+        assert_eq!(
+            e.delegation().unwrap().delegate(),
+            OPERATOR,
+            "zero-key rotation writes nothing"
+        );
+        // Rotating to the current delegate is an idempotent no-op.
+        let mut e = configured();
+        e.rotate_delegation_delegate(ALICE, OPERATOR).unwrap();
+        assert_eq!(
+            e.delegation(),
+            Some(Delegation::new(OPERATOR, full_scopes()))
+        );
+        // After the rotation the old operator loses power at once —
+        // fund, release and cancel are all Unauthorized — and the
+        // new operator may call from the next operator call. Either
+        // party may rotate: the taker performs this one.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.delegate_authority(ALICE, OPERATOR, full_scopes())
+            .unwrap();
+        e.rotate_delegation_delegate(BOB, NEW_OPERATOR).unwrap();
+        assert_eq!(
+            e.fund(OPERATOR, NOW),
+            Err(EscrowError::Unauthorized),
+            "old operator cannot fund after the rotation"
+        );
+        e.fund(NEW_OPERATOR, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            e.release(OPERATOR, NOW, 100, None, BOB),
+            Err(EscrowError::Unauthorized),
+            "old operator cannot release after the rotation"
+        );
+        assert_eq!(
+            e.cancel(OPERATOR, None, ALICE, 0),
+            Err(EscrowError::Unauthorized),
+            "old operator cannot cancel after the rotation"
+        );
+        let (payout, fee) = e.release(NEW_OPERATOR, NOW, 400_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.released_amount(), 400_000);
+        // The rotation never wipes spent: the cap keeps binding the
+        // grant's cumulative volume, not one operator's personal
+        // volume — the new operator's next release past the
+        // remaining headroom is SpendCapExceeded, while exactly the
+        // headroom still settles.
+        let mut e = configured();
+        e.delegate_authority_with_spend_cap(
+            ALICE,
+            OPERATOR,
+            DELEGATION_SCOPE_RELEASE,
+            500_000,
+        )
+        .unwrap();
+        e.release(OPERATOR, NOW, 400_000, None, BOB).unwrap();
+        assert_eq!(e.delegation().unwrap().spent(), 400_000);
+        e.rotate_delegation_delegate(ALICE, NEW_OPERATOR)
+            .unwrap();
+        let grant = e.delegation().unwrap();
+        assert_eq!(grant.delegate(), NEW_OPERATOR);
+        assert_eq!(grant.spend_cap(), 500_000, "cap untouched");
+        assert_eq!(grant.spent(), 400_000, "spent never cleared");
+        assert_eq!(
+            e.release(NEW_OPERATOR, NOW, 200_000, None, BOB),
+            Err(EscrowError::SpendCapExceeded),
+            "400k settled + 200k more exceeds the 500k cap"
+        );
+        assert_eq!(
+            e.delegation().unwrap().spent(),
+            400_000,
+            "refused release consumes nothing"
+        );
+        e.release(NEW_OPERATOR, NOW, 100_000, None, BOB).unwrap();
+        assert_eq!(e.delegation().unwrap().spent(), 500_000);
+    }
+
+    #[test]
     fn initialize_payout_allowlist_maps_param_to_payout_allowlist_field() {
         // IDL: initialize_payout_allowlist(allowlist: Vec<Pubkey>) —
         // allowlist <- param; authority <- accounts.initializer
@@ -44388,6 +44578,20 @@ pub(crate) mod anchor_idl_tests {
             "rotate_social_recovery_guardian",
             "new_guardian",
             "recovery",
+        ),
+        // AV-388: the rotation param rewrites the delegate key of
+        // the `delegation` region in place — a second param source
+        // for `delegation` (the whole grant region, like
+        // `delegate_authority`'s delegate param). The field's
+        // initial value comes from the `delegate_authority` delegate
+        // param (Uninitialized / Funded); this entry documents the
+        // rotation source. Only the delegate moves — the scopes, the
+        // spend cap, the settled `spent` counter and the expiry
+        // window are untouched.
+        (
+            "rotate_delegation_delegate",
+            "new_delegate",
+            "delegation",
         ),
         // AV-110: the rent top-up accumulates its `lamports` param
         // into the `rent_topped_up_total` tail counter (any state but
@@ -71337,6 +71541,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("rotate_social_recovery_guardian"),
             [30, 252, 240, 50, 213, 171, 103, 97]
+        );
+    }
+
+    #[test]
+    fn rotate_delegation_delegate_instruction_discriminator_is_pinned() {
+        // AV-388. IDL:
+        // sha256("global:rotate_delegation_delegate")[..8] — the
+        // Anchor instruction discriminator, pinned here and in the
+        // generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("rotate_delegation_delegate"),
+            [200, 179, 190, 166, 27, 15, 73, 168]
         );
     }
 

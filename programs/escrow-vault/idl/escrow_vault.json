@@ -1093,6 +1093,14 @@
       ]
     },
     {
+      "name": "rotate_delegation_delegate",
+      "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
+      "accounts": [],
+      "args": [
+        {"name": "new_delegate", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "top_up_rent",
       "discriminator": [228, 107, 203, 188, 137, 169, 152, 122],
       "accounts": [],

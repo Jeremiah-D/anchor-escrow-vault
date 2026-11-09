@@ -2471,6 +2471,42 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate the live operator grant's delegate key (AV-388; mirrors
+    /// `Escrow::rotate_delegation_delegate` — the AV-301 pure-logic
+    /// rotation). Either party may rotate — the initializer or the
+    /// taker alone (the operator being replaced does not sign, so a
+    /// lost operator key cannot block its own replacement). Only
+    /// `Uninitialized` / `Funded`; no live grant is
+    /// `InvalidDelegation` (code 160), and a zero `new_delegate` is
+    /// the same code leaving the original delegate untouched.
+    /// Rotating to the current delegate is an idempotent no-op. Only
+    /// the delegate moves — the scopes, the spend cap, the settled
+    /// `spent` counter and the expiry window are untouched, and
+    /// `spent` is never cleared: the cap keeps binding the grant's
+    /// cumulative volume, never one operator's personal volume. The
+    /// operator paths read the live delegate on every call, so the
+    /// new operator is effective from the next operator call and the
+    /// old operator loses power at once. A paused escrow fails fast
+    /// (`Paused`). No event is emitted — the rotation is an in-place
+    /// identity rewrite of the same grant slot, like
+    /// `renew_delegation` — so the handler does no change-only
+    /// detection: there is nothing to emit. Rewrites the delegate
+    /// field in place — no layout change.
+    pub fn rotate_delegation_delegate(
+        ctx: Context<RotateDelegationDelegate>,
+        new_delegate: Pubkey,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .rotate_delegation_delegate(
+                ctx.accounts.caller.key().to_bytes(),
+                new_delegate.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
     /// Top up the vault account's lamport balance so it stays
     /// rent-exempt (AV-110; mirrors `Escrow::top_up_rent`).
     /// Permissionless: the initializer, the taker, the keeper bot or a
@@ -9988,6 +10024,22 @@ pub struct RotateSocialRecoveryGuardian<'info> {
     /// taker consents to replacing one guardian of the lost-key
     /// recovery policy their funded escrow settles under.
     pub taker: Signer<'info>,
+}
+
+/// AV-388: accounts for `rotate_delegation_delegate` — the
+/// delegation-operator rotation is single-party governance by
+/// either party; the operator being replaced does not sign (a lost
+/// operator key must not block its own replacement). The new
+/// delegate rides as an instruction param, not an account — the
+/// only single-Pubkey-param item in the rotation family.
+#[derive(Accounts)]
+pub struct RotateDelegationDelegate<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker may rotate (the state
+    /// machine enforces the party-only rule); a stranger — or the
+    /// operator themselves — is `Unauthorized`.
+    pub caller: Signer<'info>,
 }
 
 /// AV-110: accounts for `top_up_rent` — anyone tops up the vault's
