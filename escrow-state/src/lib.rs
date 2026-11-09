@@ -15659,7 +15659,10 @@ let fee = self.charge_protocol_fee(net_amount)?;
     /// [`Escrow::initiate_release`] / [`Escrow::confirm_release`]
     /// (those are the two-step protocol itself, this item is the
     /// checker's identity). Emits `DualControlCheckerRotated` on
-    /// the event layer, except for the no-op re-affirmation.
+    /// the event layer, except for the no-op re-affirmation. AV-384
+    /// adds the Anchor program-facing
+    /// `rotate_dual_control_checker` instruction (the handler in
+    /// `programs/escrow-vault/src/program.rs` mirrors this logic).
     /// Rotation moves no funds, so no AV-36 reentrancy lock is
     /// needed (the lock only guards the fund-moving paths, the
     /// `rotate_arbiter` precedent).
@@ -39935,6 +39938,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign, one alone (or a stranger pair) is Unauthorized; the hook program itself does not sign (a lost hook key must not block its own replacement, the rotate_arbiter reasoning); new_hook <- param (Pubkey -> [u8; 32] conversion); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); only an escrow whose transfer hook is already bound may rotate (InvalidTransferHook, fail-closed — post-funding installation would add hook execution the taker never funded under); the zero address is InvalidTransferHook; rotating to the current hook is an idempotent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); a paused escrow fails fast (Paused); emits the TransferHookRotated indexer event only on an actual change (from == to == the current state); only transfer_hook changes — mint, allowlist and settled payouts are untouched, and plain release is unaffected; no clock/sysvar input to the method; the 33-byte Option region is rewritten in place — no layout / rent change",
         },
         InstructionSpec {
+            // AV-384: the dual-control checker rotation — the
+            // program-level entry point for the AV-263 pure-logic
+            // rotation. IDL: discriminator =
+            // sha256("global:rotate_dual_control_checker")[..8] =
+            // [153, 57, 53, 20, 97, 222, 49, 175] — the Anchor
+            // instruction discriminator for the
+            // rotate_dual_control_checker handler (pinned by the
+            // discriminator test below).
+            name: "rotate_dual_control_checker",
+            params: &[(
+                "new_checker",
+                "Pubkey",
+                "instruction param; the replacement dual-control checker — the old checker stops being able to confirm releases immediately; the zero address is InvalidDualControl",
+            )],
+            method: "Escrow::rotate_dual_control_checker",
+            input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign, one alone (or a stranger pair) is Unauthorized; the checker itself does not sign (a lost checker key must not block its own replacement, the rotate_arbiter reasoning); new_checker <- param (Pubkey -> [u8; 32] conversion); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); only an escrow that already opted into dual control may rotate (InvalidDualControl, fail-closed — post-funding installation would turn a single-step release into a two-step protocol the taker never funded under); the zero address is InvalidDualControl; a live dual-control intent blocks the rotation (DualControlIntentExists — the intent stores no checker key and confirm_release authenticates against the live checker, so rotating mid-flight would hand an unseen declaration to a checker who never saw it); rotating to the current checker is an idempotent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); a paused escrow fails fast (Paused); emits the DualControlCheckerRotated indexer event only on an actual change (from == to == the current state); only dual_control_checker changes — release state and settled releases are untouched; no clock/sysvar input to the method; the 33-byte Option region is rewritten in place — no layout / rent change",
+        },
+        InstructionSpec {
             // AV-110: the permissionless rent top-up. IDL:
             // discriminator = sha256("global:top_up_rent")[..8] =
             // [228, 107, 203, 188, 137, 169, 152, 122] — the Anchor
@@ -40723,6 +40744,9 @@ pub(crate) mod anchor_idl_tests {
             // AV-383: the program-level transfer-hook program rotation
             // (the AV-318 pure-logic rotation wired to the chain).
             "Escrow::rotate_transfer_hook",
+            // AV-384: the program-level dual-control checker rotation
+            // (the AV-263 pure-logic rotation wired to the chain).
+            "Escrow::rotate_dual_control_checker",
             // AV-110: permissionless rent top-up — anyone tops up the
             // vault's lamport balance in any non-Closed state; pure
             // counter bookkeeping, no state change.
@@ -41002,6 +41026,9 @@ pub(crate) mod anchor_idl_tests {
                 // AV-383: the hook-rotation target (Pubkey) — the
                 // replacement transfer-hook program.
                 &"rotate_transfer_hook",
+                // AV-384: the checker-rotation target (Pubkey) — the
+                // replacement dual-control checker.
+                &"rotate_dual_control_checker",
                 // AV-110: the rent top-up carries the lamport amount
                 // (u64) — the only input besides the permissionless
                 // caller signer.
@@ -42285,6 +42312,136 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn rotate_dual_control_checker_maps_param_to_checker_field() {
+        // IDL: rotate_dual_control_checker(new_checker: Pubkey) —
+        // new_checker <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints, not the state machine. The param rewrites the
+        // vault's dual_control_checker field in place (see
+        // PARAM_FIELD_MAP) — no layout change.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const OLD_CHECKER: [u8; 32] = [0xC0; 32];
+        const NEW_CHECKER: [u8; 32] = [0xC1; 32];
+        const NOW: u64 = 1_750_000_000;
+        const TTL: u64 = 3_600;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_control(OLD_CHECKER)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.rotate_dual_control_checker(ALICE, BOB, NEW_CHECKER).unwrap();
+        assert_eq!(e.dual_control_checker(), Some(NEW_CHECKER));
+        // Documented failure modes: one party alone is Unauthorized,
+        // the zero address can never be a checker, an unbound
+        // escrow has nothing to rotate — and, paralleling
+        // `rotate_arbiter`, re-affirming the current checker is an
+        // idempotent no-op.
+        assert_eq!(
+            e.rotate_dual_control_checker(ALICE, MALLORY, NEW_CHECKER),
+            Err(EscrowError::Unauthorized),
+            "initializer alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_dual_control_checker(MALLORY, BOB, NEW_CHECKER),
+            Err(EscrowError::Unauthorized),
+            "taker alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_dual_control_checker(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::InvalidDualControl)
+        );
+        assert_eq!(
+            e.dual_control_checker(),
+            Some(NEW_CHECKER),
+            "zero address leaves the original checker untouched"
+        );
+        e.rotate_dual_control_checker(ALICE, BOB, NEW_CHECKER).unwrap();
+        assert_eq!(
+            e.dual_control_checker(),
+            Some(NEW_CHECKER),
+            "same-value re-affirmation writes nothing"
+        );
+        // Funded-only: the Uninitialized builder owns the initial
+        // binding, so an unfunded escrow refuses.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_control(OLD_CHECKER)
+            .unwrap();
+        assert_eq!(
+            bare.rotate_dual_control_checker(ALICE, BOB, NEW_CHECKER),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.dual_control_checker(), Some(OLD_CHECKER));
+        let mut unbound = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        unbound.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            unbound.rotate_dual_control_checker(ALICE, BOB, NEW_CHECKER),
+            Err(EscrowError::InvalidDualControl),
+            "rotation never installs dual control"
+        );
+        assert_eq!(unbound.dual_control_checker(), None);
+        // A live intent pins the approver: confirm, cancel, or let
+        // it expire before rotating.
+        let mut live = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_control(OLD_CHECKER)
+            .unwrap();
+        live.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        live.initiate_release(ALICE, NOW, 400_000, None, BOB, TTL)
+            .unwrap();
+        assert_eq!(
+            live.rotate_dual_control_checker(ALICE, BOB, NEW_CHECKER),
+            Err(EscrowError::DualControlIntentExists)
+        );
+        assert_eq!(live.dual_control_checker(), Some(OLD_CHECKER));
+        // The rotation governs the next cycle: the old checker can
+        // no longer approve, the new checker settles it.
+        let mut cycled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_control(OLD_CHECKER)
+            .unwrap();
+        cycled.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        cycled
+            .rotate_dual_control_checker(ALICE, BOB, NEW_CHECKER)
+            .unwrap();
+        cycled
+            .initiate_release(ALICE, NOW, 400_000, None, BOB, TTL)
+            .unwrap();
+        assert_eq!(
+            cycled.confirm_release(OLD_CHECKER, NOW + 100),
+            Err(EscrowError::Unauthorized)
+        );
+        let (payout, fee) = cycled.confirm_release(NEW_CHECKER, NOW + 200).unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(cycled.released_amount(), 400_000);
+        // The event layer emits only on an actual change: a real
+        // rotation emits DualControlCheckerRotated, a no-op
+        // re-affirmation emits nothing.
+        let mut indexed =
+            IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], NOW)
+                .unwrap()
+                .with_dual_control(OLD_CHECKER)
+                .unwrap();
+        indexed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let before = indexed.event_count();
+        indexed
+            .rotate_dual_control_checker(ALICE, BOB, NEW_CHECKER, NOW)
+            .unwrap();
+        assert_eq!(indexed.event_count(), before + 1);
+        let ev = indexed.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::DualControlCheckerRotated);
+        indexed
+            .rotate_dual_control_checker(ALICE, BOB, NEW_CHECKER, NOW + 10)
+            .unwrap();
+        assert_eq!(
+            indexed.event_count(),
+            before + 1,
+            "no-op re-affirmation emits nothing"
+        );
+    }
+
+    #[test]
     fn initialize_payout_allowlist_maps_param_to_payout_allowlist_field() {
         // IDL: initialize_payout_allowlist(allowlist: Vec<Pubkey>) —
         // allowlist <- param; authority <- accounts.initializer
@@ -43543,6 +43700,12 @@ pub(crate) mod anchor_idl_tests {
         // comes from the `initialize_transfer_hook` program_id param
         // (Uninitialized only); this entry documents the rotation source.
         ("rotate_transfer_hook", "new_hook", "transfer_hook"),
+        // AV-384: the rotation param rewrites the same field in place —
+        // a second param source for `dual_control_checker`, like
+        // `rotate_deadman_heir`'s new_heir. The field's initial value
+        // comes from the `initialize_dual_control` checker param
+        // (Uninitialized only); this entry documents the rotation source.
+        ("rotate_dual_control_checker", "new_checker", "dual_control_checker"),
         // AV-110: the rent top-up accumulates its `lamports` param
         // into the `rent_topped_up_total` tail counter (any state but
         // Closed); the counter is zeroed by `initialize`.
@@ -70422,6 +70585,17 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("rotate_transfer_hook"),
             [135, 252, 52, 188, 249, 156, 19, 180]
+        );
+    }
+
+    #[test]
+    fn rotate_dual_control_checker_instruction_discriminator_is_pinned() {
+        // AV-384. IDL: sha256("global:rotate_dual_control_checker")[..8]
+        // — the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("rotate_dual_control_checker"),
+            [153, 57, 53, 20, 97, 222, 49, 175]
         );
     }
 

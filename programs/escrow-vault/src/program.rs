@@ -2172,6 +2172,73 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate the bound dual-control checker by dual-signed
+    /// governance (AV-384; mirrors
+    /// `Escrow::rotate_dual_control_checker`). Both the initializer
+    /// and the taker must sign — the checker itself does not sign, so
+    /// a lost checker key cannot block its own replacement (the
+    /// `rotate_arbiter` reasoning). Only `Funded`: the terminal states
+    /// and `Disputed` are `InvalidStateTransition` (no live release
+    /// left to re-check, and arbitration in flight settles under the
+    /// checker it was built with). Only an escrow that already opted
+    /// into dual control may rotate (`InvalidDualControl`, fail-closed
+    /// — post-funding installation would turn a single-step release
+    /// into a two-step protocol the taker never funded under). The
+    /// zero address is `InvalidDualControl`. A live dual-control
+    /// intent blocks the rotation (`DualControlIntentExists` — the
+    /// intent stores no checker key and `confirm_release`
+    /// authenticates against the live checker, so rotating mid-flight
+    /// would hand an unseen declaration to a checker who never saw
+    /// it). Rotating to the current checker is an idempotent no-op. A
+    /// paused escrow fails fast (`Paused`) — rotation is a config
+    /// transition, not the pause key-loss escape hatch. Only
+    /// `dual_control_checker` changes (release state and settled
+    /// releases are untouched — the rotation takes no clock
+    /// parameter). The new checker governs from the next
+    /// `initiate` / `confirm` cycle: the two-step protocol reads the
+    /// checker live, so a declaration naming the new checker confirms
+    /// while one naming the old checker fails with `Unauthorized` — a
+    /// wrong checker's confirmation is still rejected at confirm time.
+    /// Emits `DualControlCheckerRotated` only on an actual change
+    /// (from == to == the current state), mirroring
+    /// `IndexedEscrow::rotate_dual_control_checker`.
+    pub fn rotate_dual_control_checker(
+        ctx: Context<RotateDualControlChecker>,
+        new_checker: Pubkey,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.dual_control_checker();
+        escrow
+            .rotate_dual_control_checker(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_checker.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.dual_control_checker` in place in the real build
+        // (33-byte Option region, always present) — no realloc, no rent change.
+        if escrow.dual_control_checker() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::DualControlCheckerRotated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Top up the vault account's lamport balance so it stays
     /// rent-exempt (AV-110; mirrors `Escrow::top_up_rent`).
     /// Permissionless: the initializer, the taker, the keeper bot or a
@@ -8287,6 +8354,10 @@ pub enum EscrowVaultEventKind {
     /// dual-signed governance (`Escrow::rotate_transfer_hook`). Mirrors
     /// `escrow_state::EscrowEventKind::TransferHookRotated`.
     TransferHookRotated,
+    /// AV-384: the dual-control checker was rotated by dual-signed
+    /// governance (`Escrow::rotate_dual_control_checker`). Mirrors
+    /// `escrow_state::EscrowEventKind::DualControlCheckerRotated`.
+    DualControlCheckerRotated,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -8469,6 +8540,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::TransferHookRotated => {
             EscrowVaultEventKind::TransferHookRotated
+        }
+        escrow_state::EscrowEventKind::DualControlCheckerRotated => {
+            EscrowVaultEventKind::DualControlCheckerRotated
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -9583,6 +9657,24 @@ pub struct RotateTransferHook<'info> {
     /// Second governance signer: must equal the escrow's taker. The
     /// taker consents to re-hooking the settlement their payout
     /// executes under.
+    pub taker: Signer<'info>,
+}
+
+/// AV-384: accounts for `rotate_dual_control_checker` — the checker
+/// rotation is dual-signed governance by the two parties; the checker
+/// itself does not sign (a lost checker key must not block its own
+/// replacement).
+#[derive(Accounts)]
+pub struct RotateDualControlChecker<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to re-keying the approver of the two-step
+    /// release their payout settles under.
     pub taker: Signer<'info>,
 }
 

@@ -1060,6 +1060,14 @@
       ]
     },
     {
+      "name": "rotate_dual_control_checker",
+      "discriminator": [153, 57, 53, 20, 97, 222, 49, 175],
+      "accounts": [],
+      "args": [
+        {"name": "new_checker", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "top_up_rent",
       "discriminator": [228, 107, 203, 188, 137, 169, 152, 122],
       "accounts": [],
