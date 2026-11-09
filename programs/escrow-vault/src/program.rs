@@ -2114,6 +2114,64 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate the bound Token-2022 transfer-hook program by
+    /// dual-signed governance (AV-383; mirrors
+    /// `Escrow::rotate_transfer_hook`). Both the initializer and the
+    /// taker must sign — the hook program itself does not sign, so a
+    /// lost hook key cannot block its own replacement (the
+    /// `rotate_arbiter` reasoning). Only `Funded`: the terminal states
+    /// and `Disputed` are `InvalidStateTransition` (no live CPI plan
+    /// left to re-hook, and arbitration in flight settles under the
+    /// hook it was built with). Only an escrow whose transfer hook is
+    /// already bound may rotate (`InvalidTransferHook`, fail-closed —
+    /// post-funding installation would add hook execution the taker
+    /// never funded under). The zero address is `InvalidTransferHook`.
+    /// Rotating to the current hook is an idempotent no-op. A paused
+    /// escrow fails fast (`Paused`) — rotation is a config transition,
+    /// not the pause key-loss escape hatch. Only `transfer_hook`
+    /// changes (mint, allowlist and settled payouts are untouched, and
+    /// plain `release` is unaffected — the rotation takes no clock
+    /// parameter). The new hook governs from the next CPI plan build:
+    /// the builders read the live binding when the plan is built, so a
+    /// plan naming the new hook builds while a plan naming the old hook
+    /// fails with `SettlementMismatch` — a wrong program's CPI plan is
+    /// still rejected at build time. Emits `TransferHookRotated` only
+    /// on an actual change (from == to == the current state), mirroring
+    /// `IndexedEscrow::rotate_transfer_hook`.
+    pub fn rotate_transfer_hook(ctx: Context<RotateTransferHook>, new_hook: Pubkey) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.transfer_hook();
+        escrow
+            .rotate_transfer_hook(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_hook.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.transfer_hook` in place in the real build
+        // (33-byte Option region, always present) — no realloc, no rent change.
+        if escrow.transfer_hook() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::TransferHookRotated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Top up the vault account's lamport balance so it stays
     /// rent-exempt (AV-110; mirrors `Escrow::top_up_rent`).
     /// Permissionless: the initializer, the taker, the keeper bot or a
@@ -8225,6 +8283,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::rotate_credential_issuer`). Mirrors
     /// `escrow_state::EscrowEventKind::CredentialIssuerRotated`.
     CredentialIssuerRotated,
+    /// AV-383: the Token-2022 transfer-hook program was rotated by
+    /// dual-signed governance (`Escrow::rotate_transfer_hook`). Mirrors
+    /// `escrow_state::EscrowEventKind::TransferHookRotated`.
+    TransferHookRotated,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -8404,6 +8466,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::CredentialIssuerRotated => {
             EscrowVaultEventKind::CredentialIssuerRotated
+        }
+        escrow_state::EscrowEventKind::TransferHookRotated => {
+            EscrowVaultEventKind::TransferHookRotated
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -9500,6 +9565,24 @@ pub struct RotateCredentialIssuer<'info> {
     /// Second governance signer: must equal the escrow's taker. The
     /// taker consents to re-keying the gate that qualifies their
     /// release.
+    pub taker: Signer<'info>,
+}
+
+/// AV-383: accounts for `rotate_transfer_hook` — the hook-program
+/// rotation is dual-signed governance by the two parties; the hook
+/// program itself does not sign (a lost hook key must not block its
+/// own replacement).
+#[derive(Accounts)]
+pub struct RotateTransferHook<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to re-hooking the settlement their payout
+    /// executes under.
     pub taker: Signer<'info>,
 }
 

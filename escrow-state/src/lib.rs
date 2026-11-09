@@ -19943,9 +19943,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// `rotate_milestone_verifier`, which refuses the same value).
     /// The 33-byte `Option` region is already resident, so the
     /// rotation rewrites it in place with no layout change. No new
-    /// error code is needed. Pure logic only: like
-    /// `rotate_milestone_verifier` and `rotate_credential_issuer`
-    /// there is no Anchor instruction surface for this rotation.
+    /// error code is needed. AV-383 adds the Anchor program-facing
+    /// `rotate_transfer_hook` instruction (the handler in
+    /// `programs/escrow-vault/src/program.rs` mirrors this logic).
     /// Emits `TransferHookRotated` on the event layer, except for
     /// the no-op re-affirmation.
     pub fn rotate_transfer_hook(
@@ -30210,9 +30210,9 @@ let fee = self.charge_protocol_fee(taker_amount)?;
     /// which refuses the same value). The 8-byte
     /// `reveal_window_secs` field is already resident, so the
     /// revision rewrites it in place with no layout change. No new
-    /// error code is needed. Pure logic only: like
-    /// `rotate_transfer_hook` there is no Anchor instruction surface
-    /// for this revision. Emits `BlindPanelRevealWindowAmended` on
+    /// error code is needed. Pure logic only: this revision has
+    /// no Anchor instruction surface. Emits
+    /// `BlindPanelRevealWindowAmended` on
     /// the event layer, except for the no-op re-affirmation.
     pub fn amend_blind_panel_reveal_window(
         &mut self,
@@ -39918,6 +39918,23 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign, one alone (or a stranger pair) is Unauthorized; the issuer itself does not sign (a lost issuer key must not block its own replacement, the rotate_arbiter reasoning); new_issuer <- param (Pubkey -> [u8; 32] conversion); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); only an escrow whose credential gate is already bound may rotate (CredentialGateNotBound, fail-closed — post-funding installation would add a release qualification the taker never funded under); the zero address is InvalidCredentialIssuer; rotating to the current issuer is an idempotent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); a paused escrow fails fast (Paused); emits the CredentialIssuerRotated indexer event only on an actual change (from == to == the current state); only credential_issuer changes — release state and settled releases are untouched; no clock/sysvar input to the method; the 32-byte issuer region is rewritten in place — no layout / rent change",
         },
         InstructionSpec {
+            // AV-383: the transfer-hook program rotation — the
+            // program-level entry point for the AV-318 pure-logic
+            // rotation. IDL: discriminator =
+            // sha256("global:rotate_transfer_hook")[..8] = [135, 252,
+            // 52, 188, 249, 156, 19, 180] — the Anchor instruction
+            // discriminator for the rotate_transfer_hook handler
+            // (pinned by the discriminator test below).
+            name: "rotate_transfer_hook",
+            params: &[(
+                "new_hook",
+                "Pubkey",
+                "instruction param; the replacement transfer-hook program — the old program stops being named by CPI plans immediately; the zero address is InvalidTransferHook",
+            )],
+            method: "Escrow::rotate_transfer_hook",
+            input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign, one alone (or a stranger pair) is Unauthorized; the hook program itself does not sign (a lost hook key must not block its own replacement, the rotate_arbiter reasoning); new_hook <- param (Pubkey -> [u8; 32] conversion); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); only an escrow whose transfer hook is already bound may rotate (InvalidTransferHook, fail-closed — post-funding installation would add hook execution the taker never funded under); the zero address is InvalidTransferHook; rotating to the current hook is an idempotent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); a paused escrow fails fast (Paused); emits the TransferHookRotated indexer event only on an actual change (from == to == the current state); only transfer_hook changes — mint, allowlist and settled payouts are untouched, and plain release is unaffected; no clock/sysvar input to the method; the 33-byte Option region is rewritten in place — no layout / rent change",
+        },
+        InstructionSpec {
             // AV-110: the permissionless rent top-up. IDL:
             // discriminator = sha256("global:top_up_rent")[..8] =
             // [228, 107, 203, 188, 137, 169, 152, 122] — the Anchor
@@ -40703,6 +40720,9 @@ pub(crate) mod anchor_idl_tests {
             // AV-382: the program-level credential issuer rotation
             // (the AV-264 pure-logic rotation wired to the chain).
             "Escrow::rotate_credential_issuer",
+            // AV-383: the program-level transfer-hook program rotation
+            // (the AV-318 pure-logic rotation wired to the chain).
+            "Escrow::rotate_transfer_hook",
             // AV-110: permissionless rent top-up — anyone tops up the
             // vault's lamport balance in any non-Closed state; pure
             // counter bookkeeping, no state change.
@@ -40979,6 +40999,9 @@ pub(crate) mod anchor_idl_tests {
                 // AV-382: the issuer-rotation target (Pubkey) — the
                 // replacement credential issuer.
                 &"rotate_credential_issuer",
+                // AV-383: the hook-rotation target (Pubkey) — the
+                // replacement transfer-hook program.
+                &"rotate_transfer_hook",
                 // AV-110: the rent top-up carries the lamport amount
                 // (u64) — the only input besides the permissionless
                 // caller signer.
@@ -42182,6 +42205,83 @@ pub(crate) mod anchor_idl_tests {
             Err(EscrowError::CredentialGateNotBound),
             "rotation never installs the gate"
         );
+    }
+
+    #[test]
+    fn rotate_transfer_hook_maps_param_to_hook_field() {
+        // IDL: rotate_transfer_hook(new_hook: Pubkey) —
+        // new_hook <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints, not the state machine. The param rewrites the
+        // vault's transfer_hook field in place (see
+        // PARAM_FIELD_MAP) — no layout change.
+        const OLD_HOOK: [u8; 32] = [0x77; 32];
+        const NEW_HOOK: [u8; 32] = [0x78; 32];
+        const MINT: [u8; 32] = [0xD0; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_transfer_hook(OLD_HOOK)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.rotate_transfer_hook(ALICE, BOB, NEW_HOOK).unwrap();
+        assert_eq!(e.transfer_hook(), Some(NEW_HOOK));
+        // Documented failure modes: one party alone is Unauthorized,
+        // the zero address can never be the hook program, an unbound
+        // escrow has nothing to rotate — and, paralleling
+        // `rotate_arbiter`, re-affirming the current hook is an
+        // idempotent no-op.
+        assert_eq!(
+            e.rotate_transfer_hook(ALICE, MALLORY, NEW_HOOK),
+            Err(EscrowError::Unauthorized),
+            "initializer alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_transfer_hook(MALLORY, BOB, NEW_HOOK),
+            Err(EscrowError::Unauthorized),
+            "taker alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_transfer_hook(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::InvalidTransferHook)
+        );
+        assert_eq!(
+            e.transfer_hook(),
+            Some(NEW_HOOK),
+            "zero address leaves the original hook untouched"
+        );
+        e.rotate_transfer_hook(ALICE, BOB, NEW_HOOK).unwrap();
+        assert_eq!(
+            e.transfer_hook(),
+            Some(NEW_HOOK),
+            "same-value re-affirmation writes nothing"
+        );
+        // Funded-only: the Uninitialized builder owns the initial
+        // binding, so a funded-but-not-yet escrow refuses.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_transfer_hook(OLD_HOOK)
+            .unwrap();
+        assert_eq!(
+            bare.rotate_transfer_hook(ALICE, BOB, NEW_HOOK),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.transfer_hook(), Some(OLD_HOOK));
+        let mut unbound = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap();
+        unbound.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            unbound.rotate_transfer_hook(ALICE, BOB, NEW_HOOK),
+            Err(EscrowError::InvalidTransferHook),
+            "rotation never installs the hook"
+        );
+        assert_eq!(unbound.transfer_hook(), None);
     }
 
     #[test]
@@ -43437,6 +43537,12 @@ pub(crate) mod anchor_idl_tests {
         // (Uninitialized only, a state-machine method — not an instruction
         // param); this entry documents the rotation source.
         ("rotate_credential_issuer", "new_issuer", "credential_issuer"),
+        // AV-383: the rotation param rewrites the same field in place —
+        // a second param source for `transfer_hook`, like
+        // `rotate_deadman_heir`'s new_heir. The field's initial value
+        // comes from the `initialize_transfer_hook` program_id param
+        // (Uninitialized only); this entry documents the rotation source.
+        ("rotate_transfer_hook", "new_hook", "transfer_hook"),
         // AV-110: the rent top-up accumulates its `lamports` param
         // into the `rent_topped_up_total` tail counter (any state but
         // Closed); the counter is zeroed by `initialize`.
@@ -70305,6 +70411,17 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("rotate_credential_issuer"),
             [152, 182, 49, 47, 186, 171, 167, 38]
+        );
+    }
+
+    #[test]
+    fn rotate_transfer_hook_instruction_discriminator_is_pinned() {
+        // AV-383. IDL: sha256("global:rotate_transfer_hook")[..8]
+        // — the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("rotate_transfer_hook"),
+            [135, 252, 52, 188, 249, 156, 19, 180]
         );
     }
 

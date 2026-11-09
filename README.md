@@ -5764,7 +5764,13 @@ the same way. Rotating to the current hook is a no-op success
 that emits nothing; a real change emits `TransferHookRotated`
 (discriminant 155) and governs from the next CPI plan build (a
 plan naming the old hook then fails with `SettlementMismatch`),
-while plain `release` is unaffected.
+while plain `release` is unaffected. AV-383 adds the program-level
+`rotate_transfer_hook(new_hook)` — dual-signed by initializer + taker (the hook
+program itself does not sign, so a lost hook key never blocks its own
+replacement), `Funded`-only, bound-hook-only, zero program refused with
+`InvalidTransferHook`, same-value re-affirmation a no-op that emits nothing; it
+emits `TransferHookRotated` (discriminant 155) only on an actual change, and
+rewrites the 33-byte hook region in place — no layout change.
 
 ## Streaming fee on funded time (AV-100)
 
