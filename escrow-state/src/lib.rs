@@ -39884,6 +39884,23 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign, one alone (or a stranger pair) is Unauthorized; the heir itself does not sign (a lost heir key must not block its own replacement, the rotate_arbiter reasoning); new_heir <- param (Pubkey -> [u8; 32] conversion); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); only an escrow whose dead-man's switch is already configured may rotate (InvalidDeadmanConfig, code 168, fail-closed — post-funding installation would add a recovery path the taker never funded under); the zero address is InvalidDeadmanConfig (code 168); a paused escrow fails fast (Paused); rotating to the current heir is an idempotent no-op; emits the DeadmanHeirRotated indexer event only on an actual change (from == to == the current state); only deadman_heir changes — deadman_inactivity_secs and deadman_last_activity are untouched (the rotation takes no clock parameter and never resets the inactivity timer); no clock/sysvar input to the method; the 33-byte heir region is rewritten in place — no layout / rent change",
         },
         InstructionSpec {
+            // AV-381: the milestone verifier rotation — the
+            // program-level entry point for the AV-234 pure-logic
+            // rotation. IDL: discriminator =
+            // sha256("global:rotate_milestone_verifier")[..8] = [76,
+            // 214, 59, 2, 205, 82, 88, 187] — the Anchor instruction
+            // discriminator for the rotate_milestone_verifier handler
+            // (pinned by the discriminator test below).
+            name: "rotate_milestone_verifier",
+            params: &[(
+                "new_verifier",
+                "Pubkey",
+                "instruction param; the replacement milestone verifier — the old key stops attesting immediately; the zero address is InvalidMilestoneVerifier (code 323)",
+            )],
+            method: "Escrow::rotate_milestone_verifier",
+            input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign, one alone (or a stranger pair) is Unauthorized; the verifier itself does not sign (a lost verifier key must not block its own replacement, the rotate_arbiter reasoning); new_verifier <- param (Pubkey -> [u8; 32] conversion); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); only an escrow whose milestone verifier gate is already bound may rotate (InvalidMilestoneVerifier, code 323, fail-closed — rotation never creates the gate, use with_milestone_verifier before funding for the initial set); the zero address is InvalidMilestoneVerifier (code 323); rotating to the current verifier is rejected with InvalidMilestoneVerifier (code 323) — a no-change rotation is not governance, unlike rotate_arbiter's idempotent no-op; a paused escrow fails fast (Paused); emits the MilestoneVerifierRotated indexer event only on an actual change (from == to == the current state); only milestone_verifier changes — milestone plan, confirmations and settled tranches are untouched; no clock/sysvar input to the method; the 32-byte verifier region is rewritten in place — no layout / rent change",
+        },
+        InstructionSpec {
             // AV-110: the permissionless rent top-up. IDL:
             // discriminator = sha256("global:top_up_rent")[..8] =
             // [228, 107, 203, 188, 137, 169, 152, 122] — the Anchor
@@ -40663,6 +40680,9 @@ pub(crate) mod anchor_idl_tests {
             // AV-380: the program-level heir rotation (the AV-271
             // pure-logic rotation wired to the chain).
             "Escrow::rotate_deadman_heir",
+            // AV-381: the program-level milestone verifier rotation
+            // (the AV-234 pure-logic rotation wired to the chain).
+            "Escrow::rotate_milestone_verifier",
             // AV-110: permissionless rent top-up — anyone tops up the
             // vault's lamport balance in any non-Closed state; pure
             // counter bookkeeping, no state change.
@@ -40933,6 +40953,9 @@ pub(crate) mod anchor_idl_tests {
                 // AV-380: the heir-rotation target (Pubkey) — the
                 // replacement dead-man's switch heir.
                 &"rotate_deadman_heir",
+                // AV-381: the verifier-rotation target (Pubkey) — the
+                // replacement milestone verifier.
+                &"rotate_milestone_verifier",
                 // AV-110: the rent top-up carries the lamport amount
                 // (u64) — the only input besides the permissionless
                 // caller signer.
@@ -42019,6 +42042,68 @@ pub(crate) mod anchor_idl_tests {
         );
         e.rotate_deadman_heir(ALICE, BOB, NEW_HEIR).unwrap();
         assert_eq!(e.deadman_heir(), Some(NEW_HEIR));
+    }
+
+    #[test]
+
+    #[test]
+    fn rotate_milestone_verifier_maps_param_to_verifier_field() {
+        // IDL: rotate_milestone_verifier(new_verifier: Pubkey) —
+        // new_verifier <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints, not the state machine. The param rewrites the
+        // vault's milestone_verifier field in place (see
+        // PARAM_FIELD_MAP) — no layout change.
+        const OLD_VERIFIER: [u8; 32] = [0xA0; 32];
+        const NEW_VERIFIER: [u8; 32] = [0xA9; 32];
+        let plan = MilestonePlan::new(&[400_000, 600_000]).unwrap();
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan)
+            .unwrap()
+            .with_milestone_verifier(OLD_VERIFIER)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.rotate_milestone_verifier(ALICE, BOB, NEW_VERIFIER)
+            .unwrap();
+        assert_eq!(e.milestone_verifier(), NEW_VERIFIER);
+        // Documented failure modes: one party alone is Unauthorized,
+        // the zero address can never be the verifier, an unbound
+        // escrow has nothing to rotate — and, unlike
+        // `rotate_arbiter` / `rotate_deadman_heir`, re-affirming the
+        // current verifier is rejected, not a no-op.
+        assert_eq!(
+            e.rotate_milestone_verifier(ALICE, MALLORY, NEW_VERIFIER),
+            Err(EscrowError::Unauthorized),
+            "initializer alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_milestone_verifier(MALLORY, BOB, NEW_VERIFIER),
+            Err(EscrowError::Unauthorized),
+            "taker alone cannot rotate"
+        );
+        assert_eq!(
+            e.rotate_milestone_verifier(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::InvalidMilestoneVerifier)
+        );
+        assert_eq!(
+            e.rotate_milestone_verifier(ALICE, BOB, NEW_VERIFIER),
+            Err(EscrowError::InvalidMilestoneVerifier),
+            "same-value rotation is rejected, not a no-op"
+        );
+        assert_eq!(
+            e.milestone_verifier(),
+            NEW_VERIFIER,
+            "failed calls change nothing"
+        );
+        let mut unbound = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        unbound.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            unbound.rotate_milestone_verifier(ALICE, BOB, NEW_VERIFIER),
+            Err(EscrowError::InvalidMilestoneVerifier),
+            "rotation never creates the gate"
+        );
     }
 
     #[test]
@@ -43262,6 +43347,12 @@ pub(crate) mod anchor_idl_tests {
         // value comes from the `initialize_deadman_switch` heir param
         // (Uninitialized only); this entry documents the rotation source.
         ("rotate_deadman_heir", "new_heir", "deadman_heir"),
+        // AV-381: the rotation param rewrites the same field in place —
+        // the param source for `milestone_verifier`. The field's initial
+        // value comes from the `with_milestone_verifier` builder
+        // (Uninitialized only, a state-machine method — not an instruction
+        // param); this entry documents the rotation source.
+        ("rotate_milestone_verifier", "new_verifier", "milestone_verifier"),
         // AV-110: the rent top-up accumulates its `lamports` param
         // into the `rent_topped_up_total` tail counter (any state but
         // Closed); the counter is zeroed by `initialize`.
@@ -43870,14 +43961,15 @@ pub(crate) mod anchor_idl_tests {
         // `initialize`; set by `with_milestone_verifier`
         // (Uninitialized only, non-zero key); read by
         // `release_milestone` / `release_milestone_verified` as
-        // the gate. Same field-source rationale as the deadline
-        // table above: no instruction param writes this field.
-        (
-            "milestone_verifier",
-            "zeroed by initialize; set by with_milestone_verifier \
-             (Uninitialized only, non-zero key); read by \
-             release_milestone / release_milestone_verified as the gate",
-        ),
+        // the gate. AV-381: the field is populated by the
+        // `rotate_milestone_verifier` instruction param (see
+        // PARAM_FIELD_MAP), so it is not listed here — like
+        // `taker` / `arbiter`, every field gets exactly one source
+        // kind. The field's *initial* value comes from the
+        // `with_milestone_verifier` builder (a state-machine
+        // method, not an instruction param, so it cannot appear in
+        // the param table); the param entry documents the rotation
+        // source.
         // AV-212: the credential issuer pubkey — zeroed by
         // `initialize`; set by `with_credential_gate`
         // (Uninitialized only, non-zero key); read by `release` /
@@ -70105,6 +70197,17 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("rotate_pauser_program"),
             [78, 138, 233, 204, 18, 51, 195, 168]
+        );
+    }
+
+    #[test]
+    fn rotate_milestone_verifier_instruction_discriminator_is_pinned() {
+        // AV-381. IDL: sha256("global:rotate_milestone_verifier")[..8]
+        // — the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("rotate_milestone_verifier"),
+            [76, 214, 59, 2, 205, 82, 88, 187]
         );
     }
 

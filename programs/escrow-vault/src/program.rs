@@ -1994,6 +1994,68 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate the milestone verifier by dual-signed governance
+    /// (AV-381; mirrors `Escrow::rotate_milestone_verifier`). Both the
+    /// initializer and the taker must sign — the verifier itself does not
+    /// sign, so a lost verifier key cannot block its own replacement (the
+    /// `rotate_arbiter` reasoning). Only `Funded`: the terminal states
+    /// and `Disputed` are `InvalidStateTransition` (no live milestone
+    /// left to attest, and arbitration in flight adjudicates the
+    /// verifier's attestations). Only an escrow whose verifier gate is
+    /// already bound may rotate (`InvalidMilestoneVerifier`, code 323,
+    /// fail-closed — rotation never creates the gate; the initial set
+    /// belongs to `with_milestone_verifier` before funding). The zero
+    /// address is `InvalidMilestoneVerifier` (code 323). Rotating to the
+    /// current verifier is rejected with `InvalidMilestoneVerifier`
+    /// (code 323) — a no-change rotation is not governance, unlike
+    /// `rotate_arbiter`'s idempotent no-op. A paused escrow fails fast
+    /// (`Paused`) — rotation is a config transition, not the pause
+    /// key-loss escape hatch. Only `milestone_verifier` changes (the
+    /// milestone plan, confirmations and settled tranches are untouched
+    /// — the rotation takes no clock parameter). The new verifier
+    /// governs from the next `release_milestone_verified`: that path
+    /// reads the live `milestone_verifier` on every call, so
+    /// attestations signed by the old verifier stop verifying the moment
+    /// the rotation lands while attestations signed by the new verifier
+    /// verify. Emits `MilestoneVerifierRotated` only on an actual change
+    /// (from == to == the current state), mirroring
+    /// `IndexedEscrow::rotate_milestone_verifier` — the same-value path
+    /// is rejected by the pure logic, so the change-only guard below is
+    /// always true and only preserves the `rotate_taker` shape.
+    pub fn rotate_milestone_verifier(ctx: Context<RotateMilestoneVerifier>, new_verifier: Pubkey) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.milestone_verifier();
+        escrow
+            .rotate_milestone_verifier(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_verifier.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.milestone_verifier` in place in the real build
+        // (32 bytes, always present) — no realloc, no rent change.
+        if escrow.milestone_verifier() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::MilestoneVerifierRotated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Top up the vault account's lamport balance so it stays
     /// rent-exempt (AV-110; mirrors `Escrow::top_up_rent`).
     /// Permissionless: the initializer, the taker, the keeper bot or a
@@ -8097,6 +8159,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::rotate_deadman_heir`). Mirrors
     /// `escrow_state::EscrowEventKind::DeadmanHeirRotated`.
     DeadmanHeirRotated,
+    /// AV-381: the milestone verifier was rotated by dual-signed
+    /// governance (`Escrow::rotate_milestone_verifier`). Mirrors
+    /// `escrow_state::EscrowEventKind::MilestoneVerifierRotated`.
+    MilestoneVerifierRotated,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -8270,6 +8336,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::DeadmanHeirRotated => {
             EscrowVaultEventKind::DeadmanHeirRotated
+        }
+        escrow_state::EscrowEventKind::MilestoneVerifierRotated => {
+            EscrowVaultEventKind::MilestoneVerifierRotated
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -9330,6 +9399,24 @@ pub struct RotateDeadmanHeir<'info> {
     /// Second governance signer: must equal the escrow's taker. The
     /// taker consents to redirecting the inactivity recovery on the
     /// funds they stand to receive.
+    pub taker: Signer<'info>,
+}
+
+/// AV-381: accounts for `rotate_milestone_verifier` — the verifier
+/// rotation is dual-signed governance by the two parties; the verifier
+/// itself does not sign (a lost verifier key must not block its own
+/// replacement).
+#[derive(Accounts)]
+pub struct RotateMilestoneVerifier<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to re-keying the gate that attests their
+    /// milestones.
     pub taker: Signer<'info>,
 }
 

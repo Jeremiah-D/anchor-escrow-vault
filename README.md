@@ -3218,7 +3218,11 @@ tranches are untouched. Orthogonal to `rotate_arbiter` /
 `rotate_taker` (different roles: dispute settler, payout
 counterparty, delivery attester). The `MilestoneVerifierRotated`
 event (discriminant 98) carries no amounts; the new verifier is read
-from the vault. (Solana: milestone fulfillment governance.)
+from the vault. AV-381 adds the program-level `rotate_milestone_verifier(new_verifier)` — dual-signed by
+initializer + taker (the verifier itself does not sign, so a lost verifier key never blocks its own
+replacement), `Funded`-only, bound-gate-only, zero key and same-value rotation both refused with
+`InvalidMilestoneVerifier` (323); it emits `MilestoneVerifierRotated` (discriminant 98) only on an actual
+change, and rewrites the 32-byte verifier region in place — no layout change. (Solana: milestone fulfillment governance.)
 
 ## Winner payment window (AV-209)
 

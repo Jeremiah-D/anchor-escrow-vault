@@ -1036,6 +1036,14 @@
       ]
     },
     {
+      "name": "rotate_milestone_verifier",
+      "discriminator": [76, 214, 59, 2, 205, 82, 88, 187],
+      "accounts": [],
+      "args": [
+        {"name": "new_verifier", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "top_up_rent",
       "discriminator": [228, 107, 203, 188, 137, 169, 152, 122],
       "accounts": [],
