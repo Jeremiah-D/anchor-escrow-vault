@@ -2316,6 +2316,85 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate the ladder slash penalty account by dual-signed
+    /// governance (AV-386; mirrors
+    /// `Escrow::rotate_slash_ladder_penalty_account`). Both the
+    /// initializer and the taker must sign — the penalty account
+    /// itself does not sign, so a lost penalty-account key cannot
+    /// block its own replacement (the `rotate_arbiter` reasoning).
+    /// Only `Funded`: the terminal states and `Disputed` are
+    /// `InvalidStateTransition` (no live slash left to redirect, and
+    /// arbitration in flight settles under the account it was built
+    /// with). Only an escrow carrying a slash ladder may rotate
+    /// (`InvalidSlashLadder`, fail-closed — post-funding
+    /// installation would add a penalty clause the taker never
+    /// funded under, and a flat escrow's account belongs to the
+    /// AV-272 path). An insurance-pool escrow is refused with
+    /// `SlashNotEligible` (its slash routes to the neutral pool
+    /// custody, so the ladder account is a dead field). The zero
+    /// address is `InvalidSlashLadder`. Rotating to the current
+    /// account is an idempotent no-op. A paused escrow fails fast
+    /// (`Paused`) — rotation is a config transition, not the pause
+    /// key-loss escape hatch. Unlike the flat one-shot, an
+    /// already-slashed ladder stays rotatable (the top rung is
+    /// reused once the ladder is exhausted, so a rotated account
+    /// still governs real future enforcement, and banked penalties
+    /// are never restated). Only `slash_ladder.penalty_account`
+    /// changes (the rung table, the rung count and the consumption
+    /// cursor are untouched — the cursor is deliberately not reset —
+    /// and the rotation takes no clock parameter). The new account
+    /// governs from the next ladder slash: the Anchor layer
+    /// transfers to the live `penalty_account` read from the ladder
+    /// at slash time, so a default penalized after the rotation
+    /// pays the new account, while the pool path is unaffected and
+    /// a slash already settled keeps the account it settled under.
+    /// Emits `SlashLadderPenaltyAccountRotated` only on an actual
+    /// change (from == to == the current state), mirroring
+    /// `IndexedEscrow::rotate_slash_ladder_penalty_account`.
+    pub fn rotate_slash_ladder_penalty_account(
+        ctx: Context<RotateSlashLadderPenaltyAccount>,
+        new_penalty_account: Pubkey,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow
+            .slash_ladder()
+            .map(|ladder| ladder.penalty_account);
+        escrow
+            .rotate_slash_ladder_penalty_account(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_penalty_account.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.slash_ladder.penalty_account` in place in
+        // the real build (the ladder region is already resident) — no
+        // realloc, no rent change.
+        if escrow
+            .slash_ladder()
+            .map(|ladder| ladder.penalty_account)
+            != before
+        {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::SlashLadderPenaltyAccountRotated,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Top up the vault account's lamport balance so it stays
     /// rent-exempt (AV-110; mirrors `Escrow::top_up_rent`).
     /// Permissionless: the initializer, the taker, the keeper bot or a
@@ -8440,6 +8519,11 @@ pub enum EscrowVaultEventKind {
     /// (`Escrow::rotate_slash_penalty_account`). Mirrors
     /// `escrow_state::EscrowEventKind::SlashPenaltyAccountRotated`.
     SlashPenaltyAccountRotated,
+    /// AV-386: the ladder slash penalty account was rotated by
+    /// dual-signed governance
+    /// (`Escrow::rotate_slash_ladder_penalty_account`). Mirrors
+    /// `escrow_state::EscrowEventKind::SlashLadderPenaltyAccountRotated`.
+    SlashLadderPenaltyAccountRotated,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -8628,6 +8712,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::SlashPenaltyAccountRotated => {
             EscrowVaultEventKind::SlashPenaltyAccountRotated
+        }
+        escrow_state::EscrowEventKind::SlashLadderPenaltyAccountRotated => {
+            EscrowVaultEventKind::SlashLadderPenaltyAccountRotated
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -9778,6 +9865,24 @@ pub struct RotateSlashPenaltyAccount<'info> {
     /// Second governance signer: must equal the escrow's taker. The
     /// taker consents to redirecting the default penalty their
     /// funded escrow settles under.
+    pub taker: Signer<'info>,
+}
+
+/// AV-386: accounts for `rotate_slash_ladder_penalty_account` — the
+/// ladder penalty-account rotation is dual-signed governance by the
+/// two parties; the penalty account itself does not sign (a lost
+/// penalty-account key must not block its own replacement).
+#[derive(Accounts)]
+pub struct RotateSlashLadderPenaltyAccount<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to redirecting the tiered default penalty
+    /// their funded escrow settles under.
     pub taker: Signer<'info>,
 }
 
