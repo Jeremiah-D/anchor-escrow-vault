@@ -1084,6 +1084,15 @@
       ]
     },
     {
+      "name": "rotate_social_recovery_guardian",
+      "discriminator": [30, 252, 240, 50, 213, 171, 103, 97],
+      "accounts": [],
+      "args": [
+        {"name": "old_guardian", "type": "publicKey"},
+        {"name": "new_guardian", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "top_up_rent",
       "discriminator": [228, 107, 203, 188, 137, 169, 152, 122],
       "accounts": [],

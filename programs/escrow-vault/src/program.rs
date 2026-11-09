@@ -2395,6 +2395,82 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Rotate one social-recovery guardian by dual-signed
+    /// governance (AV-387; mirrors
+    /// `Escrow::rotate_social_recovery_guardian`). Both the
+    /// initializer and the taker must sign — the guardian being
+    /// replaced does not sign, so a lost guardian key cannot
+    /// block its own replacement (the `rotate_arbiter` reasoning).
+    /// Only `Funded`: the terminal states and `Disputed` are
+    /// `InvalidStateTransition` (the builder owns the initial
+    /// set). Only an escrow carrying a social-recovery policy
+    /// may rotate (`RecoveryNotConfigured`, code 287,
+    /// fail-closed — post-funding installation would add a
+    /// recovery path the taker never funded under). A pending
+    /// recovery request refuses the rotation
+    /// (`RecoveryRequestPending`, code 289 — the approval bitmap
+    /// is indexed by slot, so swapping a slot would re-attribute
+    /// already-cast approval votes). An unknown `old_guardian`
+    /// is `RecoveryNotGuardian` (code 288). A zero
+    /// `new_guardian`, or one duplicating another slot, is
+    /// `InvalidSocialRecovery` (code 286, the
+    /// `SocialRecovery::new` gate) leaving the original guardian
+    /// untouched. Rotating to the current guardian is an
+    /// idempotent no-op. A paused escrow fails fast (`Paused`) —
+    /// rotation is a config transition, not the pause key-loss
+    /// escape hatch. Only that one `recovery.guardians` slot
+    /// changes (the guardian count, the threshold and the
+    /// timelock are untouched, the pending request stays empty,
+    /// and the rotation takes no clock parameter). The new
+    /// guardian governs from the next `request_recovery` /
+    /// `approve_recovery`: the recovery path compares against
+    /// the live slot guardian at each call, so the old guardian
+    /// is refused at once while the new guardian may open and
+    /// approve, and a request already settled keeps the
+    /// guardians it settled under. Emits
+    /// `SocialRecoveryGuardianRotated` only on an actual change
+    /// (from == to == the current state), mirroring
+    /// `IndexedEscrow::rotate_social_recovery_guardian`.
+    pub fn rotate_social_recovery_guardian(
+        ctx: Context<RotateSocialRecoveryGuardian>,
+        old_guardian: Pubkey,
+        new_guardian: Pubkey,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.recovery();
+        escrow
+            .rotate_social_recovery_guardian(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                old_guardian.to_bytes(),
+                new_guardian.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites one `recovery.guardians` slot in place in
+        // the real build (the policy region is already resident) — no
+        // realloc, no rent change.
+        if escrow.recovery() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::SocialRecoveryGuardianRotated,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Top up the vault account's lamport balance so it stays
     /// rent-exempt (AV-110; mirrors `Escrow::top_up_rent`).
     /// Permissionless: the initializer, the taker, the keeper bot or a
@@ -8524,6 +8600,11 @@ pub enum EscrowVaultEventKind {
     /// (`Escrow::rotate_slash_ladder_penalty_account`). Mirrors
     /// `escrow_state::EscrowEventKind::SlashLadderPenaltyAccountRotated`.
     SlashLadderPenaltyAccountRotated,
+    /// AV-387: one social-recovery guardian slot was rotated by
+    /// dual-signed governance
+    /// (`Escrow::rotate_social_recovery_guardian`). Mirrors
+    /// `escrow_state::EscrowEventKind::SocialRecoveryGuardianRotated`.
+    SocialRecoveryGuardianRotated,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -8715,6 +8796,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::SlashLadderPenaltyAccountRotated => {
             EscrowVaultEventKind::SlashLadderPenaltyAccountRotated
+        }
+        escrow_state::EscrowEventKind::SocialRecoveryGuardianRotated => {
+            EscrowVaultEventKind::SocialRecoveryGuardianRotated
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -9883,6 +9967,26 @@ pub struct RotateSlashLadderPenaltyAccount<'info> {
     /// Second governance signer: must equal the escrow's taker. The
     /// taker consents to redirecting the tiered default penalty
     /// their funded escrow settles under.
+    pub taker: Signer<'info>,
+}
+
+/// AV-387: accounts for `rotate_social_recovery_guardian` — the
+/// social-recovery guardian rotation is dual-signed governance by the
+/// two parties; the guardian being replaced does not sign (a lost
+/// guardian key must not block its own replacement). The old and new
+/// guardians ride as instruction params, not accounts — the only
+/// dual-Pubkey-param item in the rotation family.
+#[derive(Accounts)]
+pub struct RotateSocialRecoveryGuardian<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to replacing one guardian of the lost-key
+    /// recovery policy their funded escrow settles under.
     pub taker: Signer<'info>,
 }
 
