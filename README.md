@@ -3796,6 +3796,24 @@ error they get.
   settlement already made keeps the premium it settled under.
   No event is emitted — `OptionEscrow` has no event layer.
   (Solana: option governance.)
+- **Resizing the underlying (AV-391)**: `amend_option_underlying`
+  revises the underlying on an `Active` option, authorized by
+  seller + buyer together — the underlying is the bilateral
+  notional, so a unilateral rewrite would let one side resize
+  the other's bargain alone. The new underlying reuses the
+  construction gate (a zero underlying fails closed with
+  `InvalidOptionTerms`, code 339, and the current underlying is
+  untouched); an exercised option is `OptionAlreadySettled`
+  (code 343) and an expired option is `OptionExpired` (code
+  341). Re-affirming the current underlying is a no-op. Only
+  `underlying` changes, and `exercise` / `expire` read the live
+  underlying, so the new underlying governs the next settlement
+  — a settlement already made keeps the underlying it settled
+  under. Resizing the notional does not reprice the premium:
+  the premium is an independent term, untouched unless the
+  parties revise it separately (`amend_option_premium`). No
+  event is emitted — `OptionEscrow` has no event layer.
+  (Solana: option governance.)
 
 New error codes (never renumbered): `InvalidOptionTerms`
 (339), `OptionNotBuyer` (340), `OptionExpired` (341),

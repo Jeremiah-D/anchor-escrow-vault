@@ -98,17 +98,18 @@ pub struct OptionExpiry {
 /// A fixed-strike call option over a locked underlying amount.
 ///
 /// Fixed-size and `Copy`, like the other pure-logic sidecars: the
-/// option's terms are set once at construction — with five
+/// option's terms are set once at construction — with six
 /// governed exceptions, the strike, the expiry, the seller, the
-/// buyer, and the premium, which the two parties may revise
-/// together while the option is `Active`
+/// buyer, the premium, and the underlying, which the two parties
+/// may revise together while the option is `Active`
 /// ([`OptionEscrow::amend_option_strike`], AV-294;
 /// [`OptionEscrow::amend_option_expiry`], AV-299;
 /// [`OptionEscrow::amend_option_seller`], AV-366;
 /// [`OptionEscrow::amend_option_buyer`], AV-367;
-/// [`OptionEscrow::amend_option_premium`], AV-371). A unilateral
+/// [`OptionEscrow::amend_option_premium`], AV-371;
+/// [`OptionEscrow::amend_option_underlying`], AV-391). A unilateral
 /// move of any of them would let one side rewrite the deal alone, so
-/// all five revisions need seller + buyer together.
+/// all six revisions need seller + buyer together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OptionEscrow {
     seller: [u8; 32],
@@ -175,7 +176,9 @@ impl OptionEscrow {
         self.buyer
     }
 
-    /// The locked underlying amount.
+    /// The locked underlying amount — fixed at construction,
+    /// revisable only by the dual-signed
+    /// [`OptionEscrow::amend_option_underlying`] while `Active`.
     pub fn underlying(&self) -> u64 {
         self.underlying
     }
@@ -672,6 +675,85 @@ impl OptionEscrow {
             return Ok(());
         }
         self.premium = new_premium;
+        Ok(())
+    }
+
+    /// Revise the underlying on an `Active` option (AV-391 — Solana
+    /// option governance): both parties authorize the change
+    /// (the underlying is the bilateral notional — a unilateral
+    /// rewrite would let one side resize the other's bargain
+    /// alone). Check order is authority → state → value,
+    /// mirroring [`OptionEscrow::amend_option_premium`] and
+    /// [`OptionEscrow::exercise`], so a stranger learns nothing
+    /// about the option's state from the error alone.
+    ///
+    /// Why: the underlying is fixed at construction
+    /// ([`OptionEscrow::new`]), but the parties may agree the
+    /// notional no longer reflects the deal — a partial
+    /// replacement, or a volatility-driven resize — so an
+    /// underlying that cannot move would force a fresh option
+    /// (and a fresh custody) for a legitimate resize, discarding
+    /// the `Active` state. Only an `Active` option may revise: an
+    /// exercised option has already settled
+    /// ([`EscrowError::OptionAlreadySettled`]), and an expired
+    /// option's window has lapsed ([`EscrowError::OptionExpired`]
+    /// — the lapsed-window error `exercise` returns once the
+    /// window closes, since expiry settlement is then the only
+    /// remaining path). The revision takes no timestamp: like
+    /// `amend_option_premium`, the settlement boundary is the
+    /// explicit state transition, not the wall clock, so an
+    /// `Active` option whose expiry instant has passed but which
+    /// has not yet been expired may still revise — the revision
+    /// never revives the exercise window, which still closes at
+    /// `expiry`. The new underlying reuses the `new` gate (it
+    /// must be positive, [`EscrowError::InvalidOptionTerms`]
+    /// otherwise, and the current underlying is untouched). Only
+    /// `underlying` changes — seller, buyer, premium, strike,
+    /// expiry and state are untouched — and re-affirming the
+    /// current underlying is a no-op.
+    /// [`OptionEscrow::exercise`] and [`OptionEscrow::expire`]
+    /// read the live underlying, so the new underlying governs
+    /// the next settlement (a settlement already made keeps the
+    /// underlying it settled under). Resizing the notional does
+    /// not reprice the premium: the premium is an independent
+    /// term, untouched unless the parties revise it separately
+    /// ([`OptionEscrow::amend_option_premium`]). There is no
+    /// event layer on `OptionEscrow`, so no event is emitted for
+    /// the revision. Orthogonal to [`OptionEscrow::new`] (that
+    /// installs the underlying at build time, this revises it
+    /// while `Active`) and to `exercise` / `expire` (those settle
+    /// at the underlying, this resizes it).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller pair that is not exactly seller + buyer,
+    /// ([`EscrowError::OptionAlreadySettled`], code 343) once
+    /// the option has been exercised,
+    /// ([`EscrowError::OptionExpired`], code 341) once the
+    /// option has expired, and
+    /// ([`EscrowError::InvalidOptionTerms`], code 339) for a
+    /// zero new underlying — either way the current underlying is
+    /// untouched.
+    pub fn amend_option_underlying(
+        &mut self,
+        seller: [u8; 32],
+        buyer: [u8; 32],
+        new_underlying: u64,
+    ) -> Result<(), EscrowError> {
+        if seller != self.seller || buyer != self.buyer {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            OptionState::Active => {}
+            OptionState::Exercised => return Err(EscrowError::OptionAlreadySettled),
+            OptionState::Expired => return Err(EscrowError::OptionExpired),
+        }
+        if new_underlying == 0 {
+            return Err(EscrowError::InvalidOptionTerms);
+        }
+        if new_underlying == self.underlying {
+            return Ok(());
+        }
+        self.underlying = new_underlying;
         Ok(())
     }
 }
@@ -1587,5 +1669,154 @@ mod tests {
         );
         let legs = o.expire(EXPIRY).unwrap();
         assert_eq!(legs.premium_to_seller, 80_000);
+    }
+
+    #[test]
+    fn amend_option_underlying_moves_the_live_underlying() {
+        // AV-391: the resized underlying governs the next exercise,
+        // and nothing else moves — the strike and premium legs are
+        // unchanged, only the notional paid to the buyer moves.
+        let mut o = option();
+        o.amend_option_underlying(SELLER, BUYER, 2_000_000).unwrap();
+        assert_eq!(o.underlying(), 2_000_000);
+        assert_eq!(o.seller(), SELLER);
+        assert_eq!(o.buyer(), BUYER);
+        assert_eq!(o.premium(), PREMIUM);
+        assert_eq!(o.strike(), STRIKE);
+        assert_eq!(o.expiry(), EXPIRY);
+        assert_eq!(o.state(), OptionState::Active);
+        // Exercise settles at the new underlying: the buyer takes
+        // the resized notional, the seller's legs are untouched.
+        let legs = o.exercise(BUYER, EXPIRY - 1, STRIKE).unwrap();
+        assert_eq!(legs.underlying_to_buyer, 2_000_000);
+        assert_eq!(legs.strike_to_seller, STRIKE);
+        assert_eq!(legs.premium_to_seller, PREMIUM);
+    }
+
+    #[test]
+    fn amend_option_underlying_can_resize_again() {
+        // AV-391: revisions are not one-shot — each amendment
+        // supersedes the last, and exercise always reads live.
+        let mut o = option();
+        o.amend_option_underlying(SELLER, BUYER, 500_000).unwrap();
+        o.amend_option_underlying(SELLER, BUYER, 1_500_000).unwrap();
+        assert_eq!(o.underlying(), 1_500_000);
+        let legs = o.exercise(BUYER, EXPIRY - 1, STRIKE).unwrap();
+        assert_eq!(legs.underlying_to_buyer, 1_500_000);
+        assert_eq!(legs.strike_to_seller, STRIKE);
+    }
+
+    #[test]
+    fn amend_option_underlying_rejects_zero() {
+        // AV-391: a zero underlying reuses the `new` gate and leaves
+        // the current underlying untouched.
+        let mut o = option();
+        let err = o
+            .amend_option_underlying(SELLER, BUYER, 0)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidOptionTerms);
+        assert_eq!(err.code(), 339);
+        assert_eq!(o.underlying(), UNDERLYING);
+        // Still exercisable at the untouched underlying.
+        let legs = o.exercise(BUYER, EXPIRY - 1, STRIKE).unwrap();
+        assert_eq!(legs.underlying_to_buyer, UNDERLYING);
+    }
+
+    #[test]
+    fn amend_option_underlying_reaffirmation_is_noop() {
+        // AV-391: re-affirming the current underlying succeeds and
+        // changes nothing.
+        let mut o = option();
+        o.amend_option_underlying(SELLER, BUYER, UNDERLYING)
+            .unwrap();
+        assert_eq!(o.underlying(), UNDERLYING);
+        assert_eq!(o.state(), OptionState::Active);
+        let legs = o.exercise(BUYER, EXPIRY - 1, STRIKE).unwrap();
+        assert_eq!(legs.underlying_to_buyer, UNDERLYING);
+        assert_eq!(legs.premium_to_seller, PREMIUM);
+    }
+
+    #[test]
+    fn amend_option_underlying_is_dual_signed_and_active_only() {
+        // AV-391: a stranger, either party alone, or the parties
+        // swapped is refused, and the underlying is untouched.
+        let mut o = option();
+        let err = o
+            .amend_option_underlying(STRANGER, BUYER, 2_000_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        let err = o
+            .amend_option_underlying(SELLER, STRANGER, 2_000_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        let err = o
+            .amend_option_underlying(BUYER, SELLER, 2_000_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(o.underlying(), UNDERLYING);
+        // Authority is checked before state: a stranger on a
+        // settled option still gets Unauthorized.
+        let mut exercised = option();
+        exercised.exercise(BUYER, EXPIRY - 1, STRIKE).unwrap();
+        let err = exercised
+            .amend_option_underlying(STRANGER, BUYER, 2_000_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(exercised.underlying(), UNDERLYING);
+        // The parties on an exercised option get AlreadySettled.
+        let err = exercised
+            .amend_option_underlying(SELLER, BUYER, 2_000_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::OptionAlreadySettled);
+        assert_eq!(err.code(), 343);
+        assert_eq!(exercised.underlying(), UNDERLYING);
+        // The parties on an expired option get OptionExpired.
+        let mut expired = option();
+        expired.expire(EXPIRY).unwrap();
+        let err = expired
+            .amend_option_underlying(SELLER, BUYER, 2_000_000)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::OptionExpired);
+        assert_eq!(err.code(), 341);
+        assert_eq!(expired.underlying(), UNDERLYING);
+    }
+
+    #[test]
+    fn amend_option_underlying_expiry_returns_new_underlying() {
+        // AV-391: the expiry leg reads the live underlying too — a
+        // resized option that dies unexercised returns the new
+        // underlying to the seller, and the old notional is gone.
+        let mut o = option();
+        o.amend_option_underlying(SELLER, BUYER, 2_000_000).unwrap();
+        let legs = o.expire(EXPIRY).unwrap();
+        assert_eq!(legs.underlying_to_seller, 2_000_000);
+        assert_eq!(legs.premium_to_seller, PREMIUM);
+        assert_eq!(o.state(), OptionState::Expired);
+    }
+
+    #[test]
+    fn amend_option_underlying_lapsed_window_still_revises() {
+        // AV-391: like the premium revision, the underlying revision
+        // is judged by state, not by the clock — an `Active`
+        // option whose expiry instant has passed but which has
+        // not yet been expired may still revise, and the revision
+        // never revives the exercise window.
+        let mut o = option();
+        assert_eq!(
+            o.exercise(BUYER, EXPIRY, STRIKE),
+            Err(EscrowError::OptionExpired)
+        );
+        o.amend_option_underlying(SELLER, BUYER, 2_000_000)
+            .unwrap();
+        assert_eq!(o.underlying(), 2_000_000);
+        assert!(!o.exercise_window_open(EXPIRY));
+        assert_eq!(
+            o.exercise(BUYER, EXPIRY, STRIKE),
+            Err(EscrowError::OptionExpired)
+        );
+        let legs = o.expire(EXPIRY).unwrap();
+        assert_eq!(legs.underlying_to_seller, 2_000_000);
+        assert_eq!(legs.premium_to_seller, PREMIUM);
     }
 }
