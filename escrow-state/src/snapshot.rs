@@ -1229,6 +1229,18 @@ fn write_governance_action(s: &mut String, action: &GovernanceAction) {
             }
             s.push_str("]}");
         }
+        GovernanceAction::UpdateMintAllowlist { mints, count } => {
+            s.push_str("{\"kind\":\"update_mint_allowlist\",\"mints\":[");
+            for i in 0..*count as usize {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push('"');
+                s.push_str(&hex32(&mints[i]));
+                s.push('"');
+            }
+            s.push_str("]}");
+        }
         GovernanceAction::UpdateTieredQuorum { tiers, count } => {
             s.push_str("{\"kind\":\"update_tiered_quorum\",\"tiers\":[");
             for i in 0..*count as usize {

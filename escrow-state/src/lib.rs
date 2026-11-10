@@ -5622,10 +5622,10 @@ impl MintAllowlist {
 
 // ---------- AV-158: delayed dual-signed governance ----------
 //
-// The eighteen dual-signed config changes (the four AV-158 actions
+// The nineteen dual-signed config changes (the four AV-158 actions
 // plus the eleven AV-335 actions, the two AV-336 split-shares
-// halves, and the one AV-378 action) can opt in to a two-phase propose → delay → execute/cancel
-// propose → delay → execute/cancel protocol via
+// halves, the one AV-378 action, and the one AV-390 action) can
+// opt in to a two-phase propose → delay → execute/cancel protocol via
 // `Escrow::with_governance_delay`. The delay is the anti-flash-
 // governance rule: a malicious threshold change proposed while an
 // attestor is dark cannot take effect before the other party has had
@@ -5648,7 +5648,8 @@ impl MintAllowlist {
 //   AmendSubscriptionPeriodSecs, 11 = AmendDefaultJudgment, 12 =
 //   UpdateSettlementMintAllowlist, 13 = UpdateTieredQuorum, 14 =
 //   UpdateArbiterPanelMembers, 15 = AmendPayoutSplitSharesFirst, 16
-//   = AmendPayoutSplitSharesSecond, 17 = AmendPanelThreshold) +
+//   = AmendPayoutSplitSharesSecond, 17 = AmendPanelThreshold, 18 =
+//   UpdateMintAllowlist) +
 //   [`GOVERNANCE_ACTION_PAYLOAD_LEN`]-byte payload. Per-kind layout:
 //   kind 0: payload[0..8] = new_threshold LE;
 //   kind 1: payload[0..256] = 8 attestor keys, payload[256..320] =
@@ -5679,6 +5680,8 @@ impl MintAllowlist {
 //   exactly one fixed payload (8 * 32 + 8 * 8 + 1 = 321);
 //   kind 16: same layout for the second half (shares[8..16)).
 //   kind 17: payload[0] = new_threshold.
+//   kind 18: payload[0..256] = 8 allowlist mints, payload[256] =
+//   live count (0 = clear the allowlist);
 // - `GovernanceProposal`: the action + 32-byte proposer +
 //   8-byte `proposed_at` + 8-byte `delay_secs` (the configured delay
 //   snapshotted at propose time, so an in-flight proposal keeps its
@@ -5798,6 +5801,16 @@ pub enum GovernanceAction {
     /// sibling of the `Uninitialized`-only
     /// [`Escrow::update_panel_threshold`].
     AmendPanelThreshold { new_threshold: u8 },
+    /// [`Escrow::update_mint_allowlist`] with these mints
+    /// (AV-390): only `mints[..count]` are live (`count == 0`
+    /// clears the allowlist back to `None`, mirroring the direct
+    /// call's empty-list rule). The bound mint is pinned by the
+    /// direct call's invariant — a proposed list that drops it
+    /// fails validation, so it can never execute.
+    UpdateMintAllowlist {
+        mints: [[u8; 32]; MAX_MINT_ALLOWLIST],
+        count: u8,
+    },
 }
 
 /// Serialized length of a [`GovernanceAction`]'s fixed payload: the
@@ -5869,7 +5882,8 @@ impl GovernanceAction {
     /// AmendSubscriptionPeriodSecs, 11 = AmendDefaultJudgment, 12 =
     /// UpdateSettlementMintAllowlist, 13 = UpdateTieredQuorum, 14 =
     /// UpdateArbiterPanelMembers, 15 = AmendPayoutSplitSharesFirst,
-    /// 16 = AmendPayoutSplitSharesSecond, 17 = AmendPanelThreshold.
+    /// 16 = AmendPayoutSplitSharesSecond, 17 = AmendPanelThreshold,
+    /// 18 = UpdateMintAllowlist.
     pub(crate) fn kind_byte(&self) -> u8 {
         match self {
             GovernanceAction::UpdateQuorum { .. } => 0,
@@ -5890,6 +5904,7 @@ impl GovernanceAction {
             GovernanceAction::AmendPayoutSplitSharesFirst { .. } => 15,
             GovernanceAction::AmendPayoutSplitSharesSecond { .. } => 16,
             GovernanceAction::AmendPanelThreshold { .. } => 17,
+            GovernanceAction::UpdateMintAllowlist { .. } => 18,
         }
     }
 
@@ -6011,6 +6026,13 @@ impl GovernanceAction {
             }
             GovernanceAction::AmendPanelThreshold { new_threshold } => {
                 out[0] = *new_threshold;
+            }
+            GovernanceAction::UpdateMintAllowlist { mints, count } => {
+                let n = (*count as usize).min(MAX_MINT_ALLOWLIST);
+                for (i, m) in mints[..n].iter().enumerate() {
+                    out[i * 32..(i + 1) * 32].copy_from_slice(m);
+                }
+                out[256] = *count;
             }
         }
         out
@@ -6214,6 +6236,20 @@ impl GovernanceAction {
             17 => Some(GovernanceAction::AmendPanelThreshold {
                 new_threshold: payload[0],
             }),
+            // AV-390: eight allowlist mints + live count —
+            // `count == 0` clears the allowlist (mirroring the
+            // direct call's empty-list rule) — always decodable.
+            18 => {
+                let count = payload[256];
+                if count as usize > MAX_MINT_ALLOWLIST {
+                    return None;
+                }
+                let mut mints = [[0u8; 32]; MAX_MINT_ALLOWLIST];
+                for i in 0..count as usize {
+                    mints[i].copy_from_slice(&payload[i * 32..(i + 1) * 32]);
+                }
+                Some(GovernanceAction::UpdateMintAllowlist { mints, count })
+            }
             _ => None,
         }
     }
@@ -6271,6 +6307,25 @@ impl GovernanceAction {
         let mut m = [[0u8; 32]; MAX_SETTLEMENT_MINT_ALLOWLIST];
         m[..mints.len()].copy_from_slice(mints);
         Some(GovernanceAction::UpdateSettlementMintAllowlist {
+            mints: m,
+            count: mints.len() as u8,
+        })
+    }
+
+    /// Convenience constructor for the funded-mint-allowlist
+    /// action from a slice (AV-390; bounds-checked: at most
+    /// [`MAX_MINT_ALLOWLIST`] entries; an empty slice clears the
+    /// allowlist, mirroring [`Escrow::update_mint_allowlist`]).
+    /// The list rules themselves (zero mints, the bound-mint
+    /// invariant) are validated against the live escrow by
+    /// [`Escrow::propose_governance`].
+    pub fn update_mint_allowlist(mints: &[[u8; 32]]) -> Option<Self> {
+        if mints.len() > MAX_MINT_ALLOWLIST {
+            return None;
+        }
+        let mut m = [[0u8; 32]; MAX_MINT_ALLOWLIST];
+        m[..mints.len()].copy_from_slice(mints);
+        Some(GovernanceAction::UpdateMintAllowlist {
             mints: m,
             count: mints.len() as u8,
         })
@@ -19868,6 +19923,141 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(self)
     }
 
+    /// Revise the funded-mint allowlist after funding (AV-390):
+    /// the post-funding counterpart to
+    /// [`Escrow::with_mint_allowlist`] (`Uninitialized`-only
+    /// initial configuration). A deal's funded-mint gate may need
+    /// to change mid-deal — a mint may be compromised or delisted,
+    /// or a new compliant mint adopted — without cancelling and
+    /// re-locking the escrow.
+    ///
+    /// Governance mirrors [`Escrow::update_settlement_mint_allowlist`]:
+    /// on a dual-sig escrow ([`Escrow::with_dual_sig`]) *both*
+    /// parties must sign — one party alone cannot unilaterally
+    /// reshape which mints the escrow may bind; on a plain escrow
+    /// the initializer alone authorizes. Valid on `Funded` only
+    /// (the builder owns the initial set, and terminal states have
+    /// no future binding left to gate). Check order is pause, then
+    /// authority, then the governance-delay routing gate, then
+    /// state, then the list validity and the bound-mint invariant —
+    /// the AV-46 / AV-49 convention. Replaces the whole list, or
+    /// clears it back to `None` (no restriction) when `mints` is
+    /// empty — the AV-157 empty-list convention, mirroring
+    /// [`Escrow::with_mint_allowlist`]. A non-empty list is
+    /// validated by [`MintAllowlist::new`]: more than
+    /// [`MAX_MINT_ALLOWLIST`] entries or a zero address are all
+    /// [`EscrowError::InvalidMint`], and a failed revision leaves
+    /// the original list untouched.
+    ///
+    /// Allowlist rules, not scalar rules: under governance the list
+    /// may be set, replaced, or cleared alike — no
+    /// "already configured" gate (unlike the scalar amends, where
+    /// post-funding installation would add a term the taker never
+    /// funded under). An escrow that never configured a list may
+    /// set its first one here; the bound-mint invariant below is
+    /// the only gate that ever refuses a list on the funded mint.
+    ///
+    /// The bound-mint invariant (new in AV-390, with no
+    /// settlement-mint counterpart): when a mint is already bound,
+    /// the new list must still contain it
+    /// ([`EscrowError::MintNotAllowlisted`] otherwise), mirroring
+    /// the [`Escrow::with_mint_allowlist`] gate — dropping the
+    /// bound mint would strand the funded mint outside its own
+    /// gate. Clearing to `None` is exempt: an empty list means
+    /// "allowlist off", not a list that excludes the bound mint.
+    ///
+    /// Only `mint_allowlist` changes — the bound `mint` and any
+    /// funded amount are untouched. The new list governs the mint
+    /// gate from the next [`Escrow::with_mint`] binding check: that
+    /// path reads the live list before binding, so a mint removed
+    /// here is refused at once while a mint added here binds from
+    /// the next call. Revising to the current list is a no-op: it
+    /// succeeds and writes nothing, so the event layer emits
+    /// nothing for it (paralleling `rotate_arbiter`). Orthogonal to
+    /// [`Escrow::with_mint_allowlist`] (that is the initial
+    /// configuration, this item is the post-funding revision), to
+    /// AV-157 (that is the allowlist mechanism itself, this item is
+    /// the list's revision), to AV-276 (that is the settlement-mint
+    /// allowlist, this item is the funded-mint allowlist), and to
+    /// [`Escrow::update_payout_allowlist`] /
+    /// [`Escrow::update_cpi_allowlist`] (those are the taker-payout
+    /// and CPI-target allowlists, this item is the funded-mint
+    /// allowlist). Emits `MintAllowlistUpdated` on the event layer,
+    /// except for the no-op re-affirmation.
+    pub fn update_mint_allowlist(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        mints: &[[u8; 32]],
+    ) -> Result<(), EscrowError> {
+        // AV-158: the direct entry always takes `via_delayed = false`
+        // — on a delay-opted-in escrow the allowlist moves only
+        // through the propose/execute protocol. Thin by design: one
+        // allowlist implementation, zero gate drift (see
+        // `update_quorum_impl`).
+        self.update_mint_allowlist_impl(initializer, taker, mints, false)
+    }
+
+    /// The shared funded-mint-allowlist engine behind
+    /// [`Escrow::update_mint_allowlist`] (AV-390). Same guard chain
+    /// and clear-on-empty semantics as the direct call;
+    /// `via_delayed` is `true` only when the AV-158 two-step
+    /// protocol drives the call after the delay elapsed.
+    fn update_mint_allowlist_impl(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        mints: &[[u8; 32]],
+        via_delayed: bool,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        if self.dual_sig_required() {
+            // Both parties must sign: either key alone (or a stranger)
+            // is Unauthorized — paralleling `update_quorum`'s
+            // dual-signature governance.
+            if initializer != self.initializer || taker != self.taker {
+                return Err(EscrowError::Unauthorized);
+            }
+        } else if initializer != self.initializer {
+            return Err(EscrowError::Unauthorized);
+        }
+        // AV-158: the governance-delay routing gate — on a
+        // delay-opted-in escrow the allowlist moves only through the
+        // two-step propose/execute protocol, never a direct call
+        // (see `update_quorum_impl` for the placement rationale).
+        if !via_delayed && self.governance_delay_secs != 0 {
+            return Err(EscrowError::GovernanceActionNotProposed);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        let next = if mints.is_empty() {
+            None
+        } else {
+            let list = MintAllowlist::new(mints)?;
+            // AV-390: the bound-mint invariant — a new list that
+            // drops the bound mint would strand the funded mint
+            // outside its own gate (mirroring
+            // `with_mint_allowlist`). Clearing to `None` is exempt:
+            // an empty list means "allowlist off".
+            if let Some(bound) = self.mint {
+                if !list.contains(&bound) {
+                    return Err(EscrowError::MintNotAllowlisted);
+                }
+            }
+            Some(list)
+        };
+        // No-op: re-affirming the current list writes nothing, so
+        // the event layer emits nothing for it.
+        if next == self.mint_allowlist {
+            return Ok(());
+        }
+        self.mint_allowlist = next;
+        Ok(())
+    }
+
     /// Declare the Token-2022 transfer-hook program this escrow's
     /// token transfers execute under (AV-99). Builder-style: only
     /// valid on an `Uninitialized` escrow, so the hook binding is
@@ -26466,9 +26656,10 @@ let fee = self.charge_protocol_fee(claimable)?;
 
     // ---------- AV-158: delayed dual-signed governance ----------
     //
-    // The eighteen dual-signed config changes (the four AV-158
+    // The nineteen dual-signed config changes (the four AV-158
     // actions plus the eleven AV-335 actions, the two AV-336
-    // split-shares halves, and the one AV-378 action) can opt in to a two-phase propose → delay
+    // split-shares halves, the one AV-378 action, and the one
+    // AV-390 action) can opt in to a two-phase propose → delay
     // two-phase propose → delay → execute/cancel protocol. The delay
     // is the anti-flash-governance rule: a
     // malicious threshold change proposed while an attestor is dark
@@ -26643,7 +26834,7 @@ let fee = self.charge_protocol_fee(claimable)?;
     ///    proposal is stale; the failure clears nothing and the exit
     ///    is [`Escrow::cancel_governance`]. The check is variant-
     ///    agnostic: it runs before the action `match`, so all
-    ///    eighteen actions (AV-158 + AV-335 + AV-336 + AV-378) share the
+    ///    nineteen actions (AV-158 + AV-335 + AV-336 + AV-378 + AV-390) share the
     ///    same expiry.
     pub fn execute_governance(
         &mut self,
@@ -26814,6 +27005,15 @@ let fee = self.charge_protocol_fee(claimable)?;
                     true,
                 )?;
             }
+            GovernanceAction::UpdateMintAllowlist { mints, count } => {
+                let n = count as usize;
+                self.update_mint_allowlist_impl(
+                    self.initializer,
+                    self.taker,
+                    &mints[..n],
+                    true,
+                )?;
+            }
             GovernanceAction::UpdateTieredQuorum { tiers, count } => {
                 let n = count as usize;
                 self.update_tiered_quorum_impl(
@@ -26941,6 +27141,9 @@ let fee = self.charge_protocol_fee(claimable)?;
             // pre-funding would succeed at propose time and fail at
             // execute time, breaking the propose-time fail-fast
             // design.
+            // AV-390: `UpdateMintAllowlist` joins them — the
+            // funded-mint allowlist revision is `Funded`-only too,
+            // mirroring `update_mint_allowlist_impl`.
             GovernanceAction::AmendSettlementMint { .. }
             | GovernanceAction::AmendJuryPanelSize { .. }
             | GovernanceAction::AmendEventCapacity { .. }
@@ -26949,6 +27152,7 @@ let fee = self.charge_protocol_fee(claimable)?;
             | GovernanceAction::AmendSubscriptionPeriodSecs { .. }
             | GovernanceAction::AmendDefaultJudgment { .. }
             | GovernanceAction::UpdateSettlementMintAllowlist { .. }
+            | GovernanceAction::UpdateMintAllowlist { .. }
             | GovernanceAction::UpdateTieredQuorum { .. }
             | GovernanceAction::UpdateArbiterPanelMembers { .. }
             // AV-336: the two split-shares halves revise the
@@ -27138,6 +27342,27 @@ let fee = self.charge_protocol_fee(claimable)?;
                 // direct call's empty-list rule) — always valid.
                 if n > 0 {
                     let _ = SettlementMintAllowlist::new(&mints[..n])?;
+                }
+                Ok(())
+            }
+            GovernanceAction::UpdateMintAllowlist { mints, count } => {
+                let n = *count as usize;
+                if n > MAX_MINT_ALLOWLIST {
+                    return Err(EscrowError::InvalidMint);
+                }
+                // `count == 0` clears the allowlist (mirroring the
+                // direct call's empty-list rule) — always valid.
+                if n > 0 {
+                    let list = MintAllowlist::new(&mints[..n])?;
+                    // AV-390: the bound-mint invariant — a list
+                    // that drops the bound mint could never
+                    // execute, so it is refused at propose time
+                    // (fail fast).
+                    if let Some(bound) = self.mint {
+                        if !list.contains(&bound) {
+                            return Err(EscrowError::MintNotAllowlisted);
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -54783,7 +55008,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(167), None); // AV-377: 166 is ReferenceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
     }
 
     #[test]
@@ -56478,9 +56704,19 @@ mod governance_delay_tests {
             Some(threshold_action),
             "kind 17 round-trip"
         );
+        // AV-390: kind 18 is the funded-mint allowlist revision —
+        // appended after the panel-threshold retune, kinds 0–17 unmoved.
+        let mint_action = GovernanceAction::update_mint_allowlist(&[M1, M3]).unwrap();
+        assert_eq!(mint_action.kind_byte(), 18, "kind 18");
+        let payload = mint_action.encode_payload();
+        assert_eq!(
+            GovernanceAction::decode(18, &payload),
+            Some(mint_action),
+            "kind 18 round-trip"
+        );
         // Unknown kinds fail closed.
         let payload = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
-        assert_eq!(GovernanceAction::decode(18, &payload), None);
+        assert_eq!(GovernanceAction::decode(19, &payload), None);
         assert_eq!(GovernanceAction::decode(255, &payload), None);
         // Out-of-range live counts fail closed.
         let mut bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
@@ -56495,11 +56731,23 @@ mod governance_delay_tests {
         bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
         bad[256] = 9; // arbiter panel count > 8
         assert_eq!(GovernanceAction::decode(14, &bad), None);
+        bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
+        bad[256] = 9; // funded-mint allowlist count > 8
+        assert_eq!(GovernanceAction::decode(18, &bad), None);
         // The slice constructors refuse out-of-range input, and the
         // allowlist constructors accept the empty (clear) slice.
         assert!(
             GovernanceAction::update_settlement_mint_allowlist(&[[0u8; 32]; 9])
                 .is_none()
+        );
+        assert!(
+            GovernanceAction::update_mint_allowlist(&[[0u8; 32]; 9]).is_none()
+        );
+        assert!(
+            GovernanceAction::update_mint_allowlist(&[])
+                .unwrap()
+                .encode_payload()[256]
+                == 0
         );
         assert!(
             GovernanceAction::update_settlement_mint_allowlist(&[])
@@ -56879,7 +57127,7 @@ mod governance_delay_tests {
         }
         // Unknown kinds fail closed.
         let payload = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
-        assert_eq!(GovernanceAction::decode(18, &payload), None);
+        assert_eq!(GovernanceAction::decode(19, &payload), None);
         assert_eq!(GovernanceAction::decode(255, &payload), None);
         // Out-of-range live counts fail closed.
         let mut bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
@@ -74421,7 +74669,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(164), Some(EscrowEventKind::BasketAmended)); // AV-340: 164 is BasketAmended
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
-        assert_eq!(EscrowEventKind::from_discriminant(167), None); // AV-377: 166 is ReferenceAmended
+        assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -74670,9 +74919,10 @@ mod event_history_tests {
         // `ExpiryShortened` (AV-338), 164 is
         // `BasketAmended` (AV-340), 165 is
         // `AppealWithdrawn` (AV-341), 166 is
-        // `ReferenceAmended` (AV-377) and 167 is the
+        // `ReferenceAmended` (AV-377), 167 is
+        // `MintAllowlistUpdated` (AV-390) and 168 is the
         // first still-unknown byte.
-        for bad in [167u8, 255] {
+        for bad in [168u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -87912,6 +88162,362 @@ mod update_settlement_mint_allowlist_tests {
         assert_eq!(e.event_count(), before + 2);
         let ev = e.events().last().copied().expect("event pushed");
         assert_eq!(ev.kind, EscrowEventKind::SettlementMintAllowlistUpdated);
+    }
+}
+
+mod update_mint_allowlist_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const M1: [u8; 32] = [0x11; 32];
+    const M2: [u8; 32] = [0x22; 32];
+    const M3: [u8; 32] = [0x33; 32];
+    const M4: [u8; 32] = [0x44; 32];
+    const M5: [u8; 32] = [0x55; 32];
+    const M6: [u8; 32] = [0x66; 32];
+    const M7: [u8; 32] = [0x77; 32];
+    const M8: [u8; 32] = [0x88; 32];
+    const M9: [u8; 32] = [0x99; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+    const DELAY: u64 = 3_600;
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_mint(M1)
+            .unwrap()
+            .with_mint_allowlist(&[M1, M2])
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn dual_sig_configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_mint(M1)
+            .unwrap()
+            .with_mint_allowlist(&[M1, M2])
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn delay_configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap()
+            .with_mint(M1)
+            .unwrap()
+            .with_mint_allowlist(&[M1, M2])
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn update_replaces_list_and_bound_mint_untouched() {
+        // Only the allowlist moves: the bound mint, the state, and
+        // the encoded length are untouched — the list region is
+        // already resident, so the revision rewrites it in place
+        // with no layout change.
+        let mut e = configured();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.update_mint_allowlist(ALICE, BOB, &[M1, M3]).unwrap();
+        assert_eq!(
+            e.mint_allowlist().unwrap().as_slice(),
+            &[M1, M3],
+            "list replaced"
+        );
+        assert_eq!(e.mint(), Some(M1), "bound mint untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "list region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn update_clears_on_empty_and_sets_first_list_on_unconfigured() {
+        // Empty clears back to None (the AV-157 convention).
+        let mut e = configured();
+        e.update_mint_allowlist(ALICE, BOB, &[]).unwrap();
+        assert!(e.mint_allowlist().is_none());
+        // Allowlist rules, not scalar rules: an escrow that never
+        // configured a list may set its first one here — no
+        // "already configured" gate — and clearing an already
+        // empty list is a no-op success.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_mint(M1)
+            .unwrap();
+        plain.fund(ALICE, NOW).unwrap();
+        plain.update_mint_allowlist(ALICE, BOB, &[M1]).unwrap();
+        assert_eq!(plain.mint_allowlist().unwrap().as_slice(), &[M1]);
+        let mut never = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap();
+        never.fund(ALICE, NOW).unwrap();
+        never.update_mint_allowlist(ALICE, BOB, &[]).unwrap();
+        assert!(never.mint_allowlist().is_none());
+    }
+
+    #[test]
+    fn update_rejects_invalid_lists_and_preserves_original() {
+        // The `MintAllowlist::new` gate, unchanged: more than 8
+        // entries or a zero address are all refused, and a failed
+        // revision never writes.
+        let mut e = configured();
+        assert_eq!(
+            e.update_mint_allowlist(
+                ALICE,
+                BOB,
+                &[M1, M2, M3, M4, M5, M6, M7, M8, M9]
+            ),
+            Err(EscrowError::InvalidMint)
+        );
+        assert_eq!(
+            e.update_mint_allowlist(ALICE, BOB, &[M1, M3, [0u8; 32]]),
+            Err(EscrowError::InvalidMint)
+        );
+        assert_eq!(
+            e.mint_allowlist().unwrap().as_slice(),
+            &[M1, M2],
+            "original list untouched by failed revisions"
+        );
+    }
+
+    #[test]
+    fn update_rejects_list_dropping_bound_mint() {
+        // AV-390: the bound-mint invariant — a new list that drops
+        // the bound mint is refused with `MintNotAllowlisted`
+        // (code 217), and the original list stays intact. Clearing
+        // to `None` is exempt: an empty list means "allowlist off",
+        // not a list that excludes the bound mint.
+        let mut e = configured();
+        assert_eq!(
+            e.update_mint_allowlist(ALICE, BOB, &[M2, M3]),
+            Err(EscrowError::MintNotAllowlisted)
+        );
+        assert_eq!(
+            e.update_mint_allowlist(ALICE, BOB, &[M3]),
+            Err(EscrowError::MintNotAllowlisted)
+        );
+        assert_eq!(
+            e.mint_allowlist().unwrap().as_slice(),
+            &[M1, M2],
+            "original list untouched by bound-mint refusals"
+        );
+        e.update_mint_allowlist(ALICE, BOB, &[]).unwrap();
+        assert!(e.mint_allowlist().is_none(), "clearing is exempt");
+    }
+
+    #[test]
+    fn update_rejects_wrong_state_authority_and_paused() {
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint(M1)
+            .unwrap()
+            .with_mint_allowlist(&[M1, M2])
+            .unwrap();
+        assert_eq!(
+            bare.update_mint_allowlist(ALICE, BOB, &[M1, M3]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            bare.mint_allowlist().unwrap().as_slice(),
+            &[M1, M2]
+        );
+        // Terminal states have no future binding left to gate.
+        let mut released = configured();
+        released
+            .release(ALICE, NOW, 1_000_000, Some(M1), BOB)
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.update_mint_allowlist(ALICE, BOB, &[M1, M3]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        let mut cancelled = configured();
+        cancelled.cancel(ALICE, Some(M1), ALICE, NOW).unwrap();
+        assert_eq!(cancelled.state(), EscrowState::Cancelled);
+        assert_eq!(
+            cancelled.update_mint_allowlist(ALICE, BOB, &[M1, M3]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Dual-sig escrow: one party alone, or a stranger, is
+        // Unauthorized — paralleling `update_payout_allowlist`.
+        let mut dual = dual_sig_configured();
+        assert_eq!(
+            dual.update_mint_allowlist(ALICE, ALICE, &[M1, M3]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            dual.update_mint_allowlist(MALLORY, BOB, &[M1, M3]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            dual.mint_allowlist().unwrap().as_slice(),
+            &[M1, M2]
+        );
+        // Plain escrow: the initializer alone authorizes — the taker
+        // argument is not consulted when dual-sig is off.
+        let mut plain = configured();
+        plain.update_mint_allowlist(ALICE, MALLORY, &[M1, M3]).unwrap();
+        assert_eq!(plain.mint_allowlist().unwrap().as_slice(), &[M1, M3]);
+        assert_eq!(
+            plain.update_mint_allowlist(MALLORY, BOB, &[M1, M4]),
+            Err(EscrowError::Unauthorized)
+        );
+        // The pause guard fires before the authority and state gates:
+        // even a stranger's revision on a paused escrow is `Paused`.
+        let mut paused = configured();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.update_mint_allowlist(MALLORY, BOB, &[M1, M3]),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.mint_allowlist().unwrap().as_slice(),
+            &[M1, M2]
+        );
+    }
+
+    #[test]
+    fn update_refuses_direct_call_on_delay_opted_in() {
+        // AV-158 routing: on a delay-opted-in escrow the direct call
+        // is refused — the allowlist moves only through the
+        // propose/execute protocol, never a direct call.
+        let mut e = delay_configured();
+        assert_eq!(
+            e.update_mint_allowlist(ALICE, BOB, &[M1, M3]),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(
+            e.mint_allowlist().unwrap().as_slice(),
+            &[M1, M2]
+        );
+    }
+
+    #[test]
+    fn update_same_list_is_a_noop() {
+        // Re-affirming the current list succeeds but changes nothing
+        // observable; the event layer (tested below) emits nothing.
+        let mut e = configured();
+        e.update_mint_allowlist(ALICE, BOB, &[M1, M2]).unwrap();
+        assert_eq!(
+            e.mint_allowlist().unwrap().as_slice(),
+            &[M1, M2]
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn update_governs_next_mint_binding_gate() {
+        // The `with_mint` gate reads the live list: a mint removed
+        // here is refused at once, while a mint added here binds.
+        // `with_mint` is `Uninitialized`-only, so the gate check
+        // runs on a fresh escrow built with the revised list — the
+        // same list the funded escrow now carries.
+        let mut e = configured();
+        e.update_mint_allowlist(ALICE, BOB, &[M1, M3]).unwrap();
+        let live = e.mint_allowlist().unwrap();
+        assert!(live.contains(&M3), "added mint is gated in");
+        assert!(!live.contains(&M2), "removed mint is gated out");
+        let fresh = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint_allowlist(&[M1, M3])
+            .unwrap();
+        assert_eq!(fresh.with_mint(M3).unwrap().mint(), Some(M3));
+        let fresh = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint_allowlist(&[M1, M3])
+            .unwrap();
+        assert_eq!(
+            fresh.with_mint(M2),
+            Err(EscrowError::MintNotAllowlisted)
+        );
+    }
+
+    #[test]
+    fn update_delayed_execute_path_applies() {
+        // The delayed path: propose kind 18, execute once the delay
+        // elapses — the same list lands.
+        let mut e = delay_configured();
+        let action = GovernanceAction::update_mint_allowlist(&[M1, M3]).unwrap();
+        e.propose_governance(ALICE, action, NOW).unwrap();
+        assert_eq!(
+            e.execute_governance(ALICE, NOW + DELAY - 1),
+            Err(EscrowError::GovernanceDelayNotElapsed)
+        );
+        assert_eq!(
+            e.mint_allowlist().unwrap().as_slice(),
+            &[M1, M2],
+            "early execute changes nothing"
+        );
+        e.execute_governance(BOB, NOW + DELAY).unwrap();
+        assert_eq!(
+            e.mint_allowlist().unwrap().as_slice(),
+            &[M1, M3]
+        );
+        assert!(e.governance_proposal().is_none());
+        // A list that drops the bound mint is refused at propose
+        // time (fail fast), not after the delay.
+        let bad = GovernanceAction::update_mint_allowlist(&[M2, M3]).unwrap();
+        assert_eq!(
+            e.propose_governance(ALICE, bad, NOW + DELAY),
+            Err(EscrowError::MintNotAllowlisted)
+        );
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn update_indexed_emits_event_noop_and_failed_emit_nothing() {
+        let mut e = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = e.event_count();
+        assert_eq!(
+            e.update_mint_allowlist(MALLORY, BOB, &[M1, M3], NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.update_mint_allowlist(ALICE, BOB, &[M1, M3], NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::MintAllowlistUpdated);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same list is a no-op: no new event.
+        e.update_mint_allowlist(ALICE, BOB, &[M1, M3], NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        // Clearing is a real change: it emits again.
+        e.update_mint_allowlist(ALICE, BOB, &[], NOW).unwrap();
+        assert_eq!(e.event_count(), before + 2);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::MintAllowlistUpdated);
     }
 }
 

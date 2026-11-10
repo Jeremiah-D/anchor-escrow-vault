@@ -437,6 +437,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // changes, so the bound settlement mint is untouched, while
         // the next settled release reads the live list.
         | EscrowEventKind::SettlementMintAllowlistUpdated
+        // AV-390: a revised funded-mint allowlist moves no funds
+        // and never restates a funded binding — only the list
+        // changes, so the bound mint is untouched, while the
+        // next `with_mint` binding reads the live list.
+        | EscrowEventKind::MintAllowlistUpdated
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1443,6 +1448,11 @@ mod fee_history_tests {
         // changes, so the bound settlement mint is untouched, while
         // the next settled release reads the live list.
         | EscrowEventKind::SettlementMintAllowlistUpdated
+        // AV-390: a revised funded-mint allowlist moves no funds
+        // and never restates a funded binding — only the list
+        // changes, so the bound mint is untouched, while the
+        // next `with_mint` binding reads the live list.
+        | EscrowEventKind::MintAllowlistUpdated
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
