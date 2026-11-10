@@ -516,6 +516,18 @@
 //!   here binds from the next call. A failed revision emits
 //!   nothing, and a no-op re-affirmation of the current list
 //!   emits nothing either.
+//! - `amend_insurance_pool` emits
+//!   [`EscrowEventKind::InsurancePoolAmended`] on every
+//!   successful revision that actually changes the opt-in (AV-394) —
+//!   `from == to ==` the current state, all amounts zero; only the
+//!   flag changes, so the slash terms, the deadline, the locked
+//!   amount, and the state are untouched, and the `slash` path
+//!   reads the live flag at the next slash, so a slash after the
+//!   flip routes to the pool (opted in) or to the penalty account
+//!   (opted out) while a slash already settled keeps the routing
+//!   it settled under. A failed revision emits nothing, and a
+//!   no-op re-affirmation of the current opt-in emits nothing
+//!   either.
 //! - `amend_dutch_auction_reserve_bps` emits
 //!   [`EscrowEventKind::DutchAuctionReserveBpsAmended`] on every
 //!   successful revision that actually changes the floor (AV-277) —
@@ -1016,6 +1028,7 @@
 //! | SocialRecoveryGuardianRotated (AV-275) | 0 | 0 | 0 | 0 — rotating moves no funds; only one guardian slot changes, so the guardian count, the threshold and the timelock are untouched, and the recovery path compares against the live slot guardian at the next `request_recovery` / `approve_recovery`, so the old guardian stops opening and approving the moment the rotation lands while the new guardian may open and approve, and a request already settled keeps the guardians it settled under |
 //! | SettlementMintAllowlistUpdated (AV-276) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a settled release; only the allowlist changes, so the bound settlement mint is untouched, and the settled-release path reads the live list at the next `release_with_settlement_rate`, so a mint removed here is refused at once while a mint added here settles from the next quote, and plain `release` is unaffected |
 //! | MintAllowlistUpdated (AV-390) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a funded binding; only the allowlist changes, so the bound mint is untouched, and the `with_mint` gate reads the live list at the next binding, so a mint removed here is refused at once while a mint added here binds from the next call |
+//! | InsurancePoolAmended (AV-394) | 0 | 0 | 0 | 0 — revising moves no funds and never restates settled pool accounting; only the opt-in flag changes, so the slash terms, the deadline, the locked amount, and the state are untouched, and the `slash` path reads the live flag at the next slash, so a slash after the flip routes to the pool (opted in) or to the penalty account (opted out) while a slash already settled keeps the routing it settled under |
 //! | DutchAuctionReserveBpsAmended (AV-277) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a claim already priced; only the floor changes, so the window is untouched, and claim prices through the live floor at the next call, so a claim after the amendment prices against the new floor while a claim already settled keeps the cap it settled under |
 //! | SocialRecoveryThresholdAmended (AV-278) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the threshold changes, so the guardians, the guardian count and the timelock are untouched, and the recovery path compares the live approval count against the live threshold at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new threshold while a request already settled keeps the threshold it settled under |
 //! | SocialRecoveryTimelockAmended (AV-279) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the timelock changes, so the guardians, the guardian count and the threshold are untouched, and the recovery path compares the live timelock against the request's opening timestamp at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new veto window while a request already settled keeps the window it settled under |
@@ -2973,6 +2986,23 @@ pub enum EscrowEventKind {
     /// field. A no-op re-affirmation of the current list emits
     /// nothing.
     MintAllowlistUpdated,
+    /// AV-394: the penalty insurance pool opt-in was revised by
+    /// governed post-funding amendment
+    /// ([`Escrow::amend_insurance_pool`](crate::Escrow::amend_insurance_pool)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::MintAllowlistUpdated`]); all amounts are
+    /// zero — revising moves no funds and never restates settled
+    /// pool accounting; only the flag changes, so the slash terms,
+    /// the deadline, the locked amount, and the state are
+    /// untouched — the `slash` path reads the live flag at the
+    /// next slash, so a slash after the flip routes to the pool
+    /// (opted in) or to the penalty account (opted out) while a
+    /// slash already settled keeps the routing it settled under.
+    /// The new flag is read from the vault, so the event needs no
+    /// extra field. A no-op re-affirmation of the current opt-in
+    /// emits nothing.
+    InsurancePoolAmended,
 }
 
 impl EscrowEventKind {
@@ -3512,6 +3542,10 @@ impl EscrowEventKind {
             // discriminants 0–166 stay stable for already-serialized
             // histories.
             167 => Self::MintAllowlistUpdated,
+            // AV-394: appended after MintAllowlistUpdated so
+            // discriminants 0–167 stay stable for already-serialized
+            // histories.
+            168 => Self::InsurancePoolAmended,
             _ => return None,
         })
     }
@@ -3725,6 +3759,7 @@ impl EscrowEventKind {
             Self::AppealWithdrawn => "appeal_withdrawn",
             Self::ReferenceAmended => "reference_amended",
             Self::MintAllowlistUpdated => "mint_allowlist_updated",
+            Self::InsurancePoolAmended => "insurance_pool_amended",
             Self::SlashDeadlineAmended => "slash_deadline_amended",
             Self::AmountBoundsAmended => "amount_bounds_amended",
             Self::MilestoneLatePenaltyBpsAmended => "milestone_late_penalty_bps_amended",
@@ -3972,6 +4007,7 @@ impl EscrowEventKind {
             "appeal_withdrawn" => Self::AppealWithdrawn,
             "reference_amended" => Self::ReferenceAmended,
             "mint_allowlist_updated" => Self::MintAllowlistUpdated,
+            "insurance_pool_amended" => Self::InsurancePoolAmended,
             "slash_deadline_amended" => Self::SlashDeadlineAmended,
             "amount_bounds_amended" => Self::AmountBoundsAmended,
             "milestone_late_penalty_bps_amended" => Self::MilestoneLatePenaltyBpsAmended,
@@ -7664,6 +7700,43 @@ impl IndexedEscrow {
             let state = self.inner.state();
             self.push_event(
             EscrowEventKind::MintAllowlistUpdated,
+            state,
+            state,
+            EventAmounts::none(),
+            at,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
+    /// Revise the penalty insurance pool opt-in after funding
+    /// (mirrors [`Escrow::amend_insurance_pool`]). Emits
+    /// `InsurancePoolAmended` only when the flag actually
+    /// changes; `from == to ==` the current state. `at` is the
+    /// caller-supplied event timestamp.
+    pub fn amend_insurance_pool(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        opt_in: bool,
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.insurance_pool();
+        self.inner
+            .amend_insurance_pool(initializer, taker, opt_in)?;
+        let after = self.inner.insurance_pool();
+        // The inner call rejects bad input, strangers, and wrong states,
+        // so a changed flag here always means real governance — and a
+        // same-value no-op stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+            EscrowEventKind::InsurancePoolAmended,
             state,
             state,
             EventAmounts::none(),
@@ -16176,7 +16249,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -16332,7 +16406,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -16922,7 +16997,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -16990,7 +17066,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17055,7 +17132,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17120,7 +17198,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17185,7 +17264,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17253,7 +17333,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17321,7 +17402,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17386,7 +17468,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17451,7 +17534,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17516,7 +17600,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17581,7 +17666,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17646,7 +17732,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17711,7 +17798,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17780,7 +17868,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17848,7 +17937,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17916,7 +18006,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -17984,7 +18075,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -18052,7 +18144,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -18121,7 +18214,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -18190,7 +18284,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -18259,7 +18354,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -18327,7 +18423,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -18352,7 +18449,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn));
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended));
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -18373,7 +18471,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn));
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended));
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -18393,7 +18492,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn));
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended));
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -18409,7 +18509,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn));
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended));
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -18426,7 +18527,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -18442,7 +18544,24 @@ mod event_tests {
             EscrowEventKind::from_name("mint_allowlist_updated"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(168), None);
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended));
+        assert_eq!(EscrowEventKind::from_discriminant(169), None);
+    }
+
+    #[test]
+    fn insurance_pool_amended_kind_round_trips() {
+        // AV-394: discriminant 168, appended after
+        // MintAllowlistUpdated — 0–167 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::InsurancePoolAmended;
+        assert_eq!(kind.discriminant(), 168);
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(kind));
+        assert_eq!(kind.name(), "insurance_pool_amended");
+        assert_eq!(
+            EscrowEventKind::from_name("insurance_pool_amended"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(169), None);
     }
 
     #[test]
@@ -18527,7 +18646,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]

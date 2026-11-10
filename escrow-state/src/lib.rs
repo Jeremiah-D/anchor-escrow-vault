@@ -11926,6 +11926,106 @@ impl Escrow {
         self.insurance_pool
     }
 
+    /// Revise the penalty insurance pool opt-in after funding
+    /// (AV-394 — Solana payment risk control): the post-funding
+    /// counterpart to [`Escrow::with_insurance_pool`]
+    /// (`Uninitialized`-only initial opt-in). An escrow funded
+    /// without the pool may opt in later — so a later slash routes
+    /// to neutral custody instead of the initializer — or opt out
+    /// again, restoring the slash-to-penalty-account path, without
+    /// cancelling and re-locking the escrow.
+    ///
+    /// Governance mirrors [`Escrow::amend_refund_address`]:
+    /// pause first (AV-46), then unconditional dual signature —
+    /// both the initializer and the taker must authorize, one party
+    /// alone (or a stranger pair) is
+    /// [`EscrowError::Unauthorized`] — then the `Funded`-only state
+    /// gate ([`EscrowError::InvalidStateTransition`]). Only an
+    /// escrow carrying a penalty clause may revise the routing: an
+    /// escrow with neither flat [`Escrow::slash_terms`] nor a
+    /// [`Escrow::slash_ladder`] is refused with
+    /// [`EscrowError::SlashNotEligible`] (the `slash()` gate,
+    /// unchanged — revising the routing of a penalty that cannot
+    /// exist has no semantics, and post-funding installation of
+    /// the clause itself stays forbidden). The empty-pool gate is
+    /// what makes the revision clean: all four pool counters —
+    /// `pool_paid`, `pool_slashed`, `pool_inflow`,
+    /// `pool_payout_paid` — must be zero, otherwise the flip is
+    /// refused with [`EscrowError::InvalidPoolPayout`] (the
+    /// `close_vault` / rent-sweep non-empty-pool gate, reused —
+    /// pool funds already settled have nowhere to go, so drain
+    /// via authorized `pool_payout` first). A flip only ever
+    /// re-routes *future* slashes: it never restates settled
+    /// accounting, and the cumulative counters never reset — an
+    /// escrow that ever routed a slash through the pool can never
+    /// flip again until the pool is drained, and even then the
+    /// cumulative `pool_inflow` / `pool_payout_paid` keep the gate
+    /// shut. Re-affirming the current opt-in is a no-op: it
+    /// succeeds and writes nothing, so the event layer emits
+    /// nothing for it. This does not take the AV-158 governance
+    /// delay path (the `amend_*` family convention — the revision
+    /// is a direct dual-signed call, like
+    /// [`Escrow::amend_refund_address`]).
+    ///
+    /// Only `insurance_pool` changes — `slash_terms` /
+    /// `slash_ladder`, the deadline, the locked amount, and the
+    /// state are untouched — and [`Escrow::slash`] reads the live
+    /// flag, so the next slash routes to the pool (opted in) or to
+    /// the penalty account (opted out) the moment the revision
+    /// lands, while a slash already settled keeps the routing it
+    /// settled under. [`Escrow::is_pool_payout_eligible`] reads
+    /// the flag live, so opting out also closes the payout door
+    /// at once. Emits `InsurancePoolAmended` on the event layer,
+    /// except for the no-op re-affirmation. Orthogonal to AV-106
+    /// (that is the pool mechanism itself, this is its post-funding
+    /// switch), to AV-82 (that is the slash mechanism, this is its
+    /// routing), and to AV-385/AV-386 (that rotate the penalty
+    /// accounts — a pooled escrow refuses those rotations with
+    /// `SlashNotEligible`, so opting out restores them and opting
+    /// in refuses them; the cross-semantics is pinned by test).
+    pub fn amend_insurance_pool(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        opt_in: bool,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the revision, paralleling `amend_refund_address`.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // The slash gate, unchanged: only an escrow carrying a
+        // penalty clause — flat terms or a ladder — may revise
+        // the routing; a clause can never be installed after
+        // funding.
+        if self.slash_terms.is_none() && self.slash_ladder.is_none() {
+            return Err(EscrowError::SlashNotEligible);
+        }
+        // The empty-pool gate: a flip only re-routes future
+        // slashes, so the pool must hold no settled accounting —
+        // not even cumulative counters, which never reset.
+        if self.pool_paid != 0
+            || self.pool_slashed != 0
+            || self.pool_inflow != 0
+            || self.pool_payout_paid != 0
+        {
+            return Err(EscrowError::InvalidPoolPayout);
+        }
+        // No-op: re-affirming the current opt-in writes nothing,
+        // so the event layer emits nothing for it.
+        if opt_in == self.insurance_pool {
+            return Ok(());
+        }
+        self.insurance_pool = opt_in;
+        Ok(())
+    }
+
     /// The insurance pool balance (AV-106): slashed penalties and
     /// forfeited appeal bonds currently held in neutral custody.
     pub fn pool_paid(&self) -> u64 {
@@ -55009,7 +55109,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
     }
 
     #[test]
@@ -74670,7 +74771,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(165), Some(EscrowEventKind::AppealWithdrawn)); // AV-341: 165 is AppealWithdrawn
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
-        assert_eq!(EscrowEventKind::from_discriminant(168), None); // AV-390: 167 is MintAllowlistUpdated
+        assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -74920,9 +75022,10 @@ mod event_history_tests {
         // `BasketAmended` (AV-340), 165 is
         // `AppealWithdrawn` (AV-341), 166 is
         // `ReferenceAmended` (AV-377), 167 is
-        // `MintAllowlistUpdated` (AV-390) and 168 is the
+        // `MintAllowlistUpdated` (AV-390), 168 is
+        // `InsurancePoolAmended` (AV-394) and 169 is the
         // first still-unknown byte.
-        for bad in [168u8, 255] {
+        for bad in [169u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -82553,6 +82656,259 @@ mod appeal_bond_tests {
             Err(EscrowError::Paused)
         );
         assert_eq!(paused.appeal_bond(), BOND);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AV-394: post-funding insurance-pool opt-in revision tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod insurance_pool_amend_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const PENALTY: [u8; 32] = [0xDD; 32];
+    const NEW_PENALTY: [u8; 32] = [0xDE; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+    const DEADLINE: u64 = T0 + 86_400;
+    const AMOUNT: u64 = 1_000_000;
+    const SLASHED: u64 = 200_000;
+
+    fn funded_plain() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    fn funded_pooled() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_insurance_pool()
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_insurance_pool_is_dual_signed() {
+        // AV-394: a stranger pair, the initializer alone, or the
+        // taker alone is refused and the flag is untouched — the
+        // routing changes only when both sides agree.
+        let mut e = funded_plain();
+        let err = e
+            .amend_insurance_pool(MALLORY, BOB, true)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        // The initializer cannot opt in unilaterally.
+        let err = e
+            .amend_insurance_pool(ALICE, MALLORY, true)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        // The taker cannot opt in unilaterally either.
+        let err = e
+            .amend_insurance_pool(BOB, BOB, true)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert!(!e.insurance_pool());
+        // Authority is checked before state: a stranger on an
+        // Uninitialized escrow still gets Unauthorized.
+        let mut fresh = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        let err = fresh
+            .amend_insurance_pool(MALLORY, BOB, true)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert!(!fresh.insurance_pool());
+    }
+
+    #[test]
+    fn amend_insurance_pool_is_funded_only() {
+        // AV-394: only a Funded escrow may revise the routing —
+        // the builder owns the Uninitialized-time opt-in.
+        let mut fresh = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        let err = fresh
+            .amend_insurance_pool(ALICE, BOB, true)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidStateTransition);
+        assert_eq!(err.code(), 101);
+        assert!(!fresh.insurance_pool());
+    }
+
+    #[test]
+    fn amend_insurance_pool_requires_slash_terms() {
+        // AV-394: an escrow with no penalty clause has no routing
+        // to revise — the clause itself can never be installed
+        // after funding.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert!(e.slash_terms().is_none());
+        let err = e
+            .amend_insurance_pool(ALICE, BOB, true)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::SlashNotEligible);
+        assert_eq!(err.code(), 143);
+        assert!(!e.insurance_pool());
+    }
+
+    #[test]
+    fn amend_insurance_pool_refuses_a_nonempty_pool() {
+        // AV-394: the empty-pool gate — a slash already routed to
+        // the pool leaves settled accounting with nowhere to go,
+        // so the flip is refused until the pool is drained.
+        let mut e = funded_pooled();
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        assert_eq!(e.pool_paid(), SLASHED);
+        assert_eq!(e.pool_slashed(), SLASHED);
+        assert_eq!(e.pool_inflow(), SLASHED);
+        let err = e
+            .amend_insurance_pool(ALICE, BOB, false)
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidPoolPayout);
+        assert_eq!(err.code(), 164);
+        assert!(e.insurance_pool(), "flag untouched by the refusal");
+        assert_eq!(e.pool_paid(), SLASHED);
+        assert_eq!(e.pool_slashed(), SLASHED);
+        assert_eq!(e.pool_inflow(), SLASHED);
+    }
+
+    #[test]
+    fn amend_insurance_pool_same_value_is_a_noop() {
+        // AV-394: re-affirming the current opt-in succeeds and
+        // writes nothing.
+        let mut e = funded_plain();
+        e.amend_insurance_pool(ALICE, BOB, false).unwrap();
+        assert!(!e.insurance_pool());
+        assert_eq!(e.state(), EscrowState::Funded);
+        let mut pooled = funded_pooled();
+        pooled.amend_insurance_pool(ALICE, BOB, true).unwrap();
+        assert!(pooled.insurance_pool());
+        assert_eq!(pooled.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_insurance_pool_opt_in_routes_the_next_slash_to_the_pool() {
+        // AV-394: a funded-without-pool escrow opts in, and the
+        // next slash lands in neutral custody — `penalty_paid`
+        // stays zero, so the Anchor layer must not transfer to
+        // the penalty account.
+        let mut e = funded_plain();
+        assert!(!e.insurance_pool());
+        e.amend_insurance_pool(ALICE, BOB, true).unwrap();
+        assert!(e.insurance_pool());
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        assert_eq!(e.pool_paid(), SLASHED, "slash routes to the pool");
+        assert_eq!(e.pool_slashed(), SLASHED);
+        assert_eq!(e.pool_inflow(), SLASHED);
+        assert_eq!(e.penalty_paid(), 0);
+    }
+
+    #[test]
+    fn amend_insurance_pool_opt_out_routes_the_next_slash_to_the_penalty_account() {
+        // AV-394: a pooled escrow opts out before any slash, and
+        // the next slash pays the penalty account as before AV-106.
+        let mut e = funded_pooled();
+        assert!(e.insurance_pool());
+        e.amend_insurance_pool(ALICE, BOB, false).unwrap();
+        assert!(!e.insurance_pool());
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        assert_eq!(e.penalty_paid(), SLASHED);
+        assert_eq!(e.pool_paid(), 0);
+        assert_eq!(e.pool_slashed(), 0);
+        assert_eq!(e.pool_inflow(), 0);
+    }
+
+    #[test]
+    fn amend_insurance_pool_leaves_terms_deadline_amount_and_state_untouched() {
+        // AV-394: the flip only re-routes future slashes — the
+        // clause, the deadline, the locked amount, and the state
+        // are exactly as before.
+        let mut e = funded_plain();
+        let terms_before = e.slash_terms().unwrap();
+        e.amend_insurance_pool(ALICE, BOB, true).unwrap();
+        assert!(e.insurance_pool());
+        let terms_after = e.slash_terms().unwrap();
+        assert_eq!(terms_after.penalty_account, PENALTY);
+        assert_eq!(terms_after.slash_deadline, DEADLINE);
+        assert_eq!(terms_after, terms_before);
+        assert_eq!(e.amount(), AMOUNT);
+        assert_eq!(e.remaining_amount(), AMOUNT);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.pool_paid(), 0);
+        assert_eq!(e.pool_slashed(), 0);
+        assert_eq!(e.pool_inflow(), 0);
+        assert_eq!(e.pool_payout_paid(), 0);
+    }
+
+    #[test]
+    fn amend_insurance_pool_gates_penalty_account_rotation() {
+        // AV-394 x AV-385/AV-386: a pooled escrow refuses the
+        // penalty-account rotation (the flat account is a dead
+        // field while slashes route to the pool); opting out
+        // restores the rotation, opting in refuses it again.
+        let mut e = funded_pooled();
+        assert_eq!(
+            e.rotate_slash_penalty_account(ALICE, BOB, NEW_PENALTY),
+            Err(EscrowError::SlashNotEligible),
+            "pooled: the flat account is dead"
+        );
+        e.amend_insurance_pool(ALICE, BOB, false).unwrap();
+        e.rotate_slash_penalty_account(ALICE, BOB, NEW_PENALTY)
+            .unwrap();
+        assert_eq!(
+            e.slash_terms().unwrap().penalty_account,
+            NEW_PENALTY
+        );
+        e.amend_insurance_pool(ALICE, BOB, true).unwrap();
+        assert_eq!(
+            e.rotate_slash_penalty_account(ALICE, BOB, PENALTY),
+            Err(EscrowError::SlashNotEligible),
+            "opted back in: rotation refused again"
+        );
+        assert_eq!(
+            e.slash_terms().unwrap().penalty_account,
+            NEW_PENALTY
+        );
+    }
+
+    #[test]
+    fn amend_insurance_pool_indexed_emits_event_on_change_only() {
+        // AV-394: the IndexedEscrow wrapper emits
+        // InsurancePoolAmended on a real flip, and nothing on a
+        // failed call or a no-op re-affirmation.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT, [0x1D; 32], T0)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_insurance_pool(ALICE, ALICE, true, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_insurance_pool(ALICE, BOB, true, T0).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::InsurancePoolAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the new opt-in is a no-op: no new event.
+        e.amend_insurance_pool(ALICE, BOB, true, T0).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
     }
 }
 

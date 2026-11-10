@@ -409,6 +409,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // changes, so the bound mint is untouched, while the
         // next `with_mint` binding reads the live list.
         | EscrowEventKind::MintAllowlistUpdated
+        // AV-394: a revised insurance-pool opt-in moves no funds
+        // and never restates settled pool accounting — only the
+        // flag changes, so the slash terms, the deadline, the
+        // locked amount, and the state are untouched, while the
+        // next slash reads the live flag.
+        | EscrowEventKind::InsurancePoolAmended
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1430,6 +1436,12 @@ mod event_sourcing_tests {
         // changes, so the bound mint is untouched, while the
         // next `with_mint` binding reads the live list.
         | EscrowEventKind::MintAllowlistUpdated
+        // AV-394: a revised insurance-pool opt-in moves no funds
+        // and never restates settled pool accounting — only the
+        // flag changes, so the slash terms, the deadline, the
+        // locked amount, and the state are untouched, while the
+        // next slash reads the live flag.
+        | EscrowEventKind::InsurancePoolAmended
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices

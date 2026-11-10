@@ -6005,6 +6005,31 @@ region (flag + four u64 counters): body 4640 → **4673**,
 `VAULT_SPACE` 4648 → **4681**, `VAULT_SPACE_NO_QUORUM` 4158 →
 **4191**, rent-exempt 33,240,960 → **33,470,640** lamports.
 
+Amending the insurance-pool opt-in (AV-394): an escrow funded
+without the pool may opt in later — or opt out again — via
+`amend_insurance_pool(initializer, taker, opt_in)`, dual-signed
+and `Funded`-only, without cancelling and re-locking. Only an
+escrow carrying a penalty clause (flat slash terms or a ladder)
+may revise the routing; an escrow with neither is refused with
+`SlashNotEligible`, so the clause itself can never be installed
+after funding. The empty-pool gate is what makes the revision
+clean: all four pool counters (`pool_paid`, `pool_slashed`,
+`pool_inflow`, `pool_payout_paid`) must be zero, otherwise the
+flip is refused with `InvalidPoolPayout` — pool funds already
+settled have nowhere to go, so drain via authorized `pool_payout`
+first, and the cumulative counters never reset, so an escrow that
+ever routed a slash through the pool can never flip again on a
+drained pool alone. A flip only re-routes *future* slashes — the
+slash path reads the live flag, so the next slash lands in the
+pool (opted in) or the penalty account (opted out) while a slash
+already settled keeps the routing it settled under; opting out
+also closes the `pool_payout` door at once, and restores the
+AV-385/AV-386 penalty-account rotations that a pooled escrow
+refuses. Re-affirming the current opt-in is a no-op that emits no
+event; a real flip emits `InsurancePoolAmended` (discriminant
+168), all amounts zero. No governance delay, no new error code,
+no Vault layout change.
+
 ## Interest-bearing escrow (AV-107)
 
 The problem: escrow locks the initializer's capital for the deal's
