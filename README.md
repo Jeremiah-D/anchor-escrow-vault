@@ -8858,6 +8858,31 @@ expires, custody returns to the owner automatically.
   has no event layer — and no new error code: the refusals reuse
   `Unauthorized` (100), `RentalNotActive` (269), and
   `InvalidRentalTerms` (268).
+- **Transferring the tenancy (AV-393)**: `amend_rental_renter`
+  transfers the `renter` on an `Active` rental, authorized by
+  owner + current renter together — the tenancy changes hands
+  only when both sides agree, because the owner would otherwise
+  find a stranger in the asset, and the renter could otherwise
+  pass the lease to someone the owner never agreed to host.
+  There is no pre-term window gate: a sublet, an assignment, or
+  an inheritance can happen before the term starts or during the
+  term, and the new renter inherits the lease exactly as it
+  stands — owner, asset, rent amount, term slots,
+  `slots_per_day`, and late-fee schedule all untouched — so a
+  lease that cannot transfer would force a cancel-and-reopen
+  that loses the term, the custody transfer, and the renter's
+  tenure. The value gate reuses `new()`: a zero new renter, or
+  a new renter equal to the owner (a self-lease), fails closed
+  with `InvalidRentalTerms`, code 268; re-affirming the current
+  renter is a no-op. Only `renter` changes, and the seven other
+  revision methods read the live renter, so the old renter loses
+  its co-signature the moment the tenancy changes hands and the
+  new renter co-signs the next revision, while `return_asset`
+  settles a transferred lease with late-fee accounting unchanged
+  and a return already executed is never restated. No event is
+  emitted — `RentalEscrow` has no event layer — and no new error
+  code: the refusals reuse `Unauthorized` (100),
+  `RentalNotActive` (269), and `InvalidRentalTerms` (268).
 
 New error codes (never renumbered): `InvalidRentalTerms` (268),
 `RentalNotActive` (269), `RentalCancelNotAllowed` (270). Pure logic:

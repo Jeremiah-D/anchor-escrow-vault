@@ -926,6 +926,73 @@ impl RentalEscrow {
         Ok(())
     }
 
+    /// Transfer the tenancy on an `Active` rental (AV-393 — Solana
+    /// rental governance): both parties authorize the change (the
+    /// renter is the party giving up custody — a unilateral
+    /// hand-over would let the owner install a stranger in the
+    /// asset, or let the renter pass the lease to someone the owner
+    /// never agreed to host). Check order is authority → state →
+    /// value, mirroring AV-291's `amend_late_fee`, so a stranger
+    /// learns nothing about the rental's state from the error
+    /// alone.
+    ///
+    /// Why: the renter is fixed at construction
+    /// ([`RentalEscrow::new`]), but a tenancy can change hands — a
+    /// sublet, an assignment, an inheritance — and a lease that
+    /// cannot transfer would force a cancel-and-reopen that loses
+    /// the term, the custody transfer, and the renter's tenure.
+    /// Unlike the rent/pace/asset revisions, there is no pre-term
+    /// window gate: the transfer is allowed before the term starts
+    /// and during the term alike, and the new renter inherits the
+    /// lease exactly as it stands — owner, asset, rent amount,
+    /// term slots, `slots_per_day`, and late-fee schedule all
+    /// untouched. The new renter co-signs the next revision from
+    /// the moment of the transfer: every other revision method
+    /// reads the live `renter`, so the old renter loses its
+    /// co-signature the moment the tenancy changes hands.
+    /// [`RentalEscrow::return_asset`] settles the lease with the
+    /// late-fee accounting exactly as an untransferred lease prices
+    /// it — the transfer changes the counterparty, not the fee.
+    /// There is no event layer on `RentalEscrow`, so no event is
+    /// emitted for the transfer. Orthogonal to
+    /// [`RentalEscrow::new`] (that installs the renter at build
+    /// time, this transfers it while `Active`), to AV-190 (that is
+    /// the rental mechanism itself, this is its tenancy transfer),
+    /// to AV-392 (that rotates the owner, this rotates the renter
+    /// — the same hand-over shape on the other side of the lease),
+    /// and to AV-291/292/314/329/330/331/332 (that revise the
+    /// other eight rental fields, this rotates the ninth and last
+    /// one, the renter).
+    ///
+    /// Refused ([`EscrowError::Unauthorized`], code 100) for a
+    /// caller pair that is not exactly owner + current renter,
+    /// ([`EscrowError::RentalNotActive`], code 269) once the rental
+    /// is in a terminal state, and
+    /// ([`EscrowError::InvalidRentalTerms`], code 268) when the new
+    /// renter is the zero key or equals the owner — either way the
+    /// current renter is untouched.
+    pub fn amend_rental_renter(
+        &mut self,
+        owner: [u8; 32],
+        renter: [u8; 32],
+        new_renter: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        if owner != self.owner || renter != self.renter {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.state != RentalState::Active {
+            return Err(EscrowError::RentalNotActive);
+        }
+        if new_renter == [0u8; 32] || new_renter == self.owner {
+            return Err(EscrowError::InvalidRentalTerms);
+        }
+        if new_renter == self.renter {
+            return Ok(());
+        }
+        self.renter = new_renter;
+        Ok(())
+    }
+
     /// Audit-event JSON for a return (hand-written):
     /// `{"event":"rental_returned","asset":"<64hex>","late_fee":<u64>,
     /// "overdue_days":<u64>,"late":<bool>}`.
@@ -2575,6 +2642,237 @@ mod rental_escrow_tests {
         assert_eq!(receipt.late_fee_due, 10_000);
         assert_eq!(receipt.overdue_days, 1);
         assert_eq!(r2.owner(), key(0xAA));
+    }
+
+    #[test]
+    fn amend_rental_renter_transfers_the_live_tenancy() {
+        // AV-393: a pre-term transfer swaps the renter and the
+        // getter reads the new key.
+        let mut r = open_rental();
+        assert_eq!(r.renter(), key(0xBB));
+        r.amend_rental_renter(key(0xAA), key(0xBB), key(0xDD))
+            .unwrap();
+        assert_eq!(r.renter(), key(0xDD));
+        // Only the renter moves — every other field is untouched.
+        assert_eq!(r.owner(), key(0xAA));
+        assert_eq!(r.asset_id(), key(0xCC));
+        assert_eq!(r.rent_amount(), 1_000_000);
+        assert_eq!(r.term_start_slot(), 100);
+        assert_eq!(r.term_end_slot(), 200);
+        assert_eq!(r.slots_per_day(), 100);
+        assert_eq!(r.late_fee(), terms());
+        assert_eq!(r.state(), RentalState::Active);
+        // A second transfer works on the live value.
+        r.amend_rental_renter(key(0xAA), key(0xDD), key(0xEE))
+            .unwrap();
+        assert_eq!(r.renter(), key(0xEE));
+    }
+
+    #[test]
+    fn amend_rental_renter_is_owner_plus_current_renter_only() {
+        // AV-393: a stranger, the owner acting alone, or the
+        // current renter acting alone is refused and the renter is
+        // untouched — the tenancy changes hands only when both
+        // sides agree.
+        let mut r = open_rental();
+        // A stranger pair.
+        let err = r
+            .amend_rental_renter(key(9), key(0xBB), key(0xDD))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        // The owner cannot install a stranger unilaterally.
+        let err = r
+            .amend_rental_renter(key(0xAA), key(9), key(0xDD))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        // The renter cannot pass the lease on alone.
+        let err = r
+            .amend_rental_renter(key(0xBB), key(0xBB), key(0xDD))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(err.code(), 100);
+        assert_eq!(r.renter(), key(0xBB));
+        // A valid transfer moves the co-signature: the old renter
+        // is a stranger to the next transfer.
+        r.amend_rental_renter(key(0xAA), key(0xBB), key(0xDD))
+            .unwrap();
+        let err = r
+            .amend_rental_renter(key(0xAA), key(0xBB), key(0xEE))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(r.renter(), key(0xDD));
+        // Authority is checked before state: a stranger on a
+        // terminal rental still gets Unauthorized.
+        let mut r2 = open_rental();
+        r2.return_asset(150).unwrap();
+        let err = r2
+            .amend_rental_renter(key(9), key(0xBB), key(0xDD))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(r2.renter(), key(0xBB));
+    }
+
+    #[test]
+    fn amend_rental_renter_is_active_only() {
+        // AV-393: all three terminal states refuse the transfer.
+        let mut r = open_rental();
+        r.return_asset(150).unwrap();
+        assert_eq!(r.state(), RentalState::Returned);
+        let err = r
+            .amend_rental_renter(key(0xAA), key(0xBB), key(0xDD))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(err.code(), 269);
+        assert_eq!(r.renter(), key(0xBB));
+        // ReturnedLate: an overdue return settles the lease.
+        let mut r2 = open_rental();
+        r2.return_asset(300).unwrap();
+        assert_eq!(r2.state(), RentalState::ReturnedLate);
+        let err = r2
+            .amend_rental_renter(key(0xAA), key(0xBB), key(0xDD))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(r2.renter(), key(0xBB));
+        // Cancelled: the lease is gone.
+        let mut r3 = open_rental();
+        r3.cancel(key(0xAA), 50).unwrap();
+        assert_eq!(r3.state(), RentalState::Cancelled);
+        let err = r3
+            .amend_rental_renter(key(0xAA), key(0xBB), key(0xDD))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RentalNotActive);
+        assert_eq!(r3.renter(), key(0xBB));
+    }
+
+    #[test]
+    fn amend_rental_renter_rejects_zero_new_renter() {
+        // AV-393: the zero-key gate is the new() gate — the
+        // transfer fails closed rather than blanking the renter
+        // into "no renter" while rent and late-fee terms keep
+        // accruing.
+        let mut r = open_rental();
+        let err = r
+            .amend_rental_renter(key(0xAA), key(0xBB), [0u8; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.renter(), key(0xBB));
+    }
+
+    #[test]
+    fn amend_rental_renter_rejects_new_renter_equal_to_owner() {
+        // AV-393: handing the lease back to the owner is a
+        // self-lease — the same degenerate shape new() refuses.
+        let mut r = open_rental();
+        let err = r
+            .amend_rental_renter(key(0xAA), key(0xBB), key(0xAA))
+            .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidRentalTerms);
+        assert_eq!(err.code(), 268);
+        assert_eq!(r.renter(), key(0xBB));
+    }
+
+    #[test]
+    fn amend_rental_renter_identical_value_is_a_noop() {
+        // AV-393: restating the current renter is a no-op — and,
+        // unlike the pre-term revisions, the no-op is allowed
+        // during the term too, because the transfer has no window
+        // gate at all.
+        let mut r = open_rental();
+        r.amend_rental_renter(key(0xAA), key(0xBB), key(0xBB))
+            .unwrap();
+        assert_eq!(r.renter(), key(0xBB));
+        assert_eq!(r.state(), RentalState::Active);
+        assert!(!r.is_in_term(50));
+        r.amend_rental_renter(key(0xAA), key(0xBB), key(0xBB))
+            .unwrap();
+        assert_eq!(r.renter(), key(0xBB));
+    }
+
+    #[test]
+    fn amend_rental_renter_is_allowed_before_the_term() {
+        // AV-393: the transfer has no window gate — before the
+        // term starts the incoming renter inherits the lease as
+        // it stands, with no repricing.
+        let mut r = open_rental();
+        assert!(!r.is_in_term(50));
+        r.amend_rental_renter(key(0xAA), key(0xBB), key(0xDD))
+            .unwrap();
+        assert_eq!(r.renter(), key(0xDD));
+        assert_eq!(r.owner(), key(0xAA));
+        assert_eq!(r.asset_id(), key(0xCC));
+        assert_eq!(r.rent_amount(), 1_000_000);
+        assert_eq!(r.term_start_slot(), 100);
+        assert_eq!(r.term_end_slot(), 200);
+        assert_eq!(r.slots_per_day(), 100);
+        assert_eq!(r.late_fee(), terms());
+        assert_eq!(r.state(), RentalState::Active);
+        // The fee math is untouched by the transfer.
+        assert_eq!(r.late_fee_due(300), 10_000);
+    }
+
+    #[test]
+    fn amend_rental_renter_is_allowed_during_the_term() {
+        // AV-393: like the owner rotation, a tenancy can change
+        // hands after the term starts — the new renter inherits
+        // the lease as it stands, with no repricing.
+        let mut r = open_rental();
+        assert!(r.is_in_term(150));
+        r.amend_rental_renter(key(0xAA), key(0xBB), key(0xDD))
+            .unwrap();
+        assert_eq!(r.renter(), key(0xDD));
+        assert_eq!(r.owner(), key(0xAA));
+        assert_eq!(r.asset_id(), key(0xCC));
+        assert_eq!(r.rent_amount(), 1_000_000);
+        assert_eq!(r.term_start_slot(), 100);
+        assert_eq!(r.term_end_slot(), 200);
+        assert_eq!(r.slots_per_day(), 100);
+        assert_eq!(r.late_fee(), terms());
+        assert_eq!(r.state(), RentalState::Active);
+        // The fee math is untouched by the transfer.
+        assert_eq!(r.late_fee_due(300), 10_000);
+    }
+
+    #[test]
+    fn amend_rental_renter_hands_cosigning_to_the_new_renter() {
+        // AV-393: the seven other revision methods read the live
+        // renter, so the old renter loses its co-signature the
+        // moment the tenancy changes hands, and the new renter
+        // gains it.
+        let mut r = open_rental();
+        r.amend_rental_renter(key(0xAA), key(0xBB), key(0xDD))
+            .unwrap();
+        // Old renter co-signing amend_late_fee is refused.
+        let err = r.amend_late_fee(key(0xAA), key(0xBB), None).unwrap_err();
+        assert_eq!(err, EscrowError::Unauthorized);
+        assert_eq!(r.late_fee(), terms());
+        // New renter co-signs the same revision fine.
+        r.amend_late_fee(key(0xAA), key(0xDD), None).unwrap();
+        assert_eq!(r.late_fee(), None);
+    }
+
+    #[test]
+    fn amend_rental_renter_leaves_return_settlement_unchanged() {
+        // AV-393: return_asset settles a transferred lease with
+        // the late-fee accounting exactly as an untransferred
+        // lease prices it — the transfer changes the counterparty,
+        // not the fee.
+        let mut r = open_rental();
+        r.amend_rental_renter(key(0xAA), key(0xBB), key(0xDD))
+            .unwrap();
+        let receipt = r.return_asset(300).unwrap();
+        assert_eq!(receipt.late_fee_due, 10_000);
+        assert_eq!(receipt.overdue_slots, 100);
+        assert_eq!(receipt.overdue_days, 1);
+        assert!(receipt.was_overdue);
+        assert_eq!(r.state(), RentalState::ReturnedLate);
+        assert_eq!(r.renter(), key(0xDD));
+        // The untransferred control prices identically.
+        let mut r2 = open_rental();
+        let receipt = r2.return_asset(300).unwrap();
+        assert_eq!(receipt.late_fee_due, 10_000);
+        assert_eq!(receipt.overdue_days, 1);
+        assert_eq!(r2.renter(), key(0xBB));
     }
 
     #[test]
