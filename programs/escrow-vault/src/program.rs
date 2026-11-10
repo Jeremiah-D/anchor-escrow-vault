@@ -5264,6 +5264,82 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the payout-split shares after funding (AV-399; mirrors
+    /// `Escrow::amend_payout_split_shares`). Unconditional
+    /// dual-signature governance: both initializer and taker sign —
+    /// one party alone cannot rewrite the distribution of the
+    /// other's share, paralleling `amend_vesting_curve`. `Funded`
+    /// only — the builder owns the initial table. `InvalidPayoutSplit`
+    /// (code 167) on an unconfigured escrow (fail-closed —
+    /// post-funding installation is refused), on a table naming a
+    /// third-party recipient (a third party's share is not the two
+    /// signers' to dispose of by dual signature alone), on a
+    /// partially settled escrow (`released != 0`), on a malformed new
+    /// table (the `PayoutSplit::new` gates: empty, over 8 entries, a
+    /// zero recipient, a zero share, a duplicate recipient, or a Σ
+    /// that does not equal the locked amount exactly), and on a new
+    /// table whose recipients — in table order — differ from the
+    /// current table's (swapping a recipient would redirect funds,
+    /// and even reordering would move the flooring dust's first-leg
+    /// landing). A milestone plan or a subscription schedule owns the
+    /// release path, so an escrow carrying either is refused with
+    /// `InvalidMilestones` / `InvalidSubscription` (mirroring
+    /// `release_payout_split`). A paused escrow fails fast (`Paused`,
+    /// before the authority gate). On a delay-opted-in escrow the
+    /// direct call is refused (`GovernanceActionNotProposed` — the
+    /// shares move only through the AV-158 propose/execute protocol,
+    /// kinds 15/16, staging no new proposal variant). Emits
+    /// `PayoutSplitSharesAmended` (from == to == the current state)
+    /// only on an actual change; a same-shares no-op stays silent
+    /// (mirrors `rotate_taker`).
+    pub fn amend_payout_split_shares(
+        ctx: Context<AmendPayoutSplitShares>,
+        shares: Vec<PayoutSplitShare>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.payout_split();
+        let now = Clock::get()?.unix_timestamp as u64;
+        let table: Vec<([u8; 32], u64)> = shares
+            .iter()
+            .map(|s| (s.recipient, s.amount))
+            .collect();
+        escrow
+            .amend_payout_split_shares(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &table,
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.payout_split` amounts in place in the real
+        // build (the 321-byte split region is always present, zeroed
+        // when None) — no realloc. Only the share amounts move; the
+        // recipient set and order, the locked amount, and the state
+        // are untouched.
+        // Emits only on an actual change; a same-shares no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.payout_split() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::PayoutSplitSharesAmended,
+                state,
+                state,
+                0,
+                0,
+                0,
+                now,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Update the payout destination denylist (AV-96; mirrors
     /// `Escrow::update_payout_denylist`). Initializer-signature-alone
     /// governance (unlike `update_payout_allowlist`'s dual-signature
@@ -8815,6 +8891,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::update_arbiter_panel_members`). Mirrors
     /// `escrow_state::EscrowEventKind::ArbiterPanelMembersUpdated`.
     ArbiterPanelMembersUpdated,
+    /// AV-399: the payout-split shares were revised by owner
+    /// governance (`Escrow::amend_payout_split_shares`). Mirrors
+    /// `escrow_state::EscrowEventKind::PayoutSplitSharesAmended`.
+    PayoutSplitSharesAmended,
     /// AV-52: the taker (payout counterparty) was rotated by
     /// dual-signed governance (`Escrow::rotate_taker`). Mirrors
     /// `escrow_state::EscrowEventKind::TakerRotated`.
@@ -9057,6 +9137,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::ArbiterPanelMembersUpdated => {
             EscrowVaultEventKind::ArbiterPanelMembersUpdated
+        }
+        escrow_state::EscrowEventKind::PayoutSplitSharesAmended => {
+            EscrowVaultEventKind::PayoutSplitSharesAmended
         }
         escrow_state::EscrowEventKind::TakerRotated => EscrowVaultEventKind::TakerRotated,
         escrow_state::EscrowEventKind::InitializerRotated => {
@@ -11471,6 +11554,21 @@ pub struct UpdateTieredQuorum<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct UpdateArbiterPanelMembers<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-399: accounts for `amend_payout_split_shares` — the
+/// payout-split share revision is unconditional dual-signature
+/// governance: both initializer and taker sign (the state machine
+/// enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendPayoutSplitShares<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

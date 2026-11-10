@@ -40380,6 +40380,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "no params; authority <- accounts.initializer (signer), or their RELEASE-scoped AV-104 operator — the grant authorizes the *action* and the split table pins the destinations, so an operator cannot redirect funds; a paused escrow fails fast (Paused); Funded only (InvalidStateTransition otherwise); a live swap link refuses the single-side move (SwapLinkActive, AV-105); no split table configured is InvalidPayoutSplit (code 167); every split recipient passes the AV-96 denylist and, when configured, the AV-49 payout allowlist (PayoutDenied / PayoutNotAllowlisted); milestone / subscription schedules own the release path (InvalidMilestones / InvalidSubscription — same as `release`); the AV-04 quorum gate (`policy.is_satisfied()`) and the AV-27/AV-64 timelock gate apply exactly as for `release`; now <- clock sysvar (NOT an instruction param); the release total is always the full locked amount (Σ shares == amount, pinned at setup); AV-17: the protocol fee is charged on the gross first (charge_protocol_fee — the AV-63 cap and AV-66 schedule apply), then the net splits per leg as floor(share_i * net / amount) with the dust landing on the first recipient, so Σ legs == net exactly; `released` accumulates the gross, so the conservation invariant is untouched; Funded -> Released; returns the per-recipient (recipient, net_share) legs in table order so the real build can size each transfer; the real build transfers leg i to accounts.remaining_accounts[i] (must key-match the split table order); emits the ReleasedSplit indexer event (from == Funded, to == Released; amounts follow the Released shape — payout = gross amount, fee = the protocol fee — and the (recipient, net_share) legs ride the event's release_split field)",
         },
         InstructionSpec {
+            // AV-399: revise the payout-split shares after funding —
+            // the program-level entry point for the AV-293 pure-logic
+            // revision. IDL: discriminator =
+            // sha256("global:amend_payout_split_shares")[..8] =
+            // [30, 128, 170, 82, 221, 33, 136, 211] — the Anchor
+            // instruction discriminator for the
+            // amend_payout_split_shares handler (pinned by the
+            // discriminator test below).
+            name: "amend_payout_split_shares",
+            params: &[(
+                "shares",
+                "Vec<PayoutSplitShare>",
+                "instruction param; the new (recipient, amount) split table in payout order — 1-8 entries, no zero recipient address, no zero share amount, no duplicate recipient, and a share Σ that equals the locked amount exactly (every violation is InvalidPayoutSplit, code 167)",
+            )],
+            method: "Escrow::amend_payout_split_shares",
+            input_mapping: "shares <- param (Vec<PayoutSplitShare> -> Vec<([u8; 32], u64)> conversion); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); now <- Clock sysvar (NOT an instruction param — the state machine's `now` for the auto-recovery and released gates); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed; the builder owns the initial table); on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed — the shares move only through the AV-158 propose/execute protocol, kinds 15/16, staging no new proposal variant); an unconfigured escrow is InvalidPayoutSplit (code 167, fail-closed — post-funding installation is refused); only a table whose recipients are all within {initializer, taker} may move — a table naming any third-party recipient is InvalidPayoutSplit (code 167); a milestone plan or a subscription schedule owns the release path, so an escrow carrying either is refused with InvalidMilestones / InvalidSubscription (mirroring release_payout_split); released must still be zero — a partially settled escrow is InvalidPayoutSplit (code 167, rebalancing over an amount that already moved would restate settled funds); the new table reuses the PayoutSplit::new gates (non-empty, at most 8 entries, no zero recipient, no zero share, no duplicate recipient, and a Σ that equals the locked amount exactly, via InvalidPayoutSplit, code 167, leaving the original table untouched); only the shares move — the new table's recipients, in table order, must equal the current table's recipients exactly, since swapping a recipient would redirect funds and even reordering would move the flooring dust's first-leg landing (InvalidPayoutSplit); re-affirming the current shares is a no-op (succeeds, writes nothing, emits no event); only the share amounts change — the recipient set and order, the locked amount, and the state are untouched, so the new shares govern from the next release_payout_split (which reads the live table at every call: the net legs prorate over the live shares, so a release after the amendment pays the new split while a release already settled keeps the shares it settled under); emits the PayoutSplitSharesAmended indexer event only on an actual change (from == to == the current state); the 321-byte split region is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-109: opt in to the dead-man's switch at initialize
             // time. IDL: discriminator =
             // sha256("global:initialize_deadman_switch")[..8] = [227,
@@ -41359,6 +41377,9 @@ pub(crate) mod anchor_idl_tests {
             // release the full lockup across it in one transition.
             "Escrow::with_payout_split",
             "Escrow::release_payout_split",
+            // AV-399: the program-level split-share revision (the
+            // AV-293 pure-logic revision wired to the chain).
+            "Escrow::amend_payout_split_shares",
             // AV-109: dead-man's switch — declare the inactivity
             // threshold + heir pre-fund, then the heir reclaims the
             // remaining locked funds once the inactivity window
@@ -41674,6 +41695,11 @@ pub(crate) mod anchor_idl_tests {
                 // (recipient, amount) share table; the split release
                 // itself is param-less (the table pins everything).
                 &"initialize_payout_split",
+                // AV-399: the post-funding share revision carries the
+                // new (recipient, amount) share table; authority <-
+                // accounts.initializer + accounts.taker (BOTH signers,
+                // unconditional); now <- Clock sysvar.
+                &"amend_payout_split_shares",
                 // AV-109: the deadman opt-in carries the inactivity
                 // threshold (u64) + the heir (Pubkey); the heir's
                 // claim is param-less (the config pins everything,
@@ -44844,6 +44870,269 @@ pub(crate) mod anchor_idl_tests {
             vec![ARB_M1, ARB_M2, ARB_M3]
         );
     }
+    // ----- AV-399: payout-split share revision (program-facing) -----
+
+    const SPLIT_NOW: u64 = 1_750_000_000;
+
+    fn split_funded_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_payout_split(&[(ALICE, 600_000), (BOB, 400_000)])
+            .unwrap();
+        e.fund(ALICE, SPLIT_NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn split_shares(e: &Escrow) -> Vec<([u8; 32], u64)> {
+        e.payout_split().as_slice().to_vec()
+    }
+
+    #[test]
+    fn amend_payout_split_shares_maps_param_to_payout_split_field() {
+        // IDL: amend_payout_split_shares(shares: Vec<PayoutSplitShare>)
+        // — shares <- param (Vec<PayoutSplitShare> ->
+        // Vec<([u8; 32], u64)> conversion, the handler's table build);
+        // authority <- accounts.initializer + accounts.taker (BOTH
+        // signers, unconditional dual-signature governance enforced
+        // by the state machine); now <- Clock sysvar (NOT an
+        // instruction param). The param rewrites the amounts of the
+        // same vault field the `with_payout_split` builder populates
+        // (see PARAM_FIELD_MAP) — no layout change.
+        const NOW: u64 = SPLIT_NOW;
+        // The revision lands and is readable via payout_split();
+        // only the share amounts move.
+        let mut e = split_funded_escrow();
+        e.amend_payout_split_shares(ALICE, BOB, &[(ALICE, 700_000), (BOB, 300_000)], NOW)
+            .unwrap();
+        assert_eq!(
+            split_shares(&e),
+            vec![(ALICE, 700_000), (BOB, 300_000)],
+            "shares revised"
+        );
+        assert_eq!(e.payout_split().split_count, 2, "recipient count untouched");
+        assert_eq!(e.payout_split().total_amount(), 1_000_000, "Σ still the lockup");
+        assert_eq!(e.amount(), 1_000_000, "locked amount untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        // The new shares govern the next release: the legs prorate
+        // over the live table at every call, so a release after the
+        // amendment pays the new split while a release already
+        // settled keeps the shares it settled under (settling
+        // consumes the escrow, so the check is the pre-amendment
+        // release on a sibling escrow).
+        let mut before = split_funded_escrow();
+        let legs_before = before.release_payout_split(ALICE, NOW, None).unwrap();
+        assert_eq!(legs_before, vec![(ALICE, 600_000), (BOB, 400_000)]);
+        let legs = e.release_payout_split(ALICE, NOW, None).unwrap();
+        assert_eq!(legs, vec![(ALICE, 700_000), (BOB, 300_000)]);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_payout_split_shares_rejects_stranger_and_single_signer() {
+        // Unconditional dual signature: one party alone, or a
+        // stranger, is Unauthorized — one party alone cannot rewrite
+        // the distribution of the other's share.
+        let mut e = split_funded_escrow();
+        assert_eq!(
+            e.amend_payout_split_shares(ALICE, ALICE, &[(ALICE, 700_000), (BOB, 300_000)], SPLIT_NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_payout_split_shares(MALLORY, BOB, &[(ALICE, 700_000), (BOB, 300_000)], SPLIT_NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_payout_split_shares(MALLORY, MALLORY, &[(ALICE, 700_000), (BOB, 300_000)], SPLIT_NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            split_shares(&e),
+            vec![(ALICE, 600_000), (BOB, 400_000)],
+            "failed revisions write nothing"
+        );
+        // No degenerate self-escrow sub-case here: a self-escrow
+        // (initializer == taker) cannot carry a revisable table —
+        // its only valid table is the single leg [(ALICE, amount)],
+        // whose only valid revision is itself.
+    }
+
+    #[test]
+    fn amend_payout_split_shares_rejects_non_funded_and_unconfigured_table() {
+        // Funded-only: the Uninitialized builder owns the table.
+        let mut fresh = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_payout_split(&[(ALICE, 600_000), (BOB, 400_000)])
+            .unwrap();
+        assert_eq!(
+            fresh.amend_payout_split_shares(ALICE, BOB, &[(ALICE, 700_000), (BOB, 300_000)], SPLIT_NOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Unconfigured escrows fail closed — post-funding
+        // installation would add a distribution the taker never
+        // funded under.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        bare.fund(ALICE, SPLIT_NOW).unwrap();
+        assert_eq!(
+            bare.amend_payout_split_shares(ALICE, BOB, &[(ALICE, 700_000), (BOB, 300_000)], SPLIT_NOW),
+            Err(EscrowError::InvalidPayoutSplit)
+        );
+        assert!(!bare.payout_split().is_configured());
+    }
+
+    #[test]
+    fn amend_payout_split_shares_rejects_invalid_tables() {
+        // Every `PayoutSplit::new` gate plus the revision-only
+        // gates, run against the live 600_000 / 400_000 table —
+        // and a rejected table leaves the original exactly as it
+        // was.
+        const CAROL: [u8; 32] = [0xDD; 32];
+        const NOW: u64 = 1_700_000_000;
+        assert_eq!(EscrowError::InvalidPayoutSplit.code(), 167);
+        // The two-party gate: a table naming a third-party
+        // recipient is not the two signers' to rebalance.
+        let mut third_party = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_payout_split(&[(ALICE, 600_000), (CAROL, 400_000)])
+            .unwrap();
+        third_party.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            third_party.amend_payout_split_shares(ALICE, BOB, &[(ALICE, 700_000), (BOB, 300_000)], NOW),
+            Err(EscrowError::InvalidPayoutSplit)
+        );
+        assert_eq!(
+            third_party.payout_split().as_slice(),
+            vec![(ALICE, 600_000), (CAROL, 400_000)],
+            "third-party table untouched"
+        );
+        // The schedule-ownership gates, mirroring
+        // `release_payout_split`: a milestone plan or a
+        // subscription schedule owns the release path, so the
+        // table never settles and revising it is meaningless.
+        let mut with_milestones = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[600_000, 400_000]).unwrap())
+            .unwrap()
+            .with_payout_split(&[(ALICE, 600_000), (BOB, 400_000)])
+            .unwrap();
+        with_milestones.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            with_milestones.amend_payout_split_shares(ALICE, BOB, &[(ALICE, 700_000), (BOB, 300_000)], NOW),
+            Err(EscrowError::InvalidMilestones)
+        );
+        let mut with_subscription = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_subscription(10_000, 4, 250_000)
+            .unwrap()
+            .with_payout_split(&[(ALICE, 600_000), (BOB, 400_000)])
+            .unwrap();
+        with_subscription.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            with_subscription.amend_payout_split_shares(ALICE, BOB, &[(ALICE, 700_000), (BOB, 300_000)], NOW),
+            Err(EscrowError::InvalidSubscription)
+        );
+        // The released floor: a vesting claim already pulled part
+        // of the lockup while the state stays `Funded`, so
+        // rebalancing would restate settled funds.
+        let mut partially_claimed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(NOW, NOW + 1_000).unwrap())
+            .unwrap()
+            .with_payout_split(&[(ALICE, 600_000), (BOB, 400_000)])
+            .unwrap();
+        partially_claimed.fund(ALICE, NOW).unwrap();
+        let (payout, fee) = partially_claimed.claim(BOB, NOW + 500, None, BOB).unwrap();
+        assert_eq!(fee, 0);
+        assert_eq!(payout, 500_000, "half vested at the midpoint");
+        assert_eq!(partially_claimed.state(), EscrowState::Funded);
+        assert_eq!(
+            partially_claimed.amend_payout_split_shares(ALICE, BOB, &[(ALICE, 700_000), (BOB, 300_000)], NOW + 500),
+            Err(EscrowError::InvalidPayoutSplit)
+        );
+        assert_eq!(
+            partially_claimed.payout_split().as_slice(),
+            vec![(ALICE, 600_000), (BOB, 400_000)],
+            "partially settled table untouched"
+        );
+        // Malformed new tables reuse the `with_payout_split`
+        // gates, original untouched in every case — including the
+        // Σ mismatch, the case the revision exists to police.
+        let mut e = split_funded_escrow();
+        let malformed: &[&[([u8; 32], u64)]] = &[
+            &[],
+            &[(ALICE, 600_000)],
+            &[(ALICE, 0), (BOB, 1_000_000)],
+            &[(ALICE, 600_000), (BOB, 399_999)],
+            &[(ALICE, 600_001), (BOB, 400_000)],
+            &[(ALICE, 500_000), (ALICE, 500_000)],
+            &[(ALICE, 600_000), (BOB, 400_000), ([0u8; 32], 0)],
+        ];
+        for shares in malformed {
+            assert_eq!(
+                e.amend_payout_split_shares(ALICE, BOB, shares, SPLIT_NOW),
+                Err(EscrowError::InvalidPayoutSplit),
+                "malformed table refused: {shares:?}"
+            );
+            assert_eq!(
+                split_shares(&e),
+                vec![(ALICE, 600_000), (BOB, 400_000)],
+                "original table untouched after refusal"
+            );
+        }
+        // Only the shares move: swapping a recipient, or even
+        // reordering the same recipients, is refused — the first
+        // would redirect funds, the second would move the flooring
+        // dust's first-leg landing.
+        assert_eq!(
+            e.amend_payout_split_shares(ALICE, BOB, &[(ALICE, 700_000), (CAROL, 300_000)], SPLIT_NOW),
+            Err(EscrowError::InvalidPayoutSplit)
+        );
+        assert_eq!(
+            e.amend_payout_split_shares(ALICE, BOB, &[(BOB, 400_000), (ALICE, 600_000)], SPLIT_NOW),
+            Err(EscrowError::InvalidPayoutSplit)
+        );
+        assert_eq!(
+            split_shares(&e),
+            vec![(ALICE, 600_000), (BOB, 400_000)],
+            "original table untouched after recipient change"
+        );
+    }
+
+    #[test]
+    fn amend_payout_split_shares_same_shares_is_noop() {
+        // Re-affirming the current shares is a no-op: it succeeds
+        // and changes nothing observable, so the event layer emits
+        // nothing for it (the indexed test in events.rs pins the
+        // emission).
+        let mut e = split_funded_escrow();
+        let before = e.payout_split();
+        e.amend_payout_split_shares(ALICE, BOB, &[(ALICE, 600_000), (BOB, 400_000)], SPLIT_NOW)
+            .unwrap();
+        assert_eq!(e.payout_split(), before);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_payout_split_shares_rejects_direct_call_when_delay_opted_in() {
+        // Delay-opted-in escrow: the direct call is refused with
+        // GovernanceActionNotProposed — the shares move only through
+        // the AV-158 propose/execute protocol, kinds 15/16.
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_payout_split(&[(ALICE, 600_000), (BOB, 400_000)])
+            .unwrap();
+        delayed.fund(ALICE, SPLIT_NOW).unwrap();
+        assert_eq!(
+            delayed.amend_payout_split_shares(ALICE, BOB, &[(ALICE, 700_000), (BOB, 300_000)], SPLIT_NOW),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(
+            split_shares(&delayed),
+            vec![(ALICE, 600_000), (BOB, 400_000)]
+        );
+    }
     // ----- AV-49: payout destination allowlist enforcement -----
 
     #[test]
@@ -46013,6 +46302,15 @@ pub(crate) mod anchor_idl_tests {
         // `payout_split` tail region (Uninitialized only); the region
         // is zeroed by `initialize` and written in place.
         ("initialize_payout_split", "shares", "payout_split"),
+        // AV-399: the post-funding share revision rewrites the same
+        // region's amounts in place — a second param source for
+        // `payout_split`, like `rotate_deadman_heir`'s new_heir.
+        // The field's initial value comes from the
+        // `initialize_payout_split` shares param (Uninitialized
+        // only); this entry documents the revision source. Only the
+        // amounts move — the recipients, in table order, are
+        // re-affirmed, never rewritten.
+        ("amend_payout_split_shares", "shares", "payout_split"),
         // AV-109: the deadman opt-in populates the
         // `deadman_inactivity_secs` / `deadman_heir` tail fields
         // (Uninitialized only); the region is zeroed by `initialize`
@@ -80926,13 +81224,20 @@ mod arbiter_panel_tests {
             instruction_discriminator("release_payout_split"),
             [0xed, 0x2f, 0x3a, 0xee, 0x25, 0xb9, 0xf5, 0x65]
         );
-        // And the INSTRUCTIONS table carries both specs.
+        // AV-399: the post-funding share revision's discriminator,
+        // pinned the same way.
+        assert_eq!(
+            instruction_discriminator("amend_payout_split_shares"),
+            [0x1e, 0x80, 0xaa, 0x52, 0xdd, 0x21, 0x88, 0xd3]
+        );
+        // And the INSTRUCTIONS table carries all three specs.
         let names: Vec<&&str> = crate::anchor_idl_tests::INSTRUCTIONS
             .iter()
             .map(|s| &s.name)
             .collect();
         assert!(names.contains(&&"initialize_payout_split"));
         assert!(names.contains(&&"release_payout_split"));
+        assert!(names.contains(&&"amend_payout_split_shares"));
     }
 
     #[test]

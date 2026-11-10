@@ -1045,6 +1045,14 @@
       "args": []
     },
     {
+      "name": "amend_payout_split_shares",
+      "discriminator": [30, 128, 170, 82, 221, 33, 136, 211],
+      "accounts": [],
+      "args": [
+        {"name": "shares", "type": {"vec": {"defined": "PayoutSplitShare"}}}
+      ]
+    },
+    {
       "name": "initialize_deadman_switch",
       "discriminator": [227, 118, 253, 183, 67, 134, 220, 86],
       "accounts": [],
