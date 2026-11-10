@@ -1053,6 +1053,15 @@
       ]
     },
     {
+      "name": "amend_arbiter_fee",
+      "discriminator": [63, 30, 5, 227, 59, 109, 209, 7],
+      "accounts": [],
+      "args": [
+        {"name": "flat_lamports", "type": "u64"},
+        {"name": "fee_bps", "type": "u16"}
+      ]
+    },
+    {
       "name": "initialize_deadman_switch",
       "discriminator": [227, 118, 253, 183, 67, 134, 220, 86],
       "accounts": [],

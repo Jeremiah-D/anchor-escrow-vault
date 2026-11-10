@@ -40398,6 +40398,31 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "shares <- param (Vec<PayoutSplitShare> -> Vec<([u8; 32], u64)> conversion); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); now <- Clock sysvar (NOT an instruction param — the state machine's `now` for the auto-recovery and released gates); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed; the builder owns the initial table); on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed — the shares move only through the AV-158 propose/execute protocol, kinds 15/16, staging no new proposal variant); an unconfigured escrow is InvalidPayoutSplit (code 167, fail-closed — post-funding installation is refused); only a table whose recipients are all within {initializer, taker} may move — a table naming any third-party recipient is InvalidPayoutSplit (code 167); a milestone plan or a subscription schedule owns the release path, so an escrow carrying either is refused with InvalidMilestones / InvalidSubscription (mirroring release_payout_split); released must still be zero — a partially settled escrow is InvalidPayoutSplit (code 167, rebalancing over an amount that already moved would restate settled funds); the new table reuses the PayoutSplit::new gates (non-empty, at most 8 entries, no zero recipient, no zero share, no duplicate recipient, and a Σ that equals the locked amount exactly, via InvalidPayoutSplit, code 167, leaving the original table untouched); only the shares move — the new table's recipients, in table order, must equal the current table's recipients exactly, since swapping a recipient would redirect funds and even reordering would move the flooring dust's first-leg landing (InvalidPayoutSplit); re-affirming the current shares is a no-op (succeeds, writes nothing, emits no event); only the share amounts change — the recipient set and order, the locked amount, and the state are untouched, so the new shares govern from the next release_payout_split (which reads the live table at every call: the net legs prorate over the live shares, so a release after the amendment pays the new split while a release already settled keeps the shares it settled under); emits the PayoutSplitSharesAmended indexer event only on an actual change (from == to == the current state); the 321-byte split region is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-400: revise the arbiter adjudication fee after funding —
+            // the program-level entry point for the AV-235 pure-logic
+            // revision. IDL: discriminator =
+            // sha256("global:amend_arbiter_fee")[..8] =
+            // [63, 30, 5, 227, 59, 109, 209, 7] — the Anchor
+            // instruction discriminator for the
+            // amend_arbiter_fee handler (pinned by the
+            // discriminator test below).
+            name: "amend_arbiter_fee",
+            params: &[
+                (
+                    "flat_lamports",
+                    "u64",
+                    "instruction param; the new flat arbiter fee in lamports — 0 clears the flat leg (the zero convention matches the builder: a 0 leg clears that leg, so (0, 0) disables the fee)",
+                ),
+                (
+                    "fee_bps",
+                    "u16",
+                    "instruction param; the new arbiter fee rate in basis points — 0 clears the bps leg; fee_bps > 10_000 is InvalidArbiterFee (code 198)",
+                ),
+            ],
+            method: "Escrow::amend_arbiter_fee",
+            input_mapping: "flat_lamports/fee_bps <- params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed; the builder owns the initial fee terms); no delay path covers this method — GovernanceAction has no AmendArbiterFee variant, so the direct call is the only entry point and no delayed handler is staged; fee_bps > 10_000 is InvalidArbiterFee (code 198); both legs are set atomically in one call and a failed amendment leaves both untouched (the valid flat leg in a bad-bps call does not move); a 0 leg clears that leg, so (0, 0) disables the fee; re-affirming the current fee is a no-op (succeeds, writes nothing, emits no event); only the fee legs change — the arbiter binding, the locked amount, and the state are untouched, so the new fee governs from the next dispute settlement (arbiter_fee_for reads the live fields at every call: the flat + floor(net * bps / 10_000) deduction prices the next resolve / panel settlement / default judgment at the new rate while a dispute already settled keeps the fee deducted at its own settlement); emits the ArbiterFeeAmended indexer event only on an actual change (from == to == the current state); the arbiter-fee tail region is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-109: opt in to the dead-man's switch at initialize
             // time. IDL: discriminator =
             // sha256("global:initialize_deadman_switch")[..8] = [227,
@@ -41380,6 +41405,9 @@ pub(crate) mod anchor_idl_tests {
             // AV-399: the program-level split-share revision (the
             // AV-293 pure-logic revision wired to the chain).
             "Escrow::amend_payout_split_shares",
+            // AV-400: the program-level arbiter-fee revision (the
+            // AV-235 pure-logic revision wired to the chain).
+            "Escrow::amend_arbiter_fee",
             // AV-109: dead-man's switch — declare the inactivity
             // threshold + heir pre-fund, then the heir reclaims the
             // remaining locked funds once the inactivity window
@@ -41700,6 +41728,11 @@ pub(crate) mod anchor_idl_tests {
                 // accounts.initializer + accounts.taker (BOTH signers,
                 // unconditional); now <- Clock sysvar.
                 &"amend_payout_split_shares",
+                // AV-400: the post-funding fee revision carries the
+                // new flat leg (u64) + bps leg (u16); authority <-
+                // accounts.initializer + accounts.taker (BOTH signers,
+                // unconditional); no delay path covers it.
+                &"amend_arbiter_fee",
                 // AV-109: the deadman opt-in carries the inactivity
                 // threshold (u64) + the heir (Pubkey); the heir's
                 // claim is param-less (the config pins everything,
@@ -45133,6 +45166,160 @@ pub(crate) mod anchor_idl_tests {
             vec![(ALICE, 600_000), (BOB, 400_000)]
         );
     }
+    fn fee_funded_escrow(flat: u64, bps: u16) -> Escrow {
+        // AV-400 helper: a funded escrow with an arbiter bound and a
+        // fee configured — the same shape `funded_with_fee` builds in
+        // the AV-235 pure-logic tests.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbiter_fee(flat, bps)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_arbiter_fee_maps_params_to_arbiter_fee_fields() {
+        // IDL: amend_arbiter_fee(flat_lamports: u64, fee_bps: u16)
+        // — flat_lamports/fee_bps <- params (the handler's two
+        // instruction args); authority <- accounts.initializer +
+        // accounts.taker (BOTH signers, unconditional dual-signature
+        // governance enforced by the state machine). The params
+        // rewrite the same vault fields the `with_arbiter_fee`
+        // builder populates (see PARAM_FIELD_MAP) — no layout
+        // change.
+        let mut e = fee_funded_escrow(5_000, 250);
+        assert_eq!(e.arbiter_fee_flat(), Some(5_000));
+        assert_eq!(e.arbiter_fee_bps(), Some(250));
+        assert_eq!(e.arbiter_fee_for(1_000_000), 30_000);
+        // Both legs move in one call: flat 1,000 + 1% of the share.
+        e.amend_arbiter_fee(ALICE, BOB, 1_000, 100).unwrap();
+        assert_eq!(e.arbiter_fee_flat(), Some(1_000), "flat leg revised");
+        assert_eq!(e.arbiter_fee_bps(), Some(100), "bps leg revised");
+        assert_eq!(e.arbiter_fee_for(1_000_000), 11_000);
+        assert_eq!(e.amount(), 1_000_000, "locked amount untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_arbiter_fee_rejects_stranger_and_single_signer() {
+        // Unconditional dual signature: one party alone, or a
+        // stranger, is Unauthorized — one party alone cannot raise
+        // the fee on the other's adjudicated share.
+        let mut e = fee_funded_escrow(5_000, 250);
+        assert_eq!(
+            e.amend_arbiter_fee(ALICE, ALICE, 1_000, 100),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_arbiter_fee(MALLORY, BOB, 1_000, 100),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_arbiter_fee(MALLORY, MALLORY, 1_000, 100),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.arbiter_fee_flat(), Some(5_000), "failed revisions write nothing");
+        assert_eq!(e.arbiter_fee_bps(), Some(250));
+    }
+
+    #[test]
+    fn amend_arbiter_fee_rejects_non_funded() {
+        // Funded-only: the Uninitialized builder owns the initial
+        // fee terms, and a disputed escrow's fee is fixed —
+        // arbitration in flight must not move.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let mut fresh = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_arbiter_fee(5_000, 250)
+            .unwrap();
+        assert_eq!(
+            fresh.amend_arbiter_fee(ALICE, BOB, 1_000, 100),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(fresh.arbiter_fee_flat(), Some(5_000));
+        assert_eq!(fresh.arbiter_fee_bps(), Some(250));
+    }
+
+    #[test]
+    fn amend_arbiter_fee_rejects_bad_bps_and_leaves_live_untouched() {
+        // Past 100% is not a rate — and atomicity means the valid
+        // flat leg in the same call does NOT move either: a failed
+        // amendment leaves both legs untouched, never half old,
+        // half new.
+        assert_eq!(EscrowError::InvalidArbiterFee.code(), 198);
+        let mut e = fee_funded_escrow(5_000, 250);
+        assert_eq!(
+            e.amend_arbiter_fee(ALICE, BOB, 9_999, 10_001),
+            Err(EscrowError::InvalidArbiterFee)
+        );
+        assert_eq!(e.arbiter_fee_flat(), Some(5_000), "live fee untouched");
+        assert_eq!(e.arbiter_fee_bps(), Some(250));
+        assert_eq!(e.arbiter_fee_for(1_000_000), 30_000);
+    }
+
+    #[test]
+    fn amend_arbiter_fee_zero_clears_legs_and_fee_goes_to_zero() {
+        // The zero convention matches the builder: a 0 leg clears
+        // that leg, so (0, 0) disables the fee outright.
+        let mut e = fee_funded_escrow(5_000, 250);
+        e.amend_arbiter_fee(ALICE, BOB, 0, 0).unwrap();
+        assert_eq!(e.arbiter_fee_flat(), None);
+        assert_eq!(e.arbiter_fee_bps(), None);
+        assert_eq!(e.arbiter_fee_for(1_000_000), 0);
+        // A single zero leg clears only that leg: the flat leg goes
+        // while the bps leg stays live.
+        let mut e = fee_funded_escrow(5_000, 250);
+        e.amend_arbiter_fee(ALICE, BOB, 0, 100).unwrap();
+        assert_eq!(e.arbiter_fee_flat(), None);
+        assert_eq!(e.arbiter_fee_bps(), Some(100));
+        assert_eq!(e.arbiter_fee_for(1_000_000), 10_000);
+    }
+
+    #[test]
+    fn amend_arbiter_fee_same_fee_is_noop() {
+        // Re-affirming the current fee is a no-op: it succeeds and
+        // changes nothing observable, so the event layer emits
+        // nothing for it (the indexed test in events.rs pins the
+        // emission on a real change).
+        let mut e = fee_funded_escrow(5_000, 250);
+        let before = (e.arbiter_fee_flat(), e.arbiter_fee_bps());
+        e.amend_arbiter_fee(ALICE, BOB, 5_000, 250).unwrap();
+        assert_eq!((e.arbiter_fee_flat(), e.arbiter_fee_bps()), before);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_arbiter_fee_revision_prices_next_dispute_settlement() {
+        // A dispute arising AFTER the amendment prices at the new
+        // rate: flat 1,000 + 1% = 11,000, so the taker nets 989,000
+        // — while a dispute settled before any amendment keeps the
+        // fee deducted at its own settlement (flat 5,000 + 2.5% =
+        // 30,000, taker nets 970,000). The amendment itself charges
+        // nothing.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let mut before = fee_funded_escrow(5_000, 250);
+        before
+            .escalate(ALICE, EXPIRES_AT - 1, before.remaining_amount(), None, None, 0)
+            .unwrap();
+        let (payout, fee, refund) =
+            before.resolve(ARBITER, 1_000_000, EXPIRES_AT - 1, None, None, BOB).unwrap();
+        assert_eq!((payout, fee, refund), (970_000, 0, 0));
+        let mut later = fee_funded_escrow(5_000, 250);
+        later.amend_arbiter_fee(ALICE, BOB, 1_000, 100).unwrap();
+        later
+            .escalate(ALICE, EXPIRES_AT - 1, later.remaining_amount(), None, None, 0)
+            .unwrap();
+        let (payout, fee, refund) =
+            later.resolve(ARBITER, 1_000_000, EXPIRES_AT - 1, None, None, BOB).unwrap();
+        assert_eq!((payout, fee, refund), (989_000, 0, 0));
+    }
+
     // ----- AV-49: payout destination allowlist enforcement -----
 
     #[test]
@@ -46311,6 +46498,15 @@ pub(crate) mod anchor_idl_tests {
         // amounts move — the recipients, in table order, are
         // re-affirmed, never rewritten.
         ("amend_payout_split_shares", "shares", "payout_split"),
+        // AV-400: the post-funding fee revision rewrites the same
+        // tail fields in place — a second param source for
+        // `arbiter_fee_flat` / `arbiter_fee_bps`, like
+        // `amend_payout_split_shares`' shares. The fields' initial
+        // values come from the `initialize_arbiter_fee` params
+        // (Uninitialized only); this entry documents the revision
+        // source. Both legs move atomically; a 0 leg clears that leg.
+        ("amend_arbiter_fee", "flat_lamports", "arbiter_fee_flat"),
+        ("amend_arbiter_fee", "fee_bps", "arbiter_fee_bps"),
         // AV-109: the deadman opt-in populates the
         // `deadman_inactivity_secs` / `deadman_heir` tail fields
         // (Uninitialized only); the region is zeroed by `initialize`
@@ -81238,6 +81434,30 @@ mod arbiter_panel_tests {
         assert!(names.contains(&&"initialize_payout_split"));
         assert!(names.contains(&&"release_payout_split"));
         assert!(names.contains(&&"amend_payout_split_shares"));
+    }
+
+    #[test]
+    fn arbiter_fee_instruction_discriminators_are_pinned() {
+        // AV-135 / AV-400: IDL: sha256("global:<name>")[..8] — the
+        // Anchor instruction discriminator, pinned here and in the
+        // generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("initialize_arbiter_fee"),
+            [7, 78, 191, 38, 252, 92, 232, 217]
+        );
+        // AV-400: the post-funding fee revision's discriminator,
+        // pinned the same way.
+        assert_eq!(
+            instruction_discriminator("amend_arbiter_fee"),
+            [63, 30, 5, 227, 59, 109, 209, 7]
+        );
+        // And the INSTRUCTIONS table carries both specs.
+        let names: Vec<&&str> = crate::anchor_idl_tests::INSTRUCTIONS
+            .iter()
+            .map(|s| &s.name)
+            .collect();
+        assert!(names.contains(&&"initialize_arbiter_fee"));
+        assert!(names.contains(&&"amend_arbiter_fee"));
     }
 
     #[test]
