@@ -5028,6 +5028,60 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Update the funded-mint allowlist (AV-395; mirrors
+    /// `Escrow::update_mint_allowlist`). Dual-signature governance:
+    /// on a dual-sig escrow both initializer and taker sign; on a plain
+    /// escrow the initializer alone. `Funded` only — the builder owns
+    /// the initial set. An empty list clears the allowlist (back to
+    /// any-mint binding). `InvalidMint` (code 112) on over-long /
+    /// zero-address input; a list that drops the already-bound mint is
+    /// `MintNotAllowlisted` (code 217), clearing to `None` is exempt.
+    /// On a delay-opted-in escrow the direct call is refused
+    /// (`GovernanceActionNotProposed` — the allowlist moves only
+    /// through the AV-158 propose/execute protocol, variant 18).
+    /// Emits `MintAllowlistUpdated` (from == to == the current state)
+    /// only on an actual change; a same-list no-op stays silent
+    /// (mirrors `rotate_taker`).
+    pub fn update_mint_allowlist(
+        ctx: Context<UpdateMintAllowlist>,
+        mints: Vec<Pubkey>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.mint_allowlist();
+        let addrs: Vec<[u8; 32]> = mints.iter().map(|k| k.to_bytes()).collect();
+        escrow
+            .update_mint_allowlist(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &addrs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.mint_allowlist` in place in the real build
+        // (258 bytes, always present, zeroed when None) — no realloc.
+        // Emits only on an actual change; a same-list no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.mint_allowlist() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::MintAllowlistUpdated,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Update the payout destination denylist (AV-96; mirrors
     /// `Escrow::update_payout_denylist`). Initializer-signature-alone
     /// governance (unlike `update_payout_allowlist`'s dual-signature
@@ -8562,6 +8616,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::update_payout_allowlist`). Mirrors
     /// `escrow_state::EscrowEventKind::PayoutAllowlistUpdated`.
     PayoutAllowlistUpdated,
+    /// AV-395: the funded-mint allowlist was updated by owner
+    /// governance (`Escrow::update_mint_allowlist`). Mirrors
+    /// `escrow_state::EscrowEventKind::MintAllowlistUpdated`.
+    MintAllowlistUpdated,
     /// AV-52: the taker (payout counterparty) was rotated by
     /// dual-signed governance (`Escrow::rotate_taker`). Mirrors
     /// `escrow_state::EscrowEventKind::TakerRotated`.
@@ -8792,6 +8850,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         // convention (AV-18) requires them.
         escrow_state::EscrowEventKind::PayoutAllowlistUpdated => {
             EscrowVaultEventKind::PayoutAllowlistUpdated
+        }
+        escrow_state::EscrowEventKind::MintAllowlistUpdated => {
+            EscrowVaultEventKind::MintAllowlistUpdated
         }
         escrow_state::EscrowEventKind::TakerRotated => EscrowVaultEventKind::TakerRotated,
         escrow_state::EscrowEventKind::InitializerRotated => {
@@ -11126,6 +11187,23 @@ pub struct InitializePayoutAllowlist<'info> {
 
 #[derive(Accounts)]
 pub struct UpdatePayoutAllowlist<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Dual-signature governance: on a dual-sig escrow both initializer
+    /// and taker sign; on a plain escrow the initializer alone (the
+    /// state machine enforces this — a stranger is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-395: accounts for `update_mint_allowlist` — the funded-mint
+/// allowlist revision is dual-signature governance: on a dual-sig
+/// escrow both initializer and taker sign; on a plain escrow the
+/// initializer alone (the state machine enforces this — a stranger is
+/// `Unauthorized`). The bound mint can never fall off the list
+/// (`MintNotAllowlisted`, code 217).
+#[derive(Accounts)]
+pub struct UpdateMintAllowlist<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Dual-signature governance: on a dual-sig escrow both initializer

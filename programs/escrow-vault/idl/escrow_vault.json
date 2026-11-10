@@ -368,6 +368,14 @@
       ]
     },
     {
+      "name": "update_mint_allowlist",
+      "discriminator": [170, 125, 146, 149, 76, 152, 190, 24],
+      "accounts": [],
+      "args": [
+        {"name": "mints", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
       "name": "initialize_governance_delay",
       "discriminator": [183, 43, 59, 249, 155, 248, 27, 139],
       "accounts": [],
