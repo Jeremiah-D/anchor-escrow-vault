@@ -14400,7 +14400,10 @@ let fee = self.charge_protocol_fee(net_amount)?;
     /// (those are the taker-payout and CPI-target allowlists, this
     /// item is the settlement-currency allowlist). Emits
     /// `SettlementMintAllowlistUpdated` on the event layer,
-    /// except for the no-op re-affirmation.
+    /// except for the no-op re-affirmation. AV-396 adds the Anchor
+    /// program-facing `update_settlement_mint_allowlist` instruction
+    /// (the handler in `programs/escrow-vault/src/program.rs`
+    /// mirrors this logic).
     pub fn update_settlement_mint_allowlist(
         &mut self,
         initializer: [u8; 32],
@@ -38319,6 +38322,50 @@ pub(crate) mod anchor_idl_tests {
                             place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-396: revise the settlement-mint allowlist after
+            // funding — the program-level entry point for the AV-276
+            // pure-logic revision. IDL: discriminator =
+            // sha256("global:update_settlement_mint_allowlist")[..8] =
+            // [139, 40, 129, 193, 156, 231, 131, 77] — the Anchor
+            // instruction discriminator for the
+            // update_settlement_mint_allowlist handler (pinned by
+            // the discriminator test below).
+            name: "update_settlement_mint_allowlist",
+            params: &[(
+                "mints",
+                "Vec<Pubkey>",
+                "instruction param; the new allowlisted settlement mints (empty clears the allowlist)",
+            )],
+            method: "Escrow::update_settlement_mint_allowlist",
+            input_mapping: "mints <- param (Vec<Pubkey> -> Vec<[u8; \\
+                            32]> conversion); authority <- \\
+                            accounts.initializer + accounts.taker \\
+                            (signers) on a dual-sig escrow, initializer \\
+                            alone on a plain escrow - enforced by the \\
+                            state machine (dual_sig_required); a \\
+                            stranger is Unauthorized; Funded only \\
+                            (InvalidStateTransition otherwise — \\
+                            Uninitialized, terminal states and \\
+                            Disputed); on a delay-opted-in escrow the \\
+                            direct call is refused \\
+                            (GovernanceActionNotProposed — the allowlist \\
+                            moves only through the AV-158 \\
+                            propose/execute protocol, variant 12); \\
+                            over-long / zero-address / duplicate input \\
+                            is InvalidSettlementMintAllowlist (code \\
+                            349); a list that drops the already-bound \\
+                            mint is allowed here (no AV-395 bound-mint \\
+                            invariant — the release-time gate is the \\
+                            single enforcement point); empty clears to \\
+                            None (no restriction); emits the \\
+                            SettlementMintAllowlistUpdated indexer \\
+                            event only on an actual change (from == to \\
+                            == the current state); no clock/sysvar \\
+                            input to the method; the 258-byte region is \\
+                            rewritten in place - no layout / rent \\
+                            change",
+        },
+        InstructionSpec {
             // AV-158: the opt-in governance delay window in seconds.
             name: "initialize_governance_delay",
             params: &[(
@@ -41035,6 +41082,10 @@ pub(crate) mod anchor_idl_tests {
             // AV-395: the program-level funded-mint allowlist revision
             // (the AV-390 pure-logic revision wired to the chain).
             "Escrow::update_mint_allowlist",
+            // AV-396: the program-level settlement-mint allowlist
+            // revision (the AV-276 pure-logic revision wired to the
+            // chain).
+            "Escrow::update_settlement_mint_allowlist",
             // AV-158: the opt-in governance delay window (Uninitialized
             // only).
             "Escrow::with_governance_delay",
@@ -41408,6 +41459,10 @@ pub(crate) mod anchor_idl_tests {
                 // the instruction param (Vec<Pubkey>); authority <-
                 // accounts.initializer + accounts.taker (signers).
                 &"update_mint_allowlist",
+                // AV-396: the settlement-mint allowlist revision rides
+                // as the instruction param (Vec<Pubkey>); authority <-
+                // accounts.initializer + accounts.taker (signers).
+                &"update_settlement_mint_allowlist",
                 &"initialize_governance_delay",
                 &"initialize_protocol_fee",
                 &"initialize_grace_period",
@@ -43899,6 +43954,209 @@ pub(crate) mod anchor_idl_tests {
             &[M1, M2]
         );
     }
+
+    #[test]
+    fn update_settlement_mint_allowlist_maps_param_to_settlement_mint_allowlist_field() {
+        // IDL: update_settlement_mint_allowlist(mints: Vec<Pubkey>) —
+        // mints <- param; authority <- accounts.initializer +
+        // accounts.taker (signers) on a dual-sig escrow, initializer
+        // alone on a plain escrow (enforced by the state machine). The
+        // param rewrites the same vault field the
+        // with_settlement_mint_allowlist param populates (see
+        // PARAM_FIELD_MAP) — no layout change.
+        const M1: [u8; 32] = [0x11; 32];
+        const M2: [u8; 32] = [0x22; 32];
+        const M3: [u8; 32] = [0x33; 32];
+        const M4: [u8; 32] = [0x44; 32];
+        const M5: [u8; 32] = [0x55; 32];
+        const M6: [u8; 32] = [0x66; 32];
+        const M7: [u8; 32] = [0x77; 32];
+        const M8: [u8; 32] = [0x88; 32];
+        const M9: [u8; 32] = [0x99; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const DELAY: u64 = 3_600;
+        const NOW: u64 = 1_700_000_000;
+        // A funded escrow with M1 bound as the settlement mint and
+        // [M1, M2] allowlisted.
+        let funded = || {
+            let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_settlement_mint(M1)
+                .unwrap()
+                .with_settlement_mint_allowlist(&[M1, M2])
+                .unwrap();
+            e.fund(ALICE, NOW).unwrap();
+            assert_eq!(e.state(), EscrowState::Funded);
+            e
+        };
+        // The revision lands and is readable via
+        // settlement_mint_allowlist(); only the list moves — the bound
+        // mint and the state stay.
+        let mut e = funded();
+        e.update_settlement_mint_allowlist(ALICE, BOB, &[M1, M3])
+            .unwrap();
+        assert_eq!(
+            e.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1, M3],
+            "list replaced"
+        );
+        assert_eq!(e.settlement_mint(), Some(M1), "bound mint untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        // Empty clears back to no restriction.
+        e.update_settlement_mint_allowlist(ALICE, BOB, &[]).unwrap();
+        assert_eq!(e.settlement_mint_allowlist(), None);
+        // Documented failure modes: over-long / zero-address /
+        // duplicate input is InvalidSettlementMintAllowlist (code 349)
+        // and leaves the original list intact.
+        let mut e = funded();
+        assert_eq!(
+            e.update_settlement_mint_allowlist(
+                ALICE,
+                BOB,
+                &[M1, M2, M3, M4, M5, M6, M7, M8, M9]
+            ),
+            Err(EscrowError::InvalidSettlementMintAllowlist)
+        );
+        assert_eq!(EscrowError::InvalidSettlementMintAllowlist.code(), 349);
+        assert_eq!(
+            e.update_settlement_mint_allowlist(ALICE, BOB, &[M1, M3, [0u8; 32]]),
+            Err(EscrowError::InvalidSettlementMintAllowlist)
+        );
+        assert_eq!(
+            e.update_settlement_mint_allowlist(ALICE, BOB, &[M1, M2, M2]),
+            Err(EscrowError::InvalidSettlementMintAllowlist)
+        );
+        assert_eq!(
+            e.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1, M2],
+            "failed revisions write nothing"
+        );
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_settlement_mint(M1)
+            .unwrap()
+            .with_settlement_mint_allowlist(&[M1, M2])
+            .unwrap();
+        assert_eq!(
+            bare.update_settlement_mint_allowlist(ALICE, BOB, &[M1, M3]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Dual-sig escrow: one party alone, or a stranger, is
+        // Unauthorized — paralleling `update_payout_allowlist`.
+        let mut dual = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_settlement_mint(M1)
+            .unwrap()
+            .with_settlement_mint_allowlist(&[M1, M2])
+            .unwrap();
+        dual.activate(ALICE).unwrap();
+        dual.activate(BOB).unwrap();
+        dual.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            dual.update_settlement_mint_allowlist(ALICE, ALICE, &[M1, M3]),
+            Err(EscrowError::Unauthorized),
+            "single party cannot revise on a dual-sig escrow"
+        );
+        assert_eq!(
+            dual.update_settlement_mint_allowlist(MALLORY, BOB, &[M1, M3]),
+            Err(EscrowError::Unauthorized),
+            "stranger cannot revise"
+        );
+        assert_eq!(
+            dual.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1, M2],
+            "failed revisions write nothing"
+        );
+        // Re-affirming the current list is a no-op: it succeeds and
+        // changes nothing observable, so the event layer emits
+        // nothing for it (AV-276's indexed test pins the emission).
+        let mut e = funded();
+        e.update_settlement_mint_allowlist(ALICE, BOB, &[M1, M2])
+            .unwrap();
+        assert_eq!(
+            e.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1, M2]
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        // The new gate governs the next settled release: a mint
+        // removed here is refused at once, while a mint added here
+        // settles — the settled-release path reads the live list
+        // before rate verification.
+        let init_key = SigningKey::from_seed([0x11; 32]);
+        let taker_key = SigningKey::from_seed([0x22; 32]);
+        let init = init_key.public_key();
+        let tak = taker_key.public_key();
+        let quote = |settle: [u8; 32]| {
+            let mut attestation = SettlementRateAttestation {
+                settle_mint: settle,
+                numerator: 2,
+                denominator: 1,
+                expires_at: 2_000_000_000,
+                initializer_signature: [0u8; 64],
+                taker_signature: [0u8; 64],
+            };
+            let message = settlement_rate_message(&attestation);
+            attestation.initializer_signature = init_key.sign(&message);
+            attestation.taker_signature = taker_key.sign(&message);
+            attestation
+        };
+        let mut e = Escrow::initialize(init, tak, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_settlement_mint(M1)
+            .unwrap()
+            .with_settlement_mint_allowlist(&[M1, M2])
+            .unwrap();
+        e.fund(init, NOW).unwrap();
+        // M1 is off the revised list: the settled release is refused
+        // before any pricing.
+        e.update_settlement_mint_allowlist(init, tak, &[M2, M3])
+            .unwrap();
+        assert_eq!(
+            e.release_with_settlement_rate(init, NOW, 1_000, None, tak, &quote(M1)),
+            Err(EscrowError::SettlementMintNotAllowlisted)
+        );
+        assert_eq!(e.released_amount(), 0);
+        // M3 is on the revised list and now bound: the quote settles.
+        e.update_settlement_mint_allowlist(init, tak, &[M1, M3])
+            .unwrap();
+        e.amend_settlement_mint(init, tak, M3).unwrap();
+        let settled = e
+            .release_with_settlement_rate(init, NOW, 1_000, None, tak, &quote(M3))
+            .unwrap();
+        assert_eq!(settled.payout, 2_000);
+        assert_eq!(settled.settle_mint, M3);
+        // Delay-opted-in escrow: the direct call is refused with
+        // GovernanceActionNotProposed — the allowlist moves only
+        // through the AV-158 propose/execute protocol.
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap()
+            .with_settlement_mint(M1)
+            .unwrap()
+            .with_settlement_mint_allowlist(&[M1, M2])
+            .unwrap();
+        delayed.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            delayed.update_settlement_mint_allowlist(ALICE, BOB, &[M1, M3]),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(
+            delayed.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M1, M2]
+        );
+    }
     // ----- AV-49: payout destination allowlist enforcement -----
 
     #[test]
@@ -44757,6 +45015,14 @@ pub(crate) mod anchor_idl_tests {
         // second param source for `mint_allowlist`, like
         // `update_payout_allowlist`.
         ("update_mint_allowlist", "mints", "mint_allowlist"),
+        // AV-396: the update param rewrites the same field in place — a
+        // second param source for `settlement_mint_allowlist`, like
+        // `update_mint_allowlist`.
+        (
+            "update_settlement_mint_allowlist",
+            "mints",
+            "settlement_mint_allowlist",
+        ),
         // AV-158: the delay window param populates
         // `governance_delay_secs` (u64, not an Option — 0 is the
         // valid "no delay" opt-out, rejected as InvalidGovernanceDelay
@@ -45835,18 +46101,15 @@ pub(crate) mod anchor_idl_tests {
              (Uninitialized only, non-zero key); read by \
              release_with_settlement_rate as the denomination",
         ),
-        // AV-218: the settlement-mint allowlist — `None` by
-        // `initialize` (no allowlist); set by
-        // `with_settlement_mint_allowlist` (Uninitialized only);
-        // read by `release_with_settlement_rate` as the gate on
-        // the attestation's settlement mint. Same field-source
-        // rationale as above.
-        (
-            "settlement_mint_allowlist",
-            "None by initialize; set by with_settlement_mint_allowlist \
-             (Uninitialized only); read by \
-             release_with_settlement_rate as the settlement-mint gate",
-        ),
+        // AV-218 / AV-396: the settlement-mint allowlist was a
+        // field source (`None` by `initialize`; set by
+        // `with_settlement_mint_allowlist`, Uninitialized only; read
+        // by `release_with_settlement_rate` as the gate on the
+        // attestation's settlement mint) until AV-396 added the
+        // `update_settlement_mint_allowlist` instruction param that
+        // rewrites it — the field is now param-sourced (see
+        // PARAM_FIELD_MAP), like `mint_allowlist`, so it is not
+        // listed here: every field gets exactly one source kind.
         // AV-220: the partial-funding opt-in — `false` by
         // `initialize` (classic single-shot funding); set by
         // `with_partial_funding` (Uninitialized only); read by
@@ -72136,6 +72399,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("update_mint_allowlist"),
             [170, 125, 146, 149, 76, 152, 190, 24]
+        );
+    }
+
+    #[test]
+    fn update_settlement_mint_allowlist_instruction_discriminator_is_pinned() {
+        // AV-396. IDL:
+        // sha256("global:update_settlement_mint_allowlist")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("update_settlement_mint_allowlist"),
+            [139, 40, 129, 193, 156, 231, 131, 77]
         );
     }
 

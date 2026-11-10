@@ -376,6 +376,14 @@
       ]
     },
     {
+      "name": "update_settlement_mint_allowlist",
+      "discriminator": [139, 40, 129, 193, 156, 231, 131, 77],
+      "accounts": [],
+      "args": [
+        {"name": "mints", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
       "name": "initialize_governance_delay",
       "discriminator": [183, 43, 59, 249, 155, 248, 27, 139],
       "accounts": [],
