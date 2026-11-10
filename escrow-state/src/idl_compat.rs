@@ -1491,13 +1491,14 @@ mod idl_compat_tests {
         // AV-387 adds `rotate_social_recovery_guardian`;
         // AV-388 adds `rotate_delegation_delegate`;
         // AV-395 adds `update_mint_allowlist`;
-        // AV-396 adds `update_settlement_mint_allowlist`);
+        // AV-396 adds `update_settlement_mint_allowlist`;
+        // AV-397 adds `update_tiered_quorum`);
         // the checked-in file diffed against itself has no changes
         // (exercises the parser on the production artifact).
         let idl = std::fs::read_to_string("../programs/escrow-vault/idl/escrow_vault.json")
             .expect("read checked-in IDL");
         let spec = parse_idl(&idl).expect("parse checked-in IDL");
-        assert_eq!(spec.instructions.len(), 176);
+        assert_eq!(spec.instructions.len(), 177);
         // AV-179 adds 4 upgrade-authority errors; AV-180 adds 4
         // freeze-authority errors; AV-184 adds UnsafeMint; AV-186 adds
         // 5 HTLC errors; AV-187 adds 2 NFT-escrow errors; AV-188 adds
@@ -1513,8 +1514,9 @@ mod idl_compat_tests {
         assert_eq!(spec.errors.len(), 253); // AV-209 adds 4 winner-payment errors; AV-212 adds 6 credential-gate errors; AV-214 adds 6 option-escrow errors; AV-215 adds 1 delegation-expiry error; AV-217 adds 3 settlement-rate errors; AV-218 adds 2 settlement-allowlist errors; AV-220 adds 1 partial-funding error; AV-266 adds 1 keeper-bounty error; AV-284 adds 1 collection-allowlist error; AV-287 adds 1 auto-unpause-at error; AV-337 adds 1 governance-proposal-expired error; AV-342 adds 1 distribution-claims-started error.
         // AV-178 adds the TieredQuorum + Tier named types; AV-195 adds
         // the SocialRecovery named type; AV-218 adds the
-        // SettlementMintAllowlist named type.
-        assert_eq!(spec.types.len(), 37);
+        // SettlementMintAllowlist named type; AV-397 adds the TierArg
+        // instruction-arg type.
+        assert_eq!(spec.types.len(), 38);
         let diff = diff_idl(&idl, &idl).unwrap();
         assert!(diff.changes.is_empty());
     }

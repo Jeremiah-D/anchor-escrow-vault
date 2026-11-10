@@ -17359,7 +17359,10 @@ let fee = self.charge_protocol_fee(amount)?;
     /// table) and to [`Escrow::update_attestors`] (that is the
     /// attestor set, this item is the tier table). Emits
     /// `TieredQuorumUpdated` on the event layer, except for the
-    /// no-op re-affirmation.
+    /// no-op re-affirmation. AV-397 adds the Anchor
+    /// program-facing `update_tiered_quorum` instruction (the
+    /// handler in `programs/escrow-vault/src/program.rs` mirrors
+    /// this logic, converting the `TierArg` instruction args).
     pub fn update_tiered_quorum(
         &mut self,
         initializer: [u8; 32],
@@ -37667,6 +37670,55 @@ pub(crate) mod anchor_idl_tests {
                             indexer event only fires on a real set change)",
         },
         InstructionSpec {
+            // AV-397: revise the tiered quorum table after funding
+            // — the program-level entry point for the AV-280
+            // pure-logic revision. IDL: discriminator =
+            // sha256("global:update_tiered_quorum")[..8] = [110,
+            // 223, 233, 25, 24, 239, 156, 13] — the Anchor
+            // instruction discriminator for the
+            // update_tiered_quorum handler (pinned by the
+            // discriminator test below).
+            name: "update_tiered_quorum",
+            params: &[(
+                "tiers",
+                "Vec<TierArg>",
+                "instruction param; the new amount-tier table (1-4 tiers, each a (max_amount, threshold) pair)",
+            )],
+            method: "Escrow::update_tiered_quorum",
+            input_mapping: "tiers <- param (Vec<TierArg> -> Vec<Tier> \
+                            conversion, TierArg { max_amount, threshold } \
+                            mirroring escrow_state::Tier); authority <- \
+                            accounts.initializer + accounts.taker \
+                            (BOTH signers — unconditional dual-signature \
+                            governance, enforced by the state machine; \
+                            one party alone, or a stranger, is \
+                            Unauthorized); Funded only \
+                            (InvalidStateTransition otherwise — \
+                            Uninitialized, terminal states and \
+                            Disputed); on a delay-opted-in escrow the \
+                            direct call is refused \
+                            (GovernanceActionNotProposed — the table \
+                            moves only through the AV-158 \
+                            propose/execute protocol, variant 13); an \
+                            unconfigured or plain-quorum escrow is \
+                            InvalidQuorum (code 104, fail-closed — \
+                            post-funding installation is refused); a \
+                            malformed table (empty, over MAX_TIERS = \
+                            4, non-strictly-increasing ceilings, a top \
+                            tier that is not open-ended (u64::MAX), \
+                            non-decreasing-threshold violations, or a \
+                            threshold of 0 / above the wrapped \
+                            policy's total weight) is InvalidQuorum \
+                            (code 104); emits the TieredQuorumUpdated \
+                            indexer event only on an actual change \
+                            (from == to == the current state); no \
+                            clock/sysvar input to the method; the \
+                            403-byte region is rewritten in place - no \
+                            layout / rent change, the wrapped base \
+                            policy (attestor registry, weights, \
+                            accumulated attestations) is untouched",
+        },
+        InstructionSpec {
             // AV-154: single-slot attestor key rotation by dual-signed
             // governance (the key-compromise response — unlike
             // update_attestors, the rotated slot's vote is cleared).
@@ -41042,6 +41094,9 @@ pub(crate) mod anchor_idl_tests {
             "QuorumPolicy::new + Escrow::with_quorum",
             "Escrow::update_quorum",
             "Escrow::update_attestors",
+            // AV-397: the program-level tiered-quorum table revision
+            // (the AV-280 pure-logic revision wired to the chain).
+            "Escrow::update_tiered_quorum",
             // AV-154: single-slot attestor key rotation by dual-signed
             // governance (the rotated slot's vote is cleared).
             "Escrow::replace_attestor",
@@ -41427,6 +41482,10 @@ pub(crate) mod anchor_idl_tests {
                 &"initialize_quorum",
                 &"update_quorum",
                 &"update_attestors",
+                // AV-397: the tier table rides as the instruction
+                // param (Vec<TierArg>); authority <- accounts.initializer
+                // + accounts.taker (BOTH signers, unconditional).
+                &"update_tiered_quorum",
                 // AV-154: the rotation target slot (u8) + the new key.
                 &"replace_attestor",
                 &"initialize_vesting",
@@ -44157,6 +44216,320 @@ pub(crate) mod anchor_idl_tests {
             &[M1, M2]
         );
     }
+
+    #[test]
+    fn update_tiered_quorum_maps_param_to_tiered_quorum_field() {
+        // IDL: update_tiered_quorum(tiers: Vec<TierArg>) — tiers <-
+        // param; authority <- accounts.initializer + accounts.taker
+        // (BOTH signers, unconditional dual-signature governance
+        // enforced by the state machine). The param rewrites the
+        // tier table of the same vault field the with_tiered_quorum
+        // builder populates (see PARAM_FIELD_MAP) — no layout change.
+        const ATTESTOR_1: [u8; 32] = [0xA1; 32];
+        const ATTESTOR_2: [u8; 32] = [0xA2; 32];
+        const ATTESTOR_3: [u8; 32] = [0xA3; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const DELAY: u64 = 3_600;
+        const NOW: u64 = 1_700_000_000;
+        // 3 attestors, weight 1 each. Tiers: releases <= 1_000 need
+        // weight 1 (1-of-3), anything above needs weight 3 (3-of-3).
+        fn base_policy() -> QuorumPolicy {
+            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 1)
+                .unwrap()
+        }
+        fn initial_tiers() -> [Tier; 2] {
+            [
+                Tier {
+                    max_amount: 1_000,
+                    threshold: 1,
+                },
+                Tier {
+                    max_amount: u64::MAX,
+                    threshold: 3,
+                },
+            ]
+        }
+        let funded = || {
+            let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_tiered_quorum(
+                    TieredQuorum::new(base_policy(), &initial_tiers()).unwrap(),
+                )
+                .unwrap();
+            e.fund(ALICE, NOW).unwrap();
+            assert_eq!(e.state(), EscrowState::Funded);
+            e
+        };
+        // The revision lands and is readable via tiered_quorum();
+        // only the tier table moves — the wrapped base policy and
+        // the state stay.
+        let mut e = funded();
+        let new_tiers = [
+            Tier {
+                max_amount: 1_000,
+                threshold: 2,
+            },
+            Tier {
+                max_amount: u64::MAX,
+                threshold: 3,
+            },
+        ];
+        e.update_tiered_quorum(ALICE, BOB, &new_tiers).unwrap();
+        assert_eq!(
+            e.tiered_quorum().unwrap(),
+            TieredQuorum::new(base_policy(), &new_tiers).unwrap(),
+            "table replaced, base policy carried over"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        // Documented failure modes: every malformed table is
+        // InvalidQuorum (code 104) and leaves the original table
+        // intact.
+        let mut e = funded();
+        assert_eq!(EscrowError::InvalidQuorum.code(), 104);
+        assert_eq!(
+            e.update_tiered_quorum(ALICE, BOB, &[]),
+            Err(EscrowError::InvalidQuorum),
+            "empty table"
+        );
+        assert_eq!(
+            e.update_tiered_quorum(
+                ALICE,
+                BOB,
+                &[
+                    Tier {
+                        max_amount: 100,
+                        threshold: 1
+                    },
+                    Tier {
+                        max_amount: 200,
+                        threshold: 1
+                    },
+                    Tier {
+                        max_amount: 300,
+                        threshold: 2
+                    },
+                    Tier {
+                        max_amount: 400,
+                        threshold: 2
+                    },
+                    Tier {
+                        max_amount: u64::MAX,
+                        threshold: 3
+                    },
+                ]
+            ),
+            Err(EscrowError::InvalidQuorum),
+            "over MAX_TIERS = 4"
+        );
+        assert_eq!(
+            e.update_tiered_quorum(
+                ALICE,
+                BOB,
+                &[
+                    Tier {
+                        max_amount: 1_000,
+                        threshold: 1
+                    },
+                    Tier {
+                        max_amount: 1_000,
+                        threshold: 3
+                    },
+                ]
+            ),
+            Err(EscrowError::InvalidQuorum),
+            "ceilings must strictly increase"
+        );
+        assert_eq!(
+            e.update_tiered_quorum(
+                ALICE,
+                BOB,
+                &[
+                    Tier {
+                        max_amount: 1_000,
+                        threshold: 1
+                    },
+                    Tier {
+                        max_amount: 2_000,
+                        threshold: 3
+                    },
+                ]
+            ),
+            Err(EscrowError::InvalidQuorum),
+            "top tier must be open-ended (u64::MAX)"
+        );
+        assert_eq!(
+            e.update_tiered_quorum(
+                ALICE,
+                BOB,
+                &[
+                    Tier {
+                        max_amount: 1_000,
+                        threshold: 2
+                    },
+                    Tier {
+                        max_amount: u64::MAX,
+                        threshold: 1
+                    },
+                ]
+            ),
+            Err(EscrowError::InvalidQuorum),
+            "thresholds must not decrease"
+        );
+        assert_eq!(
+            e.update_tiered_quorum(
+                ALICE,
+                BOB,
+                &[
+                    Tier {
+                        max_amount: 1_000,
+                        threshold: 0
+                    },
+                    Tier {
+                        max_amount: u64::MAX,
+                        threshold: 3
+                    },
+                ]
+            ),
+            Err(EscrowError::InvalidQuorum),
+            "threshold 0 is unreachable"
+        );
+        assert_eq!(
+            e.update_tiered_quorum(
+                ALICE,
+                BOB,
+                &[
+                    Tier {
+                        max_amount: 1_000,
+                        threshold: 1
+                    },
+                    Tier {
+                        max_amount: u64::MAX,
+                        threshold: 4
+                    },
+                ]
+            ),
+            Err(EscrowError::InvalidQuorum),
+            "threshold above total weight is unreachable"
+        );
+        assert_eq!(
+            e.tiered_quorum().unwrap(),
+            TieredQuorum::new(base_policy(), &initial_tiers()).unwrap(),
+            "failed revisions write nothing"
+        );
+        // Funded-only: the Uninitialized builder owns the initial table.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_tiered_quorum(
+                TieredQuorum::new(base_policy(), &initial_tiers()).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            bare.update_tiered_quorum(ALICE, BOB, &new_tiers),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Unconfigured / plain-quorum escrows are refused with
+        // InvalidQuorum (code 104) — post-funding installation would
+        // add a tiered gate the taker never funded under.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            plain.update_tiered_quorum(ALICE, BOB, &new_tiers),
+            Err(EscrowError::InvalidQuorum)
+        );
+        let mut plain_quorum = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(base_policy())
+            .unwrap();
+        plain_quorum.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            plain_quorum.update_tiered_quorum(ALICE, BOB, &new_tiers),
+            Err(EscrowError::InvalidQuorum)
+        );
+        // Unconditional dual signature: one party alone, or a
+        // stranger, is Unauthorized — even on a plain escrow, unlike
+        // the conditional AV-276 gate.
+        let mut e = funded();
+        assert_eq!(
+            e.update_tiered_quorum(ALICE, ALICE, &new_tiers),
+            Err(EscrowError::Unauthorized),
+            "single party cannot revise the quorum table"
+        );
+        assert_eq!(
+            e.update_tiered_quorum(MALLORY, BOB, &new_tiers),
+            Err(EscrowError::Unauthorized),
+            "stranger cannot revise"
+        );
+        assert_eq!(
+            e.tiered_quorum().unwrap(),
+            TieredQuorum::new(base_policy(), &initial_tiers()).unwrap(),
+            "failed revisions write nothing"
+        );
+        // The degenerate self-escrow (initializer == taker) authorizes
+        // with one key passed twice, like AV-12's activation.
+        let mut solo = Escrow::initialize(ALICE, ALICE, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_tiered_quorum(
+                TieredQuorum::new(base_policy(), &initial_tiers()).unwrap(),
+            )
+            .unwrap();
+        solo.fund(ALICE, NOW).unwrap();
+        solo.update_tiered_quorum(ALICE, ALICE, &new_tiers)
+            .unwrap();
+        assert_eq!(
+            solo.tiered_quorum().unwrap(),
+            TieredQuorum::new(base_policy(), &new_tiers).unwrap()
+        );
+        // Re-affirming the current table is a no-op: it succeeds and
+        // changes nothing observable, so the event layer emits
+        // nothing for it (AV-280's indexed test pins the emission).
+        let mut e = funded();
+        e.update_tiered_quorum(ALICE, BOB, &initial_tiers())
+            .unwrap();
+        assert_eq!(
+            e.tiered_quorum().unwrap(),
+            TieredQuorum::new(base_policy(), &initial_tiers()).unwrap()
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        // The new table governs the next release: in-flight
+        // attestations are re-judged under the new thresholds.
+        let mut e = funded();
+        e.attest(ATTESTOR_1).unwrap();
+        assert!(e.tiered_quorum().unwrap().is_satisfied_for(1_000));
+        e.update_tiered_quorum(ALICE, BOB, &new_tiers).unwrap();
+        assert!(!e.tiered_quorum().unwrap().is_satisfied_for(1_000));
+        assert_eq!(
+            e.release(ALICE, NOW, 1_000, None, BOB),
+            Err(EscrowError::QuorumNotReached)
+        );
+        e.attest(ATTESTOR_2).unwrap();
+        assert!(e.tiered_quorum().unwrap().is_satisfied_for(1_000));
+        e.release(ALICE, NOW, 1_000, None, BOB).unwrap();
+        assert_eq!(e.released_amount(), 1_000);
+        // Delay-opted-in escrow: the direct call is refused with
+        // GovernanceActionNotProposed — the table moves only through
+        // the AV-158 propose/execute protocol.
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap()
+            .with_tiered_quorum(
+                TieredQuorum::new(base_policy(), &initial_tiers()).unwrap(),
+            )
+            .unwrap();
+        delayed.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            delayed.update_tiered_quorum(ALICE, BOB, &new_tiers),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(
+            delayed.tiered_quorum().unwrap(),
+            TieredQuorum::new(base_policy(), &initial_tiers()).unwrap()
+        );
+    }
     // ----- AV-49: payout destination allowlist enforcement -----
 
     #[test]
@@ -44906,6 +45279,10 @@ pub(crate) mod anchor_idl_tests {
         // param.
         ("update_attestors", "attestors", "quorum.attestors"),
         ("update_attestors", "weights", "quorum.weights"),
+        // AV-397: the tier-table param rewrites the tiered-quorum
+        // region in place — the table's param source, like
+        // `update_quorum`'s threshold.
+        ("update_tiered_quorum", "tiers", "tiered_quorum"),
         // AV-154: the single-slot key rotation writes the selected
         // element of the quorum's attestor array; the slot index is
         // transient (see TRANSIENT_PARAMS).
@@ -45947,16 +46324,15 @@ pub(crate) mod anchor_idl_tests {
              which shifts vesting.start/end/cliff_at forward by \
              now - paused_at",
         ),
-        // AV-178: no instruction param writes this field —
-        // `with_tiered_quorum` is a pre-fund builder (Uninitialized
-        // only, mutually exclusive with the plain `with_quorum`), so
-        // it is a field source, not a param mapping.
-        (
-            "tiered_quorum",
-            "None by initialize; set by with_tiered_quorum (Uninitialized only, \
-             mutually exclusive with with_quorum); attestor votes accumulate \
-             in place on the wrapped AV-04 policy via attest",
-        ),
+        // AV-178 / AV-397: the tiered quorum was a field source
+        // (`None` by `initialize`; set by `with_tiered_quorum`,
+        // Uninitialized only, mutually exclusive with `with_quorum`;
+        // attestor votes accumulate in place on the wrapped AV-04
+        // policy via `attest`) until AV-397 added the
+        // `update_tiered_quorum` instruction param that rewrites the
+        // tier table — the field is now param-sourced (see
+        // PARAM_FIELD_MAP), like `quorum.threshold`, so it is not
+        // listed here: every field gets exactly one source kind.
         // AV-191: the cumulative referral share — zeroed by
         // `initialize`; each `release` accumulates
         // `referral_for(amount)` into it via `charge_referral` (the
@@ -72411,6 +72787,17 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("update_settlement_mint_allowlist"),
             [139, 40, 129, 193, 156, 231, 131, 77]
+        );
+    }
+
+    #[test]
+    fn update_tiered_quorum_instruction_discriminator_is_pinned() {
+        // AV-397. IDL: sha256("global:update_tiered_quorum")[..8]
+        // — the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("update_tiered_quorum"),
+            [110, 223, 233, 25, 24, 239, 156, 13]
         );
     }
 

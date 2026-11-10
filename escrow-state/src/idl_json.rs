@@ -328,6 +328,9 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         "Vec<ClaimantShare>" => {
             IdlType::Vec(Box::new(IdlType::Named("ClaimantShare")))
         }
+        // AV-397: the update_tiered_quorum instruction's tier table
+        // — a Vec of the program-side TierArg instruction args.
+        "Vec<TierArg>" => IdlType::Vec(Box::new(IdlType::Named("TierArg"))),
         // AV-157: the initialize_mint_allowlist instruction's base58
         // mint address list.
         "Vec<String>" => IdlType::Vec(Box::new(IdlType::Str)),
@@ -396,6 +399,15 @@ fn named_type_fields(name: &str) -> Vec<(&'static str, IdlType)> {
         // Tier { max_amount: u64, threshold: u64 } (AV-178): one
         // amount tier of the tiered quorum.
         "Tier" => vec![
+            ("max_amount", IdlType::U64),
+            ("threshold", IdlType::U64),
+        ],
+        // TierArg { max_amount: u64, threshold: u64 } (AV-397): one
+        // amount tier as an update_tiered_quorum instruction arg —
+        // the program-side mirror of `Tier`, kept distinct so the
+        // instruction arg type can evolve independently of the
+        // stored tier shape.
+        "TierArg" => vec![
             ("max_amount", IdlType::U64),
             ("threshold", IdlType::U64),
         ],
@@ -986,6 +998,8 @@ fn render_idl_json() -> String {
         "QuorumPolicy",
         "TieredQuorum",
         "Tier",
+        // AV-397: the update_tiered_quorum instruction-arg tier.
+        "TierArg",
         "VestingSchedule",
         "MilestonePlan",
         "PayoutAllowlist",
@@ -1189,6 +1203,8 @@ fn named_type_sizes_pin_constants() {
     // threshold.
     assert_eq!(size("TieredQuorum"), TIERED_QUORUM_LEN);
     assert_eq!(size("Tier"), 16);
+    // AV-397: the instruction-arg tier mirrors `Tier` field-for-field.
+    assert_eq!(size("TierArg"), 16);
     // AV-51: the cliff_at u64 joins start/end.
     assert_eq!(size("VestingSchedule"), 24);
     // AV-90: 8 fixed (u64, u16) tier slots + the live tier-count byte.

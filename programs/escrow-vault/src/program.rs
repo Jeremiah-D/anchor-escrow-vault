@@ -5139,6 +5139,71 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Update the tiered quorum table (AV-397; mirrors
+    /// `Escrow::update_tiered_quorum`). Unconditional dual-signature
+    /// governance: both initializer and taker sign, even on a plain
+    /// escrow — the tier table is quorum policy, so the
+    /// `update_quorum` rule applies, not the conditional AV-276
+    /// gate. `Funded` only — the builder owns the initial table.
+    /// `InvalidQuorum` (code 104) on an unconfigured / plain-quorum
+    /// escrow and on a malformed table (empty, over `MAX_TIERS` = 4,
+    /// non-strictly-increasing ceilings, a top tier that is not
+    /// open-ended (`u64::MAX`), non-decreasing-threshold violations,
+    /// or a threshold of 0 / above the wrapped policy's total
+    /// weight). On a delay-opted-in escrow the direct call is refused
+    /// (`GovernanceActionNotProposed` — the table moves only through
+    /// the AV-158 propose/execute protocol, variant 13). Emits
+    /// `TieredQuorumUpdated` (from == to == the current state) only
+    /// on an actual change; a same-table no-op stays silent
+    /// (mirrors `rotate_taker`).
+    pub fn update_tiered_quorum(
+        ctx: Context<UpdateTieredQuorum>,
+        tiers: Vec<TierArg>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.tiered_quorum();
+        let state_tiers: Vec<escrow_state::Tier> = tiers
+            .iter()
+            .map(|t| escrow_state::Tier {
+                max_amount: t.max_amount,
+                threshold: t.threshold,
+            })
+            .collect();
+        escrow
+            .update_tiered_quorum(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &state_tiers,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.tiered_quorum` tiers/tier_count in place in
+        // the real build (403 bytes, always present, zeroed when None)
+        // — no realloc. The wrapped base policy (attestor registry,
+        // weights, accumulated attestations) is untouched.
+        // Emits only on an actual change; a same-table no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.tiered_quorum() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::TieredQuorumUpdated,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Update the payout destination denylist (AV-96; mirrors
     /// `Escrow::update_payout_denylist`). Initializer-signature-alone
     /// governance (unlike `update_payout_allowlist`'s dual-signature
@@ -8682,6 +8747,10 @@ pub enum EscrowVaultEventKind {
     /// Mirrors
     /// `escrow_state::EscrowEventKind::SettlementMintAllowlistUpdated`.
     SettlementMintAllowlistUpdated,
+    /// AV-397: the tiered quorum table was updated by owner
+    /// governance (`Escrow::update_tiered_quorum`). Mirrors
+    /// `escrow_state::EscrowEventKind::TieredQuorumUpdated`.
+    TieredQuorumUpdated,
     /// AV-52: the taker (payout counterparty) was rotated by
     /// dual-signed governance (`Escrow::rotate_taker`). Mirrors
     /// `escrow_state::EscrowEventKind::TakerRotated`.
@@ -8918,6 +8987,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::SettlementMintAllowlistUpdated => {
             EscrowVaultEventKind::SettlementMintAllowlistUpdated
+        }
+        escrow_state::EscrowEventKind::TieredQuorumUpdated => {
+            EscrowVaultEventKind::TieredQuorumUpdated
         }
         escrow_state::EscrowEventKind::TakerRotated => EscrowVaultEventKind::TakerRotated,
         escrow_state::EscrowEventKind::InitializerRotated => {
@@ -11292,6 +11364,35 @@ pub struct UpdateSettlementMintAllowlist<'info> {
     /// Dual-signature governance: on a dual-sig escrow both initializer
     /// and taker sign; on a plain escrow the initializer alone (the
     /// state machine enforces this — a stranger is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-397: one amount tier as an instruction argument — the
+/// instruction-arg mirror of `escrow_state::Tier` (`max_amount` /
+/// `threshold`). Kept distinct from the AV-335 `Tier` skeleton
+/// mirror (the delayed-governance path stages a fixed `[Tier; 4]`
+/// array; the direct instruction takes a variable-length `Vec` of
+/// fresh args, validated by `TieredQuorum::new` before any write).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TierArg {
+    /// Inclusive amount ceiling of this tier, in base units.
+    pub max_amount: u64,
+    /// Weight-sum threshold for releases landing in this tier.
+    pub threshold: u64,
+}
+
+/// AV-397: accounts for `update_tiered_quorum` — the tiered-quorum
+/// table revision is unconditional dual-signature governance: both
+/// initializer and taker sign, even on a plain escrow (the state
+/// machine enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct UpdateTieredQuorum<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
     pub initializer: Signer<'info>,
     pub taker: Signer<'info>,
 }
