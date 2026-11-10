@@ -5204,6 +5204,66 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Update the arbiter panel roster (AV-398; mirrors
+    /// `Escrow::update_arbiter_panel_members`). Unconditional
+    /// dual-signature governance: both initializer and taker sign,
+    /// even on a plain escrow — the roster is adjudication policy,
+    /// so the `update_quorum` rule applies, not the conditional
+    /// AV-276 gate. `Funded` only — the builder owns the initial
+    /// roster. `InvalidArbiterPanel` (code 136) on an unconfigured
+    /// escrow (fail-closed — post-funding installation is refused)
+    /// and on a malformed roster (empty, over `MAX_PANEL_MEMBERS`
+    /// = 8, a zero key, a duplicate, or a new count below the
+    /// current threshold). On a delay-opted-in escrow the direct
+    /// call is refused (`GovernanceActionNotProposed` — the roster
+    /// moves only through the AV-158 propose/execute protocol,
+    /// variant 14). Emits `ArbiterPanelMembersUpdated` (from == to
+    /// == the current state) only on an actual change; a same-roster
+    /// no-op stays silent, while a reordering IS a revision
+    /// (mirrors `rotate_taker`).
+    pub fn update_arbiter_panel_members(
+        ctx: Context<UpdateArbiterPanelMembers>,
+        members: Vec<Pubkey>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.arbiter_panel();
+        let addrs: Vec<[u8; 32]> = members.iter().map(|k| k.to_bytes()).collect();
+        escrow
+            .update_arbiter_panel_members(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &addrs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `vault.arbiter_panel` members/n in place in the
+        // real build (the panel region is always present, zeroed when
+        // None) — no realloc. The threshold, the blind mode, and the
+        // reveal window are carried over verbatim, and the vote state
+        // is untouched.
+        // Emits only on an actual change; a same-roster no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.arbiter_panel() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::ArbiterPanelMembersUpdated,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Update the payout destination denylist (AV-96; mirrors
     /// `Escrow::update_payout_denylist`). Initializer-signature-alone
     /// governance (unlike `update_payout_allowlist`'s dual-signature
@@ -8751,6 +8811,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::update_tiered_quorum`). Mirrors
     /// `escrow_state::EscrowEventKind::TieredQuorumUpdated`.
     TieredQuorumUpdated,
+    /// AV-398: the arbiter panel roster was revised by owner
+    /// governance (`Escrow::update_arbiter_panel_members`). Mirrors
+    /// `escrow_state::EscrowEventKind::ArbiterPanelMembersUpdated`.
+    ArbiterPanelMembersUpdated,
     /// AV-52: the taker (payout counterparty) was rotated by
     /// dual-signed governance (`Escrow::rotate_taker`). Mirrors
     /// `escrow_state::EscrowEventKind::TakerRotated`.
@@ -8990,6 +9054,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::TieredQuorumUpdated => {
             EscrowVaultEventKind::TieredQuorumUpdated
+        }
+        escrow_state::EscrowEventKind::ArbiterPanelMembersUpdated => {
+            EscrowVaultEventKind::ArbiterPanelMembersUpdated
         }
         escrow_state::EscrowEventKind::TakerRotated => EscrowVaultEventKind::TakerRotated,
         escrow_state::EscrowEventKind::InitializerRotated => {
@@ -11388,6 +11455,22 @@ pub struct TierArg {
 /// machine enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct UpdateTieredQuorum<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-398: accounts for `update_arbiter_panel_members` — the
+/// arbiter-panel roster revision is unconditional dual-signature
+/// governance: both initializer and taker sign, even on a plain
+/// escrow (the state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct UpdateArbiterPanelMembers<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

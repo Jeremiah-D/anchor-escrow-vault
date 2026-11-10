@@ -786,6 +786,14 @@
       ]
     },
     {
+      "name": "update_arbiter_panel_members",
+      "discriminator": [100, 152, 249, 110, 44, 16, 73, 93],
+      "accounts": [],
+      "args": [
+        {"name": "members", "type": {"vec": "publicKey"}}
+      ]
+    },
+    {
       "name": "migrate_schema",
       "discriminator": [223, 9, 156, 218, 187, 90, 169, 85],
       "accounts": [],

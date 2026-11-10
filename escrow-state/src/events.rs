@@ -16147,6 +16147,46 @@ mod event_tests {
         assert_eq!(e.event_count(), before, "failed call emits nothing");
     }
 
+    // ---------- AV-398: ArbiterPanelMembersUpdated events ----------
+    //
+    // The roster revision emits only on an actual change; a
+    // same-roster re-affirmation stays silent, while a reordering
+    // emits — slot order is vote identity.
+
+    const PM4: [u8; 32] = [0xC4; 32];
+
+    #[test]
+    fn update_arbiter_panel_members_changed_emits_event_on_change() {
+        let mut e = funded_panel_indexed(2);
+        let before = e.event_count();
+        e.update_arbiter_panel_members(ALICE, BOB, &[PM1, PM3, PM4], T0 + 2)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "one event on change");
+        let ev = e.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::ArbiterPanelMembersUpdated);
+        assert_eq!(ev.from, EscrowState::Funded);
+        assert_eq!(ev.to, EscrowState::Funded);
+        assert_eq!(ev.amounts, EventAmounts::none(), "moves no funds");
+        assert_eq!(
+            e.inner().arbiter_panel().unwrap().members[..3],
+            [PM1, PM3, PM4],
+            "vault carries the new roster"
+        );
+    }
+
+    #[test]
+    fn update_arbiter_panel_members_no_op_emits_nothing() {
+        let mut e = funded_panel_indexed(2);
+        let before = e.event_count();
+        e.update_arbiter_panel_members(ALICE, BOB, &[PM1, PM2, PM3], T0 + 2)
+            .unwrap();
+        assert_eq!(e.event_count(), before, "no-op revision emits nothing");
+        // A reordering IS a revision: slot order is vote identity.
+        e.update_arbiter_panel_members(ALICE, BOB, &[PM2, PM1, PM3], T0 + 3)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "reorder emits one event");
+    }
+
     #[test]
     fn panel_threshold_changed_kind_round_trips() {
         // discriminant 34: appended last, 0–33 stable for

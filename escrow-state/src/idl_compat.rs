@@ -1492,13 +1492,14 @@ mod idl_compat_tests {
         // AV-388 adds `rotate_delegation_delegate`;
         // AV-395 adds `update_mint_allowlist`;
         // AV-396 adds `update_settlement_mint_allowlist`;
-        // AV-397 adds `update_tiered_quorum`);
+        // AV-397 adds `update_tiered_quorum`;
+        // AV-398 adds `update_arbiter_panel_members`);
         // the checked-in file diffed against itself has no changes
         // (exercises the parser on the production artifact).
         let idl = std::fs::read_to_string("../programs/escrow-vault/idl/escrow_vault.json")
             .expect("read checked-in IDL");
         let spec = parse_idl(&idl).expect("parse checked-in IDL");
-        assert_eq!(spec.instructions.len(), 177);
+        assert_eq!(spec.instructions.len(), 178);
         // AV-179 adds 4 upgrade-authority errors; AV-180 adds 4
         // freeze-authority errors; AV-184 adds UnsafeMint; AV-186 adds
         // 5 HTLC errors; AV-187 adds 2 NFT-escrow errors; AV-188 adds
