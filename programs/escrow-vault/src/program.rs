@@ -5518,6 +5518,68 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the funding amount window after funding (AV-403;
+    /// mirrors `Escrow::amend_amount_bounds`). Unconditional
+    /// dual-signature governance: both initializer and taker sign —
+    /// one party alone cannot move the deposit window on the
+    /// other's funds. `Funded` only — the builder owns the initial
+    /// window. A paused escrow fails fast (`Paused`, before the
+    /// authority gate). Only an escrow already carrying a window
+    /// may revise it (no window is `InvalidAmountBounds`, code
+    /// 196, fail-closed — post-funding installation would add a
+    /// deposit gate the taker never funded under). The whole pair
+    /// is replaced at once (no partial revision) and `min_amount >
+    /// max_amount` is `InvalidAmountBounds`, leaving the original
+    /// window untouched. No delay path covers this method —
+    /// `GovernanceAction` has no `AmendAmountBounds` variant, so
+    /// the direct call is the only entry point. Emits
+    /// `AmountBoundsAmended` (from == to == the current state)
+    /// only on an actual change; a same-window no-op stays silent
+    /// (mirrors `rotate_taker`).
+    pub fn amend_amount_bounds(
+        ctx: Context<AmendAmountBounds>,
+        min_amount: u64,
+        max_amount: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.amount_bounds();
+        escrow
+            .amend_amount_bounds(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                min_amount,
+                max_amount,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `min_funding_amount` / `max_funding_amount`
+        // tail fields in place in the real build (the window region
+        // is always present, zeroed when unconfigured) — no
+        // realloc. Only the window moves; the funded total, the
+        // plan, and the state are untouched.
+        // Emits only on an actual change; a same-window no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.amount_bounds() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::AmountBoundsAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Update the payout destination denylist (AV-96; mirrors
     /// `Escrow::update_payout_denylist`). Initializer-signature-alone
     /// governance (unlike `update_payout_allowlist`'s dual-signature
@@ -9085,6 +9147,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::amend_fee_cap`). Mirrors
     /// `escrow_state::EscrowEventKind::FeeCapAmended`.
     FeeCapAmended,
+    /// AV-403: the funding amount window was revised by owner
+    /// governance (`Escrow::amend_amount_bounds`). Mirrors
+    /// `escrow_state::EscrowEventKind::AmountBoundsAmended`.
+    AmountBoundsAmended,
     /// AV-52: the taker (payout counterparty) was rotated by
     /// dual-signed governance (`Escrow::rotate_taker`). Mirrors
     /// `escrow_state::EscrowEventKind::TakerRotated`.
@@ -9337,6 +9403,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::FeeCapAmended => {
             EscrowVaultEventKind::FeeCapAmended
+        }
+        escrow_state::EscrowEventKind::AmountBoundsAmended => {
+            EscrowVaultEventKind::AmountBoundsAmended
         }
         escrow_state::EscrowEventKind::TakerRotated => EscrowVaultEventKind::TakerRotated,
         escrow_state::EscrowEventKind::InitializerRotated => {
@@ -11811,6 +11880,21 @@ pub struct AmendProtocolFee<'info> {
 /// enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendFeeCap<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-403: accounts for `amend_amount_bounds` — the
+/// funding-amount-window revision is unconditional dual-signature
+/// governance: both initializer and taker sign (the state machine
+/// enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendAmountBounds<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

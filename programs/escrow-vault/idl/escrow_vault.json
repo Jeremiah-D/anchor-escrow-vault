@@ -1079,6 +1079,15 @@
       ]
     },
     {
+      "name": "amend_amount_bounds",
+      "discriminator": [233, 126, 95, 158, 206, 110, 173, 18],
+      "accounts": [],
+      "args": [
+        {"name": "min_amount", "type": "u64"},
+        {"name": "max_amount", "type": "u64"}
+      ]
+    },
+    {
       "name": "initialize_deadman_switch",
       "discriminator": [227, 118, 253, 183, 67, 134, 220, 86],
       "accounts": [],

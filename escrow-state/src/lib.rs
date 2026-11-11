@@ -40466,6 +40466,31 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "fee_cap <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed; the builder owns the initial ceiling); no delay path covers this method — GovernanceAction has no AmendFeeCap variant, so the direct call is the only entry point and no delayed handler is staged; only an escrow already carrying a ceiling may revise (fee_cap == 0 is InvalidProtocolFee, code 114, fail-closed — post-funding installation would add a fee term the taker never funded under, so a ceiling can never be installed after funding); any u64 is a legal new ceiling and 0 is legal (it removes the cap outright, so later bps fees are no longer floored — and the removal is one-way post-funding, since a cap-less escrow fails the same gate on any later amendment); re-affirming the current ceiling is a no-op (succeeds, writes nothing, emits no event); only fee_cap changes — fee_bps, fee_schedule and fees_paid / fees_withdrawn are untouched and fees already charged are never restated, so the new ceiling governs from the next taker payout (protocol_fee_for reads the live ceiling at every pricing: min(bps fee, cap) prices the next claim / release / release_milestone / resolve taker share / release_period at the new ceiling while a payout already settled keeps the fee it settled under, on flat-rate and tiered-schedule escrows alike); emits the FeeCapAmended indexer event only on an actual change (from == to == the current state); the fee_cap tail field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-403: revise the funding amount window after funding
+            // — the program-level entry point for the AV-268
+            // pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_amount_bounds")[..8] =
+            // [233, 126, 95, 158, 206, 110, 173, 18] — the Anchor
+            // instruction discriminator for the
+            // amend_amount_bounds handler (pinned by the
+            // discriminator test below).
+            name: "amend_amount_bounds",
+            params: &[
+                (
+                    "min_amount",
+                    "u64",
+                    "instruction param; the new funding floor — a fund / fund_tranche deposit below this is AmountOutOfBounds (code 197); 0 disables the floor",
+                ),
+                (
+                    "max_amount",
+                    "u64",
+                    "instruction param; the new funding ceiling — a fund / fund_tranche deposit above this is AmountOutOfBounds (code 197); min_amount > max_amount is InvalidAmountBounds (code 196)",
+                ),
+            ],
+            method: "Escrow::amend_amount_bounds",
+            input_mapping: "min_amount/max_amount <- params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed; the builder owns the initial window); no delay path covers this method — GovernanceAction has no AmendAmountBounds variant, so the direct call is the only entry point and no delayed handler is staged; only an escrow already carrying a window may revise (no window is InvalidAmountBounds, code 196, fail-closed — post-funding installation would add a deposit gate the taker never funded under, so a window can never be installed after funding); the whole pair is replaced at once (no partial revision) and min_amount > max_amount is InvalidAmountBounds (code 196, the with_amount_bounds gate, unchanged), leaving the original window untouched; re-affirming the current window is a no-op (succeeds, writes nothing, emits no event); only the window fields change — funded_total and the funding plan's total and tranche budget are untouched (the window caps each tranche, it never reschedules the plan), so the new window governs from the next fund_tranche call (the tranche path reads the live window on every deposit, so a deposit outside the new window is AmountOutOfBounds while a tranche already funded keeps the window it funded under); emits the AmountBoundsAmended indexer event only on an actual change (from == to == the current state); the min_funding_amount / max_funding_amount tail fields are rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-109: opt in to the dead-man's switch at initialize
             // time. IDL: discriminator =
             // sha256("global:initialize_deadman_switch")[..8] = [227,
@@ -41458,6 +41483,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-273 pure-logic revision wired to the
             // chain).
             "Escrow::amend_fee_cap",
+            // AV-403: the program-level funding-amount-window
+            // revision (the AV-268 pure-logic revision wired to the
+            // chain).
+            "Escrow::amend_amount_bounds",
             // AV-109: dead-man's switch — declare the inactivity
             // threshold + heir pre-fund, then the heir reclaims the
             // remaining locked funds once the inactivity window
@@ -41793,6 +41822,12 @@ pub(crate) mod anchor_idl_tests {
                 // accounts.initializer + accounts.taker (BOTH
                 // signers, unconditional); no delay path covers it.
                 &"amend_fee_cap",
+                // AV-403: the post-funding funding-window revision
+                // carries the new floor (u64) + ceiling (u64);
+                // authority <- accounts.initializer +
+                // accounts.taker (BOTH signers, unconditional); no
+                // delay path covers it.
+                &"amend_amount_bounds",
                 // AV-109: the deadman opt-in carries the inactivity
                 // threshold (u64) + the heir (Pubkey); the heir's
                 // claim is param-less (the config pins everything,
@@ -45683,6 +45718,144 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(later.fees_paid(), 25_000);
     }
 
+    fn amount_bounds_funded_plan_escrow() -> Escrow {
+        // AV-403 helper: a funded plan escrow carrying the AV-134
+        // window, one tranche already funded — the same shape the
+        // AV-268 pure-logic tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_amount_bounds(100_000, 900_000)
+            .unwrap();
+        e.with_funding_plan(1_000_000, 3).unwrap();
+        e.fund_tranche(ALICE, 200_000, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn amend_amount_bounds_maps_params_to_window_fields() {
+        // IDL: amend_amount_bounds(min_amount: u64, max_amount: u64)
+        // — min_amount/max_amount <- params (the handler's two
+        // instruction args); authority <- accounts.initializer +
+        // accounts.taker (BOTH signers, unconditional dual-signature
+        // governance enforced by the state machine). The params
+        // rewrite the same vault fields the `with_amount_bounds`
+        // builder populates (see PARAM_FIELD_MAP) — no layout change.
+        let mut e = amount_bounds_funded_plan_escrow();
+        assert_eq!(e.amount_bounds(), Some((100_000, 900_000)));
+        assert_eq!(e.funded_total(), 200_000);
+        // The whole pair moves at once: [300k, 600k].
+        e.amend_amount_bounds(ALICE, BOB, 300_000, 600_000).unwrap();
+        assert_eq!(e.amount_bounds(), Some((300_000, 600_000)));
+        assert_eq!(e.min_funding_amount(), Some(300_000), "floor leg revised");
+        assert_eq!(e.max_funding_amount(), Some(600_000), "ceiling leg revised");
+        assert_eq!(e.funded_total(), 200_000, "funded total untouched");
+        assert_eq!(e.amount(), 1_000_000, "deal size untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_amount_bounds_rejects_stranger_and_single_signer() {
+        // Unconditional dual signature: one party alone, or a
+        // stranger, is Unauthorized — one party alone cannot move
+        // the deposit window on the other's funds.
+        let mut e = amount_bounds_funded_plan_escrow();
+        assert_eq!(
+            e.amend_amount_bounds(ALICE, ALICE, 300_000, 600_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_amount_bounds(MALLORY, BOB, 300_000, 600_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_amount_bounds(MALLORY, MALLORY, 300_000, 600_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amount_bounds(),
+            Some((100_000, 900_000)),
+            "failed revisions write nothing"
+        );
+    }
+
+    #[test]
+    fn amend_amount_bounds_rejects_non_funded() {
+        // Funded-only: the Uninitialized builder owns the initial
+        // window, and a disputed escrow's window is fixed — deposits
+        // in flight must not move.
+        let mut fresh = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_amount_bounds(100_000, 900_000)
+            .unwrap();
+        assert_eq!(
+            fresh.amend_amount_bounds(ALICE, BOB, 300_000, 600_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(fresh.amount_bounds(), Some((100_000, 900_000)));
+    }
+
+    #[test]
+    fn amend_amount_bounds_rejects_unwindowed_and_leaves_live_untouched() {
+        // Fail-closed: a funded escrow that never configured a
+        // window can never acquire one after funding — and the
+        // failed revision leaves it window-less.
+        assert_eq!(EscrowError::InvalidAmountBounds.code(), 196);
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(plain.amount_bounds(), None);
+        assert_eq!(
+            plain.amend_amount_bounds(ALICE, BOB, 100_000, 900_000),
+            Err(EscrowError::InvalidAmountBounds)
+        );
+        assert_eq!(plain.amount_bounds(), None);
+    }
+
+    #[test]
+    fn amend_amount_bounds_rejects_inverted_and_leaves_live_untouched() {
+        // An inverted window is a configuration error, not a funding
+        // error — the original window survives the refused revision
+        // untouched.
+        let mut e = amount_bounds_funded_plan_escrow();
+        assert_eq!(
+            e.amend_amount_bounds(ALICE, BOB, 900_000, 100_000),
+            Err(EscrowError::InvalidAmountBounds)
+        );
+        assert_eq!(e.amount_bounds(), Some((100_000, 900_000)));
+        assert_eq!(e.funded_total(), 200_000);
+    }
+
+    #[test]
+    fn amend_amount_bounds_same_window_is_noop() {
+        // Re-affirming the current window is a no-op: it succeeds
+        // and changes nothing observable, so the event layer emits
+        // nothing for it (the indexed test in the AV-268 module pins
+        // the emission on a real change).
+        let mut e = amount_bounds_funded_plan_escrow();
+        e.amend_amount_bounds(ALICE, BOB, 100_000, 900_000).unwrap();
+        assert_eq!(e.amount_bounds(), Some((100_000, 900_000)));
+        assert_eq!(e.funded_total(), 200_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_amount_bounds_revision_governs_next_fund_tranche() {
+        // The first tranche funded under [100k, 900k]; tightening
+        // to [300k, 600k] must not restate it, but the next tranche
+        // is judged against the live window: 200k is now below the
+        // floor, 400k passes.
+        let mut e = amount_bounds_funded_plan_escrow();
+        e.amend_amount_bounds(ALICE, BOB, 300_000, 600_000).unwrap();
+        assert_eq!(e.funded_total(), 200_000, "old tranche not restated");
+        assert_eq!(
+            e.fund_tranche(ALICE, 200_000, EXPIRES_AT - 3_600),
+            Err(EscrowError::AmountOutOfBounds)
+        );
+        assert_eq!(e.funded_total(), 200_000, "rejected tranche funds nothing");
+        e.fund_tranche(ALICE, 400_000, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.funded_total(), 600_000);
+    }
+
     // ----- AV-49: payout destination allowlist enforcement -----
 
     #[test]
@@ -46886,6 +47059,15 @@ pub(crate) mod anchor_idl_tests {
         // (Uninitialized only); this entry documents the revision
         // source. A 0 cap removes the ceiling outright.
         ("amend_fee_cap", "fee_cap", "fee_cap"),
+        // AV-403: the post-funding window revision rewrites the same
+        // tail fields in place — a second param source for
+        // `min_funding_amount` / `max_funding_amount`, like
+        // `amend_protocol_fee`'s legs. The fields' initial values
+        // come from the `initialize_amount_bounds` params
+        // (Uninitialized only); this entry documents the revision
+        // source. Both legs move atomically.
+        ("amend_amount_bounds", "min_amount", "min_funding_amount"),
+        ("amend_amount_bounds", "max_amount", "max_funding_amount"),
         // AV-109: the deadman opt-in populates the
         // `deadman_inactivity_secs` / `deadman_heir` tail fields
         // (Uninitialized only); the region is zeroed by `initialize`
@@ -81868,6 +82050,30 @@ mod arbiter_panel_tests {
         assert!(names.contains(&&"initialize_protocol_fee"));
         assert!(names.contains(&&"amend_protocol_fee"));
         assert!(names.contains(&&"amend_fee_cap"));
+    }
+
+    #[test]
+    fn amount_bounds_instruction_discriminators_are_pinned() {
+        // AV-134 / AV-403: IDL: sha256("global:<name>")[..8] — the
+        // Anchor instruction discriminator, pinned here and in the
+        // generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("initialize_amount_bounds"),
+            [79, 16, 125, 146, 48, 120, 89, 84]
+        );
+        // AV-403: the post-funding window revision's discriminator,
+        // pinned the same way.
+        assert_eq!(
+            instruction_discriminator("amend_amount_bounds"),
+            [233, 126, 95, 158, 206, 110, 173, 18]
+        );
+        // And the INSTRUCTIONS table carries both specs.
+        let names: Vec<&&str> = crate::anchor_idl_tests::INSTRUCTIONS
+            .iter()
+            .map(|s| &s.name)
+            .collect();
+        assert!(names.contains(&&"initialize_amount_bounds"));
+        assert!(names.contains(&&"amend_amount_bounds"));
     }
 
     #[test]
