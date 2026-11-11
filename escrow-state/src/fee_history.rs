@@ -468,6 +468,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // checker fact flips to None, so the next release reads
         // the live checker.
         | EscrowEventKind::DualControlDisabled
+        // AV-410: a removed credential gate moves no funds and
+        // never restates a release already settled — only the
+        // issuer fact flips to the zero key, so the next release
+        // reads the live issuer.
+        | EscrowEventKind::CredentialGateDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1505,6 +1510,11 @@ mod fee_history_tests {
         // checker fact flips to None, so the next release reads
         // the live checker.
         | EscrowEventKind::DualControlDisabled
+        // AV-410: a removed credential gate moves no funds and
+        // never restates a release already settled — only the
+        // issuer fact flips to the zero key, so the next release
+        // reads the live issuer.
+        | EscrowEventKind::CredentialGateDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices

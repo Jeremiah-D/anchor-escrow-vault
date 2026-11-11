@@ -356,6 +356,17 @@
 //!   already settled keeps the issuer it settled under. A failed
 //!   rotation emits nothing, and a no-op re-affirmation of the
 //!   current issuer emits nothing either.
+//! - `disable_credential_gate` emits
+//!   [`EscrowEventKind::CredentialGateDisabled`] on every
+//!   successful disable that actually removes the gate (AV-410)
+//!   — `from == to ==` the current state, all amounts zero; the
+//!   issuer is read from the vault, and the credential gate
+//!   verifies the next `release_with_credential` against the live
+//!   issuer, so a direct `release` after the disable settles
+//!   while a credentialed release is refused, and a release
+//!   already settled keeps the issuer it settled under. A failed
+//!   disable emits nothing, and a no-op disable of a never-bound
+//!   escrow emits nothing either.
 //! - `amend_deadman_inactivity` emits
 //!   [`EscrowEventKind::DeadmanInactivityAmended`] on every
 //!   successful revision that actually changes the threshold
@@ -1045,6 +1056,7 @@
 //! | EmergencyUnlockDisabled (AV-405) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a release already settled; only the `emergency_unlock` flag flips, so the AV-27/AV-64 timelocks are untouched, and the `emergency_unlock` path reads the live flag at the next call — an unlock after the disable is refused with `InvalidStateTransition` (code 101) while a release after the disable proceeds under the live timelock, and a release already settled keeps the terms it settled under |
 //! | DeliveryConfirmationWaived (AV-406) | 0 | 0 | 0 | 0 — waiving moves no funds and never restates a release already settled; only the `delivery_confirmed` fact flips, so the `delivery_confirmation` gate config is untouched, and the payout paths read the live fact at the next call — a `release` / `claim` / `release_milestone_partial` after the waiver settles without `confirm_delivery` while a payout already refused keeps the refusal it settled under |
 //! | DualControlDisabled (AV-409) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a release already settled; only the `dual_control_checker` fact flips to `None`, so the `release_impl` gate reads the live checker at the next call — a `release` after the disable settles directly while an `initiate_release` after the disable is refused with `InvalidDualControl` (code 188), and a release already settled keeps the checker it settled under |
+//! | CredentialGateDisabled (AV-410) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a release already settled; only the `credential_issuer` fact flips to the zero key, so the `release_impl` gate reads the live issuer at the next call — a `release` after the disable settles directly while a `release_with_credential` after the disable is refused with `CredentialGateNotBound` (code 335), and a release already settled keeps the issuer it settled under |
 //! | DutchAuctionReserveBpsAmended (AV-277) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a claim already priced; only the floor changes, so the window is untouched, and claim prices through the live floor at the next call, so a claim after the amendment prices against the new floor while a claim already settled keeps the cap it settled under |
 //! | SocialRecoveryThresholdAmended (AV-278) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the threshold changes, so the guardians, the guardian count and the timelock are untouched, and the recovery path compares the live approval count against the live threshold at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new threshold while a request already settled keeps the threshold it settled under |
 //! | SocialRecoveryTimelockAmended (AV-279) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the timelock changes, so the guardians, the guardian count and the threshold are untouched, and the recovery path compares the live timelock against the request's opening timestamp at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new veto window while a request already settled keeps the window it settled under |
@@ -3087,6 +3099,26 @@ pub enum EscrowEventKind {
     /// no-op disable (the escrow never opted in, or already
     /// disabled) emits nothing.
     DualControlDisabled,
+    /// AV-410: the credential gate was removed by mutual
+    /// agreement ([`Escrow::disable_credential_gate`](crate::Escrow::disable_credential_gate))
+    /// — both parties signed that the compliance qualification is
+    /// gone, so a direct `release` settles again. `from == to ==`
+    /// the current state (a governance revision, not a lifecycle
+    /// move — like [`EscrowEventKind::CredentialIssuerRotated`]);
+    /// all amounts are zero — disabling moves no funds and never
+    /// restates a release already settled; only the
+    /// `credential_issuer` fact flips to the zero key, so the
+    /// `release_impl` gate reads the live issuer at the next
+    /// call — a `release` after the disable settles directly while
+    /// a `release_with_credential` after the disable is refused
+    /// with `CredentialGateNotBound`, and a release already settled
+    /// keeps the issuer it settled under. A distinct kind from
+    /// `CredentialIssuerRotated` (127) so indexers can tell an
+    /// issuer swap apart from a gate removal. The fact is read
+    /// from the vault, so the event needs no extra field. A no-op
+    /// disable (the escrow never bound a gate, or already removed
+    /// it) emits nothing.
+    CredentialGateDisabled,
 }
 
 impl EscrowEventKind {
@@ -3643,6 +3675,10 @@ impl EscrowEventKind {
             // discriminants 0–171 stay stable for already-serialized
             // histories.
             172 => Self::DualControlDisabled,
+            // AV-410: appended after DualControlDisabled so
+            // discriminants 0–172 stay stable for already-serialized
+            // histories.
+            173 => Self::CredentialGateDisabled,
             _ => return None,
         })
     }
@@ -3861,6 +3897,7 @@ impl EscrowEventKind {
             Self::EmergencyUnlockDisabled => "emergency_unlock_disabled",
             Self::DeliveryConfirmationWaived => "delivery_confirmation_waived",
             Self::DualControlDisabled => "dual_control_disabled",
+            Self::CredentialGateDisabled => "credential_gate_disabled",
             Self::SlashDeadlineAmended => "slash_deadline_amended",
             Self::AmountBoundsAmended => "amount_bounds_amended",
             Self::MilestoneLatePenaltyBpsAmended => "milestone_late_penalty_bps_amended",
@@ -4113,6 +4150,7 @@ impl EscrowEventKind {
             "emergency_unlock_disabled" => Self::EmergencyUnlockDisabled,
             "delivery_confirmation_waived" => Self::DeliveryConfirmationWaived,
             "dual_control_disabled" => Self::DualControlDisabled,
+            "credential_gate_disabled" => Self::CredentialGateDisabled,
             "slash_deadline_amended" => Self::SlashDeadlineAmended,
             "amount_bounds_amended" => Self::AmountBoundsAmended,
             "milestone_late_penalty_bps_amended" => Self::MilestoneLatePenaltyBpsAmended,
@@ -11061,6 +11099,47 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Disable the credential gate after funding
+    /// (mirrors [`Escrow::disable_credential_gate`]). Emits
+    /// `CredentialGateDisabled` only when the gate is actually
+    /// removed (`from == to ==` the current state — the issuer,
+    /// not the lifecycle state, is what changed; all amounts
+    /// zero, since removing the gate moves no funds — the
+    /// `release_impl` gate reads the live issuer, so a direct
+    /// `release` after the disable settles while a
+    /// `release_with_credential` is refused with
+    /// `CredentialGateNotBound`, and a release already settled
+    /// keeps the issuer it settled under). The issuer is read
+    /// from the vault, so the event needs no extra field. A
+    /// failed disable emits nothing, and a no-op disable of a
+    /// never-bound escrow emits nothing either, paralleling
+    /// `disable_emergency_unlock`'s no-op rule.
+    pub fn disable_credential_gate(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.credential_issuer();
+        self.inner.disable_credential_gate(initializer, taker)?;
+        if self.inner.credential_issuer() != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::CredentialGateDisabled,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Revise the dead-man's switch inactivity threshold after
     /// funding (mirrors [`Escrow::amend_deadman_inactivity`]).
     /// Emits `DeadmanInactivityAmended` when the threshold
@@ -16548,7 +16627,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -16709,7 +16789,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -17304,7 +17385,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -17377,7 +17459,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -17447,7 +17530,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -17517,7 +17601,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -17587,7 +17672,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -17660,7 +17746,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -17733,7 +17820,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -17803,7 +17891,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -17873,7 +17962,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -17943,7 +18033,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18013,7 +18104,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18083,7 +18175,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18153,7 +18246,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18227,7 +18321,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18300,7 +18395,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18373,7 +18469,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18446,7 +18543,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18519,7 +18617,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18593,7 +18692,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18667,7 +18767,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18741,7 +18842,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18814,7 +18916,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18844,7 +18947,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18870,7 +18974,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18895,7 +19000,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18916,7 +19022,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18938,7 +19045,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
@@ -18959,7 +19067,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(173), None);
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(174), None);
     }
 
     #[test]
@@ -18979,7 +19088,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(173), None);
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(174), None);
     }
 
     #[test]
@@ -18998,7 +19108,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(173), None);
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(174), None);
     }
 
     #[test]
@@ -19016,7 +19127,8 @@ mod event_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(173), None);
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(174), None);
     }
 
     #[test]
@@ -19037,7 +19149,8 @@ mod event_tests {
         assert_ne!(kind, EscrowEventKind::DeliveryConfirmed);
         assert_eq!(EscrowEventKind::from_discriminant(86), Some(EscrowEventKind::DeliveryConfirmed));
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(173), None);
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(174), None);
     }
 
     #[test]
@@ -19127,7 +19240,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
     }
 
     #[test]
