@@ -15987,6 +15987,76 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(())
     }
 
+    /// Disable the dual-control release protocol after funding
+    /// (AV-409): the post-funding counterpart to
+    /// [`Escrow::rotate_dual_control_checker`] (that swaps the
+    /// approver, this item removes the protocol itself). Dual-signed
+    /// governance, `Funded`-only, pause first — paralleling
+    /// [`Escrow::disable_emergency_unlock`]. Only an escrow that
+    /// opted into dual control has anything to remove: a
+    /// never-opted-in escrow (checker already `None`) is a silent
+    /// no-op success that writes nothing and emits nothing (the
+    /// `rotate_*` same-value no-op precedent — removing a protocol
+    /// that was never installed cannot smuggle in a new release
+    /// path, unlike a rotation's fail-closed direction). A live
+    /// declaration blocks the disable
+    /// ([`EscrowError::DualControlIntentExists`] — the intent stores
+    /// no checker key and `confirm_release` authenticates against
+    /// the live checker, so removing the protocol mid-flight would
+    /// hand an unseen declaration to a checker who never saw it;
+    /// confirm, cancel, or let it expire first). One-way only —
+    /// there is no post-funding opt-in: installing dual control
+    /// after the taker funded under single-step release would
+    /// rewrite the deal the taker accepted, so it is a new
+    /// transaction, not a revision (the AV-263 precedent).
+    /// After disabling, a direct `release` settles again (the
+    /// `release_impl` gate reads the live checker), while
+    /// `initiate_release` refuses with `InvalidDualControl` (its
+    /// existing never-opted-in gate). A release already settled
+    /// keeps the checker it settled under. The 33-byte checker
+    /// region is cleared in place with no layout change.
+    /// Emits `DualControlDisabled` on the event layer, except for
+    /// the no-op. Orthogonal to [`Escrow::with_dual_control`]
+    /// (that is the initial opt-in, this item is the post-funding
+    /// removal), to [`Escrow::rotate_dual_control_checker`] (that
+    /// swaps the approver, this item removes the protocol) and to
+    /// [`Escrow::initiate_release`] / [`Escrow::confirm_release`]
+    /// (those are the two-step protocol itself, this item is its
+    /// removal).
+    pub fn disable_dual_control(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the removal, paralleling `rotate_dual_control_checker`.
+        // The checker itself does not sign: removing the protocol
+        // is the two parties' decision, not the approver's.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // A live intent pins the protocol: removing it now would
+        // hand an unseen declaration to a checker who never saw
+        // it. Confirm, cancel, or let it expire first.
+        if self.dual_control_intent.is_some() {
+            return Err(EscrowError::DualControlIntentExists);
+        }
+        // No-op: never opted in (or already removed) — closing a
+        // protocol that is not installed writes nothing, so the
+        // event layer emits nothing for it.
+        if self.dual_control_checker.is_none() {
+            return Ok(());
+        }
+        self.dual_control_checker = None;
+        Ok(())
+    }
+
     /// Opt into the permissionless-crank keeper bounty (AV-124).
     /// Builder-style: only valid on an `Uninitialized` escrow, so the
     /// bounty terms are fixed before any funds move — mirroring
@@ -57520,7 +57590,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -71869,7 +71940,8 @@ mod emergency_unlock_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
-        assert_eq!(EscrowEventKind::from_discriminant(172), None);
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(173), None);
     }
 }
 
@@ -77719,7 +77791,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -77973,9 +78046,9 @@ mod event_history_tests {
         // `InsurancePoolAmended` (AV-394), 169 is
         // `ReleaseIntentsRevoked` (AV-404), 170 is
         // `EmergencyUnlockDisabled` (AV-405), 171 is
-        // `DeliveryConfirmationWaived` (AV-406) and 172 is the
+        // `DualControlDisabled` (AV-409) and 173 is the
         // first still-unknown byte.
-        for bad in [172u8, 255] {
+        for bad in [173u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -81370,7 +81443,8 @@ mod release_via_intent_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
-        assert_eq!(EscrowEventKind::from_discriminant(172), None);
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(173), None);
     }
 
     #[test]
@@ -89306,6 +89380,294 @@ mod dual_control_tests {
             before_rotate + 1,
             "no-op emits nothing"
         );
+    }
+}
+
+// ---------- AV-409: disable dual control after funding ----------
+//
+// Both parties can remove the maker-checker release protocol once
+// the checker is gone — a checker service that shut down with no
+// successor must not freeze every payout behind an approval nobody
+// can give. One-way only: there is no post-funding opt-in.
+#[cfg(test)]
+mod disable_dual_control_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const CHECKER: [u8; 32] = [0xC0; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const PAUSE_AUTH: [u8; 32] = [0xA6; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_750_000_000;
+    const TTL: u64 = 3_600;
+
+    /// A funded dual-control escrow: initializer ALICE, taker BOB,
+    /// checker CHECKER, 1_000_000 locked.
+    fn funded_dc() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_control(CHECKER)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    /// A funded dual-control escrow with a live declaration.
+    fn declared(amount: u64, now: u64) -> Escrow {
+        let mut e = funded_dc();
+        e.initiate_release(ALICE, now, amount, None, BOB, TTL)
+            .unwrap();
+        e
+    }
+
+    #[test]
+    fn stranger_and_single_party_cannot_disable_and_checker_unchanged() {
+        // AV-409: the checker is jointly owned release-approval
+        // power — one party alone removing it would strip the
+        // other of the maker's counter-signature, so a stranger or
+        // a single party is Unauthorized and the failed call moves
+        // nothing.
+        let mut e = funded_dc();
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_dual_control(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.dual_control_checker(),
+            Some(CHECKER),
+            "rejected disable changes nothing"
+        );
+    }
+
+    #[test]
+    fn disable_is_funded_only() {
+        // AV-409: the protocol can only be removed once funds are
+        // locked — before funding the opt-in is still a builder
+        // decision.
+        let mut unfunded = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_control(CHECKER)
+            .unwrap();
+        assert_eq!(
+            unfunded.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            unfunded.dual_control_checker(),
+            Some(CHECKER),
+            "refused disable writes nothing"
+        );
+        // Disputed refuses too: resolve first.
+        let mut disputed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_dual_control(CHECKER)
+            .unwrap();
+        disputed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        disputed
+            .escalate(ALICE, EXPIRES_AT - 1, disputed.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(disputed.state(), EscrowState::Disputed);
+        assert_eq!(
+            disputed.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(disputed.dual_control_checker(), Some(CHECKER));
+        // Terminal states refuse too: nothing is locked anymore.
+        let mut e = funded_dc();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.dual_control_checker(), Some(CHECKER));
+    }
+
+    #[test]
+    fn disable_refused_while_paused() {
+        // AV-409: pause first (AV-46) — a paused escrow fails fast,
+        // before the dual-signature check.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSE_AUTH)
+            .unwrap()
+            .with_dual_control(CHECKER)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause(PAUSE_AUTH, None).unwrap();
+        assert_eq!(
+            e.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            e.dual_control_checker(),
+            Some(CHECKER),
+            "paused disable writes nothing"
+        );
+        e.unpause(PAUSE_AUTH).unwrap();
+        e.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(e.dual_control_checker(), None);
+    }
+
+    #[test]
+    fn live_intent_blocks_disable_and_checker_unchanged() {
+        // AV-409: a live declaration pins the protocol — removing
+        // it now would hand an unseen declaration to a checker who
+        // never saw it.
+        let mut e = declared(400_000, NOW);
+        assert_eq!(
+            e.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::DualControlIntentExists)
+        );
+        assert_eq!(EscrowError::DualControlIntentExists.code(), 189);
+        assert_eq!(e.dual_control_checker(), Some(CHECKER));
+        assert!(e.dual_control_intent().is_some());
+    }
+
+    #[test]
+    fn disable_after_confirm_succeeds() {
+        // AV-409: once the declaration settles, the protocol may
+        // be removed — the settled release keeps the checker it
+        // settled under.
+        let mut e = declared(400_000, NOW);
+        let (payout, _) = e.confirm_release(CHECKER, NOW + 100).unwrap();
+        assert_eq!(payout, 400_000);
+        assert_eq!(e.dual_control_intent(), None);
+        e.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(e.dual_control_checker(), None);
+        assert_eq!(e.released_amount(), 400_000);
+    }
+
+    #[test]
+    fn disable_after_cancel_succeeds() {
+        // AV-409: cancelling the declaration unpins the protocol.
+        let mut e = declared(400_000, NOW);
+        e.cancel_release(ALICE, NOW + 100).unwrap();
+        assert_eq!(e.dual_control_intent(), None);
+        e.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(e.dual_control_checker(), None);
+    }
+
+    #[test]
+    fn disable_after_intent_expires_succeeds() {
+        // AV-409: an expired declaration dies on the next confirm
+        // attempt (`now == intent_expires_at` is already expired),
+        // clearing the intent — the protocol may then be removed.
+        let mut e = declared(400_000, NOW);
+        assert_eq!(
+            e.confirm_release(CHECKER, NOW + TTL),
+            Err(EscrowError::DualControlExpired)
+        );
+        assert_eq!(e.dual_control_intent(), None);
+        e.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(e.dual_control_checker(), None);
+    }
+
+    #[test]
+    fn never_opted_in_is_a_silent_noop() {
+        // AV-409: removing a protocol that was never installed
+        // writes nothing and emits nothing — the `rotate_*`
+        // same-value no-op precedent. That covers both a
+        // never-opted-in escrow and a second disable after a
+        // successful first one.
+        let mut never_opted = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        never_opted.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        never_opted.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(never_opted.dual_control_checker(), None);
+
+        let mut ie = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], 0)
+            .unwrap()
+            .with_dual_control(CHECKER)
+            .unwrap();
+        ie.fund(ALICE, 0).unwrap();
+        let _ = ie.drain_events();
+        ie.disable_dual_control(ALICE, BOB, 42).unwrap();
+        assert_eq!(ie.event_count(), 1, "first disable emits once");
+        ie.disable_dual_control(ALICE, BOB, 43).unwrap();
+        assert_eq!(ie.event_count(), 1, "second disable emits nothing");
+        assert_eq!(ie.inner().dual_control_checker(), None);
+    }
+
+    #[test]
+    fn disable_restores_direct_release_and_blocks_initiate() {
+        // AV-409: once the protocol is gone, a direct release
+        // settles again while the two-step entry points refuse
+        // with their existing never-opted-in gate.
+        let mut e = funded_dc();
+        e.disable_dual_control(ALICE, BOB).unwrap();
+        let (payout, fee) = e.release(ALICE, NOW, 400_000, None, BOB).unwrap();
+        assert_eq!(payout, 400_000);
+        assert_eq!(fee, 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            e.initiate_release(ALICE, NOW, 100_000, None, BOB, TTL),
+            Err(EscrowError::InvalidDualControl)
+        );
+        assert_eq!(
+            e.confirm_release(CHECKER, NOW),
+            Err(EscrowError::InvalidDualControl)
+        );
+        assert_eq!(
+            e.cancel_release(ALICE, NOW),
+            Err(EscrowError::InvalidDualControl)
+        );
+
+        let mut ie = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], 0)
+            .unwrap()
+            .with_dual_control(CHECKER)
+            .unwrap();
+        ie.fund(ALICE, 0).unwrap();
+        let _ = ie.drain_events();
+        let before = ie.event_count();
+        assert_eq!(
+            ie.disable_dual_control(ALICE, MALLORY, 42),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(ie.event_count(), before, "failed calls emit nothing");
+        ie.disable_dual_control(ALICE, BOB, 42).unwrap();
+        let events = ie.drain_events();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EscrowEventKind::DualControlDisabled);
+        assert_eq!(ev.from, EscrowState::Funded);
+        assert_eq!(ev.to, EscrowState::Funded);
+        assert_eq!(ev.at, 42);
+        assert_eq!((ev.amounts.payout, ev.amounts.fee), (0, 0));
+    }
+
+    #[test]
+    fn dual_control_disabled_discriminant_is_pinned() {
+        // AV-409: discriminant 172, appended after
+        // DeliveryConfirmationWaived — 0–171 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::DualControlDisabled;
+        assert_eq!(kind.discriminant(), 172);
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(kind));
+        assert_eq!(kind.name(), "dual_control_disabled");
+        assert_eq!(
+            EscrowEventKind::from_name("dual_control_disabled"),
+            Some(kind)
+        );
+        assert_eq!(
+            EscrowEventKind::from_discriminant(171),
+            Some(EscrowEventKind::DeliveryConfirmationWaived)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(173), None);
     }
 }
 

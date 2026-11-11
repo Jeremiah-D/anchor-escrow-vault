@@ -333,6 +333,18 @@
 //!   a rotation blocked by a live intent emits nothing, and a
 //!   no-op re-affirmation of the current checker emits nothing
 //!   either.
+//! - `disable_dual_control` emits
+//!   [`EscrowEventKind::DualControlDisabled`] on every successful
+//!   disable that actually removes the protocol (AV-409) — `from
+//!   == to ==` the current state, all amounts zero; the checker
+//!   is read from the vault, and the two-step protocol's
+//!   `release_impl` gate reads the live checker, so a direct
+//!   `release` after the disable settles while a new
+//!   `initiate_release` is refused, and a declaration already
+//!   settled keeps the checker it settled under. A failed disable
+//!   emits nothing, a disable blocked by a live intent emits
+//!   nothing, and a no-op disable of a never-opted-in escrow
+//!   emits nothing either.
 //! - `rotate_credential_issuer` emits
 //!   [`EscrowEventKind::CredentialIssuerRotated`] on every
 //!   successful rotation that actually changes the issuer
@@ -1032,6 +1044,7 @@
 //! | ReleaseIntentsRevoked (AV-404) | 0 | 0 | 0 | 0 — revoking moves no funds and never restates a release already settled; only the `last_intent_nonce` watermark moves, so the intent path reads the live watermark at the next `release_via_intent` call — an intent at or below the watermark is refused with `IntentNonceReused` (code 182) while an intent above it releases as before, and an intent already consumed keeps the nonce it consumed under |
 //! | EmergencyUnlockDisabled (AV-405) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a release already settled; only the `emergency_unlock` flag flips, so the AV-27/AV-64 timelocks are untouched, and the `emergency_unlock` path reads the live flag at the next call — an unlock after the disable is refused with `InvalidStateTransition` (code 101) while a release after the disable proceeds under the live timelock, and a release already settled keeps the terms it settled under |
 //! | DeliveryConfirmationWaived (AV-406) | 0 | 0 | 0 | 0 — waiving moves no funds and never restates a release already settled; only the `delivery_confirmed` fact flips, so the `delivery_confirmation` gate config is untouched, and the payout paths read the live fact at the next call — a `release` / `claim` / `release_milestone_partial` after the waiver settles without `confirm_delivery` while a payout already refused keeps the refusal it settled under |
+//! | DualControlDisabled (AV-409) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a release already settled; only the `dual_control_checker` fact flips to `None`, so the `release_impl` gate reads the live checker at the next call — a `release` after the disable settles directly while an `initiate_release` after the disable is refused with `InvalidDualControl` (code 188), and a release already settled keeps the checker it settled under |
 //! | DutchAuctionReserveBpsAmended (AV-277) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a claim already priced; only the floor changes, so the window is untouched, and claim prices through the live floor at the next call, so a claim after the amendment prices against the new floor while a claim already settled keeps the cap it settled under |
 //! | SocialRecoveryThresholdAmended (AV-278) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the threshold changes, so the guardians, the guardian count and the timelock are untouched, and the recovery path compares the live approval count against the live threshold at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new threshold while a request already settled keeps the threshold it settled under |
 //! | SocialRecoveryTimelockAmended (AV-279) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the timelock changes, so the guardians, the guardian count and the threshold are untouched, and the recovery path compares the live timelock against the request's opening timestamp at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new veto window while a request already settled keeps the window it settled under |
@@ -3054,6 +3067,26 @@ pub enum EscrowEventKind {
     /// no-op waiver (the delivery already confirmed) emits
     /// nothing.
     DeliveryConfirmationWaived,
+    /// AV-409: the dual-control release protocol was removed by
+    /// mutual agreement ([`Escrow::disable_dual_control`](crate::Escrow::disable_dual_control))
+    /// — both parties signed that the maker-checker gate is gone,
+    /// so a direct `release` settles again. `from == to ==` the
+    /// current state (a governance revision, not a lifecycle move
+    /// — like [`EscrowEventKind::DualControlCheckerRotated`]); all
+    /// amounts are zero — disabling moves no funds and never
+    /// restates a release already settled; only the
+    /// `dual_control_checker` fact flips to `None`, so the
+    /// `release_impl` gate reads the live checker at the next
+    /// call — a `release` after the disable settles directly while
+    /// an `initiate_release` after the disable is refused with
+    /// `InvalidDualControl`, and a release already settled keeps
+    /// the checker it settled under. A distinct kind from
+    /// `DualControlCheckerRotated` (126) so indexers can tell a
+    /// checker swap apart from a protocol removal. The fact is
+    /// read from the vault, so the event needs no extra field. A
+    /// no-op disable (the escrow never opted in, or already
+    /// disabled) emits nothing.
+    DualControlDisabled,
 }
 
 impl EscrowEventKind {
@@ -3606,6 +3639,10 @@ impl EscrowEventKind {
             // discriminants 0–170 stay stable for already-serialized
             // histories.
             171 => Self::DeliveryConfirmationWaived,
+            // AV-409: appended after DeliveryConfirmationWaived so
+            // discriminants 0–171 stay stable for already-serialized
+            // histories.
+            172 => Self::DualControlDisabled,
             _ => return None,
         })
     }
@@ -3823,6 +3860,7 @@ impl EscrowEventKind {
             Self::ReleaseIntentsRevoked => "release_intents_revoked",
             Self::EmergencyUnlockDisabled => "emergency_unlock_disabled",
             Self::DeliveryConfirmationWaived => "delivery_confirmation_waived",
+            Self::DualControlDisabled => "dual_control_disabled",
             Self::SlashDeadlineAmended => "slash_deadline_amended",
             Self::AmountBoundsAmended => "amount_bounds_amended",
             Self::MilestoneLatePenaltyBpsAmended => "milestone_late_penalty_bps_amended",
@@ -4074,6 +4112,7 @@ impl EscrowEventKind {
             "release_intents_revoked" => Self::ReleaseIntentsRevoked,
             "emergency_unlock_disabled" => Self::EmergencyUnlockDisabled,
             "delivery_confirmation_waived" => Self::DeliveryConfirmationWaived,
+            "dual_control_disabled" => Self::DualControlDisabled,
             "slash_deadline_amended" => Self::SlashDeadlineAmended,
             "amount_bounds_amended" => Self::AmountBoundsAmended,
             "milestone_late_penalty_bps_amended" => Self::MilestoneLatePenaltyBpsAmended,
@@ -10938,6 +10977,47 @@ impl IndexedEscrow {
         Ok(())
     }
 
+    /// Disable the dual-control release protocol after funding
+    /// (mirrors [`Escrow::disable_dual_control`]). Emits
+    /// `DualControlDisabled` only when the protocol is actually
+    /// removed (`from == to ==` the current state — the checker,
+    /// not the lifecycle state, is what changed; all amounts
+    /// zero, since removing the protocol moves no funds — the
+    /// `release_impl` gate reads the live checker, so a direct
+    /// `release` after the disable settles while a new
+    /// `initiate_release` is refused with `InvalidDualControl`,
+    /// and a release already settled keeps the checker it settled
+    /// under). The checker is read from the vault, so the event
+    /// needs no extra field. A failed disable emits nothing, a
+    /// disable blocked by a live intent emits nothing, and a
+    /// no-op disable of a never-opted-in escrow emits nothing
+    /// either, paralleling `disable_emergency_unlock`'s no-op rule.
+    pub fn disable_dual_control(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.dual_control_checker();
+        self.inner.disable_dual_control(initializer, taker)?;
+        if self.inner.dual_control_checker() != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::DualControlDisabled,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Rotate the credential-gate issuer after funding
     /// (mirrors [`Escrow::rotate_credential_issuer`]). Emits
     /// `CredentialIssuerRotated` when the issuer actually
@@ -16467,7 +16547,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -16627,7 +16708,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -17221,7 +17303,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -17293,7 +17376,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -17362,7 +17446,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -17431,7 +17516,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -17500,7 +17586,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -17572,7 +17659,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -17644,7 +17732,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -17713,7 +17802,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -17782,7 +17872,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -17851,7 +17942,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -17920,7 +18012,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -17989,7 +18082,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18058,7 +18152,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18131,7 +18226,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18203,7 +18299,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18275,7 +18372,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18347,7 +18445,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18419,7 +18518,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18492,7 +18592,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18565,7 +18666,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18638,7 +18740,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18710,7 +18813,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18739,7 +18843,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18764,7 +18869,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18788,7 +18894,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18808,7 +18915,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18829,7 +18937,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]
@@ -18849,7 +18958,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked));
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
-        assert_eq!(EscrowEventKind::from_discriminant(172), None);
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(173), None);
     }
 
     #[test]
@@ -18868,7 +18978,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked));
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
-        assert_eq!(EscrowEventKind::from_discriminant(172), None);
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(173), None);
     }
 
     #[test]
@@ -18886,7 +18997,8 @@ mod event_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
-        assert_eq!(EscrowEventKind::from_discriminant(172), None);
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(173), None);
     }
 
     #[test]
@@ -18903,7 +19015,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
-        assert_eq!(EscrowEventKind::from_discriminant(172), None);
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(173), None);
     }
 
     #[test]
@@ -18923,7 +19036,8 @@ mod event_tests {
         );
         assert_ne!(kind, EscrowEventKind::DeliveryConfirmed);
         assert_eq!(EscrowEventKind::from_discriminant(86), Some(EscrowEventKind::DeliveryConfirmed));
-        assert_eq!(EscrowEventKind::from_discriminant(172), None);
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(173), None);
     }
 
     #[test]
@@ -19012,7 +19126,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
-        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(173), None); // AV-409: 172 is DualControlDisabled
     }
 
     #[test]

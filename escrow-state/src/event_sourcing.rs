@@ -430,6 +430,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // confirmation fact flips, so the next payout call reads
         // the live fact.
         | EscrowEventKind::DeliveryConfirmationWaived
+        // AV-409: a removed dual-control protocol moves no funds
+        // and never restates a release already settled — only the
+        // checker fact flips to None, so the next release reads
+        // the live checker.
+        | EscrowEventKind::DualControlDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1472,6 +1477,11 @@ mod event_sourcing_tests {
         // confirmation fact flips, so the next payout call reads
         // the live fact.
         | EscrowEventKind::DeliveryConfirmationWaived
+        // AV-409: a removed dual-control protocol moves no funds
+        // and never restates a release already settled — only the
+        // checker fact flips to None, so the next release reads
+        // the live checker.
+        | EscrowEventKind::DualControlDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
