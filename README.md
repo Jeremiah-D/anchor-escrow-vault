@@ -1837,7 +1837,7 @@ program error per variant):
 | `NoUpgradeHandoverPending` | 244 | `UpgradeAuthority::confirm_handover` / `cancel_handover` (AV-179) with no live handover proposal |
 | `UpgradeHandoverDelayNotElapsed` | 245 | `UpgradeAuthority::confirm_handover` (AV-179) before `proposed_at + handover_delay_secs` |
 | `InvalidFreezeAuthority` | 246 | `ManagedFreezeAuthority::new` / `set_freeze_authority` (AV-180) with a zero token account or freeze authority key, or a rotation to the key already bound |
-| `TokenAccountAlreadyFrozen` | 247 | `ManagedFreezeAuthority::freeze` (AV-180) on an already-frozen token account |
+| `TokenAccountAlreadyFrozen` | 247 | `ManagedFreezeAuthority::freeze` (AV-180) on an already-frozen token account; `disable_freeze_authority` (AV-413) while frozen |
 | `TokenAccountNotFrozen` | 248 | `ManagedFreezeAuthority::thaw` (AV-180) on a token account that is not frozen |
 | `EscrowFrozen` | 249 | `ManagedFreezeAuthority::require_unfrozen` (AV-180) while the managed token account is frozen |
 | `UnsafeMint` | 250 | `Escrow::check_mint_safety` (AV-184) on a mint carrying an escrow-hostile Token-2022 extension — fail-closed |
@@ -9074,6 +9074,17 @@ spec of that custody, one struct per managed token account:
   `FreezeAuditEntry` to the bounded 32-entry ring. Rotating the
   authority never thaws the account — the freeze survives custody
   changes.
+- **One-way removal (AV-413)**: `disable_freeze_authority` retires the
+  freeze switch for good (the SPL `SetAuthority`-to-`None`
+  equivalent) — only the current authority, only while unfrozen. A
+  frozen account refuses removal (`TokenAccountAlreadyFrozen`, code
+  247): removing the switch while frozen would lock the account
+  forever with nobody left to thaw it. After removal the account can
+  never be frozen again (`freeze` / `thaw` / `set_freeze_authority`
+  all refuse with `Unauthorized`), `require_unfrozen` passes forever,
+  and the removal is audited (`FreezeAuthorityRemoved`, zero key in
+  effect). Removing an already-removed authority is a silent no-op.
+  The escrow term ends, the freeze power ends with it.
 
 New error codes (never renumbered): `InvalidFreezeAuthority` (246),
 `TokenAccountAlreadyFrozen` (247), `TokenAccountNotFrozen` (248),

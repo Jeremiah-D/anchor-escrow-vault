@@ -49342,7 +49342,7 @@ mod error_code_tests {
         (
             EscrowError::TokenAccountAlreadyFrozen,
             247,
-            "ManagedFreezeAuthority::freeze on an already-frozen token account — strict toggle, never a silent no-op (AV-180)",
+            "ManagedFreezeAuthority::freeze on an already-frozen token account — strict toggle, never a silent no-op (AV-180); ManagedFreezeAuthority::disable_freeze_authority while frozen (AV-413)",
         ),
         // AV-180: appended, never renumbered.
         (
