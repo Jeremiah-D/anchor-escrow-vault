@@ -15562,6 +15562,72 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(())
     }
 
+    /// Disable the milestone verifier gate after funding
+    /// (AV-411): the post-funding counterpart to
+    /// [`Escrow::rotate_milestone_verifier`] (that swaps the
+    /// verifier, this item removes the gate itself). Dual-signed
+    /// governance, `Funded`-only, pause first — paralleling
+    /// [`Escrow::disable_credential_gate`]. Only an escrow that
+    /// bound a milestone verifier has anything to remove: a
+    /// never-bound escrow (verifier already the zero key) is a
+    /// silent no-op success that writes nothing and emits
+    /// nothing (the `rotate_*` same-value no-op precedent —
+    /// removing a gate that was never installed cannot smuggle
+    /// in a new release path). One-way only — there is no
+    /// post-funding opt-in: installing a milestone verifier
+    /// after the taker funded under ungated milestone release
+    /// would add a release qualification the taker never
+    /// accepted, so it is a new transaction, not a revision
+    /// (the AV-264 precedent). After disabling, a plain
+    /// `release_milestone` settles again (the
+    /// `release_milestone_inner` gate reads the live verifier),
+    /// while `release_milestone_verified` refuses with
+    /// `MilestoneVerifierNotBound` (its existing never-bound
+    /// gate). An attestation signed by the old verifier — even
+    /// one never used — stops verifying the moment the gate is
+    /// removed: there is no gate left to verify against. A
+    /// tranche already settled keeps the verifier it settled
+    /// under. The 32-byte verifier region is cleared in place
+    /// with no layout change. Emits
+    /// `MilestoneVerifierDisabled` on the event layer, except
+    /// for the no-op. Orthogonal to
+    /// [`Escrow::with_milestone_verifier`] (that is the initial
+    /// binding, this item is the post-funding removal), to
+    /// [`Escrow::rotate_milestone_verifier`] (that swaps the
+    /// verifier, this item removes the gate) and to AV-409 /
+    /// AV-410 (those remove the dual-control / credential
+    /// routing gates, this item the milestone release gate —
+    /// the three gates sit in `release_impl` /
+    /// `release_milestone_inner` and never read or write each
+    /// other).
+    pub fn disable_milestone_verifier(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the removal, paralleling `rotate_milestone_verifier`.
+        // The verifier itself does not sign: removing the gate is
+        // the two parties' decision, not the verifier's.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // No-op: never bound (or already removed) — closing a
+        // gate that is not installed writes nothing, so the
+        // event layer emits nothing for it.
+        if self.milestone_verifier == [0u8; 32] {
+            return Ok(());
+        }
+        self.milestone_verifier = [0u8; 32];
+        Ok(())
+    }
+
     /// The credential issuer pubkey bound via
     /// [`Escrow::with_credential_gate`]; the zero key when no
     /// credential gate is configured.
@@ -57655,7 +57721,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
     }
 
     #[test]
@@ -72006,7 +72073,8 @@ mod emergency_unlock_tests {
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(174), None);
+        assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(175), None);
     }
 }
 
@@ -77858,7 +77926,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(174), None); // AV-410: 173 is CredentialGateDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -78112,9 +78181,9 @@ mod event_history_tests {
         // `InsurancePoolAmended` (AV-394), 169 is
         // `ReleaseIntentsRevoked` (AV-404), 170 is
         // `EmergencyUnlockDisabled` (AV-405), 171 is
-        // `CredentialGateDisabled` (AV-410) and 174 is the
+        // `MilestoneVerifierDisabled` (AV-411) and 175 is the
         // first still-unknown byte.
-        for bad in [174u8, 255] {
+        for bad in [175u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -81511,7 +81580,8 @@ mod release_via_intent_tests {
         assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(174), None);
+        assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(175), None);
     }
 
     #[test]
@@ -89735,7 +89805,8 @@ mod disable_dual_control_tests {
             Some(EscrowEventKind::DeliveryConfirmationWaived)
         );
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(174), None);
+        assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(175), None);
     }
 }
 
@@ -90161,7 +90232,346 @@ mod disable_credential_gate_tests {
             EscrowEventKind::from_discriminant(172),
             Some(EscrowEventKind::DualControlDisabled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(174), None);
+        assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(175), None);
+    }
+}
+
+// ---------- AV-411: disable milestone verifier gate after funding ----------
+//
+// Both parties can remove the milestone verifier gate once the
+// verifier is gone — a verifier service that shut down with no
+// successor must not freeze every milestone payout behind an
+// attestation nobody can sign. One-way only: there is no
+// post-funding opt-in.
+#[cfg(test)]
+mod disable_milestone_verifier_tests {
+    use super::*;
+    use crate::ed25519::SigningKey;
+    use crate::events::IndexedEscrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const PAUSE_AUTH: [u8; 32] = [0xA6; 32];
+    const VAULT: [u8; 32] = [0xE0; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_750_000_000;
+
+    fn verifier_key() -> SigningKey {
+        SigningKey::from_seed([0x77; 32])
+    }
+
+    fn plan_2() -> MilestonePlan {
+        MilestonePlan::new(&[400_000, 600_000]).unwrap()
+    }
+
+    fn verified() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap()
+            .with_milestone_verifier(verifier_key().public_key())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn attest(index: u64, amount: u64) -> MilestoneAttestation {
+        sign_milestone_attestation(
+            &verifier_key(),
+            VAULT,
+            index,
+            milestone_tranche_hash(VAULT, index, amount),
+            EXPIRES_AT,
+        )
+    }
+
+    fn confirm_both(e: &mut Escrow, index: u8) {
+        e.confirm_milestone(ALICE, index).unwrap();
+        e.confirm_milestone(BOB, index).unwrap();
+        assert!(e.milestone_confirmed(index as usize));
+    }
+
+    #[test]
+    fn stranger_and_single_party_cannot_disable_and_verifier_unchanged() {
+        // AV-411: the gate is jointly owned delivery-fact
+        // protection — one party alone removing it would strip the
+        // other of the third-party attestation check, so a stranger
+        // or a single party is Unauthorized and the failed call
+        // moves nothing.
+        let mut e = verified();
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_milestone_verifier(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.milestone_verifier(),
+            verifier_key().public_key(),
+            "rejected disable changes nothing"
+        );
+    }
+
+    #[test]
+    fn disable_is_funded_only() {
+        // AV-411: the gate can only be removed once funds are
+        // locked — before funding the binding is still a builder
+        // decision.
+        let mut unfunded = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap()
+            .with_milestone_verifier(verifier_key().public_key())
+            .unwrap();
+        assert_eq!(
+            unfunded.disable_milestone_verifier(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            unfunded.milestone_verifier(),
+            verifier_key().public_key(),
+            "refused disable writes nothing"
+        );
+        // Disputed refuses too: resolve first.
+        let mut disputed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap()
+            .with_milestone_verifier(verifier_key().public_key())
+            .unwrap();
+        disputed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        disputed
+            .escalate(ALICE, EXPIRES_AT - 1, disputed.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(disputed.state(), EscrowState::Disputed);
+        assert_eq!(
+            disputed.disable_milestone_verifier(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(disputed.milestone_verifier(), verifier_key().public_key());
+        // Terminal states refuse too: nothing is locked anymore.
+        let mut e = verified();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_milestone_verifier(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.milestone_verifier(), verifier_key().public_key());
+    }
+
+    #[test]
+    fn disable_refused_while_paused() {
+        // AV-411: pause first (AV-46) — a paused escrow fails fast,
+        // before the dual-signature check.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSE_AUTH)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap()
+            .with_milestone_verifier(verifier_key().public_key())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause(PAUSE_AUTH, None).unwrap();
+        assert_eq!(
+            e.disable_milestone_verifier(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            e.milestone_verifier(),
+            verifier_key().public_key(),
+            "paused disable writes nothing"
+        );
+        e.unpause(PAUSE_AUTH).unwrap();
+        e.disable_milestone_verifier(ALICE, BOB).unwrap();
+        assert_eq!(e.milestone_verifier(), [0u8; 32]);
+    }
+
+    #[test]
+    fn never_bound_is_a_silent_noop() {
+        // AV-411: removing a gate that was never installed writes
+        // nothing and emits nothing — the `rotate_*` same-value
+        // no-op precedent. That covers both a never-bound escrow
+        // and a second disable after a successful first one.
+        let mut never_bound = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap();
+        never_bound.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        never_bound.disable_milestone_verifier(ALICE, BOB).unwrap();
+        assert_eq!(never_bound.milestone_verifier(), [0u8; 32]);
+
+        let mut ie = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], 0)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap();
+        ie.fund(ALICE, 0).unwrap();
+        let _ = ie.drain_events();
+        ie.disable_milestone_verifier(ALICE, BOB, 42).unwrap();
+        assert_eq!(ie.event_count(), 0, "never-bound disable emits nothing");
+
+        let mut ie = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], 0)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap()
+            .with_milestone_verifier(verifier_key().public_key())
+            .unwrap();
+        ie.fund(ALICE, 0).unwrap();
+        let _ = ie.drain_events();
+        ie.disable_milestone_verifier(ALICE, BOB, 42).unwrap();
+        assert_eq!(ie.event_count(), 1, "first disable emits once");
+        ie.disable_milestone_verifier(ALICE, BOB, 43).unwrap();
+        assert_eq!(ie.event_count(), 1, "second disable emits nothing");
+        assert_eq!(ie.inner().milestone_verifier(), [0u8; 32]);
+    }
+
+    #[test]
+    fn disable_clears_verifier_and_restores_plain_release() {
+        // AV-411: once the gate is gone, a plain milestone release
+        // settles again — the `release_milestone_inner` gate reads
+        // the live verifier.
+        let mut e = verified();
+        confirm_both(&mut e, 0);
+        assert_eq!(
+            e.release_milestone(ALICE, NOW, 0, None, BOB),
+            Err(EscrowError::MilestoneVerifierRequired),
+            "bound gate closes the plain path"
+        );
+        assert_eq!(EscrowError::MilestoneVerifierRequired.code(), 324);
+        e.disable_milestone_verifier(ALICE, BOB).unwrap();
+        assert_eq!(e.milestone_verifier(), [0u8; 32]);
+        assert_eq!(e.state(), EscrowState::Funded);
+        let (payout, fee) = e.release_milestone(ALICE, NOW, 0, None, BOB).unwrap();
+        assert_eq!(payout, 400_000);
+        assert_eq!(fee, 0);
+
+        let mut ie = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], 0)
+            .unwrap()
+            .with_milestones(plan_2())
+            .unwrap()
+            .with_milestone_verifier(verifier_key().public_key())
+            .unwrap();
+        ie.fund(ALICE, 0).unwrap();
+        let _ = ie.drain_events();
+        let before = ie.event_count();
+        assert_eq!(
+            ie.disable_milestone_verifier(ALICE, MALLORY, 42),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(ie.event_count(), before, "failed calls emit nothing");
+        ie.disable_milestone_verifier(ALICE, BOB, 42).unwrap();
+        let events = ie.drain_events();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EscrowEventKind::MilestoneVerifierDisabled);
+        assert_eq!(ev.from, EscrowState::Funded);
+        assert_eq!(ev.to, EscrowState::Funded);
+        assert_eq!(ev.at, 42);
+        assert_eq!((ev.amounts.payout, ev.amounts.fee), (0, 0));
+    }
+
+    #[test]
+    fn disable_blocks_verified_release() {
+        // AV-411: with no gate bound, the verified path refuses
+        // with its existing never-bound gate.
+        let mut e = verified();
+        e.disable_milestone_verifier(ALICE, BOB).unwrap();
+        let attestation = attest(0, 400_000);
+        assert_eq!(
+            e.release_milestone_verified(ALICE, NOW, 0, None, BOB, VAULT, &attestation),
+            Err(EscrowError::MilestoneVerifierNotBound)
+        );
+        assert_eq!(EscrowError::MilestoneVerifierNotBound.code(), 325);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn old_verifier_attestation_stops_verifying_after_disable() {
+        // AV-411: the same valid attestation releases before the
+        // disable and is refused after it — there is no gate left
+        // to verify against, so the old verifier's signature buys
+        // nothing anymore.
+        let attestation = attest(0, 400_000);
+        let mut control = verified();
+        confirm_both(&mut control, 0);
+        let (payout, _) = control
+            .release_milestone_verified(ALICE, NOW, 0, None, BOB, VAULT, &attestation)
+            .unwrap();
+        assert_eq!(payout, 400_000);
+        assert!(control.milestone_settled(0));
+
+        let mut e = verified();
+        confirm_both(&mut e, 0);
+        e.disable_milestone_verifier(ALICE, BOB).unwrap();
+        assert_eq!(
+            e.release_milestone_verified(ALICE, NOW, 0, None, BOB, VAULT, &attestation),
+            Err(EscrowError::MilestoneVerifierNotBound)
+        );
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert!(!e.milestone_settled(0));
+    }
+
+    #[test]
+    fn disable_keeps_partial_claim_ledger() {
+        // AV-411: a tranche partially claimed before the disable
+        // still settles exactly its remainder after it — the
+        // per-tranche ledger is untouched by the gate removal, so
+        // no slice is ever paid twice.
+        let mut e = verified();
+        confirm_both(&mut e, 0);
+        assert_eq!(
+            e.release_milestone_partial(ALICE, NOW, 0, 150_000, None, BOB),
+            Err(EscrowError::MilestoneVerifierRequired),
+            "bound gate closes the partial path too"
+        );
+        e.disable_milestone_verifier(ALICE, BOB).unwrap();
+        let (slice, slice_fee) = e
+            .release_milestone_partial(ALICE, NOW, 0, 150_000, None, BOB)
+            .unwrap();
+        assert_eq!(slice, 150_000);
+        assert_eq!(slice_fee, 0);
+        assert_eq!(e.milestone_partial_claimed_at(0), Some(150_000));
+        assert!(!e.milestone_settled(0), "slice alone never settles the tranche");
+        let (rest, rest_fee) = e.release_milestone(ALICE, NOW, 0, None, BOB).unwrap();
+        assert_eq!(rest, 250_000, "full release settles only the remainder");
+        assert_eq!(rest_fee, 0);
+        assert_eq!(e.released_amount(), 400_000, "no slice paid twice");
+        assert!(e.milestone_settled(0));
+    }
+
+    #[test]
+    fn milestone_verifier_disabled_discriminant_is_pinned() {
+        // AV-411: discriminant 174, appended after
+        // CredentialGateDisabled — 0–173 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::MilestoneVerifierDisabled;
+        assert_eq!(kind.discriminant(), 174);
+        assert_eq!(EscrowEventKind::from_discriminant(174), Some(kind));
+        assert_eq!(kind.name(), "milestone_verifier_disabled");
+        assert_eq!(
+            EscrowEventKind::from_name("milestone_verifier_disabled"),
+            Some(kind)
+        );
+        assert_eq!(
+            EscrowEventKind::from_discriminant(173),
+            Some(EscrowEventKind::CredentialGateDisabled)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(175), None);
     }
 }
 

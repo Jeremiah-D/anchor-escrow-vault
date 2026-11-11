@@ -473,6 +473,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // issuer fact flips to the zero key, so the next release
         // reads the live issuer.
         | EscrowEventKind::CredentialGateDisabled
+        // AV-411: a removed milestone verifier gate moves no funds and
+        // never restates a tranche already settled — only the
+        // verifier fact flips to the zero key, so the next milestone
+        // release reads the live verifier.
+        | EscrowEventKind::MilestoneVerifierDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1515,6 +1520,11 @@ mod fee_history_tests {
         // issuer fact flips to the zero key, so the next release
         // reads the live issuer.
         | EscrowEventKind::CredentialGateDisabled
+        // AV-411: a removed milestone verifier gate moves no funds and
+        // never restates a tranche already settled — only the
+        // verifier fact flips to the zero key, so the next milestone
+        // release reads the live verifier.
+        | EscrowEventKind::MilestoneVerifierDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
