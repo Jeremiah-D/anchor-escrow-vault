@@ -378,6 +378,16 @@
 //!   settled keeps the verifier it settled under. A failed
 //!   disable emits nothing, and a no-op disable of a never-bound
 //!   escrow emits nothing either.
+//! - `disable_arbiter` emits
+//!   [`EscrowEventKind::ArbiterDisabled`] on every successful
+//!   disable that actually removes the arbiter (AV-412) — `from
+//!   == to ==` the current state, all amounts zero; the arbiter
+//!   is read from the vault, and the dispute forum is gone after
+//!   the disable, so a `resolve` or `escalate` after the disable
+//!   is refused with `InvalidArbiter` while a dispute already
+//!   settled keeps the arbiter it settled under. A failed
+//!   disable emits nothing, and a no-op disable of a
+//!   never-bound or panel-mode escrow emits nothing either.
 //! - `amend_deadman_inactivity` emits
 //!   [`EscrowEventKind::DeadmanInactivityAmended`] on every
 //!   successful revision that actually changes the threshold
@@ -1069,6 +1079,7 @@
 //! | DualControlDisabled (AV-409) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a release already settled; only the `dual_control_checker` fact flips to `None`, so the `release_impl` gate reads the live checker at the next call — a `release` after the disable settles directly while an `initiate_release` after the disable is refused with `InvalidDualControl` (code 188), and a release already settled keeps the checker it settled under |
 //! | CredentialGateDisabled (AV-410) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a release already settled; only the `credential_issuer` fact flips to the zero key, so the `release_impl` gate reads the live issuer at the next call — a `release` after the disable settles directly while a `release_with_credential` after the disable is refused with `CredentialGateNotBound` (code 335), and a release already settled keeps the issuer it settled under |
 //! | MilestoneVerifierDisabled (AV-411) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a tranche already settled; only the `milestone_verifier` fact flips to the zero key, so the `release_milestone_inner` gate reads the live verifier at the next call — a plain `release_milestone` after the disable settles directly while a `release_milestone_verified` after the disable is refused with `MilestoneVerifierNotBound` (code 325), and a tranche already settled keeps the verifier it settled under |
+//! | ArbiterDisabled (AV-412) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a dispute already settled; only the `arbiter` fact flips to `None`, so the `resolve` / `escalate` paths read the live arbiter at the next call — a `resolve` or `escalate` after the disable is refused with `InvalidArbiter` (code 108), and a dispute already settled keeps the arbiter it settled under |
 //! | DutchAuctionReserveBpsAmended (AV-277) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a claim already priced; only the floor changes, so the window is untouched, and claim prices through the live floor at the next call, so a claim after the amendment prices against the new floor while a claim already settled keeps the cap it settled under |
 //! | SocialRecoveryThresholdAmended (AV-278) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the threshold changes, so the guardians, the guardian count and the timelock are untouched, and the recovery path compares the live approval count against the live threshold at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new threshold while a request already settled keeps the threshold it settled under |
 //! | SocialRecoveryTimelockAmended (AV-279) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the timelock changes, so the guardians, the guardian count and the threshold are untouched, and the recovery path compares the live timelock against the request's opening timestamp at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new veto window while a request already settled keeps the window it settled under |
@@ -3153,6 +3164,25 @@ pub enum EscrowEventKind {
     /// A no-op disable (the escrow never bound a verifier, or
     /// already removed it) emits nothing.
     MilestoneVerifierDisabled,
+    /// AV-412: the dispute arbiter was removed by mutual
+    /// agreement ([`Escrow::disable_arbiter`](crate::Escrow::disable_arbiter))
+    /// — both parties signed that the neutral adjudication forum
+    /// is gone, so the dispute paths close. `from == to ==` the
+    /// current state (a governance revision, not a lifecycle
+    /// move — like [`EscrowEventKind::ArbiterRotated`]); all
+    /// amounts are zero — disabling moves no funds and never
+    /// restates a dispute already settled; only the `arbiter`
+    /// fact flips to `None`, so the `resolve` / `escalate`
+    /// paths read the live arbiter at the next call — a
+    /// `resolve` or `escalate` after the disable is refused
+    /// with `InvalidArbiter`, and a dispute already settled
+    /// keeps the arbiter it settled under. A distinct kind from
+    /// `ArbiterRotated` (29) so indexers can tell an arbiter
+    /// swap apart from a forum removal. The fact is read from
+    /// the vault, so the event needs no extra field. A no-op
+    /// disable (the escrow never bound an arbiter, already
+    /// removed it, or runs in panel mode) emits nothing.
+    ArbiterDisabled,
 }
 
 impl EscrowEventKind {
@@ -3717,6 +3747,10 @@ impl EscrowEventKind {
             // discriminants 0–173 stay stable for already-serialized
             // histories.
             174 => Self::MilestoneVerifierDisabled,
+            // AV-412: appended after MilestoneVerifierDisabled so
+            // discriminants 0–174 stay stable for already-serialized
+            // histories.
+            175 => Self::ArbiterDisabled,
             _ => return None,
         })
     }
@@ -3937,6 +3971,7 @@ impl EscrowEventKind {
             Self::DualControlDisabled => "dual_control_disabled",
             Self::CredentialGateDisabled => "credential_gate_disabled",
             Self::MilestoneVerifierDisabled => "milestone_verifier_disabled",
+            Self::ArbiterDisabled => "arbiter_disabled",
             Self::SlashDeadlineAmended => "slash_deadline_amended",
             Self::AmountBoundsAmended => "amount_bounds_amended",
             Self::MilestoneLatePenaltyBpsAmended => "milestone_late_penalty_bps_amended",
@@ -4191,6 +4226,7 @@ impl EscrowEventKind {
             "dual_control_disabled" => Self::DualControlDisabled,
             "credential_gate_disabled" => Self::CredentialGateDisabled,
             "milestone_verifier_disabled" => Self::MilestoneVerifierDisabled,
+            "arbiter_disabled" => Self::ArbiterDisabled,
             "slash_deadline_amended" => Self::SlashDeadlineAmended,
             "amount_bounds_amended" => Self::AmountBoundsAmended,
             "milestone_late_penalty_bps_amended" => Self::MilestoneLatePenaltyBpsAmended,
@@ -8456,6 +8492,45 @@ impl IndexedEscrow {
             None,
             None,
         );
+        }
+        Ok(())
+    }
+
+    /// Disable the dispute arbiter after funding (mirrors
+    /// [`Escrow::disable_arbiter`]). Emits `ArbiterDisabled`
+    /// only when the arbiter is actually removed (`from == to ==`
+    /// the current state — the arbiter, not the lifecycle state,
+    /// is what changed; all amounts zero, since removing the
+    /// forum moves no funds — a `resolve` or `escalate` after the
+    /// disable is refused with `InvalidArbiter`, and a dispute
+    /// already settled keeps the arbiter it settled under). The
+    /// arbiter is read from the vault, so the event needs no
+    /// extra field. A failed disable emits nothing, and a no-op
+    /// disable of a never-bound or panel-mode escrow emits
+    /// nothing either, paralleling `disable_milestone_verifier`'s
+    /// no-op rule.
+    pub fn disable_arbiter(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.arbiter();
+        self.inner.disable_arbiter(initializer, taker)?;
+        if self.inner.arbiter() != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::ArbiterDisabled,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
         }
         Ok(())
     }
@@ -16710,7 +16785,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -16873,7 +16949,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17470,7 +17547,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17545,7 +17623,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17617,7 +17696,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17689,7 +17769,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17761,7 +17842,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17836,7 +17918,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17911,7 +17994,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17983,7 +18067,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18055,7 +18140,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18127,7 +18213,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18199,7 +18286,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18271,7 +18359,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18343,7 +18432,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18419,7 +18509,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18494,7 +18585,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18569,7 +18661,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18644,7 +18737,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18719,7 +18813,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18795,7 +18890,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18871,7 +18967,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18947,7 +19044,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19022,7 +19120,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19054,7 +19153,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19082,7 +19182,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19109,7 +19210,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19132,7 +19234,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19156,7 +19259,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19179,7 +19283,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(175), None);
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(176), None);
     }
 
     #[test]
@@ -19201,7 +19306,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(175), None);
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(176), None);
     }
 
     #[test]
@@ -19222,7 +19328,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(175), None);
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(176), None);
     }
 
     #[test]
@@ -19242,7 +19349,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(175), None);
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(176), None);
     }
 
     #[test]
@@ -19265,7 +19373,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(175), None);
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(176), None);
     }
 
     #[test]
@@ -19357,7 +19466,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(172), Some(EscrowEventKind::DualControlDisabled)); // AV-409: 172 is DualControlDisabled
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(175), None); // AV-411: 174 is MilestoneVerifierDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]

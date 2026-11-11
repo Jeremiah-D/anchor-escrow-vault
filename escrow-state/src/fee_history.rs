@@ -478,6 +478,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // verifier fact flips to the zero key, so the next milestone
         // release reads the live verifier.
         | EscrowEventKind::MilestoneVerifierDisabled
+        // AV-412: a removed dispute arbiter moves no funds and
+        // never restates a dispute already settled — only the
+        // arbiter fact flips to None, so the next resolve /
+        // escalate reads the live arbiter.
+        | EscrowEventKind::ArbiterDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1525,6 +1530,11 @@ mod fee_history_tests {
         // verifier fact flips to the zero key, so the next milestone
         // release reads the live verifier.
         | EscrowEventKind::MilestoneVerifierDisabled
+        // AV-412: a removed dispute arbiter moves no funds and
+        // never restates a dispute already settled — only the
+        // arbiter fact flips to None, so the next resolve /
+        // escalate reads the live arbiter.
+        | EscrowEventKind::ArbiterDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
