@@ -20,18 +20,21 @@
 //!   [`KEEPER_HEARTBEAT_DOMAIN`] (the cross-protocol replay defense,
 //!   same convention as AV-123).
 //! - [`HeartbeatRegistry`]: the fleet roster. `register` enrolls a
-//!   keeper; [`HeartbeatRegistry::heartbeat`] verifies and folds a
-//!   signed heartbeat; [`HeartbeatRegistry::scan`] is the missed-beat
-//!   detector (marks keepers unhealthy); [`HeartbeatRegistry::claim`]
-//!   lets a standby claim an unhealthy keeper's escrow set;
-//!   [`HeartbeatRegistry::amend_config`] revises the detector's
-//!   thresholds live, without touching the roster.
+//!   keeper; [`HeartbeatRegistry::deregister`] removes one (revoking
+//!   any live takeover claim on its set); [`HeartbeatRegistry::heartbeat`]
+//!   verifies and folds a signed heartbeat; [`HeartbeatRegistry::scan`]
+//!   is the missed-beat detector (marks keepers unhealthy);
+//!   [`HeartbeatRegistry::claim`] lets a standby claim an unhealthy
+//!   keeper's escrow set; [`HeartbeatRegistry::amend_config`] revises
+//!   the detector's thresholds live, without touching the roster.
 //! - [`HeartbeatAuditEntry`]: the structured audit — `HeartbeatMissed`
 //!   on the unhealthy transition (edge-triggered), `TakeoverClaimed`
 //!   on a successful claim, `ClaimConflict` when two standbys race for
-//!   the same set (first-come-first-served, the loser is audited), and
-//!   `ClaimRevoked` when the original keeper recovers. Bounded 64-entry
-//!   ring, oldest evicts first (the AV-163 convention).
+//!   the same set (first-come-first-served, the loser is audited),
+//!   `ClaimRevoked` when the original keeper recovers (or is
+//!   deregistered while claimed), and `KeeperDeregistered` when a
+//!   keeper leaves the roster. Bounded 64-entry ring, oldest evicts
+//!   first (the AV-163 convention).
 //!
 //! # What is real here
 //!
@@ -224,6 +227,9 @@ pub enum HeartbeatAuditKind {
     /// The original keeper recovered (fresh heartbeat) and the
     /// standby's claim was revoked.
     ClaimRevoked,
+    /// A keeper was removed from the roster
+    /// ([`HeartbeatRegistry::deregister`]).
+    KeeperDeregistered,
 }
 
 /// One structured heartbeat audit entry.
@@ -239,10 +245,13 @@ pub struct HeartbeatAuditEntry {
     /// The actor: the claiming standby for `TakeoverClaimed`, the
     /// losing standby for `ClaimConflict`, the recovering keeper for
     /// `ClaimRevoked`, and `[0; 32]` for `HeartbeatMissed` (the
-    /// detector has no human actor).
+    /// detector has no human actor) and for `KeeperDeregistered`
+    /// (the operator deregistering the keeper carries no key in the
+    /// call).
     pub actor: [u8; 32],
     /// Escrow ids carried by the claim (`TakeoverClaimed` /
-    /// `ClaimConflict` / `ClaimRevoked`); `0` for `HeartbeatMissed`.
+    /// `ClaimConflict` / `ClaimRevoked`); `0` for `HeartbeatMissed`
+    /// and `KeeperDeregistered` (neither carries an escrow set).
     pub escrow_count: u32,
 }
 
@@ -333,6 +342,56 @@ impl HeartbeatRegistry {
             claimed_escrows: Vec::new(),
         });
         Ok(())
+    }
+
+    /// Remove a keeper from the roster (AV-407) — the missing half of
+    /// the roster lifecycle: without it the `keepers` vec grows
+    /// without bound and `scan` keeps evaluating keepers that have
+    /// long since left the fleet. The zero key is rejected
+    /// ([`EscrowError::InvalidHeartbeatConfig`], the same refusal as
+    /// `register`); an unknown keeper is a silent idempotent no-op
+    /// returning `Ok(false)` with no audit entry (the `register`
+    /// idempotence convention, mirrored). A registered keeper is
+    /// removed — `Vec::remove`, so the remaining keepers keep their
+    /// registration order and `scan` stays deterministic — and the
+    /// call returns `Ok(true)` with a `KeeperDeregistered` audit
+    /// entry. If the record carried a live takeover claim
+    /// (`claimed_by.is_some()`), the claim is revoked with it: a
+    /// `ClaimRevoked` audit entry follows (same shape as the
+    /// recovery revocation in [`HeartbeatRegistry::heartbeat`] — the
+    /// standby stands down and the escrow set falls back to
+    /// unassigned, to be rediscovered by the next
+    /// `scan_keeper_actions` pass over the watch list; deregistering
+    /// only clears the roster mapping, never the escrow itself).
+    /// A deregistered key may be re-registered later with a fresh
+    /// record. No new error code; `register` / `heartbeat` / `scan` /
+    /// `claim` semantics and the audit-ring bound are untouched.
+    pub fn deregister(&mut self, keeper: [u8; 32], now: u64) -> Result<bool, EscrowError> {
+        if keeper == [0u8; 32] {
+            return Err(EscrowError::InvalidHeartbeatConfig);
+        }
+        let idx = match self.find(&keeper) {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+        let rec = self.keepers.remove(idx);
+        self.push_audit(HeartbeatAuditEntry {
+            kind: HeartbeatAuditKind::KeeperDeregistered,
+            at: now,
+            keeper,
+            actor: [0u8; 32],
+            escrow_count: 0,
+        });
+        if rec.claimed_by.is_some() {
+            self.push_audit(HeartbeatAuditEntry {
+                kind: HeartbeatAuditKind::ClaimRevoked,
+                at: now,
+                keeper,
+                actor: keeper,
+                escrow_count: rec.claimed_escrows.len() as u32,
+            });
+        }
+        Ok(true)
     }
 
     fn find(&self, keeper: &[u8; 32]) -> Option<usize> {
@@ -1079,5 +1138,170 @@ mod keeper_heartbeat_tests {
         let (hb, sig) = heartbeat_for(&kc, 1_001, KeeperLastAction::Idle);
         r.heartbeat(&hb, &sig).unwrap();
         assert_eq!(r.claimed_by(&pc), None);
+    }
+
+    #[test]
+    fn deregister_rejects_zero_key() {
+        let (mut r, _, _, _) = registry();
+        assert_eq!(
+            r.deregister([0u8; 32], 1),
+            Err(EscrowError::InvalidHeartbeatConfig)
+        );
+        // The roster is untouched: every keeper still heartbeats.
+        heartbeat_all_at(&mut r, 100);
+    }
+
+    #[test]
+    fn deregister_unknown_keeper_is_silent_noop() {
+        let (mut r, pa, pb, pc) = registry();
+        let outsider = SigningKey::from_seed([0xFF; 32]).public_key();
+        assert_eq!(r.deregister(outsider, 1), Ok(false));
+        assert!(r.audit().is_empty());
+        // The roster is intact: A still heartbeats, and B/C (which
+        // never heartbeated) still trip the detector at slot 105.
+        let ka = SigningKey::from_seed(KEEPER_A_SEED);
+        let (hb, sig) = heartbeat_for(&ka, 100, KeeperLastAction::Idle);
+        assert!(r.heartbeat(&hb, &sig).is_ok());
+        assert_eq!(r.scan(105, 2), vec![pb, pc]);
+        let _ = pa;
+    }
+
+    #[test]
+    fn deregister_healthy_keeper_removes_and_audits() {
+        let (mut r, pa, pb, pc) = registry();
+        assert_eq!(r.deregister(pa, 7), Ok(true));
+        let audit = r.audit();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].kind, HeartbeatAuditKind::KeeperDeregistered);
+        assert_eq!(audit[0].at, 7);
+        assert_eq!(audit[0].keeper, pa);
+        assert_eq!(audit[0].actor, [0u8; 32]); // the operator, no key in the call
+        assert_eq!(audit[0].escrow_count, 0);
+        // A is gone: heartbeats are refused, scans never see it.
+        let ka = SigningKey::from_seed(KEEPER_A_SEED);
+        let (hb, sig) = heartbeat_for(&ka, 100, KeeperLastAction::Idle);
+        assert_eq!(
+            r.heartbeat(&hb, &sig),
+            Err(EscrowError::KeeperNotRegistered)
+        );
+        assert!(!r.is_unhealthy(&pa));
+        assert_eq!(r.claimed_by(&pa), None);
+        // B and C are untouched: both still on the roster and both
+        // trip the detector at slot 1000 (never heartbeated).
+        assert_eq!(r.scan(1_000, 8), vec![pb, pc]);
+    }
+
+    #[test]
+    fn deregister_twice_second_is_noop() {
+        let (mut r, pa, _, _) = registry();
+        assert_eq!(r.deregister(pa, 1), Ok(true));
+        assert_eq!(r.deregister(pa, 2), Ok(false));
+        // Exactly one deregistration audit entry — the repeat is silent.
+        let deregistered: Vec<_> = r
+            .audit()
+            .into_iter()
+            .filter(|e| e.kind == HeartbeatAuditKind::KeeperDeregistered)
+            .collect();
+        assert_eq!(deregistered.len(), 1);
+        assert_eq!(deregistered[0].at, 1);
+    }
+
+    #[test]
+    fn deregister_with_live_claim_revokes_it() {
+        let (mut r, _, pb, pc) = registry();
+        let escrows = [[0xE1; 32], [0xE2; 32]];
+        // C never heartbeated (last_slot 0): unhealthy at slot 1000
+        // — B claims C's set.
+        r.claim(pb, pc, &escrows, 42, 1_000).unwrap();
+        assert_eq!(r.claimed_by(&pc), Some(pb));
+        assert_eq!(r.deregister(pc, 99), Ok(true));
+        // The claim is gone with the keeper: the standby stands down.
+        assert_eq!(r.claimed_by(&pc), None);
+        assert_eq!(r.claimed_escrows(&pc), None);
+        let audit = r.audit();
+        let deregistered: Vec<_> = audit
+            .iter()
+            .filter(|e| e.kind == HeartbeatAuditKind::KeeperDeregistered)
+            .collect();
+        assert_eq!(deregistered.len(), 1);
+        assert_eq!(deregistered[0].keeper, pc);
+        let revoked: Vec<_> = audit
+            .iter()
+            .filter(|e| e.kind == HeartbeatAuditKind::ClaimRevoked)
+            .collect();
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(revoked[0].keeper, pc);
+        assert_eq!(revoked[0].actor, pc);
+        assert_eq!(revoked[0].escrow_count, 2);
+        // The standby itself is untouched and still registered.
+        let kb = SigningKey::from_seed(KEEPER_B_SEED);
+        let (hb, sig) = heartbeat_for(&kb, 1_001, KeeperLastAction::Idle);
+        assert!(r.heartbeat(&hb, &sig).is_ok());
+    }
+
+    #[test]
+    fn deregister_unhealthy_keeper_stops_scan_reporting_it() {
+        let (mut r, pa, pb, pc) = registry();
+        heartbeat_all_at(&mut r, 100);
+        // All three trip at slot 131.
+        assert_eq!(r.scan(131, 9_999), vec![pa, pb, pc]);
+        assert!(r.is_unhealthy(&pa));
+        // A leaves the fleet: later scans never report it again, and
+        // the latched B/C entries are unaffected (edge-triggered).
+        assert_eq!(r.deregister(pa, 10_000), Ok(true));
+        assert!(!r.is_unhealthy(&pa));
+        assert!(r.scan(200, 10_001).is_empty());
+        assert!(r.is_unhealthy(&pb));
+        assert!(r.is_unhealthy(&pc));
+    }
+
+    #[test]
+    fn deregister_then_reregister_works() {
+        let (mut r, pa, pb, pc) = registry();
+        assert_eq!(r.deregister(pa, 1), Ok(true));
+        // The same key re-enrolls with a fresh record.
+        assert!(r.register(pa).is_ok());
+        let ka = SigningKey::from_seed(KEEPER_A_SEED);
+        let (hb, sig) = heartbeat_for(&ka, 100, KeeperLastAction::Idle);
+        assert!(r.heartbeat(&hb, &sig).is_ok());
+        assert!(!r.is_unhealthy(&pa));
+        // A is healthy at slot 105; only the never-heartbeated B/C trip.
+        assert_eq!(r.scan(105, 2), vec![pb, pc]);
+    }
+
+    #[test]
+    fn deregister_keeps_audit_ring_bounded() {
+        let (mut r, _, pb, pc) = registry();
+        let kd = SigningKey::from_seed([0xD4; 32]);
+        let ke = SigningKey::from_seed([0xE5; 32]);
+        r.register(kd.public_key()).unwrap();
+        r.register(ke.public_key()).unwrap();
+        let escrows = [[0xE1; 32]];
+        // C never heartbeated → unhealthy at slot 1000: B claims.
+        r.claim(pb, pc, &escrows, 1, 1_000).unwrap();
+        // Fill the ring past capacity with lost races (1 takeover +
+        // 69 conflicts = 70 entries; the ring holds 64).
+        for i in 0..(MAX_KEEPER_AUDIT_ENTRIES + 5) {
+            let standby = if i % 2 == 0 {
+                kd.public_key()
+            } else {
+                ke.public_key()
+            };
+            assert_eq!(
+                r.claim(standby, pc, &escrows, i as u64 + 2, 1_000),
+                Err(EscrowError::ClaimConflict)
+            );
+        }
+        assert_eq!(r.audit().len(), MAX_KEEPER_AUDIT_ENTRIES);
+        // Deregistering C pushes two more entries (deregistration +
+        // claim revocation): the ring still holds exactly 64, oldest
+        // evicted first.
+        assert_eq!(r.deregister(pc, 500), Ok(true));
+        let audit = r.audit();
+        assert_eq!(audit.len(), MAX_KEEPER_AUDIT_ENTRIES);
+        assert_eq!(audit[62].kind, HeartbeatAuditKind::KeeperDeregistered);
+        assert_eq!(audit[62].keeper, pc);
+        assert_eq!(audit[63].kind, HeartbeatAuditKind::ClaimRevoked);
+        assert_eq!(audit[63].keeper, pc);
     }
 }

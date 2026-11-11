@@ -7563,6 +7563,18 @@ this module *detects dead operators and reassigns their work*.
 - **The recovery**: a fresh heartbeat from a claimed keeper revokes
   the claim (`ClaimRevoked` audit) — the original keeper is back, so
   the standby stands down. No split-brain.
+- **The deregistration (AV-407)**: `deregister(keeper, now)` removes
+  a keeper from the roster — the missing half of the roster lifecycle,
+  so `scan` stops evaluating keepers that left the fleet. The zero key
+  is refused (`InvalidHeartbeatConfig`, code 231, as in `register`); an
+  unknown keeper is a silent no-op returning `false` with no audit
+  entry. A registered keeper is removed (the remaining keepers keep
+  their registration order, so `scan` stays deterministic) and returns
+  `true` with a `KeeperDeregistered` audit entry; if the record carried
+  a live takeover claim, a `ClaimRevoked` audit entry follows — the
+  standby stands down and the escrow set falls back to unassigned, to
+  be rediscovered by the next keeper scan over the watch list. A
+  deregistered key may be re-registered later with a fresh record.
 - **The live revision (AV-316)**: `amend_config(new_config)` revises
   the detector's thresholds without touching the roster: the new
   config is validated first (zero interval or zero max-missed fails
