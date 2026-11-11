@@ -17,6 +17,12 @@
 //! and use count, so operators can see which template versions are
 //! actually originating escrows.
 //!
+//! Retirement (AV-414): a published version found misconfigured
+//! (wrong fee tier, currency, or mint) can be retired by its creator
+//! — it stays in history but [`TemplateLibrary::from_template`] will
+//! no longer instantiate it, and [`TemplateLibrary::latest`] skips
+//! it. Retirement is one-way; corrections publish a new version.
+//!
 //! Off-chain by design: versioning and usage accounting are keeper/
 //! operator state, exactly like the other off-chain registries in this
 //! crate.
@@ -133,6 +139,11 @@ pub struct EscrowBlueprint {
     pub use_count: u64,
     /// Last instantiation time, `None` when never used.
     pub last_used_at: Option<u64>,
+    /// Whether this version was retired (AV-414): retired versions
+    /// stay in history but can no longer be instantiated. One-way.
+    pub retired: bool,
+    /// Unix timestamp of retirement, `None` while live.
+    pub retired_at: Option<u64>,
 }
 
 /// What the library can reject.
@@ -149,6 +160,11 @@ pub enum LibraryError {
     /// instantiation anyway (defensive — unreachable for a published
     /// blueprint with honest inputs).
     InstantiationFailed(EscrowError),
+    /// Only the version's recorded creator may retire it (AV-414).
+    NotCreator,
+    /// The version exists but was retired (AV-414) — it can no longer
+    /// be instantiated; publish a new version to correct it.
+    RetiredVersion(u32),
 }
 
 /// Named, versioned registry of escrow blueprints (AV-143).
@@ -187,12 +203,56 @@ impl TemplateLibrary {
         blueprint.created_at = at;
         blueprint.use_count = 0;
         blueprint.last_used_at = None;
+        blueprint.retired = false;
+        blueprint.retired_at = None;
         entry.push(blueprint);
         Ok(version)
     }
 
+    /// Retire one version (AV-414): the template registry's version
+    /// governance — a published version found misconfigured (wrong
+    /// fee tier, currency, or mint) is taken out of service without
+    /// deleting history. Only the version's recorded creator may
+    /// retire it (the trust model follows `publish`: caller-supplied
+    /// identity, no signature check — this is an off-chain registry).
+    /// Unknown name is [`LibraryError::UnknownTemplate`], unknown
+    /// version is [`LibraryError::UnknownVersion`]. Retiring an
+    /// already-retired version is a silent no-op. The retirement
+    /// writes `retired` / `retired_at` only — `use_count` /
+    /// `last_used_at` keep the version's history, and escrows already
+    /// instantiated from the version are unaffected (they locked the
+    /// blueprint at instantiation). One-way: there is no un-retire —
+    /// corrections publish a new version.
+    pub fn retire(
+        &mut self,
+        name: &str,
+        version: u32,
+        caller: [u8; 32],
+        at: u64,
+    ) -> Result<(), LibraryError> {
+        let entry = self
+            .templates
+            .get_mut(name)
+            .ok_or(LibraryError::UnknownTemplate)?;
+        let bp = entry
+            .iter_mut()
+            .find(|b| b.version == version)
+            .ok_or(LibraryError::UnknownVersion(version))?;
+        if caller != bp.creator {
+            return Err(LibraryError::NotCreator);
+        }
+        // Already retired: nothing to write.
+        if bp.retired {
+            return Ok(());
+        }
+        bp.retired = true;
+        bp.retired_at = Some(at);
+        Ok(())
+    }
+
     /// Look up one version (1-based). `None` for an unknown name or
-    /// version.
+    /// version. A retired version is still returned: this is the
+    /// read-only query, and the caller sees the `retired` flag.
     pub fn get(&self, name: &str, version: u32) -> Option<&EscrowBlueprint> {
         self.templates
             .get(name)?
@@ -200,9 +260,17 @@ impl TemplateLibrary {
             .find(|b| b.version == version)
     }
 
-    /// The newest version of a template, or `None` when unknown.
+    /// The newest live (non-retired) version of a template, or `None`
+    /// when unknown or every version is retired.
     pub fn latest(&self, name: &str) -> Option<&EscrowBlueprint> {
-        self.templates.get(name)?.last()
+        self.latest_live(name)
+    }
+
+    /// The newest live (non-retired) version. Shared by
+    /// [`latest`](Self::latest) and [`from_template`](Self::from_template)'s
+    /// `None` branch so the two can never drift.
+    fn latest_live(&self, name: &str) -> Option<&EscrowBlueprint> {
+        self.templates.get(name)?.iter().rev().find(|b| !b.retired)
     }
 
     /// How many versions exist under `name`.
@@ -220,10 +288,12 @@ impl TemplateLibrary {
     /// Instantiate a template into a fully-configured escrow in one
     /// call: build the AV-72 composition from the blueprint, apply the
     /// fee tier ladder and vesting curve, and bump the version's use
-    /// count. `version == None` takes the latest version. The
-    /// instantiated escrow locks the blueprint's version — a later
-    /// publish under the same name does not change already-created
-    /// escrows.
+    /// count. `version == None` takes the latest live version
+    /// (retired versions are skipped; all retired is
+    /// [`LibraryError::UnknownTemplate`]). An explicit retired version
+    /// is [`LibraryError::RetiredVersion`]. The instantiated escrow
+    /// locks the blueprint's version — a later publish under the same
+    /// name does not change already-created escrows.
     pub fn from_template(
         &mut self,
         name: &str,
@@ -233,13 +303,24 @@ impl TemplateLibrary {
         now: u64,
     ) -> Result<Escrow, LibraryError> {
         let (version, escrow) = {
-            let entry = self.templates.get(name).ok_or(LibraryError::UnknownTemplate)?;
+            let entry = self
+                .templates
+                .get(name)
+                .ok_or(LibraryError::UnknownTemplate)?;
             let bp = match version {
-                Some(v) => entry
-                    .iter()
-                    .find(|b| b.version == v)
-                    .ok_or(LibraryError::UnknownVersion(v))?,
-                None => entry.last().ok_or(LibraryError::UnknownTemplate)?,
+                Some(v) => {
+                    let bp = entry
+                        .iter()
+                        .find(|b| b.version == v)
+                        .ok_or(LibraryError::UnknownVersion(v))?;
+                    if bp.retired {
+                        return Err(LibraryError::RetiredVersion(v));
+                    }
+                    bp
+                }
+                None => self
+                    .latest_live(name)
+                    .ok_or(LibraryError::UnknownTemplate)?,
             };
             (
                 bp.version,
@@ -345,6 +426,8 @@ mod tests {
             created_at: 0,
             use_count: 0,
             last_used_at: None,
+            retired: false,
+            retired_at: None,
         }
     }
 
@@ -428,6 +511,171 @@ mod tests {
             Err(LibraryError::UnknownVersion(7))
         );
         assert!(lib.get("gig", 7).is_none());
+    }
+
+    #[test]
+    fn retire_rejects_non_creator_and_keeps_version_live() {
+        let mut lib = TemplateLibrary::new();
+        lib.publish(milestone_blueprint("gig"), key(1), 1_000).unwrap();
+        assert_eq!(
+            lib.retire("gig", 1, key(9), 2_000),
+            Err(LibraryError::NotCreator)
+        );
+        let v1 = lib.get("gig", 1).unwrap();
+        assert!(!v1.retired);
+        assert_eq!(v1.retired_at, None);
+        // The version still instantiates.
+        lib.from_template("gig", Some(1), key(9), key(10), 3_000)
+            .unwrap();
+    }
+
+    #[test]
+    fn retire_unknown_name_and_version() {
+        let mut lib = TemplateLibrary::new();
+        lib.publish(milestone_blueprint("gig"), key(1), 1_000).unwrap();
+        assert_eq!(
+            lib.retire("nope", 1, key(1), 2_000),
+            Err(LibraryError::UnknownTemplate)
+        );
+        assert_eq!(
+            lib.retire("gig", 7, key(1), 2_000),
+            Err(LibraryError::UnknownVersion(7))
+        );
+        assert!(!lib.get("gig", 1).unwrap().retired);
+    }
+
+    #[test]
+    fn retire_latest_falls_back_to_previous_live_version() {
+        let mut lib = TemplateLibrary::new();
+        lib.publish(milestone_blueprint("gig"), key(1), 1_000).unwrap();
+        lib.publish(milestone_blueprint("gig"), key(1), 2_000).unwrap();
+        lib.retire("gig", 2, key(1), 3_000).unwrap();
+        // latest() skips the retired v2.
+        assert_eq!(lib.latest("gig").unwrap().version, 1);
+        // from_template(None) takes the newest live version.
+        let e = lib
+            .from_template("gig", None, key(9), key(10), 4_000)
+            .unwrap();
+        assert_eq!(lib.get("gig", 1).unwrap().use_count, 1);
+        assert_eq!(lib.get("gig", 2).unwrap().use_count, 0);
+        assert_eq!(e.expires_at(), 4_000 + 86_400);
+    }
+
+    #[test]
+    fn retire_explicit_version_is_refused() {
+        let mut lib = TemplateLibrary::new();
+        lib.publish(milestone_blueprint("gig"), key(1), 1_000).unwrap();
+        lib.publish(milestone_blueprint("gig"), key(1), 2_000).unwrap();
+        lib.retire("gig", 1, key(1), 3_000).unwrap();
+        assert_eq!(
+            lib.from_template("gig", Some(1), key(9), key(10), 4_000),
+            Err(LibraryError::RetiredVersion(1))
+        );
+        // The live v2 still instantiates by pin and by latest.
+        lib.from_template("gig", Some(2), key(9), key(10), 4_000)
+            .unwrap();
+        lib.from_template("gig", None, key(9), key(10), 5_000)
+            .unwrap();
+        assert_eq!(lib.get("gig", 2).unwrap().use_count, 2);
+    }
+
+    #[test]
+    fn retire_all_versions_blocks_latest_and_none() {
+        let mut lib = TemplateLibrary::new();
+        lib.publish(milestone_blueprint("gig"), key(1), 1_000).unwrap();
+        lib.retire("gig", 1, key(1), 2_000).unwrap();
+        assert!(lib.latest("gig").is_none());
+        assert_eq!(
+            lib.from_template("gig", None, key(9), key(10), 3_000),
+            Err(LibraryError::UnknownTemplate)
+        );
+        // History is still queryable: counts and names include it.
+        assert_eq!(lib.version_count("gig"), 1);
+        assert_eq!(lib.names(), vec!["gig"]);
+        let v1 = lib.get("gig", 1).unwrap();
+        assert!(v1.retired);
+        assert_eq!(v1.retired_at, Some(2_000));
+    }
+
+    #[test]
+    fn retire_twice_is_a_silent_noop() {
+        let mut lib = TemplateLibrary::new();
+        lib.publish(milestone_blueprint("gig"), key(1), 1_000).unwrap();
+        lib.retire("gig", 1, key(1), 2_000).unwrap();
+        lib.retire("gig", 1, key(1), 3_000).unwrap();
+        // The first retirement timestamp stands: the second call
+        // writes nothing.
+        let v1 = lib.get("gig", 1).unwrap();
+        assert!(v1.retired);
+        assert_eq!(v1.retired_at, Some(2_000));
+    }
+
+    #[test]
+    fn retire_keeps_usage_history_and_get_visible() {
+        let mut lib = TemplateLibrary::new();
+        lib.publish(milestone_blueprint("gig"), key(1), 1_000).unwrap();
+        lib.from_template("gig", None, key(9), key(10), 2_000)
+            .unwrap();
+        lib.retire("gig", 1, key(1), 3_000).unwrap();
+        let v1 = lib.get("gig", 1).unwrap();
+        assert!(v1.retired);
+        assert_eq!(v1.retired_at, Some(3_000));
+        // History is preserved, not wiped.
+        assert_eq!(v1.use_count, 1);
+        assert_eq!(v1.last_used_at, Some(2_000));
+        assert_eq!(v1.creator, key(1));
+        assert_eq!(v1.created_at, 1_000);
+        assert_eq!(lib.version_count("gig"), 1);
+    }
+
+    #[test]
+    fn retire_then_publish_new_version_still_works() {
+        let mut lib = TemplateLibrary::new();
+        lib.publish(milestone_blueprint("gig"), key(1), 1_000).unwrap();
+        lib.retire("gig", 1, key(1), 2_000).unwrap();
+        // Corrections publish a new version; versions keep
+        // self-incrementing and the new one is live.
+        assert_eq!(lib.publish(milestone_blueprint("gig"), key(1), 3_000), Ok(2));
+        let v2 = lib.get("gig", 2).unwrap();
+        assert!(!v2.retired);
+        assert_eq!(v2.retired_at, None);
+        assert_eq!(lib.latest("gig").unwrap().version, 2);
+        lib.from_template("gig", None, key(9), key(10), 4_000)
+            .unwrap();
+        assert_eq!(lib.get("gig", 2).unwrap().use_count, 1);
+        // The retired v1 stays refused even after the new publish.
+        assert_eq!(
+            lib.from_template("gig", Some(1), key(9), key(10), 4_000),
+            Err(LibraryError::RetiredVersion(1))
+        );
+    }
+
+    #[test]
+    fn retire_is_scoped_to_one_name() {
+        let mut lib = TemplateLibrary::new();
+        lib.publish(milestone_blueprint("gig"), key(1), 1_000).unwrap();
+        lib.publish(milestone_blueprint("other"), key(2), 1_000)
+            .unwrap();
+        lib.retire("gig", 1, key(1), 2_000).unwrap();
+        assert!(lib.get("gig", 1).unwrap().retired);
+        assert!(!lib.get("other", 1).unwrap().retired);
+        assert_eq!(lib.latest("other").unwrap().version, 1);
+        lib.from_template("other", None, key(9), key(10), 3_000)
+            .unwrap();
+    }
+
+    #[test]
+    fn publish_resets_retired_flags_on_the_input() {
+        let mut lib = TemplateLibrary::new();
+        // A caller reusing a retired blueprint struct must not smuggle
+        // the flags into the fresh version: publish owns them.
+        let mut bp = milestone_blueprint("gig");
+        bp.retired = true;
+        bp.retired_at = Some(9_999);
+        assert_eq!(lib.publish(bp, key(1), 1_000), Ok(1));
+        let v1 = lib.get("gig", 1).unwrap();
+        assert!(!v1.retired);
+        assert_eq!(v1.retired_at, None);
     }
 
     #[test]

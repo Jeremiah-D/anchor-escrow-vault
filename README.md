@@ -7156,6 +7156,20 @@ already created from v1. Every blueprint audits its creator,
 creation time, version, and use count, so operators can see which
 template versions are actually originating escrows.
 
+Version retirement (AV-414): `retire(name, version, caller, at)`
+takes a misconfigured version out of service — only its recorded
+creator may retire it (`NotCreator` otherwise; unknown name/version
+are `UnknownTemplate` / `UnknownVersion`). A retired version stays in
+history (`get` still returns it with the `retired` flag and
+`retired_at`, `version_count` / `names` unchanged, `use_count` /
+`last_used_at` preserved), but `latest()` skips it,
+`from_template(name, None)` falls back to the newest live version (or
+`UnknownTemplate` when all are retired), and an explicit
+`from_template(name, Some(v))` on a retired version is
+`RetiredVersion(v)`. Retirement is one-way — there is no un-retire;
+corrections publish a new version. Retiring an already-retired
+version is a silent no-op.
+
 ## Protocol-fee revenue history (AV-144)
 
 Which fee types earned, on which vaults, on which days — the
