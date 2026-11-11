@@ -2,8 +2,9 @@
 //!
 //! An off-chain, read-only rollup over a fleet of watched escrows for
 //! keeper/operator dashboards: per-state counts, an amount histogram,
-//! average escrow durations, and total locked value. Pure reads — no
-//! chain writes, no state mutation, no events emitted.
+//! average escrow durations, total locked value, and the locked total
+//! split per mint. Pure reads — no chain writes, no state mutation,
+//! no events emitted.
 //!
 //! Two constructors serve the two fidelity levels the crate offers:
 //!
@@ -128,7 +129,20 @@ pub struct EscrowAggregateView {
     pub open_durations_sampled: usize,
     /// Sum of [`crate::Escrow::remaining_amount`] over the fleet, in the
     /// smallest unit. `u128` because a fleet sum can exceed `u64::MAX`.
+    /// Kept as the cross-mint sum for backward compatibility — but
+    /// note the units are mixed: native-SOL lamports and SPL token
+    /// base units are added into one number, so a multi-mint fleet
+    /// should read [`Self::locked_by_mint`] for the per-currency
+    /// picture.
     pub total_locked: u128,
+    /// Locked value split per mint: `(mint, remaining total)` with
+    /// `None` for native SOL, in deterministic order — `None` first,
+    /// then mints in ascending byte order. Every mint present in the
+    /// fleet appears, even one whose remaining total is `0` (a fully
+    /// released escrow still reports its mint). Pure fold of
+    /// [`crate::Escrow::remaining_amount`], same as `total_locked`
+    /// but never mixed across currencies.
+    pub locked_by_mint: Vec<(Option<[u8; 32]>, u128)>,
     // Scratch accumulators for the duration averages. They are private
     // and never serialized (to_json never reads them).
     completed_sum: u128,
@@ -143,7 +157,12 @@ impl EscrowAggregateView {
         view.escrow_count = escrows.len();
         for ix in escrows {
             let e = ix.inner();
-            view.count_one(e.state(), e.amount(), e.remaining_amount() as u128);
+            view.count_one(
+                e.state(),
+                e.amount(),
+                e.remaining_amount() as u128,
+                e.mint(),
+            );
             if is_funded_open(e.state()) {
                 view.sample_open(e.fund_at(), now);
             }
@@ -171,7 +190,12 @@ impl EscrowAggregateView {
         view.escrow_count = watched.len();
         for w in watched {
             let e = &w.escrow;
-            view.count_one(e.state(), e.amount(), e.remaining_amount() as u128);
+            view.count_one(
+                e.state(),
+                e.amount(),
+                e.remaining_amount() as u128,
+                e.mint(),
+            );
             if is_funded_open(e.state()) {
                 view.sample_open(e.fund_at(), now);
             }
@@ -195,6 +219,7 @@ impl EscrowAggregateView {
             avg_open_duration_secs: None,
             open_durations_sampled: 0,
             total_locked: 0,
+            locked_by_mint: Vec::new(),
             completed_sum: 0,
             open_sum: 0,
         }
@@ -202,7 +227,13 @@ impl EscrowAggregateView {
 
     /// Accumulator fields below are scratch space for averaging; they
     /// are not part of the public report shape.
-    fn count_one(&mut self, state: EscrowState, amount: u64, remaining: u128) {
+    fn count_one(
+        &mut self,
+        state: EscrowState,
+        amount: u64,
+        remaining: u128,
+        mint: Option<[u8; 32]>,
+    ) {
         if let Some(row) = self.state_counts.iter_mut().find(|r| r.state == state) {
             row.count += 1;
         }
@@ -215,6 +246,22 @@ impl EscrowAggregateView {
             }
         }
         self.total_locked = self.total_locked.saturating_add(remaining);
+        // Per-mint fold: the bucket is created even when `remaining`
+        // is 0, so a fully released mint still reports its (zero)
+        // total. Insertion keeps deterministic order — native SOL
+        // (`None`) first, then mints in ascending byte order (the
+        // `Option<[u8; 32]>` ordering).
+        match self.locked_by_mint.iter_mut().find(|(m, _)| *m == mint) {
+            Some((_, total)) => *total = total.saturating_add(remaining),
+            None => {
+                let pos = self
+                    .locked_by_mint
+                    .iter()
+                    .position(|(m, _)| m > &mint)
+                    .unwrap_or(self.locked_by_mint.len());
+                self.locked_by_mint.insert(pos, (mint, remaining));
+            }
+        }
     }
 
     fn sample_open(&mut self, fund_at: u64, now: u64) {
@@ -248,7 +295,8 @@ impl EscrowAggregateView {
     ///  "amount_histogram":[{"bucket":"1k-10k","min_inclusive":1000,"max_exclusive":10000,"count":2},...],
     ///  "avg_completed_duration_secs":86400,"completed_durations_sampled":1,
     ///  "avg_open_duration_secs":3600,"open_durations_sampled":2,
-    ///  "total_locked":"2500000"}
+    ///  "total_locked":"2500000",
+    ///  "locked_by_mint":[{"mint":null,"total_locked":"1500000"},{"mint":"ab12...","total_locked":"1000000"}]}
     /// ```
     pub fn to_json(&self) -> String {
         let mut s = String::with_capacity(512);
@@ -299,9 +347,39 @@ impl EscrowAggregateView {
         s.push_str(&self.open_durations_sampled.to_string());
         s.push_str(",\"total_locked\":\"");
         s.push_str(&self.total_locked.to_string());
-        s.push_str("\"}");
+        s.push_str("\",\"locked_by_mint\":[");
+        for (i, (mint, total)) in self.locked_by_mint.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"mint\":");
+            match mint {
+                Some(m) => {
+                    s.push('"');
+                    s.push_str(&hex32(m));
+                    s.push('"');
+                }
+                None => s.push_str("null"),
+            }
+            s.push_str(",\"total_locked\":\"");
+            s.push_str(&total.to_string());
+            s.push_str("\"}");
+        }
+        s.push_str("]}");
         s
     }
+}
+
+/// Lowercase hex encoding of a 32-byte key (the crate's deterministic
+/// JSON convention — same shape as `keeper.rs`'s `hex32`).
+fn hex32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
 }
 
 // Scratch accumulators live as private struct fields (see above); no
@@ -337,6 +415,36 @@ mod aggregate_tests {
             vault_derivation: None,
             pending_intent: None,
         }
+    }
+
+    /// A funded escrow as an indexed wrapper, optionally bound to an
+    /// SPL mint. `with_mint` only applies while `Uninitialized`, so it
+    /// runs before `fund`.
+    fn indexed_funded(
+        id: u8,
+        amount: u64,
+        created_at: u64,
+        funded_at: u64,
+        mint: Option<[u8; 32]>,
+    ) -> IndexedEscrow {
+        let mut ix =
+            IndexedEscrow::initialize(key(1), key(2), amount, u64::MAX, [id; 32], created_at)
+                .expect("initialize");
+        if let Some(m) = mint {
+            ix = ix.with_mint(m).expect("with_mint");
+        }
+        ix.fund(key(1), funded_at).expect("fund");
+        ix
+    }
+
+    fn funded_escrow_with_mint(
+        id: u8,
+        amount: u64,
+        created_at: u64,
+        funded_at: u64,
+        mint: Option<[u8; 32]>,
+    ) -> Escrow {
+        *indexed_funded(id, amount, created_at, funded_at, mint).inner()
     }
 
     #[test]
@@ -504,7 +612,7 @@ mod aggregate_tests {
         assert!(j.contains("\"bucket\":\"1b+\",\"min_inclusive\":1000000000,\"max_exclusive\":null,\"count\":0"));
         assert!(j.contains("\"avg_completed_duration_secs\":null"));
         assert!(j.contains("\"avg_open_duration_secs\":1000"));
-        assert!(j.ends_with("\"total_locked\":\"1500\"}"));
+        assert!(j.ends_with("\"total_locked\":\"1500\",\"locked_by_mint\":[{\"mint\":null,\"total_locked\":\"1500\"}]}"));
         // Deterministic: same input, byte-identical output.
         assert_eq!(j, view.to_json());
     }
@@ -520,5 +628,173 @@ mod aggregate_tests {
         let direct = EscrowAggregateView::from_watched(&w, now);
         assert_eq!(via_keeper, direct);
         assert_eq!(via_keeper.escrow_count, 2);
+    }
+
+    #[test]
+    fn empty_fleet_has_empty_locked_by_mint() {
+        let view = EscrowAggregateView::from_watched(&[], 1_000_000);
+        assert!(view.locked_by_mint.is_empty());
+        assert_eq!(view.total_locked, 0);
+        let indexed = EscrowAggregateView::from_indexed(&[], 1_000_000);
+        assert!(indexed.locked_by_mint.is_empty());
+    }
+
+    #[test]
+    fn single_native_mint_total_matches_total_locked() {
+        let w = vec![watched(funded_escrow(1, 1_500, 998_900, 999_000), 1)];
+        let view = EscrowAggregateView::from_watched(&w, 1_000_000);
+        assert_eq!(view.locked_by_mint, vec![(None, 1_500)]);
+        assert_eq!(view.total_locked, 1_500);
+    }
+
+    #[test]
+    fn multi_mint_buckets_are_exact_and_isolated() {
+        let mint_a = key(0xA0);
+        let mint_b = key(0xB0);
+        let now = 1_000_000u64;
+        let w = vec![
+            watched(funded_escrow(1, 500, 998_900, 999_000), 1), // native SOL
+            watched(
+                funded_escrow_with_mint(2, 5_000, 997_900, 998_000, Some(mint_a)),
+                2,
+            ),
+            watched(
+                funded_escrow_with_mint(3, 7_000, 997_900, 998_000, Some(mint_a)),
+                3,
+            ),
+            watched(
+                funded_escrow_with_mint(4, 5_000_000, 989_900, 990_000, Some(mint_b)),
+                4,
+            ),
+        ];
+        let view = EscrowAggregateView::from_watched(&w, now);
+        // Two mint-A escrows fold into one bucket; SOL and mint B
+        // never leak into each other.
+        assert_eq!(
+            view.locked_by_mint,
+            vec![
+                (None, 500),
+                (Some(mint_a), 12_000),
+                (Some(mint_b), 5_000_000)
+            ]
+        );
+        assert_eq!(view.total_locked, 500 + 12_000 + 5_000_000);
+    }
+
+    #[test]
+    fn locked_by_mint_order_is_deterministic() {
+        let mint_a = key(0x01);
+        let mint_b = key(0x02);
+        let now = 1_000_000u64;
+        // Input order is deliberately scrambled: B, SOL, A.
+        let w = vec![
+            watched(
+                funded_escrow_with_mint(1, 100, 998_900, 999_000, Some(mint_b)),
+                1,
+            ),
+            watched(funded_escrow(2, 200, 998_900, 999_000), 2),
+            watched(
+                funded_escrow_with_mint(3, 300, 998_900, 999_000, Some(mint_a)),
+                3,
+            ),
+        ];
+        let view = EscrowAggregateView::from_watched(&w, now);
+        assert_eq!(
+            view.locked_by_mint,
+            vec![(None, 200), (Some(mint_a), 300), (Some(mint_b), 100)]
+        );
+        // Reversed input gives the identical vec.
+        let w2 = vec![
+            watched(
+                funded_escrow_with_mint(3, 300, 998_900, 999_000, Some(mint_a)),
+                3,
+            ),
+            watched(funded_escrow(2, 200, 998_900, 999_000), 2),
+            watched(
+                funded_escrow_with_mint(1, 100, 998_900, 999_000, Some(mint_b)),
+                1,
+            ),
+        ];
+        assert_eq!(
+            EscrowAggregateView::from_watched(&w2, now).locked_by_mint,
+            view.locked_by_mint
+        );
+    }
+
+    #[test]
+    fn indexed_and_watched_paths_agree_on_locked_by_mint() {
+        let mint_a = key(0xA0);
+        let now = 1_000_000u64;
+        let ix = vec![
+            indexed_funded(1, 500, 998_900, 999_000, None),
+            indexed_funded(2, 5_000, 997_900, 998_000, Some(mint_a)),
+        ];
+        let w: Vec<WatchedEscrow> = ix
+            .iter()
+            .enumerate()
+            .map(|(i, e)| watched(*e.inner(), (i + 1) as u8))
+            .collect();
+        let via_indexed = EscrowAggregateView::from_indexed(&ix, now);
+        let via_watched = EscrowAggregateView::from_watched(&w, now);
+        assert_eq!(via_indexed.locked_by_mint, via_watched.locked_by_mint);
+        assert_eq!(via_indexed, via_watched);
+    }
+
+    #[test]
+    fn zero_remaining_mint_still_appears() {
+        // A fully released SPL escrow holds nothing — its mint still
+        // reports a (zero) total, so the fleet report never silently
+        // drops a currency.
+        let mint_a = key(0xA0);
+        let mut ix = indexed_funded(1, 2_000, 100, 200, Some(mint_a));
+        // The release carries the bound mint (None would be MintMismatch).
+        ix.release(key(1), 2_000, Some(mint_a), key(2), 1100)
+            .expect("release");
+        let view = EscrowAggregateView::from_indexed(&[ix], 2_000);
+        assert_eq!(view.locked_by_mint, vec![(Some(mint_a), 0)]);
+        assert_eq!(view.total_locked, 0);
+    }
+
+    #[test]
+    fn total_locked_is_unchanged_cross_mint_sum() {
+        // total_locked keeps its historical meaning (plain sum across
+        // mints) so existing consumers are unaffected; the per-mint
+        // split lives in locked_by_mint.
+        let mint_a = key(0xA0);
+        let w = vec![
+            watched(funded_escrow(1, 500, 998_900, 999_000), 1),
+            watched(
+                funded_escrow_with_mint(2, 5_000, 997_900, 998_000, Some(mint_a)),
+                2,
+            ),
+        ];
+        let view = EscrowAggregateView::from_watched(&w, 1_000_000);
+        assert_eq!(view.total_locked, 5_500);
+        assert_eq!(
+            view.locked_by_mint,
+            vec![(None, 500), (Some(mint_a), 5_000)]
+        );
+    }
+
+    #[test]
+    fn json_renders_locked_by_mint_as_hex_or_null() {
+        let mint_a = key(0xA0);
+        let hex_a = "a0".repeat(32);
+        let now = 1_000_000u64;
+        let w = vec![
+            watched(funded_escrow(1, 500, 998_900, 999_000), 1),
+            watched(
+                funded_escrow_with_mint(2, 5_000, 997_900, 998_000, Some(mint_a)),
+                2,
+            ),
+        ];
+        let view = EscrowAggregateView::from_watched(&w, now);
+        let j = view.to_json();
+        // Native SOL renders as null; the SPL mint as lowercase hex.
+        assert!(j.contains(&format!(
+            "\"locked_by_mint\":[{{\"mint\":null,\"total_locked\":\"500\"}},{{\"mint\":\"{hex_a}\",\"total_locked\":\"5000\"}}]"
+        )));
+        // Deterministic: same input, byte-identical output.
+        assert_eq!(j, view.to_json());
     }
 }

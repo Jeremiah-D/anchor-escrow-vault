@@ -4269,6 +4269,16 @@ integer range). `EscrowAggregateView::to_json()` follows the crate's
 deterministic JSON convention, so the aggregate result exports next to
 the per-escrow snapshots.
 
+`locked_by_mint` (AV-408) splits the same remaining total per mint —
+`(mint, total)` with `None` for native SOL, in deterministic order
+(`None` first, then mints in ascending byte order) — because
+`total_locked` mixes lamports and SPL base units into one number, so a
+multi-mint fleet cannot read its per-currency lockup off it. Every
+mint present in the fleet appears, even one whose remaining total is
+`0` (a fully released escrow still reports its mint). `to_json()`
+renders it as `"locked_by_mint":[{"mint":null,"total_locked":"..."},
+{"mint":"<lowercase hex>","total_locked":"..."}]`.
+
 ## Close sweep (AV-40)
 
 Terminal-state vaults (`Cancelled` / `Released` / `Settled` / `Split` — AV-81) have
