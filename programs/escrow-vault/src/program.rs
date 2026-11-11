@@ -5399,6 +5399,65 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the protocol fee rate and ceiling after funding (AV-401;
+    /// mirrors `Escrow::amend_protocol_fee`). Unconditional
+    /// dual-signature governance: both initializer and taker sign —
+    /// one party alone cannot raise the fee on the other's
+    /// payouts. `Funded` only — the builder owns the initial fee
+    /// terms. A paused escrow fails fast (`Paused`, before the
+    /// authority gate). `fee_bps > 10_000` is `InvalidProtocolFee`
+    /// (code 114), as is amending a tiered-schedule escrow (the flat
+    /// rate and the schedule are mutually exclusive). Both legs are
+    /// set atomically in one call and a failed amendment leaves both
+    /// untouched. No delay path covers this method —
+    /// `GovernanceAction` has no `AmendProtocolFee` variant, so the
+    /// direct call is the only entry point. Emits
+    /// `ProtocolFeeAmended` (from == to == the current state) only
+    /// on an actual change; a same-fee no-op stays silent
+    /// (mirrors `rotate_taker`).
+    pub fn amend_protocol_fee(
+        ctx: Context<AmendProtocolFee>,
+        fee_bps: u16,
+        fee_cap: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = (escrow.fee_bps(), escrow.fee_cap());
+        escrow
+            .amend_protocol_fee(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                fee_bps,
+                fee_cap,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `fee_bps` / `fee_cap` tail fields in place in
+        // the real build (the fee tail region is always present,
+        // zeroed when unconfigured) — no realloc. Only the rate and
+        // cap move; the state is untouched.
+        // Emits only on an actual change; a same-fee no-op stays
+        // silent (mirrors `rotate_taker`).
+        if (escrow.fee_bps(), escrow.fee_cap()) != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ProtocolFeeAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Update the payout destination denylist (AV-96; mirrors
     /// `Escrow::update_payout_denylist`). Initializer-signature-alone
     /// governance (unlike `update_payout_allowlist`'s dual-signature
@@ -8958,6 +9017,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::amend_arbiter_fee`). Mirrors
     /// `escrow_state::EscrowEventKind::ArbiterFeeAmended`.
     ArbiterFeeAmended,
+    /// AV-401: the protocol fee rate and ceiling were revised by
+    /// owner governance (`Escrow::amend_protocol_fee`). Mirrors
+    /// `escrow_state::EscrowEventKind::ProtocolFeeAmended`.
+    ProtocolFeeAmended,
     /// AV-52: the taker (payout counterparty) was rotated by
     /// dual-signed governance (`Escrow::rotate_taker`). Mirrors
     /// `escrow_state::EscrowEventKind::TakerRotated`.
@@ -9205,6 +9268,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
             EscrowVaultEventKind::PayoutSplitSharesAmended
         }
         escrow_state::EscrowEventKind::ArbiterFeeAmended => EscrowVaultEventKind::ArbiterFeeAmended,
+        escrow_state::EscrowEventKind::ProtocolFeeAmended => {
+            EscrowVaultEventKind::ProtocolFeeAmended
+        }
         escrow_state::EscrowEventKind::TakerRotated => EscrowVaultEventKind::TakerRotated,
         escrow_state::EscrowEventKind::InitializerRotated => {
             EscrowVaultEventKind::InitializerRotated
@@ -11648,6 +11714,21 @@ pub struct AmendPayoutSplitShares<'info> {
 /// enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendArbiterFee<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-401: accounts for `amend_protocol_fee` — the
+/// protocol-fee revision is unconditional dual-signature
+/// governance: both initializer and taker sign (the state machine
+/// enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendProtocolFee<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

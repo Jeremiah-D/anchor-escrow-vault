@@ -40423,6 +40423,31 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "flat_lamports/fee_bps <- params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed; the builder owns the initial fee terms); no delay path covers this method — GovernanceAction has no AmendArbiterFee variant, so the direct call is the only entry point and no delayed handler is staged; fee_bps > 10_000 is InvalidArbiterFee (code 198); both legs are set atomically in one call and a failed amendment leaves both untouched (the valid flat leg in a bad-bps call does not move); a 0 leg clears that leg, so (0, 0) disables the fee; re-affirming the current fee is a no-op (succeeds, writes nothing, emits no event); only the fee legs change — the arbiter binding, the locked amount, and the state are untouched, so the new fee governs from the next dispute settlement (arbiter_fee_for reads the live fields at every call: the flat + floor(net * bps / 10_000) deduction prices the next resolve / panel settlement / default judgment at the new rate while a dispute already settled keeps the fee deducted at its own settlement); emits the ArbiterFeeAmended indexer event only on an actual change (from == to == the current state); the arbiter-fee tail region is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-401: revise the protocol fee rate and ceiling after
+            // funding — the program-level entry point for the AV-233
+            // pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_protocol_fee")[..8] =
+            // [43, 7, 216, 146, 164, 200, 97, 121] — the Anchor
+            // instruction discriminator for the
+            // amend_protocol_fee handler (pinned by the
+            // discriminator test below).
+            name: "amend_protocol_fee",
+            params: &[
+                (
+                    "fee_bps",
+                    "u16",
+                    "instruction param; the new protocol fee rate in basis points — fee_bps > 10_000 is InvalidProtocolFee (code 114)",
+                ),
+                (
+                    "fee_cap",
+                    "u64",
+                    "instruction param; the new per-payout protocol fee ceiling in lamports — 0 means uncapped, the same convention as with_fee_cap",
+                ),
+            ],
+            method: "Escrow::amend_protocol_fee",
+            input_mapping: "fee_bps/fee_cap <- params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed; the builder owns the initial fee terms); no delay path covers this method — GovernanceAction has no AmendProtocolFee variant, so the direct call is the only entry point and no delayed handler is staged; fee_bps > 10_000 is InvalidProtocolFee (code 114); a configured tiered schedule rejects the amendment outright (InvalidProtocolFee, code 114 — the flat rate and the schedule are mutually exclusive, and protocol_fee_for prices from the schedule whenever one is configured, so a flat amendment there would be silently discarded); both legs are set atomically in one call and a failed amendment leaves both untouched; re-affirming the current rate and cap is a no-op (succeeds, writes nothing, emits no event); only the rate and cap change — the fee recipient, the locked amount, and the state are untouched, so the new rate governs from the next taker payout (protocol_fee_for reads the live fields at every call: the rate floored by the cap prices the next claim / release / release_milestone / resolve taker share / release_period at the new rate while fees already charged are never repriced); emits the ProtocolFeeAmended indexer event only on an actual change (from == to == the current state); the fee_bps / fee_cap tail fields are rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-109: opt in to the dead-man's switch at initialize
             // time. IDL: discriminator =
             // sha256("global:initialize_deadman_switch")[..8] = [227,
@@ -41408,6 +41433,9 @@ pub(crate) mod anchor_idl_tests {
             // AV-400: the program-level arbiter-fee revision (the
             // AV-235 pure-logic revision wired to the chain).
             "Escrow::amend_arbiter_fee",
+            // AV-401: the program-level protocol-fee revision (the
+            // AV-233 pure-logic revision wired to the chain).
+            "Escrow::amend_protocol_fee",
             // AV-109: dead-man's switch — declare the inactivity
             // threshold + heir pre-fund, then the heir reclaims the
             // remaining locked funds once the inactivity window
@@ -41733,6 +41761,11 @@ pub(crate) mod anchor_idl_tests {
                 // accounts.initializer + accounts.taker (BOTH signers,
                 // unconditional); no delay path covers it.
                 &"amend_arbiter_fee",
+                // AV-401: the post-funding protocol-fee revision
+                // carries the new rate (u16) + cap (u64); authority
+                // <- accounts.initializer + accounts.taker (BOTH
+                // signers, unconditional); no delay path covers it.
+                &"amend_protocol_fee",
                 // AV-109: the deadman opt-in carries the inactivity
                 // threshold (u64) + the heir (Pubkey); the heir's
                 // claim is param-less (the config pins everything,
@@ -45320,6 +45353,165 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!((payout, fee, refund), (989_000, 0, 0));
     }
 
+    // ----- AV-401: post-funding protocol-fee amendment -----
+
+    fn protocol_fee_funded_escrow() -> Escrow {
+        // AV-401 helper: a funded escrow with a protocol fee
+        // configured — the same shape the AV-233 pure-logic tests
+        // build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(500)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_protocol_fee_maps_params_to_fee_fields() {
+        // IDL: amend_protocol_fee(fee_bps: u16, fee_cap: u64)
+        // — fee_bps/fee_cap <- params (the handler's two
+        // instruction args); authority <- accounts.initializer +
+        // accounts.taker (BOTH signers, unconditional dual-signature
+        // governance enforced by the state machine). The params
+        // rewrite the same vault fields the `with_protocol_fee` /
+        // `with_fee_cap` builders populate (see PARAM_FIELD_MAP) —
+        // no layout change.
+        let mut e = protocol_fee_funded_escrow();
+        assert_eq!(e.fee_bps(), 500);
+        assert_eq!(e.fee_cap(), 0);
+        assert_eq!(e.protocol_fee_for(1_000_000), 50_000);
+        // Both legs move in one call: 10% floored by the 15,000 cap.
+        e.amend_protocol_fee(ALICE, BOB, 1_000, 15_000).unwrap();
+        assert_eq!(e.fee_bps(), 1_000, "rate leg revised");
+        assert_eq!(e.fee_cap(), 15_000, "cap leg revised");
+        assert_eq!(e.protocol_fee_for(1_000_000), 15_000);
+        assert_eq!(e.amount(), 1_000_000, "locked amount untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_protocol_fee_rejects_stranger_and_single_signer() {
+        // Unconditional dual signature: one party alone, or a
+        // stranger, is Unauthorized — one party alone cannot raise
+        // the fee on the other's payouts.
+        let mut e = protocol_fee_funded_escrow();
+        assert_eq!(
+            e.amend_protocol_fee(ALICE, ALICE, 1_000, 15_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_protocol_fee(MALLORY, BOB, 1_000, 15_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_protocol_fee(MALLORY, MALLORY, 1_000, 15_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.fee_bps(), 500, "failed revisions write nothing");
+        assert_eq!(e.fee_cap(), 0);
+    }
+
+    #[test]
+    fn amend_protocol_fee_rejects_non_funded() {
+        // Funded-only: the Uninitialized builder owns the initial
+        // fee terms, and a disputed escrow's fee is fixed —
+        // pricing in flight must not move.
+        let mut fresh = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(500)
+            .unwrap();
+        assert_eq!(
+            fresh.amend_protocol_fee(ALICE, BOB, 1_000, 15_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(fresh.fee_bps(), 500);
+        assert_eq!(fresh.fee_cap(), 0);
+    }
+
+    #[test]
+    fn amend_protocol_fee_rejects_bad_bps_and_leaves_live_untouched() {
+        // Past 100% is not a rate — and atomicity means the valid
+        // cap leg in the same call does NOT move either: a failed
+        // amendment leaves both legs untouched, never half old,
+        // half new.
+        assert_eq!(EscrowError::InvalidProtocolFee.code(), 114);
+        let mut e = protocol_fee_funded_escrow();
+        assert_eq!(
+            e.amend_protocol_fee(ALICE, BOB, 10_001, 15_000),
+            Err(EscrowError::InvalidProtocolFee)
+        );
+        assert_eq!(e.fee_bps(), 500, "live rate untouched");
+        assert_eq!(e.fee_cap(), 0, "live cap untouched");
+        assert_eq!(e.protocol_fee_for(1_000_000), 50_000);
+    }
+
+    #[test]
+    fn amend_protocol_fee_rejects_configured_schedule_and_leaves_live_untouched() {
+        // A tiered schedule owns the rate: a flat amendment here
+        // would be silently discarded by `protocol_fee_for`, so it
+        // fails — and the schedule itself is untouched.
+        let mut scheduled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_schedule(&[(0, 500)])
+            .unwrap();
+        scheduled.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            scheduled.amend_protocol_fee(ALICE, BOB, 1_000, 15_000),
+            Err(EscrowError::InvalidProtocolFee)
+        );
+        assert_eq!(scheduled.fee_schedule().tier_count, 1);
+        assert_eq!(scheduled.fee_bps(), 0);
+        assert_eq!(scheduled.fee_cap(), 0);
+    }
+
+    #[test]
+    fn amend_protocol_fee_same_fee_is_noop() {
+        // Re-affirming the current rate and cap is a no-op: it
+        // succeeds and changes nothing observable, so the event
+        // layer emits nothing for it (the indexed test in events.rs
+        // pins the emission on a real change).
+        let mut e = protocol_fee_funded_escrow();
+        let before = (e.fee_bps(), e.fee_cap());
+        e.amend_protocol_fee(ALICE, BOB, 500, 0).unwrap();
+        assert_eq!((e.fee_bps(), e.fee_cap()), before);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    fn protocol_fee_vesting_escrow() -> Escrow {
+        // AV-401 helper: a funded escrow with a protocol fee and a
+        // vesting schedule, so the taker's `claim` pull path is live
+        // — `claim` on a schedule-less escrow is `InvalidVesting`,
+        // and the whole lockup vests by EXPIRES_AT - 2_600.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(500)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(EXPIRES_AT - 3_600, EXPIRES_AT - 2_600).unwrap())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_protocol_fee_revision_prices_next_claim() {
+        // A claim made AFTER the amendment prices at the new rate
+        // floored by the new cap: 10% of 1,000,000 floored at
+        // 15,000, so the taker nets 985,000 — while a claim settled
+        // before any amendment keeps the fee charged at its own
+        // settlement (5% = 50,000, taker nets 950,000). The
+        // amendment itself charges nothing.
+        let mut before = protocol_fee_vesting_escrow();
+        let (payout, fee) = before.claim(BOB, EXPIRES_AT - 1_800, None, BOB).unwrap();
+        assert_eq!((payout, fee), (950_000, 50_000));
+        let mut later = protocol_fee_vesting_escrow();
+        later.amend_protocol_fee(ALICE, BOB, 1_000, 15_000).unwrap();
+        assert_eq!(later.fees_paid(), 0, "amendment charges nothing");
+        let (payout, fee) = later.claim(BOB, EXPIRES_AT - 1_800, None, BOB).unwrap();
+        assert_eq!((payout, fee), (985_000, 15_000));
+        assert_eq!(later.fees_paid(), 15_000);
+    }
+
     // ----- AV-49: payout destination allowlist enforcement -----
 
     #[test]
@@ -46507,6 +46699,15 @@ pub(crate) mod anchor_idl_tests {
         // source. Both legs move atomically; a 0 leg clears that leg.
         ("amend_arbiter_fee", "flat_lamports", "arbiter_fee_flat"),
         ("amend_arbiter_fee", "fee_bps", "arbiter_fee_bps"),
+        // AV-401: the post-funding rate/cap revision rewrites the same
+        // tail fields in place — a second param source for
+        // `fee_bps` / `fee_cap`, like `amend_arbiter_fee`'s legs. The
+        // fields' initial values come from the
+        // `initialize_protocol_fee` / `initialize_fee_cap` params
+        // (Uninitialized only); this entry documents the revision
+        // source. Both legs move atomically; a 0 cap means uncapped.
+        ("amend_protocol_fee", "fee_bps", "fee_bps"),
+        ("amend_protocol_fee", "fee_cap", "fee_cap"),
         // AV-109: the deadman opt-in populates the
         // `deadman_inactivity_secs` / `deadman_heir` tail fields
         // (Uninitialized only); the region is zeroed by `initialize`
@@ -81458,6 +81659,30 @@ mod arbiter_panel_tests {
             .collect();
         assert!(names.contains(&&"initialize_arbiter_fee"));
         assert!(names.contains(&&"amend_arbiter_fee"));
+    }
+
+    #[test]
+    fn protocol_fee_instruction_discriminators_are_pinned() {
+        // AV-17 / AV-401: IDL: sha256("global:<name>")[..8] — the
+        // Anchor instruction discriminator, pinned here and in the
+        // generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("initialize_protocol_fee"),
+            [60, 79, 173, 116, 35, 243, 151, 134]
+        );
+        // AV-401: the post-funding rate/cap revision's discriminator,
+        // pinned the same way.
+        assert_eq!(
+            instruction_discriminator("amend_protocol_fee"),
+            [43, 7, 216, 146, 164, 200, 97, 121]
+        );
+        // And the INSTRUCTIONS table carries both specs.
+        let names: Vec<&&str> = crate::anchor_idl_tests::INSTRUCTIONS
+            .iter()
+            .map(|s| &s.name)
+            .collect();
+        assert!(names.contains(&&"initialize_protocol_fee"));
+        assert!(names.contains(&&"amend_protocol_fee"));
     }
 
     #[test]
