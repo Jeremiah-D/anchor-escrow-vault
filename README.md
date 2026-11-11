@@ -204,6 +204,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_emergency_unlock()`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opts into dual-signed emergency timelock-unlock governance) |
 | `emergency_unlock(initializer, taker)`       | `Funded`       | `Funded` (no state change) | **both** parties must sign (dual-signature governance; one party alone is `Unauthorized`); requires the opt-in and an active timelock (`InvalidStateTransition` otherwise); clears the timelock (`timelock`, or the AV-64 relative lock) to `0` so payouts become immediately eligible — state and amounts untouched; emits `EmergencyUnlock` |
 | `disable_emergency_unlock(initializer, taker)` (AV-405) | `Funded` | `Funded` (no state change) | **both** parties must sign (dual-signature governance — the escape hatch is jointly owned, so one party alone closing it is `Unauthorized`); check order — pause → dual-signature (`Unauthorized`, code 100) → `Funded`-only (`InvalidStateTransition`, code 101); **one-way** — the flag flips to `false` in place and there is no post-funding opt-in (installing the escape hatch after funding would rewrite the deal the taker accepted); an already-disabled escrow (including one that never opted in) is a silent no-op success that writes nothing and emits nothing; the AV-27/AV-64 timelocks themselves, the state, and all amounts are untouched; after disabling, `emergency_unlock` refuses with `InvalidStateTransition`; emits `EmergencyUnlockDisabled` except on the no-op |
+| `waive_delivery_confirmation(initializer, taker)` (AV-406) | `Funded` / `Disputed` | `Funded` / `Disputed` (no state change) | **both** parties must sign (dual-signature governance — the gate protects the initializer, the confirmation fact is the taker's to assert, so one party alone waiving it is `Unauthorized`); check order — pause → dual-signature (`Unauthorized`, code 100) → `Funded`/`Disputed`-only (`InvalidStateTransition`, code 101); **treated as confirmed, gate config untouched** — only the `delivery_confirmed` fact flips, the `delivery_confirmation` gate flag never moves, so `release` / `claim` / `release_milestone_partial` settle without `confirm_delivery` while the escrow still reads as a gated deal; an already-confirmed escrow is a silent no-op success that writes nothing and emits nothing; milestones, subscriptions, amounts, and state are untouched; emits `DeliveryConfirmationWaived` (discriminant 171), distinct from `DeliveryConfirmed` (86), except on the no-op |
 | `initialize_decimals(decimals)`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `decimals` is the SPL mint's decimal places — SPL mints declare at most 9, `> 18` is rejected; `0` = no decimal metadata; display-only, never gates a transition or moves funds) |
 | `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; AV-104: a live CANCEL-scoped operator may call for the initializer instead (the `refund_to` pin is unchanged — delegation never reroutes funds); `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
 | `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); AV-104: a live CANCEL-scoped operator may also call (either party's grant — the refund routing is unchanged); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
@@ -2587,6 +2588,11 @@ successful calls that change nothing observable:
   no extra field) only when the flag actually flips — an
   already-disabled escrow (including one that never opted in) is a
   silent no-op that emits nothing.
+- `waive_delivery_confirmation` (AV-406) emits `DeliveryConfirmationWaived`
+  (`from == to ==` the current state, zeroed amounts — waiving moves
+  no funds; the new fact is read from the vault, so the event carries
+  no extra field) only when the fact actually flips — an
+  already-confirmed escrow is a silent no-op that emits nothing.
 - `release_basket` / `cancel_basket` / `cancel_expired_basket` (AV-95b)
   emit `BasketReleased` / `BasketCancelled` / `BasketExpiredCancelled`
   per settled leg (`from == Funded`, `to == Funded` while legs remain,
@@ -9431,6 +9437,26 @@ two appended vault tail bytes (`delivery_confirmation`,
 `delivery_confirmed`), so `ESCROW_BODY_LEN` grows 7655 → 7657 and
 `VAULT_SPACE` 7663 → 7665 (rent-exempt 54_225_360 → 54_239_280
 lamports); earlier field offsets are untouched.
+
+**Waiving delivery confirmation (AV-406).** When the taker is
+unreachable or refuses to click confirm while both sides agree the
+goods arrived, the initializer and the taker can jointly waive the
+gate: `waive_delivery_confirmation(initializer, taker)` records the
+delivery as confirmed, so `release`, `claim`, and
+`release_milestone_partial` settle without a `confirm_delivery`
+call. Both parties must sign (the gate protects the initializer,
+the confirmation fact is the taker's to assert — each holds half a
+veto), the escrow must be `Funded` or `Disputed`, and a paused
+escrow fails fast; waiving an already-confirmed escrow is a silent
+no-op success that emits nothing. The waiver is *treated as
+confirmed, gate config untouched*: it flips only the
+`delivery_confirmed` fact, never the `delivery_confirmation` gate
+flag, so the escrow still reads as a gated deal whose delivery was
+confirmed by consensus rather than by the taker's own call — the
+gate is not dismantled. The `DeliveryConfirmationWaived` event
+(discriminant 171) is a distinct kind from `DeliveryConfirmed`
+(86), so indexers can tell a taker confirmation apart from a
+dual-signed waiver.
 
 ## Per-call release cap (AV-205)
 

@@ -13570,6 +13570,55 @@ let fee = self.charge_protocol_fee(net_amount)?;
         Ok(())
     }
 
+    /// Waive the delivery-confirmation gate by mutual agreement
+    /// (AV-406): both parties sign that delivery is complete, so the
+    /// gate is treated as confirmed and the three payout paths may
+    /// settle without the taker's [`Escrow::confirm_delivery`]. The
+    /// waiver records the confirmation *fact*
+    /// (`delivery_confirmed = true`); the gate configuration
+    /// (`delivery_confirmation`) is left untouched — waiving is not
+    /// dismantling the gate, so the escrow still reads as a gated
+    /// deal whose delivery was confirmed by consensus rather than
+    /// by the taker's own call. The gate protects the initializer
+    /// (no payout before confirmation) and the confirmation fact
+    /// is the taker's to assert, so each party holds half a veto:
+    /// a stranger or a single party is [`EscrowError::Unauthorized`].
+    /// `Funded` or `Disputed` only, paralleling
+    /// `confirm_delivery`'s state window. Idempotent: waiving an
+    /// already-confirmed escrow is a no-op success — the
+    /// [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits the
+    /// `DeliveryConfirmationWaived` event only on the first
+    /// transition, like `confirm_delivery`'s `DeliveryConfirmed`.
+    ///
+    /// Check order is pause → dual-signature → state, mirroring
+    /// [`Escrow::disable_emergency_unlock`].
+    pub fn waive_delivery_confirmation(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Both parties must sign: the gate protects the initializer
+        // and the confirmation fact is the taker's to assert, so
+        // either key alone (or a stranger) is Unauthorized.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded | EscrowState::Disputed => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // No-op: already confirmed (by the taker, or by an earlier
+        // waiver) — waiving again writes nothing, so the event
+        // layer stays silent.
+        if self.delivery_confirmed {
+            return Ok(());
+        }
+        self.delivery_confirmed = true;
+        Ok(())
+    }
+
     /// Opt into the delivery-confirmation deadline (AV-216): once
     /// set, a timed confirmation after this timestamp records the
     /// escrow late (see [`Escrow::confirm_delivery_at`]), and the
@@ -57470,7 +57519,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
     }
 
     #[test]
@@ -71818,7 +71868,264 @@ mod emergency_unlock_tests {
             EscrowEventKind::from_name("emergency_unlock_disabled"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(171), None);
+        assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
+        assert_eq!(EscrowEventKind::from_discriminant(172), None);
+    }
+}
+
+// ---------- AV-406: dual-signed delivery-confirmation waiver ----------
+//
+// Both parties can sign that delivery is complete, so the gate is
+// treated as confirmed without the taker's `confirm_delivery` —
+// for a taker who is unreachable or refuses to click confirm while
+// both sides agree the goods arrived.
+#[cfg(test)]
+mod waive_delivery_confirmation_tests {
+    use super::*;
+    use crate::events::{EscrowEventKind, IndexedEscrow};
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ARBITER: [u8; 32] = [0xA8; 32]; // dispute arbiter
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const ESCROW_ID: [u8; 32] = [0xE5; 32];
+
+    fn funded_with_delivery_confirmation() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_delivery_confirmation()
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    /// The claim-test escrow: `claim` prices through a vesting
+    /// schedule (`InvalidVesting` without one), so the claim path
+    /// needs a fully-vested linear schedule — and the disputed
+    /// variant needs an arbiter for `escalate`. The schedule ends
+    /// (1_750_000_000) before any claim `now`, so the full amount
+    /// is vested when the claim runs.
+    fn funded_vested_with_delivery_confirmation() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_delivery_confirmation()
+            .unwrap()
+            .with_vesting(VestingSchedule::new(1_700_000_000, 1_750_000_000).unwrap())
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn indexed_funded_with_delivery_confirmation() -> IndexedEscrow {
+        let mut ie = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, 0)
+            .unwrap()
+            .with_delivery_confirmation()
+            .unwrap();
+        ie.fund(ALICE, 0).unwrap();
+        ie
+    }
+
+    #[test]
+    fn stranger_and_single_party_cannot_waive_and_confirmation_unchanged() {
+        // AV-406: the gate protects the initializer and the
+        // confirmation fact is the taker's to assert — each party
+        // holds half a veto, so a stranger or a single party is
+        // Unauthorized and the failed call confirms nothing.
+        let mut e = funded_with_delivery_confirmation();
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.waive_delivery_confirmation(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert!(e.delivery_confirmation(), "gate config untouched");
+        assert!(!e.delivery_confirmed(), "rejected waiver confirms nothing");
+        assert_eq!(
+            e.release(ALICE, EXPIRES_AT - 3_600, 1_000_000, None, BOB),
+            Err(EscrowError::DeliveryNotConfirmed),
+            "gate still shut after refused waivers"
+        );
+    }
+
+    #[test]
+    fn waive_is_funded_or_disputed_only() {
+        // AV-406: the waiver opens a live payout, so it shares
+        // `confirm_delivery`'s Funded/Disputed window — before
+        // funding there is nothing to waive, and a terminal escrow
+        // has no payout left to open.
+        let mut unfunded = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_delivery_confirmation()
+            .unwrap();
+        assert_eq!(
+            unfunded.waive_delivery_confirmation(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert!(!unfunded.delivery_confirmed(), "refused waiver writes nothing");
+        // Terminal states refuse too: nothing is locked anymore.
+        let mut e = funded_with_delivery_confirmation();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.waive_delivery_confirmation(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(!e.delivery_confirmed());
+    }
+
+    #[test]
+    fn waive_refused_while_paused() {
+        // AV-406: pause first (AV-46) — a paused escrow fails fast,
+        // before the dual-signature check.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_delivery_confirmation()
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause(ALICE, None).unwrap();
+        assert_eq!(
+            e.waive_delivery_confirmation(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert!(!e.delivery_confirmed(), "paused waiver writes nothing");
+        e.unpause(ALICE).unwrap();
+        e.waive_delivery_confirmation(ALICE, BOB).unwrap();
+        assert!(e.delivery_confirmed());
+    }
+
+    #[test]
+    fn waiver_opens_release_without_confirm_delivery() {
+        // AV-406: the waiver is the consensus settlement road —
+        // after it, `release` settles with no taker confirmation
+        // call, and the gate config still reads as installed.
+        let mut e = funded_with_delivery_confirmation();
+        assert_eq!(
+            e.release(ALICE, EXPIRES_AT - 3_600, 1_000_000, None, BOB),
+            Err(EscrowError::DeliveryNotConfirmed),
+            "gate shut before the waiver"
+        );
+        e.waive_delivery_confirmation(ALICE, BOB).unwrap();
+        assert!(e.delivery_confirmation(), "waiver leaves the gate config in place");
+        assert!(e.delivery_confirmed(), "waiver records the confirmation fact");
+        e.release(ALICE, EXPIRES_AT - 3_600, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn waiver_opens_claim_too() {
+        // AV-406: `claim` is the second gated payout path — the
+        // waiver opens it exactly like `release`.
+        let mut e = funded_vested_with_delivery_confirmation();
+        assert_eq!(
+            e.claim(BOB, EXPIRES_AT - 1_800, None, BOB),
+            Err(EscrowError::DeliveryNotConfirmed),
+            "gate shut before the waiver"
+        );
+        e.waive_delivery_confirmation(ALICE, BOB).unwrap();
+        let (payout, _fee) = e.claim(BOB, EXPIRES_AT - 1_800, None, BOB).unwrap();
+        assert!(payout > 0, "claim settles after the waiver");
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn waiver_in_disputed_state_opens_claim_of_undisputed_remainder() {
+        // AV-406: the waiver shares `confirm_delivery`'s
+        // Funded/Disputed window — a partial dispute (AV-131)
+        // leaves the undisputed remainder claimable once waived.
+        let mut e = funded_vested_with_delivery_confirmation();
+        e.escalate(ALICE, EXPIRES_AT - 1, 400_000, None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(e.disputed_amount(), 400_000);
+        e.waive_delivery_confirmation(ALICE, BOB).unwrap();
+        assert!(e.delivery_confirmed());
+        let (payout, _fee) = e.claim(BOB, EXPIRES_AT - 1_800, None, BOB).unwrap();
+        assert!(payout > 0, "undisputed remainder claims after the waiver");
+        assert_eq!(e.state(), EscrowState::Disputed, "disputed pool stays locked");
+    }
+
+    #[test]
+    fn waiving_after_confirmation_is_a_silent_noop() {
+        // AV-406: waiving an already-confirmed escrow writes
+        // nothing and emits nothing — the `confirm_delivery`
+        // idempotency precedent. That covers both a taker
+        // confirmation and a second waiver after a successful
+        // first one.
+        let mut e = funded_with_delivery_confirmation();
+        e.confirm_delivery(BOB).unwrap();
+        e.waive_delivery_confirmation(ALICE, BOB).unwrap();
+        assert!(e.delivery_confirmed());
+
+        let mut ie = indexed_funded_with_delivery_confirmation();
+        ie.confirm_delivery(BOB, 42).unwrap();
+        let _ = ie.drain_events();
+        ie.waive_delivery_confirmation(ALICE, BOB, 43).unwrap();
+        assert_eq!(ie.event_count(), 0, "waiver after confirmation emits nothing");
+
+        let mut ie2 = indexed_funded_with_delivery_confirmation();
+        let _ = ie2.drain_events();
+        ie2.waive_delivery_confirmation(ALICE, BOB, 42).unwrap();
+        assert_eq!(ie2.event_count(), 1, "first waiver emits once");
+        ie2.waive_delivery_confirmation(ALICE, BOB, 43).unwrap();
+        assert_eq!(ie2.event_count(), 1, "second waiver emits nothing");
+    }
+
+    #[test]
+    fn successful_waiver_emits_once() {
+        // AV-406: the waiver flips only the confirmation fact and
+        // the event layer records the governance decision — a
+        // distinct kind from `DeliveryConfirmed` so indexers can
+        // tell a taker confirmation apart from a dual-signed
+        // waiver.
+        let mut ie = indexed_funded_with_delivery_confirmation();
+        let _ = ie.drain_events();
+        ie.waive_delivery_confirmation(ALICE, BOB, 42).unwrap();
+        let events = ie.drain_events();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EscrowEventKind::DeliveryConfirmationWaived);
+        assert_eq!(ev.from, EscrowState::Funded);
+        assert_eq!(ev.to, EscrowState::Funded);
+        assert_eq!(ev.at, 42);
+        assert_eq!((ev.amounts.payout, ev.amounts.fee), (0, 0));
+        assert!(ie.inner().delivery_confirmation(), "gate config untouched");
+        assert!(ie.inner().delivery_confirmed(), "fact recorded");
+    }
+
+    #[test]
+    fn waiver_touches_nothing_else() {
+        // AV-406: the waiver is a one-fact flip — no milestone,
+        // subscription, amount, or state moves with it.
+        let mut e = funded_with_delivery_confirmation();
+        e.waive_delivery_confirmation(ALICE, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded, "state untouched");
+        assert_eq!(e.amount(), 1_000_000, "amount untouched");
+        assert_eq!(
+            (e.released_amount(), e.remaining_amount()),
+            (0, 1_000_000),
+            "amounts untouched"
+        );
+        assert!(e.milestone_plan().is_none(), "no milestone plan appears");
+        assert!(
+            e.subscription_schedule().is_none(),
+            "no subscription appears"
+        );
+        assert!(e.delivery_confirmation(), "gate config untouched");
+        assert!(e.delivery_confirmed(), "fact recorded");
     }
 }
 
@@ -77411,7 +77718,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived)); // AV-406: 171 is DeliveryConfirmationWaived
+        assert_eq!(EscrowEventKind::from_discriminant(172), None); // AV-406: 171 is DeliveryConfirmationWaived
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -77664,9 +77972,10 @@ mod event_history_tests {
         // `MintAllowlistUpdated` (AV-390), 168 is
         // `InsurancePoolAmended` (AV-394), 169 is
         // `ReleaseIntentsRevoked` (AV-404), 170 is
-        // `EmergencyUnlockDisabled` (AV-405) and 171 is the
+        // `EmergencyUnlockDisabled` (AV-405), 171 is
+        // `DeliveryConfirmationWaived` (AV-406) and 172 is the
         // first still-unknown byte.
-        for bad in [171u8, 255] {
+        for bad in [172u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -81060,7 +81369,8 @@ mod release_via_intent_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(171), None);
+        assert_eq!(EscrowEventKind::from_discriminant(171), Some(EscrowEventKind::DeliveryConfirmationWaived));
+        assert_eq!(EscrowEventKind::from_discriminant(172), None);
     }
 
     #[test]

@@ -458,6 +458,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // flag flips, so the next emergency_unlock call reads the
         // live flag.
         | EscrowEventKind::EmergencyUnlockDisabled
+        // AV-406: a waived delivery confirmation moves no funds
+        // and never restates a release already settled — only the
+        // confirmation fact flips, so the next payout call reads
+        // the live fact.
+        | EscrowEventKind::DeliveryConfirmationWaived
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1485,6 +1490,11 @@ mod fee_history_tests {
         // flag flips, so the next emergency_unlock call reads the
         // live flag.
         | EscrowEventKind::EmergencyUnlockDisabled
+        // AV-406: a waived delivery confirmation moves no funds
+        // and never restates a release already settled — only the
+        // confirmation fact flips, so the next payout call reads
+        // the live fact.
+        | EscrowEventKind::DeliveryConfirmationWaived
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
