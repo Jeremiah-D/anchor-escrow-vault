@@ -203,6 +203,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_relative_timelock(secs)` (AV-64) | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `secs` is the duration in seconds after *funding* before which no taker payout may leave; `0` = no lock; mutually exclusive with the AV-27 absolute timelock — both nonzero is `InvalidTimelock`, code 135) |
 | `initialize_emergency_unlock()`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; opts into dual-signed emergency timelock-unlock governance) |
 | `emergency_unlock(initializer, taker)`       | `Funded`       | `Funded` (no state change) | **both** parties must sign (dual-signature governance; one party alone is `Unauthorized`); requires the opt-in and an active timelock (`InvalidStateTransition` otherwise); clears the timelock (`timelock`, or the AV-64 relative lock) to `0` so payouts become immediately eligible — state and amounts untouched; emits `EmergencyUnlock` |
+| `disable_emergency_unlock(initializer, taker)` (AV-405) | `Funded` | `Funded` (no state change) | **both** parties must sign (dual-signature governance — the escape hatch is jointly owned, so one party alone closing it is `Unauthorized`); check order — pause → dual-signature (`Unauthorized`, code 100) → `Funded`-only (`InvalidStateTransition`, code 101); **one-way** — the flag flips to `false` in place and there is no post-funding opt-in (installing the escape hatch after funding would rewrite the deal the taker accepted); an already-disabled escrow (including one that never opted in) is a silent no-op success that writes nothing and emits nothing; the AV-27/AV-64 timelocks themselves, the state, and all amounts are untouched; after disabling, `emergency_unlock` refuses with `InvalidStateTransition`; emits `EmergencyUnlockDisabled` except on the no-op |
 | `initialize_decimals(decimals)`             | `Uninitialized`| `Uninitialized` | initializer (once, before funding; `decimals` is the SPL mint's decimal places — SPL mints declare at most 9, `> 18` is rejected; `0` = no decimal metadata; display-only, never gates a transition or moves funds) |
 | `cancel(authority, refund_to)`               | `Funded`       | `Cancelled` | initializer; AV-104: a live CANCEL-scoped operator may call for the initializer instead (the `refund_to` pin is unchanged — delegation never reroutes funds); `refund_to` must equal the whitelisted address (or the initializer with no whitelist) — `RefundAddressMismatch` otherwise |
 | `cancel_expired(authority, now, refund_to)`  | `Funded`       | `Cancelled` | initializer **or** taker, only when `now >= expires_at + grace_period` (opt-in via `with_grace_period`, `0` by default); AV-104: a live CANCEL-scoped operator may also call (either party's grant — the refund routing is unchanged); the refund still goes to the whitelisted address even when the taker calls; returns `(refund, penalty)` — a taker-initiated cancel with `penalty_bps > 0` slices an anti-griefing penalty for the initializer (see below) |
@@ -517,6 +518,22 @@ untouched, and the `EmergencyUnlock` event (from == to == the current
 state) records the governance decision for indexers. Check order is
 authority → state → governance config, so a stranger learns nothing about
 the escrow's configuration from the error alone.
+
+**Disabling the emergency unlock (AV-405).** Once the deal moves into
+execution and neither party has a reason left to unlock early, both
+parties can shut the escape hatch for good: `disable_emergency_unlock(initializer, taker)`
+flips the opt-in flag to `false` in place. Both parties must sign (the
+hatch is jointly owned — one party alone closing it would strip the other
+of the early-unlock right), the escrow must be `Funded`, and a paused
+escrow fails fast; an already-disabled escrow — including one that never
+opted in — is a silent no-op success that emits nothing. The disable is
+one-way: there is no post-funding opt-in, because installing the escape
+hatch after the taker funded under the locked terms would rewrite the deal
+the taker accepted. The AV-27/AV-64 timelocks themselves are untouched, so
+a release after disabling still waits for the clock, and after disabling
+`emergency_unlock` refuses with `InvalidStateTransition`. The
+`EmergencyUnlockDisabled` event (from == to == the current state) records
+the decision for indexers.
 
 **Token decimals.** An escrow can declare its SPL mint's decimal places
 (`with_decimals(decimals)`, once, before funding; SPL mints declare at most
@@ -2564,6 +2581,12 @@ successful calls that change nothing observable:
   carries no extra field) only when the watermark actually rises — a
   cutoff at or below the live watermark is a silent no-op that emits
   nothing.
+- `disable_emergency_unlock` (AV-405) emits `EmergencyUnlockDisabled`
+  (`from == to ==` the current state, zeroed amounts — disabling moves
+  no funds; the new flag is read from the vault, so the event carries
+  no extra field) only when the flag actually flips — an
+  already-disabled escrow (including one that never opted in) is a
+  silent no-op that emits nothing.
 - `release_basket` / `cancel_basket` / `cancel_expired_basket` (AV-95b)
   emit `BasketReleased` / `BasketCancelled` / `BasketExpiredCancelled`
   per settled leg (`from == Funded`, `to == Funded` while legs remain,

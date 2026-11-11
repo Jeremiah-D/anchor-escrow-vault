@@ -29874,6 +29874,55 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Disable the emergency timelock-unlock governance (AV-405):
+    /// close the AV-41 escape hatch after funding, so the AV-27
+    /// timelock (or the AV-64 relative lock) can no longer be lifted
+    /// early by mutual agreement. One-way only — there is no
+    /// post-funding opt-in: installing the escape hatch after the
+    /// taker funded under the locked terms would rewrite the deal
+    /// the taker accepted, so it is a new transaction, not a
+    /// revision (the AV-263 precedent). The flag flips in place;
+    /// the timelocks themselves, the state, and all amounts are
+    /// untouched.
+    ///
+    /// Check order mirrors [`Escrow::amend_insurance_pool`]:
+    /// pause (`require_not_paused`, AV-46) first, then the
+    /// dual-signature check (the escape hatch belongs to both
+    /// parties — one party alone closing it would strip the other
+    /// of the early-unlock right, so a stranger or a single party
+    /// is [`EscrowError::Unauthorized`]), then `Funded`-only
+    /// ([`EscrowError::InvalidStateTransition`]). An already-disabled
+    /// escrow — including one that never opted in — is a silent
+    /// no-op success: it writes nothing, so the event layer emits
+    /// nothing for it (the `rotate_*` same-value no-op precedent).
+    /// After disabling, [`Escrow::emergency_unlock`] refuses with
+    /// `InvalidStateTransition` (its existing opt-in gate).
+    pub fn disable_emergency_unlock(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Both parties must sign: either key alone (or a stranger) is
+        // Unauthorized — the escape hatch is jointly owned, like
+        // `emergency_unlock` itself.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // No-op: already disabled (or never opted in) — closing a
+        // shut hatch writes nothing, so the event layer stays silent.
+        if !self.emergency_unlock {
+            return Ok(());
+        }
+        self.emergency_unlock = false;
+        Ok(())
+    }
+
     /// Opt in to token decimal metadata (AV-28). Builder-style: only
     /// valid on an `Uninitialized` escrow, so the precision is fixed
     /// before any funds move — mirroring [`Escrow::with_timelock`] and
@@ -57420,7 +57469,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -71538,6 +71588,238 @@ mod emergency_unlock_tests {
         );
         assert!(e2.drain_events().is_empty());
     }
+
+    fn funded_with_relative_timelock_and_governance() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_relative_timelock(86_400)
+            .unwrap()
+            .with_emergency_unlock()
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn stranger_and_single_party_cannot_disable_and_flag_unchanged() {
+        // AV-405: the escape hatch is jointly owned — one party
+        // alone closing it would strip the other of the early-unlock
+        // right, so a stranger or a single party is Unauthorized and
+        // the failed call moves nothing.
+        let mut e = funded_with_timelock_and_governance();
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_emergency_unlock(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert!(e.emergency_unlock_enabled(), "rejected disable changes nothing");
+        assert_eq!(e.unlock_at(), UNLOCK_AT, "rejected disable moves no lock");
+    }
+
+    #[test]
+    fn disable_is_funded_only() {
+        // AV-405: the hatch can only be shut once funds are locked —
+        // before funding the opt-in is still a builder decision.
+        let mut unfunded = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap()
+            .with_emergency_unlock()
+            .unwrap();
+        assert_eq!(
+            unfunded.disable_emergency_unlock(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert!(unfunded.emergency_unlock_enabled(), "refused disable writes nothing");
+        // Terminal states refuse too: nothing is locked anymore.
+        let mut e = funded_with_timelock_and_governance();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_emergency_unlock(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(e.emergency_unlock_enabled());
+    }
+
+    #[test]
+    fn disable_refused_while_paused() {
+        // AV-405: pause first (AV-46) — a paused escrow fails fast,
+        // before the dual-signature check.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap()
+            .with_emergency_unlock()
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.pause(ALICE, None).unwrap();
+        assert_eq!(
+            e.disable_emergency_unlock(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert!(e.emergency_unlock_enabled(), "paused disable writes nothing");
+        e.unpause(ALICE).unwrap();
+        e.disable_emergency_unlock(ALICE, BOB).unwrap();
+        assert!(!e.emergency_unlock_enabled());
+    }
+
+    #[test]
+    fn already_disabled_is_a_silent_noop() {
+        // AV-405: closing a shut hatch writes nothing and emits
+        // nothing — the `rotate_*` same-value no-op precedent. That
+        // covers both a never-opted-in escrow and a second disable
+        // after a successful first one.
+        let mut never_opted = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap();
+        never_opted.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        never_opted.disable_emergency_unlock(ALICE, BOB).unwrap();
+        assert!(!never_opted.emergency_unlock_enabled());
+        assert_eq!(never_opted.unlock_at(), UNLOCK_AT);
+
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, 0)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap()
+            .with_emergency_unlock()
+            .unwrap();
+        e.fund(ALICE, 0).unwrap();
+        let _ = e.drain_events();
+        e.disable_emergency_unlock(ALICE, BOB, 42).unwrap();
+        assert_eq!(e.event_count(), 1, "first disable emits once");
+        e.disable_emergency_unlock(ALICE, BOB, 43).unwrap();
+        assert_eq!(e.event_count(), 1, "second disable emits nothing");
+        assert!(!e.inner().emergency_unlock_enabled());
+    }
+
+    #[test]
+    fn successful_disable_clears_the_flag_and_emits() {
+        // AV-405: the disable flips the flag in place and the event
+        // layer records the governance decision.
+        let mut e = funded_with_timelock_and_governance();
+        assert!(e.emergency_unlock_enabled());
+        e.disable_emergency_unlock(ALICE, BOB).unwrap();
+        assert!(!e.emergency_unlock_enabled());
+
+        let mut ie = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, 0)
+            .unwrap()
+            .with_timelock(UNLOCK_AT)
+            .unwrap()
+            .with_emergency_unlock()
+            .unwrap();
+        ie.fund(ALICE, 0).unwrap();
+        let _ = ie.drain_events();
+        ie.disable_emergency_unlock(ALICE, BOB, 42).unwrap();
+        let events = ie.drain_events();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, EscrowEventKind::EmergencyUnlockDisabled);
+        assert_eq!(ev.from, EscrowState::Funded);
+        assert_eq!(ev.to, EscrowState::Funded);
+        assert_eq!(ev.at, 42);
+        assert_eq!((ev.amounts.payout, ev.amounts.fee), (0, 0));
+    }
+
+    #[test]
+    fn after_disable_emergency_unlock_refuses_and_locks_unchanged() {
+        // AV-405: once the hatch is shut, the dual-signed early
+        // unlock is dead — the existing opt-in gate refuses it, and
+        // the refusal moves neither lock.
+        let mut e = funded_with_timelock_and_governance();
+        e.disable_emergency_unlock(ALICE, BOB).unwrap();
+        assert_eq!(
+            e.emergency_unlock(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.unlock_at(), UNLOCK_AT, "absolute lock untouched");
+        assert_eq!(e.relative_timelock_secs(), 0);
+
+        let mut rel = funded_with_relative_timelock_and_governance();
+        rel.disable_emergency_unlock(ALICE, BOB).unwrap();
+        assert_eq!(
+            rel.emergency_unlock(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(rel.unlock_at(), 0);
+        assert_eq!(
+            rel.relative_timelock_secs(),
+            86_400,
+            "relative lock untouched"
+        );
+    }
+
+    #[test]
+    fn release_still_works_after_disabling() {
+        // AV-405: disabling only shuts the escape hatch — the
+        // timelock itself still governs, and a release at the lock
+        // settles exactly as before.
+        let mut e = funded_with_timelock_and_governance();
+        e.disable_emergency_unlock(ALICE, BOB).unwrap();
+        // Before the unlock timestamp the payout gate is still shut.
+        assert_eq!(
+            e.release(ALICE, UNLOCK_AT - 1, 1_000_000, None, BOB),
+            Err(EscrowError::TimelockNotReached)
+        );
+        e.release(ALICE, UNLOCK_AT, 1_000_000, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn disable_leaves_both_locks_and_state_untouched() {
+        // AV-405: the disable is a one-byte flag flip — the AV-27
+        // absolute lock, the AV-64 relative lock, the state, and the
+        // amounts are all untouched.
+        let mut e = funded_with_timelock_and_governance();
+        e.disable_emergency_unlock(ALICE, BOB).unwrap();
+        assert_eq!(e.unlock_at(), UNLOCK_AT);
+        assert_eq!(e.relative_timelock_secs(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            (e.released_amount(), e.remaining_amount()),
+            (0, 1_000_000),
+            "amounts untouched"
+        );
+
+        let mut rel = funded_with_relative_timelock_and_governance();
+        rel.disable_emergency_unlock(ALICE, BOB).unwrap();
+        assert_eq!(rel.unlock_at(), 0);
+        assert_eq!(rel.relative_timelock_secs(), 86_400);
+        assert_eq!(rel.state(), EscrowState::Funded);
+        assert_eq!(
+            (rel.released_amount(), rel.remaining_amount()),
+            (0, 1_000_000),
+            "amounts untouched"
+        );
+    }
+
+    #[test]
+    fn emergency_unlock_disabled_discriminant_is_pinned() {
+        // AV-405: discriminant 170, appended after
+        // ReleaseIntentsRevoked — 0–169 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::EmergencyUnlockDisabled;
+        assert_eq!(kind.discriminant(), 170);
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(kind));
+        assert_eq!(kind.name(), "emergency_unlock_disabled");
+        assert_eq!(
+            EscrowEventKind::from_name("emergency_unlock_disabled"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(171), None);
+    }
 }
 
 // ---------- AV-28: token decimal metadata ----------
@@ -77128,7 +77410,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -77380,9 +77663,10 @@ mod event_history_tests {
         // `ReferenceAmended` (AV-377), 167 is
         // `MintAllowlistUpdated` (AV-390), 168 is
         // `InsurancePoolAmended` (AV-394), 169 is
-        // `ReleaseIntentsRevoked` (AV-404) and 170 is the
+        // `ReleaseIntentsRevoked` (AV-404), 170 is
+        // `EmergencyUnlockDisabled` (AV-405) and 171 is the
         // first still-unknown byte.
-        for bad in [170u8, 255] {
+        for bad in [171u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -80775,7 +81059,8 @@ mod release_via_intent_tests {
             EscrowEventKind::from_name("release_intents_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(170), None);
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(171), None);
     }
 
     #[test]

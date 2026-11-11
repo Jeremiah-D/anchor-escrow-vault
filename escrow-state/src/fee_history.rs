@@ -453,6 +453,11 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // nonce watermark moves, so the next intent submission
         // reads the live watermark.
         | EscrowEventKind::ReleaseIntentsRevoked
+        // AV-405: a disabled emergency-unlock flag moves no funds
+        // and never restates a release already settled — only the
+        // flag flips, so the next emergency_unlock call reads the
+        // live flag.
+        | EscrowEventKind::EmergencyUnlockDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1475,6 +1480,11 @@ mod fee_history_tests {
         // nonce watermark moves, so the next intent submission
         // reads the live watermark.
         | EscrowEventKind::ReleaseIntentsRevoked
+        // AV-405: a disabled emergency-unlock flag moves no funds
+        // and never restates a release already settled — only the
+        // flag flips, so the next emergency_unlock call reads the
+        // live flag.
+        | EscrowEventKind::EmergencyUnlockDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices

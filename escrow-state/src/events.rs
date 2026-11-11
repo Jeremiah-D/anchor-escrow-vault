@@ -1030,6 +1030,7 @@
 //! | MintAllowlistUpdated (AV-390) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a funded binding; only the allowlist changes, so the bound mint is untouched, and the `with_mint` gate reads the live list at the next binding, so a mint removed here is refused at once while a mint added here binds from the next call |
 //! | InsurancePoolAmended (AV-394) | 0 | 0 | 0 | 0 — revising moves no funds and never restates settled pool accounting; only the opt-in flag changes, so the slash terms, the deadline, the locked amount, and the state are untouched, and the `slash` path reads the live flag at the next slash, so a slash after the flip routes to the pool (opted in) or to the penalty account (opted out) while a slash already settled keeps the routing it settled under |
 //! | ReleaseIntentsRevoked (AV-404) | 0 | 0 | 0 | 0 — revoking moves no funds and never restates a release already settled; only the `last_intent_nonce` watermark moves, so the intent path reads the live watermark at the next `release_via_intent` call — an intent at or below the watermark is refused with `IntentNonceReused` (code 182) while an intent above it releases as before, and an intent already consumed keeps the nonce it consumed under |
+//! | EmergencyUnlockDisabled (AV-405) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a release already settled; only the `emergency_unlock` flag flips, so the AV-27/AV-64 timelocks are untouched, and the `emergency_unlock` path reads the live flag at the next call — an unlock after the disable is refused with `InvalidStateTransition` (code 101) while a release after the disable proceeds under the live timelock, and a release already settled keeps the terms it settled under |
 //! | DutchAuctionReserveBpsAmended (AV-277) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a claim already priced; only the floor changes, so the window is untouched, and claim prices through the live floor at the next call, so a claim after the amendment prices against the new floor while a claim already settled keeps the cap it settled under |
 //! | SocialRecoveryThresholdAmended (AV-278) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the threshold changes, so the guardians, the guardian count and the timelock are untouched, and the recovery path compares the live approval count against the live threshold at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new threshold while a request already settled keeps the threshold it settled under |
 //! | SocialRecoveryTimelockAmended (AV-279) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the timelock changes, so the guardians, the guardian count and the threshold are untouched, and the recovery path compares the live timelock against the request's opening timestamp at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new veto window while a request already settled keeps the window it settled under |
@@ -3020,6 +3021,21 @@ pub enum EscrowEventKind {
     /// extra field. A no-op revocation (a cutoff at or below the
     /// live watermark) emits nothing.
     ReleaseIntentsRevoked,
+    /// AV-405: the AV-41 emergency timelock-unlock governance was
+    /// disabled after funding
+    /// ([`Escrow::disable_emergency_unlock`](crate::Escrow::disable_emergency_unlock)).
+    /// `from == to ==` the current state (a governance revision,
+    /// not a lifecycle move — like
+    /// [`EscrowEventKind::InsurancePoolAmended`]); all amounts are
+    /// zero — disabling moves no funds and never restates a release
+    /// already settled; only the `emergency_unlock` flag flips, so
+    /// the timelocks themselves are untouched while the next
+    /// `emergency_unlock` call is refused with
+    /// `InvalidStateTransition` (code 101). The new flag is read
+    /// from the vault, so the event needs no extra field. A no-op
+    /// disable (the hatch already shut, or never opted in) emits
+    /// nothing.
+    EmergencyUnlockDisabled,
 }
 
 impl EscrowEventKind {
@@ -3564,6 +3580,10 @@ impl EscrowEventKind {
             // histories.
             168 => Self::InsurancePoolAmended,
             169 => Self::ReleaseIntentsRevoked,
+            // AV-405: appended after ReleaseIntentsRevoked so
+            // discriminants 0–169 stay stable for already-serialized
+            // histories.
+            170 => Self::EmergencyUnlockDisabled,
             _ => return None,
         })
     }
@@ -3779,6 +3799,7 @@ impl EscrowEventKind {
             Self::MintAllowlistUpdated => "mint_allowlist_updated",
             Self::InsurancePoolAmended => "insurance_pool_amended",
             Self::ReleaseIntentsRevoked => "release_intents_revoked",
+            Self::EmergencyUnlockDisabled => "emergency_unlock_disabled",
             Self::SlashDeadlineAmended => "slash_deadline_amended",
             Self::AmountBoundsAmended => "amount_bounds_amended",
             Self::MilestoneLatePenaltyBpsAmended => "milestone_late_penalty_bps_amended",
@@ -4028,6 +4049,7 @@ impl EscrowEventKind {
             "mint_allowlist_updated" => Self::MintAllowlistUpdated,
             "insurance_pool_amended" => Self::InsurancePoolAmended,
             "release_intents_revoked" => Self::ReleaseIntentsRevoked,
+            "emergency_unlock_disabled" => Self::EmergencyUnlockDisabled,
             "slash_deadline_amended" => Self::SlashDeadlineAmended,
             "amount_bounds_amended" => Self::AmountBoundsAmended,
             "milestone_late_penalty_bps_amended" => Self::MilestoneLatePenaltyBpsAmended,
@@ -7242,6 +7264,41 @@ impl IndexedEscrow {
             None,
             None,
         );
+        Ok(())
+    }
+
+    /// Disable the emergency timelock-unlock governance (mirrors
+    /// [`Escrow::disable_emergency_unlock`], AV-405). Emits
+    /// `EmergencyUnlockDisabled` only when the flag actually flips;
+    /// `from == to ==` the current state. `at` is the
+    /// caller-supplied event timestamp.
+    pub fn disable_emergency_unlock(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.emergency_unlock_enabled();
+        self.inner.disable_emergency_unlock(initializer, taker)?;
+        let after = self.inner.emergency_unlock_enabled();
+        // The inner call rejects strangers, wrong states, and a
+        // paused escrow, so a flipped flag here always means real
+        // governance — and an already-disabled hatch stays silent.
+        if after != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::EmergencyUnlockDisabled,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
         Ok(())
     }
 
@@ -16347,7 +16404,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -16505,7 +16563,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17097,7 +17156,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17167,7 +17227,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17234,7 +17295,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17301,7 +17363,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17368,7 +17431,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17438,7 +17502,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17508,7 +17573,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17575,7 +17641,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17642,7 +17709,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17709,7 +17777,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17776,7 +17845,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17843,7 +17913,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17910,7 +17981,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -17981,7 +18053,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18051,7 +18124,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18121,7 +18195,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18191,7 +18266,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18261,7 +18337,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18332,7 +18409,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18403,7 +18481,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18474,7 +18553,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18544,7 +18624,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18571,7 +18652,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18594,7 +18676,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18616,7 +18699,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18634,7 +18718,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18653,7 +18738,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]
@@ -18671,7 +18757,8 @@ mod event_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended));
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked));
-        assert_eq!(EscrowEventKind::from_discriminant(170), None);
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(171), None);
     }
 
     #[test]
@@ -18688,7 +18775,8 @@ mod event_tests {
             Some(kind)
         );
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked));
-        assert_eq!(EscrowEventKind::from_discriminant(170), None);
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(171), None);
     }
 
     #[test]
@@ -18704,7 +18792,24 @@ mod event_tests {
             EscrowEventKind::from_name("release_intents_revoked"),
             Some(kind)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(170), None);
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(171), None);
+    }
+
+    #[test]
+    fn emergency_unlock_disabled_kind_round_trips() {
+        // AV-405: discriminant 170, appended after
+        // ReleaseIntentsRevoked — 0–169 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::EmergencyUnlockDisabled;
+        assert_eq!(kind.discriminant(), 170);
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(kind));
+        assert_eq!(kind.name(), "emergency_unlock_disabled");
+        assert_eq!(
+            EscrowEventKind::from_name("emergency_unlock_disabled"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(171), None);
     }
 
     #[test]
@@ -18791,7 +18896,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
         assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
-        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), Some(EscrowEventKind::EmergencyUnlockDisabled)); // AV-405: 170 is EmergencyUnlockDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(171), None); // AV-405: 170 is EmergencyUnlockDisabled
     }
 
     #[test]

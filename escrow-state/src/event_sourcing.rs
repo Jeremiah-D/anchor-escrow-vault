@@ -420,6 +420,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // nonce watermark moves, so the next intent submission
         // reads the live watermark.
         | EscrowEventKind::ReleaseIntentsRevoked
+        // AV-405: a disabled emergency-unlock flag moves no funds
+        // and never restates a release already settled — only the
+        // flag flips, so the next emergency_unlock call reads the
+        // live flag.
+        | EscrowEventKind::EmergencyUnlockDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1452,6 +1457,11 @@ mod event_sourcing_tests {
         // nonce watermark moves, so the next intent submission
         // reads the live watermark.
         | EscrowEventKind::ReleaseIntentsRevoked
+        // AV-405: a disabled emergency-unlock flag moves no funds
+        // and never restates a release already settled — only the
+        // flag flips, so the next emergency_unlock call reads the
+        // live flag.
+        | EscrowEventKind::EmergencyUnlockDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
