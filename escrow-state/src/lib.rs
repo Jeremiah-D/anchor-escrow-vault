@@ -13387,6 +13387,73 @@ let fee = self.charge_protocol_fee(net_amount)?;
         self.last_intent_nonce
     }
 
+    /// Revoke outstanding gasless-release intents (AV-404): raise
+    /// the `last_intent_nonce` watermark to `up_to_nonce`, voiding
+    /// every signed-but-unsubmitted intent at or below the cutoff.
+    /// The initializer signed those intents into existence, so only
+    /// the initializer may void them — a signed intent sitting in a
+    /// relayer's queue is otherwise unrecallable, and a compromised
+    /// or stale intent must not stay live until its `expiry_slot`.
+    ///
+    /// Check order mirrors the other governance revisions
+    /// ([`Escrow::amend_amount_bounds`], [`Escrow::rotate_arbiter`]):
+    ///
+    /// 1. pause (`require_not_paused`) — AV-46 fails fast, the crate
+    ///    convention;
+    /// 2. initializer-only — a stranger is [`EscrowError::Unauthorized`];
+    /// 3. state — `Uninitialized`, `Activated`, `Funded` and
+    ///    `Disputed` may revoke (a dispute does not freeze the
+    ///    initializer's own intent bookkeeping: the contested pool
+    ///    stays locked by `resolve`, this only voids intents); the
+    ///    terminal states (`Released` / `Cancelled` / `Settled` /
+    ///    `Split` / `Declined` / `Closed`) and `CounterOffered` are
+    ///    [`EscrowError::InvalidStateTransition`] — there is no live
+    ///    intent left to void once the escrow has settled, and a
+    ///    live negotiation owns the settlement path.
+    ///
+    /// The watermark only ever rises: `up_to_nonce <=
+    /// last_intent_nonce` is a silent no-op success — it writes
+    /// nothing, so the event layer emits nothing for it (the
+    /// `rotate_*` same-value no-op precedent). Above the watermark
+    /// the cutoff is the new watermark, and from then on the
+    /// [`Escrow::release_via_intent`] replay gate (`intent.nonce <=
+    /// last_intent_nonce` is `IntentNonceReused`, code 182) refuses
+    /// every revoked intent, while an intent above the new watermark
+    /// releases exactly as before. A nonce already consumed by a
+    /// successful release stays consumed — revocation never rewinds
+    /// the watermark, so a consumed intent cannot be revived.
+    /// Revoking moves no funds, so no AV-36 reentrancy lock is
+    /// needed (the lock only guards the fund-moving paths, the
+    /// `rotate_arbiter` precedent). Emits `ReleaseIntentsRevoked`
+    /// on the event layer, except for the no-op.
+    pub fn revoke_release_intents(
+        &mut self,
+        initializer: [u8; 32],
+        up_to_nonce: u64,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Initializer-only: only the key that signed the intents
+        // may void them.
+        if initializer != self.initializer {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Uninitialized
+            | EscrowState::Activated
+            | EscrowState::Funded
+            | EscrowState::Disputed => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // No-op: a cutoff at or below the live watermark revokes
+        // nothing — the watermark only ever rises.
+        if up_to_nonce <= self.last_intent_nonce {
+            return Ok(());
+        }
+        self.last_intent_nonce = up_to_nonce;
+        Ok(())
+    }
+
     /// Opt into dual-control (maker-checker) release governance
     /// (AV-130). Builder-style: only valid on an `Uninitialized`
     /// escrow, so the checker's identity is fixed before any funds
@@ -57352,7 +57419,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
-        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
     }
 
     #[test]
@@ -77059,7 +77127,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(166), Some(EscrowEventKind::ReferenceAmended)); // AV-377: 166 is ReferenceAmended
         assert_eq!(EscrowEventKind::from_discriminant(167), Some(EscrowEventKind::MintAllowlistUpdated)); // AV-390: 167 is MintAllowlistUpdated
         assert_eq!(EscrowEventKind::from_discriminant(168), Some(EscrowEventKind::InsurancePoolAmended)); // AV-394: 168 is InsurancePoolAmended
-        assert_eq!(EscrowEventKind::from_discriminant(169), None); // AV-394: 168 is InsurancePoolAmended
+        assert_eq!(EscrowEventKind::from_discriminant(169), Some(EscrowEventKind::ReleaseIntentsRevoked)); // AV-404: 169 is ReleaseIntentsRevoked
+        assert_eq!(EscrowEventKind::from_discriminant(170), None); // AV-404: 169 is ReleaseIntentsRevoked
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -77310,9 +77379,10 @@ mod event_history_tests {
         // `AppealWithdrawn` (AV-341), 166 is
         // `ReferenceAmended` (AV-377), 167 is
         // `MintAllowlistUpdated` (AV-390), 168 is
-        // `InsurancePoolAmended` (AV-394) and 169 is the
+        // `InsurancePoolAmended` (AV-394), 169 is
+        // `ReleaseIntentsRevoked` (AV-404) and 170 is the
         // first still-unknown byte.
-        for bad in [169u8, 255] {
+        for bad in [170u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -80551,6 +80621,230 @@ mod release_via_intent_tests {
         let back = csv_to_events(&csv).unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].kind, EscrowEventKind::ReleaseViaIntent);
+    }
+
+    #[test]
+    fn stranger_cannot_revoke_and_watermark_unchanged() {
+        // AV-404: only the initializer may void its own intents —
+        // a stranger learns nothing and moves nothing.
+        let (mut e, key) = funded();
+        let init = key.public_key();
+        let mallory = [0xCC; 32];
+        assert_eq!(
+            e.revoke_release_intents(mallory, 5),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(e.last_intent_nonce(), 0, "failed revoke writes nothing");
+        // The initializer still can, afterwards.
+        e.revoke_release_intents(init, 5).unwrap();
+        assert_eq!(e.last_intent_nonce(), 5);
+    }
+
+    #[test]
+    fn terminal_states_refuse_revocation() {
+        // AV-404: once the escrow has settled there is no live
+        // intent left to void.
+        let (mut e, key) = funded();
+        let init = key.public_key();
+        let i = intent(1, 1_000_000);
+        e.release_via_intent(&i, &sign_release_intent(&key, &i), T0 + 10, SLOT0, None)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.revoke_release_intents(init, 5),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(e.last_intent_nonce(), 1, "refused revoke writes nothing");
+
+        let (mut e, key) = funded();
+        let init = key.public_key();
+        e.cancel(init, None, init, T0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.revoke_release_intents(init, 5),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.last_intent_nonce(), 0);
+    }
+
+    #[test]
+    fn cutoff_at_or_below_watermark_is_silent_noop() {
+        // AV-404: the watermark only ever rises — a cutoff at or
+        // below it revokes nothing and emits nothing (the
+        // `rotate_*` same-value no-op precedent).
+        let key = initializer_key();
+        let init = key.public_key();
+        let mut e =
+            IndexedEscrow::initialize(init, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0).unwrap();
+        e.fund(init, T0 + 1).unwrap();
+        let before = e.event_count();
+        e.revoke_release_intents(init, 5, T0 + 2).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::ReleaseIntentsRevoked);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the cutoff, and a lower one, are silent
+        // no-ops: success, watermark and event count untouched.
+        e.revoke_release_intents(init, 5, T0 + 3).unwrap();
+        assert_eq!(e.event_count(), before + 1, "equal cutoff emits nothing");
+        e.revoke_release_intents(init, 3, T0 + 4).unwrap();
+        assert_eq!(e.event_count(), before + 1, "lower cutoff emits nothing");
+        assert_eq!(e.inner().last_intent_nonce(), 5);
+    }
+
+    #[test]
+    fn revoked_intent_is_rejected_as_reused() {
+        // AV-404: after the cutoff, every intent at or below it
+        // is dead — the same `IntentNonceReused` the replay gate
+        // already returns for a consumed nonce.
+        let (mut e, key) = funded();
+        let init = key.public_key();
+        e.revoke_release_intents(init, 5).unwrap();
+        assert_eq!(e.last_intent_nonce(), 5);
+        for nonce in [3, 5] {
+            let i = intent(nonce, 400_000);
+            assert_eq!(
+                e.release_via_intent(&i, &sign_release_intent(&key, &i), T0 + 10, SLOT0, None),
+                Err(EscrowError::IntentNonceReused),
+                "nonce {nonce} is revoked"
+            );
+        }
+        assert_eq!(EscrowError::IntentNonceReused.code(), 182);
+        assert_eq!(e.last_intent_nonce(), 5, "rejected intents move nothing");
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn intent_above_watermark_still_releases() {
+        // AV-404: revocation is a cutoff, not a kill-switch —
+        // intents minted above it release exactly as before.
+        let (mut e, key) = funded();
+        let init = key.public_key();
+        e.revoke_release_intents(init, 5).unwrap();
+        let i = intent(6, 400_000);
+        let (payout, fee) = e
+            .release_via_intent(&i, &sign_release_intent(&key, &i), T0 + 10, SLOT0, None)
+            .unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.last_intent_nonce(), 6);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn consumed_nonce_stays_consumed_after_revocation() {
+        // AV-404: revocation never rewinds the watermark — a nonce
+        // already consumed by a successful release stays consumed,
+        // and the cutoff still governs the un-consumed range.
+        let (mut e, key) = funded();
+        let init = key.public_key();
+        let i1 = intent(1, 400_000);
+        e.release_via_intent(&i1, &sign_release_intent(&key, &i1), T0 + 10, SLOT0, None)
+            .unwrap();
+        assert_eq!(e.last_intent_nonce(), 1);
+        e.revoke_release_intents(init, 5).unwrap();
+        assert_eq!(e.last_intent_nonce(), 5);
+        // The consumed nonce is still dead (not revived by the
+        // cutoff passing over it).
+        assert_eq!(
+            e.release_via_intent(&i1, &sign_release_intent(&key, &i1), T0 + 20, SLOT0, None),
+            Err(EscrowError::IntentNonceReused)
+        );
+        // And an intent above the cutoff still releases.
+        let i6 = intent(6, 600_000);
+        let (payout, fee) = e
+            .release_via_intent(&i6, &sign_release_intent(&key, &i6), T0 + 30, SLOT0, None)
+            .unwrap();
+        assert_eq!((payout, fee), (600_000, 0));
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn release_intents_revoked_discriminant_is_pinned() {
+        // AV-404: discriminant 169, appended after
+        // InsurancePoolAmended — 0–168 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::ReleaseIntentsRevoked;
+        assert_eq!(kind.discriminant(), 169);
+        assert_eq!(EscrowEventKind::from_discriminant(169), Some(kind));
+        assert_eq!(kind.name(), "release_intents_revoked");
+        assert_eq!(
+            EscrowEventKind::from_name("release_intents_revoked"),
+            Some(kind)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(170), None);
+    }
+
+    #[test]
+    fn revoke_before_funding_blocks_old_intent_after_funding() {
+        // AV-404: revocation is allowed pre-funding
+        // (`Uninitialized`) — the cutoff survives funding, so an
+        // intent signed before the escrow was funded is already
+        // dead by the time a relayer could submit it.
+        let key = initializer_key();
+        let init = key.public_key();
+        let mut e = Escrow::initialize(init, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        e.revoke_release_intents(init, 5).unwrap();
+        assert_eq!(e.last_intent_nonce(), 5);
+        e.fund(init, T0).unwrap();
+        let i5 = intent(5, 400_000);
+        assert_eq!(
+            e.release_via_intent(&i5, &sign_release_intent(&key, &i5), T0 + 10, SLOT0, None),
+            Err(EscrowError::IntentNonceReused)
+        );
+        let i6 = intent(6, 400_000);
+        assert!(e
+            .release_via_intent(&i6, &sign_release_intent(&key, &i6), T0 + 10, SLOT0, None)
+            .is_ok());
+    }
+
+    #[test]
+    fn paused_escrow_refuses_revocation() {
+        // AV-404 / AV-46: the pause guard fires before the
+        // authority and state gates.
+        let key = initializer_key();
+        let init = key.public_key();
+        let mut e = Escrow::initialize(init, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(init)
+            .unwrap();
+        e.fund(init, T0).unwrap();
+        e.pause(init, None).unwrap();
+        assert_eq!(
+            e.revoke_release_intents(init, 5),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(e.last_intent_nonce(), 0, "refused revoke writes nothing");
+    }
+
+    #[test]
+    fn disputed_escrow_may_revoke() {
+        // AV-404: a dispute does not freeze the initializer's own
+        // intent bookkeeping — revoking voids intents, it never
+        // touches the contested pool, so `Disputed` stays
+        // revocable while `resolve` owns the settlement.
+        let key = initializer_key();
+        let init = key.public_key();
+        let arbiter = [0xA8; 32];
+        let mut e = Escrow::initialize(init, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(arbiter)
+            .unwrap();
+        e.fund(init, T0).unwrap();
+        e.escalate(init, T0, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        e.revoke_release_intents(init, 5).unwrap();
+        assert_eq!(e.last_intent_nonce(), 5);
+        let i5 = intent(5, 400_000);
+        assert_eq!(
+            e.release_via_intent(&i5, &sign_release_intent(&key, &i5), T0 + 10, SLOT0, None),
+            Err(EscrowError::IntentNonceReused)
+        );
     }
 }
 

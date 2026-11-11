@@ -415,6 +415,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // locked amount, and the state are untouched, while the
         // next slash reads the live flag.
         | EscrowEventKind::InsurancePoolAmended
+        // AV-404: a revoked-intent watermark moves no funds and
+        // never restates a release already settled — only the
+        // nonce watermark moves, so the next intent submission
+        // reads the live watermark.
+        | EscrowEventKind::ReleaseIntentsRevoked
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1442,6 +1447,11 @@ mod event_sourcing_tests {
         // locked amount, and the state are untouched, while the
         // next slash reads the live flag.
         | EscrowEventKind::InsurancePoolAmended
+        // AV-404: a revoked-intent watermark moves no funds and
+        // never restates a release already settled — only the
+        // nonce watermark moves, so the next intent submission
+        // reads the live watermark.
+        | EscrowEventKind::ReleaseIntentsRevoked
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
