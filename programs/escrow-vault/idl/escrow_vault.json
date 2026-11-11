@@ -1071,6 +1071,14 @@
       ]
     },
     {
+      "name": "amend_fee_cap",
+      "discriminator": [243, 249, 155, 252, 97, 50, 80, 77],
+      "accounts": [],
+      "args": [
+        {"name": "fee_cap", "type": "u64"}
+      ]
+    },
+    {
       "name": "initialize_deadman_switch",
       "discriminator": [227, 118, 253, 183, 67, 134, 220, 86],
       "accounts": [],
