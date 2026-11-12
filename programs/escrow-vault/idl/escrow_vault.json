@@ -1176,6 +1176,14 @@
       ]
     },
     {
+      "name": "amend_social_recovery_timelock",
+      "discriminator": [104, 196, 59, 165, 48, 42, 29, 6],
+      "accounts": [],
+      "args": [
+        {"name": "new_timelock_secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

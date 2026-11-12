@@ -41979,6 +41979,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_threshold <- param (u8); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's AV-276 gate would accept the initializer alone on a plain escrow, but the program layer never offers that shape, paralleling rotate_social_recovery_guardian); the guardians themselves do not sign (a lost guardian key must not block the quorum's own revision, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); only an escrow with a configured social-recovery policy may amend (RecoveryNotConfigured, code 287, fail-closed — post-funding installation would add a recovery path the taker never funded under); a pending recovery request refuses the amendment (RecoveryRequestPending, code 289 — in-flight requests count under the old threshold, so changing it would reinterpret already-cast approval votes); the new threshold reuses the SocialRecovery::new gate (1..=guardian_count, otherwise InvalidSocialRecovery, code 286) leaving the original threshold untouched; amending to the current threshold is an idempotent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); emits the SocialRecoveryThresholdAmended indexer event only on an actual change (from == to == the current state); only recovery.threshold changes — guardians, guardian_count and timelock_secs are untouched and pending stays empty; no clock/sysvar input to the method; the policy region is rewritten in place — no layout / rent change",
         },
         InstructionSpec {
+            // AV-426: the social-recovery timelock amendment — the
+            // program-level entry point for the AV-279 pure-logic
+            // amendment. IDL: discriminator =
+            // sha256("global:amend_social_recovery_timelock")[..8]
+            // = [104, 196, 59, 165, 48, 42, 29, 6] — the Anchor
+            // instruction discriminator for the
+            // amend_social_recovery_timelock handler (pinned by
+            // the discriminator test below).
+            name: "amend_social_recovery_timelock",
+            params: &[(
+                "new_timelock_secs",
+                "u64",
+                "instruction param; the replacement veto-window timelock in seconds — any value is valid, including zero (the veto window is then only the approval latency, the initializer opting out of the delay deliberately, per the SocialRecovery::new comment)",
+            )],
+            method: "Escrow::amend_social_recovery_timelock",
+            input_mapping: "new_timelock_secs <- param (u64); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's AV-276 gate would accept the initializer alone on a plain escrow, but the program layer never offers that shape, paralleling rotate_social_recovery_guardian and amend_social_recovery_threshold); the guardians themselves do not sign (a lost guardian key must not block the veto window's own revision, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); only an escrow with a configured social-recovery policy may amend (RecoveryNotConfigured, code 287, fail-closed — post-funding installation would add a recovery path the taker never funded under); a pending recovery request refuses the amendment (RecoveryRequestPending, code 289 — the in-flight request's veto window already started under the old timelock, so changing it would re-time the remaining wait); the new timelock reuses the SocialRecovery::new gate (any value is valid, including zero, so no value is refused by the gate); amending to the current timelock is an idempotent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); emits the SocialRecoveryTimelockAmended indexer event only on an actual change (from == to == the current state); only recovery.timelock_secs changes — guardians, guardian_count and threshold are untouched and pending stays empty; no clock/sysvar input to the method; the policy region is rewritten in place — no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -42834,6 +42852,10 @@ pub(crate) mod anchor_idl_tests {
             // amendment (the AV-278 pure-logic amendment wired to
             // the chain).
             "Escrow::amend_social_recovery_threshold",
+            // AV-426: the program-level social-recovery timelock
+            // amendment (the AV-279 pure-logic amendment wired to
+            // the chain).
+            "Escrow::amend_social_recovery_timelock",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -43179,6 +43201,11 @@ pub(crate) mod anchor_idl_tests {
                 // single-u8-param item in the social-recovery
                 // family.
                 &"amend_social_recovery_threshold",
+                // AV-426: the timelock-amendment value (u64) — the
+                // replacement veto window in seconds; zero is
+                // legal (the veto window is then only the approval
+                // latency).
+                &"amend_social_recovery_timelock",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -45334,6 +45361,223 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(ev.amounts.fee, 0);
         indexed
             .amend_social_recovery_threshold(ALICE, BOB, 3, NOW + 10)
+            .unwrap();
+        assert_eq!(
+            indexed.event_count(),
+            before + 1,
+            "no-op re-affirmation emits nothing"
+        );
+    }
+
+    #[test]
+    fn amend_social_recovery_timelock_maps_param_to_recovery_field() {
+        // IDL: amend_social_recovery_timelock(new_timelock_secs:
+        // u64) — new_timelock_secs <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints, not the state machine (the state machine's
+        // AV-276 gate would accept the initializer alone on a
+        // plain escrow, but the program layer never offers that
+        // shape — the on-chain call is dual-signed either way).
+        // The new timelock rewrites recovery.timelock_secs in
+        // place (see PARAM_FIELD_MAP) — no layout change.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const G1: [u8; 32] = [0x11; 32];
+        const G2: [u8; 32] = [0x22; 32];
+        const G3: [u8; 32] = [0x33; 32];
+        const NEW_KEY: [u8; 32] = [0x99; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        let configured = || {
+            let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+                .unwrap();
+            e.fund(ALICE, FUND_AT).unwrap();
+            assert_eq!(e.state(), EscrowState::Funded);
+            e
+        };
+        let dual_sig_configured = || {
+            let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+                .unwrap();
+            // A dual-sig escrow activates only once both parties sign.
+            e.activate(ALICE).unwrap();
+            e.activate(BOB).unwrap();
+            e.fund(ALICE, FUND_AT).unwrap();
+            assert_eq!(e.state(), EscrowState::Funded);
+            e
+        };
+        // Only the timelock moves: the guardians, the count,
+        // the threshold and the state are untouched.
+        let mut e = configured();
+        e.amend_social_recovery_timelock(ALICE, BOB, 7_200).unwrap();
+        let policy = e.recovery().expect("policy still configured");
+        assert_eq!(policy.timelock_secs(), 7_200, "timelock moved");
+        assert_eq!(policy.guardians(), &[G1, G2, G3], "guardians untouched");
+        assert_eq!(policy.guardian_count(), 3, "count untouched");
+        assert_eq!(policy.threshold(), 2, "threshold untouched");
+        assert!(policy.pending().is_none(), "pending stays empty");
+        assert_eq!(e.state(), EscrowState::Funded);
+        // Zero is legal: the initializer opting out of the delay
+        // deliberately, per the `SocialRecovery::new` comment —
+        // and the other fields still do not move.
+        e.amend_social_recovery_timelock(ALICE, BOB, 0).unwrap();
+        let policy = e.recovery().expect("policy still configured");
+        assert_eq!(policy.timelock_secs(), 0, "zero timelock accepted");
+        assert_eq!(policy.threshold(), 2, "threshold untouched");
+        assert_eq!(policy.guardians(), &[G1, G2, G3], "guardians untouched");
+        // Documented failure modes: a stranger initializer is
+        // Unauthorized, and on a dual-sig escrow one party alone
+        // cannot move the timelock. On a plain escrow the
+        // initializer alone authorizes (the AV-276 gate), so a
+        // stranger taker key does not block the amendment — the
+        // program layer still collects both signatures.
+        assert_eq!(
+            e.amend_social_recovery_timelock(MALLORY, BOB, 60),
+            Err(EscrowError::Unauthorized),
+            "stranger initializer cannot amend"
+        );
+        assert_eq!(e.recovery().unwrap().timelock_secs(), 0);
+        let mut e = configured();
+        e.amend_social_recovery_timelock(ALICE, MALLORY, 7_200)
+            .unwrap();
+        assert_eq!(e.recovery().unwrap().timelock_secs(), 7_200);
+        let mut dual = dual_sig_configured();
+        assert_eq!(
+            dual.amend_social_recovery_timelock(ALICE, ALICE, 7_200),
+            Err(EscrowError::Unauthorized),
+            "initializer alone cannot amend a dual-sig escrow"
+        );
+        assert_eq!(
+            dual.amend_social_recovery_timelock(MALLORY, BOB, 7_200),
+            Err(EscrowError::Unauthorized),
+            "stranger pair cannot amend a dual-sig escrow"
+        );
+        assert_eq!(dual.recovery().unwrap().timelock_secs(), 3_600);
+        dual.amend_social_recovery_timelock(ALICE, BOB, 7_200)
+            .unwrap();
+        assert_eq!(dual.recovery().unwrap().timelock_secs(), 7_200);
+        // Funded-only: the Uninitialized builder owns the initial set.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        assert_eq!(
+            bare.amend_social_recovery_timelock(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.recovery().unwrap().timelock_secs(), 3_600);
+        // Fail-closed: a never-configured escrow can never acquire a
+        // recovery policy after funding.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            plain.amend_social_recovery_timelock(ALICE, BOB, 7_200),
+            Err(EscrowError::RecoveryNotConfigured),
+            "amendment never installs a policy"
+        );
+        assert!(plain.recovery().is_none());
+        // A live request blocks the amendment: its veto window
+        // already started under the old timelock, so changing it
+        // would re-time the remaining wait.
+        let mut pending = configured();
+        pending.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        pending.approve_recovery(G2).unwrap();
+        assert_eq!(pending.recovery().unwrap().approval_count(), 2);
+        assert_eq!(
+            pending.amend_social_recovery_timelock(ALICE, BOB, 7_200),
+            Err(EscrowError::RecoveryRequestPending)
+        );
+        let policy = pending.recovery().unwrap();
+        assert_eq!(policy.timelock_secs(), 3_600, "original timelock untouched");
+        assert_eq!(policy.approval_count(), 2);
+        assert_eq!(policy.pending().unwrap().new_authority, NEW_KEY);
+        // The refused amendment changed nothing, so the request
+        // still executes under its original 3_600s window — not
+        // the refused 7_200s one.
+        assert_eq!(
+            pending.execute_recovery(NOW + 3_599),
+            Err(EscrowError::RecoveryTimelockNotElapsed)
+        );
+        pending.execute_recovery(NOW + 3_600).unwrap();
+        assert_eq!(pending.initializer(), NEW_KEY);
+        // Re-affirming the current timelock is an idempotent no-op.
+        let mut e = configured();
+        e.amend_social_recovery_timelock(ALICE, BOB, 3_600).unwrap();
+        assert_eq!(e.recovery().unwrap().timelock_secs(), 3_600);
+        // The pause guard fires before the authority and state gates.
+        let mut paused = configured();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_social_recovery_timelock(MALLORY, BOB, 7_200),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.recovery().unwrap().timelock_secs(), 3_600);
+        // After the amendment the new timelock governs from the
+        // next request: shortened to 60s a request executes once
+        // the new, shorter window elapses; lengthened to 7_200s
+        // the old 3_600s window no longer suffices; zero means
+        // the veto window is only the approval latency.
+        let mut e = configured();
+        e.amend_social_recovery_timelock(ALICE, BOB, 60).unwrap();
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        e.approve_recovery(G2).unwrap();
+        assert_eq!(
+            e.execute_recovery(NOW + 59),
+            Err(EscrowError::RecoveryTimelockNotElapsed)
+        );
+        e.execute_recovery(NOW + 60).unwrap();
+        assert_eq!(e.initializer(), NEW_KEY);
+        let mut f = configured();
+        f.amend_social_recovery_timelock(ALICE, BOB, 7_200).unwrap();
+        f.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        f.approve_recovery(G2).unwrap();
+        assert_eq!(
+            f.execute_recovery(NOW + 3_600),
+            Err(EscrowError::RecoveryTimelockNotElapsed)
+        );
+        f.execute_recovery(NOW + 7_200).unwrap();
+        assert_eq!(f.initializer(), NEW_KEY);
+        let mut g = configured();
+        g.amend_social_recovery_timelock(ALICE, BOB, 0).unwrap();
+        g.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        g.approve_recovery(G2).unwrap();
+        g.execute_recovery(NOW).unwrap();
+        assert_eq!(g.initializer(), NEW_KEY);
+        // The event layer emits only on an actual change: a real
+        // amendment emits SocialRecoveryTimelockAmended, a no-op
+        // re-affirmation emits nothing, and a failed call emits
+        // nothing.
+        let mut indexed = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = indexed.event_count();
+        assert_eq!(
+            indexed.amend_social_recovery_timelock(MALLORY, BOB, 7_200, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(indexed.event_count(), before, "failed calls emit nothing");
+        indexed
+            .amend_social_recovery_timelock(ALICE, BOB, 7_200, NOW)
+            .unwrap();
+        assert_eq!(indexed.event_count(), before + 1);
+        let ev = indexed.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::SocialRecoveryTimelockAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        indexed
+            .amend_social_recovery_timelock(ALICE, BOB, 7_200, NOW + 10)
             .unwrap();
         assert_eq!(
             indexed.event_count(),
@@ -48681,6 +48925,19 @@ pub(crate) mod anchor_idl_tests {
         (
             "amend_social_recovery_threshold",
             "new_threshold",
+            "recovery",
+        ),
+        // AV-426: the amendment param rewrites the
+        // `timelock_secs` sub-field of the `recovery` region in
+        // place — a fourth param source for `recovery` (the whole
+        // policy region, like `configure_social_recovery`'s
+        // timelock_secs param). The field's initial value comes
+        // from the `configure_social_recovery` timelock_secs
+        // param (Uninitialized only); this entry documents the
+        // amendment source.
+        (
+            "amend_social_recovery_timelock",
+            "new_timelock_secs",
             "recovery",
         ),
         // AV-388: the rotation param rewrites the delegate key of
@@ -77655,6 +77912,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_social_recovery_threshold"),
             [162, 58, 222, 237, 240, 29, 102, 106]
+        );
+    }
+
+    #[test]
+    fn amend_social_recovery_timelock_instruction_discriminator_is_pinned() {
+        // AV-426. IDL:
+        // sha256("global:amend_social_recovery_timelock")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_social_recovery_timelock"),
+            [104, 196, 59, 165, 48, 42, 29, 6]
         );
     }
 

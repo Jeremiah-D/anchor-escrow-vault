@@ -2542,6 +2542,78 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Amend the social-recovery veto-window timelock by dual-signed
+    /// governance (AV-426; mirrors
+    /// `Escrow::amend_social_recovery_timelock`). Both the
+    /// initializer and the taker must sign at the program layer —
+    /// the Anchor accounts require both signers, so the on-chain
+    /// call is dual-signed either way (the state machine's AV-276
+    /// gate would accept the initializer alone on a plain escrow).
+    /// Only `Funded`: the terminal states and `Disputed` are
+    /// `InvalidStateTransition` (the builder owns the initial
+    /// timelock). Only an escrow carrying a social-recovery policy
+    /// may amend (`RecoveryNotConfigured`, code 287,
+    /// fail-closed — post-funding installation would add a
+    /// recovery path the taker never funded under). A pending
+    /// recovery request refuses the amendment
+    /// (`RecoveryRequestPending`, code 289 — the in-flight
+    /// request's veto window already started under the old
+    /// timelock, so changing it would re-time the remaining
+    /// wait). Any value is valid, including zero — the veto
+    /// window is then only the approval latency, the initializer
+    /// opting out of the delay deliberately — so no value is
+    /// refused by the gate. Amending to the current timelock is
+    /// an idempotent no-op. A paused escrow fails fast
+    /// (`Paused`). Only the timelock changes (the guardians,
+    /// the guardian count and the threshold are untouched, the
+    /// pending request stays empty). The new timelock governs
+    /// from the next `request_recovery` / `execute_recovery`:
+    /// the recovery path compares the live timelock against the
+    /// request's opening timestamp at each call, so a request
+    /// opened after the amendment arms and executes under the
+    /// new veto window while a request already settled keeps the
+    /// window it settled under. Emits
+    /// `SocialRecoveryTimelockAmended` only on an actual change
+    /// (from == to == the current state), mirroring
+    /// `IndexedEscrow::amend_social_recovery_timelock`.
+    pub fn amend_social_recovery_timelock(
+        ctx: Context<AmendSocialRecoveryTimelock>,
+        new_timelock_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.recovery();
+        escrow
+            .amend_social_recovery_timelock(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_timelock_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `recovery.timelock_secs` in place in the real
+        // build (the policy region is already resident) — no
+        // realloc, no rent change.
+        if escrow.recovery() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::SocialRecoveryTimelockAmended,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Rotate the live operator grant's delegate key (AV-388; mirrors
     /// `Escrow::rotate_delegation_delegate` — the AV-301 pure-logic
     /// rotation). Either party may rotate — the initializer or the
@@ -9306,6 +9378,11 @@ pub enum EscrowVaultEventKind {
     /// (`Escrow::amend_social_recovery_threshold`). Mirrors
     /// `escrow_state::EscrowEventKind::SocialRecoveryThresholdAmended`.
     SocialRecoveryThresholdAmended,
+    /// AV-426: the social-recovery veto-window timelock was amended by
+    /// dual-signed governance
+    /// (`Escrow::amend_social_recovery_timelock`). Mirrors
+    /// `escrow_state::EscrowEventKind::SocialRecoveryTimelockAmended`.
+    SocialRecoveryTimelockAmended,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -9528,6 +9605,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::SocialRecoveryThresholdAmended => {
             EscrowVaultEventKind::SocialRecoveryThresholdAmended
+        }
+        escrow_state::EscrowEventKind::SocialRecoveryTimelockAmended => {
+            EscrowVaultEventKind::SocialRecoveryTimelockAmended
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -10736,6 +10816,26 @@ pub struct AmendSocialRecoveryThreshold<'info> {
     /// Second governance signer: must equal the escrow's taker. The
     /// taker consents to moving the lost-key recovery quorum their
     /// funded escrow settles under.
+    pub taker: Signer<'info>,
+}
+
+/// AV-426: accounts for `amend_social_recovery_timelock` — the
+/// social-recovery timelock amendment is dual-signed governance by
+/// the two parties; the guardians themselves do not sign (a lost
+/// guardian key must not block the veto window's own revision).
+/// The new timelock rides as an instruction param, not an account
+/// — the only single-u64-param item in the social-recovery family.
+#[derive(Accounts)]
+pub struct AmendSocialRecoveryTimelock<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to moving the lost-key recovery veto window
+    /// their funded escrow settles under.
     pub taker: Signer<'info>,
 }
 
