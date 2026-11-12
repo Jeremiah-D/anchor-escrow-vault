@@ -9222,7 +9222,9 @@ co-sign each state) → settlement is either `close_cooperative`
 (dual-signed final state, instant) or `close_unilateral` (one party
 submits the latest co-signed state, challenge window opens;
 `dispute` with a newer co-signed state replaces it and restarts the
-window; `finalize` settles once the window elapses).
+window; `cancel_unilateral_close` with a newer dual-signed state
+returns the channel to `Open`; `finalize` settles once the window
+elapses).
 
 Safety properties (all pinned by tests):
 
@@ -9247,7 +9249,10 @@ New error codes 299–303: `InvalidChannelConfig`,
 `InvalidChannelState`, `InvalidChannelSignature`, `StaleChannelNonce`,
 `ChannelBalanceMismatch`. `finalize` on an unelapsed window and
 `dispute` after expiry are `InvalidChannelState` (code 300) — the
-window state, not a new error, decides which call is legal.
+window state, not a new error, decides which call is legal; a
+cancellation after the window expires is likewise refused with
+`InvalidChannelState` (code 300), since `finalize` owns the channel
+once the window has elapsed.
 
 **Challenge-period amendment (AV-315):**
 `amend_challenge_period(party_a, party_b, new_challenge_period)`
@@ -9295,6 +9300,31 @@ while the new party's co-signature verifies — `apply_update`,
 live parties with no further change. No new error codes, no vault
 layout change, no Anchor instruction surface. (Solana: payment-channel
 governance.)
+
+**Cancelling a unilateral close (AV-416):**
+`cancel_unilateral_close(submitter, signed, now)` is the
+non-settlement exit from a pending unilateral close: when both parties
+co-sign a newer state while the challenge window is still live, the
+channel returns to `Open` with the co-signed balances and nonce, and
+`challenge_until` clears to 0. One party alone cannot erase the
+counterparty's window — the update must be dual-signed
+(`InvalidChannelSignature`, code 301, if either signature is missing or
+tampered), and the submitter must still be a party (`Unauthorized`,
+code 100, checked before any state). Check order mirrors `dispute`:
+authority → state → window-live → signatures → nonce → conservation.
+A non-pending channel, or a cancellation after the window elapsed
+(`now >= challenge_until`), is `InvalidChannelState` (code 300) —
+after expiry `finalize` owns the channel. The nonce must be newer than
+the channel's current nonce (`StaleChannelNonce`, code 302), so an
+off-chain co-signed state newer than the submitted state is adopted
+and an update identical to the submitted state is refused — there is no
+same-value no-op. After cancellation the channel fully recovers `Open`
+semantics: `apply_update` resumes with a new nonce strictly +1 and
+`close_cooperative` / `close_unilateral` are usable again, while
+`dispute` / `finalize` refuse with `InvalidChannelState`.
+`challenge_period`, the parties, and `total` are unchanged, and no new
+window is created. No new error codes, no vault layout change, no
+Anchor instruction surface. (Solana: payment-channel governance.)
 
 ## Payment streams (AV-198)
 

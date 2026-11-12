@@ -18,6 +18,7 @@
 //!    |                  |
 //!    |                  +--close_unilateral--> UnilateralClosePending
 //!    |                                            |--dispute (newer state)--> window restarts
+//!    |                                            |--cancel_unilateral_close (newer state, both sigs)--> Open
 //!    |                                            |--finalize (now >= challenge_until)--> Closed
 //! ```
 //!
@@ -69,7 +70,10 @@ pub enum ChannelState {
     /// Funded via [`PaymentChannel::fund`]; off-chain updates accepted.
     Open = 1,
     /// Unilateral close submitted; the counterparty may dispute with a
-    /// newer co-signed state until `challenge_until`.
+    /// newer co-signed state until `challenge_until`, or both parties
+    /// may cancel the close together (see
+    /// [`PaymentChannel::cancel_unilateral_close`]) and return the
+    /// channel to [`ChannelState::Open`].
     UnilateralClosePending = 2,
     /// Settled — terminal. [`PaymentChannel::settlement`] reads the
     /// final split.
@@ -185,6 +189,9 @@ pub fn sign_channel_update(
 /// unilaterally with a challenge window
 /// ([`PaymentChannel::close_unilateral`] /
 /// [`PaymentChannel::dispute`] / [`PaymentChannel::finalize`]).
+/// A pending unilateral close may also be cancelled by both parties
+/// together ([`PaymentChannel::cancel_unilateral_close`]) — the
+/// non-settlement exit that returns the channel to `Open`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaymentChannel {
     party_a: [u8; 32],
@@ -370,6 +377,82 @@ impl PaymentChannel {
         self.balance_b = update.balance_b;
         self.nonce = update.nonce;
         self.challenge_until = challenge_until;
+        Ok(())
+    }
+
+    /// Cancel a pending unilateral close and return the channel to
+    /// `Open` (AV-416) — the non-settlement exit.
+    ///
+    /// A unilateral close is one party's *submission* of a co-signed
+    /// state, so one party alone cannot erase it: cancellation
+    /// requires the *same* dual-signed state the close paths demand —
+    /// both parties co-sign the update the channel resumes from, and
+    /// the submitter must still be a party (the signatures are what
+    /// authorize the state, not the submitter). A single submitter
+    /// cannot wipe out the counterparty's challenge window.
+    ///
+    /// Check order mirrors [`PaymentChannel::dispute`]: authority →
+    /// state → window-live → signatures → nonce → conservation.
+    /// A stranger is [`EscrowError::Unauthorized`] (code 100) before
+    /// any state is examined; any other state is
+    /// [`EscrowError::InvalidChannelState`] (code 300), and once the
+    /// window has elapsed (`now >= challenge_until`) the same error
+    /// applies — after expiry [`PaymentChannel::finalize`] owns the
+    /// channel. The update must be newer than the channel's current
+    /// nonce ([`EscrowError::StaleChannelNonce`], code 302): an
+    /// off-chain co-signed state newer than the submitted state may
+    /// exist, and cancellation adopts it, so an update identical to
+    /// the submitted state is refused — there is no same-value
+    /// no-op, every successful call advances the nonce.
+    ///
+    /// On success the balances and nonce follow the co-signed update,
+    /// the state returns to [`ChannelState::Open`], and
+    /// `challenge_until` is cleared to 0 (it is meaningful only in
+    /// [`ChannelState::UnilateralClosePending`]). `challenge_period`,
+    /// the parties, and `total` are unchanged, and the channel fully
+    /// recovers `Open` semantics: [`PaymentChannel::apply_update`]
+    /// resumes with a new nonce strictly +1, and
+    /// [`PaymentChannel::close_cooperative`] /
+    /// [`PaymentChannel::close_unilateral`] are usable again, while
+    /// `dispute` / `finalize` refuse with `InvalidChannelState`.
+    /// No new window is created, so there is no `checked_add` and no
+    /// [`EscrowError::InvalidChannelConfig`] path. There is no
+    /// audit-event JSON layer in this module (the whole
+    /// `PaymentChannel` module has none), so the cancellation is
+    /// pinned by tests, like the other channel transitions. No vault
+    /// layout change and no Anchor instruction surface (`program.rs`
+    /// has no payment-channel instructions). Orthogonal to AV-197
+    /// (the channel mechanism itself), AV-315 (the challenge-period
+    /// revision — this cancels a live window, it does not retime it),
+    /// and AV-389 (the counterparty rotation — `Unfunded`-only);
+    /// `dispute` keeps the channel pending with an updated state,
+    /// while this is the exit back to `Open`.
+    pub fn cancel_unilateral_close(
+        &mut self,
+        submitter: &[u8; 32],
+        signed: &SignedChannelUpdate,
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        self.check_party(submitter)?;
+        if self.state != ChannelState::UnilateralClosePending {
+            return Err(EscrowError::InvalidChannelState);
+        }
+        if now >= self.challenge_until {
+            return Err(EscrowError::InvalidChannelState);
+        }
+        if !signed.verify(self) {
+            return Err(EscrowError::InvalidChannelSignature);
+        }
+        let update = &signed.update;
+        if update.nonce <= self.nonce {
+            return Err(EscrowError::StaleChannelNonce);
+        }
+        self.check_conservation(update.balance_a, update.balance_b)?;
+        self.balance_a = update.balance_a;
+        self.balance_b = update.balance_b;
+        self.nonce = update.nonce;
+        self.state = ChannelState::Open;
+        self.challenge_until = 0;
         Ok(())
     }
 
@@ -643,6 +726,17 @@ mod payment_channel_tests {
     fn open_channel() -> PaymentChannel {
         let mut ch = channel();
         ch.fund(600_000).unwrap();
+        ch
+    }
+
+    /// An `Open` channel whose unilateral close is pending: Alice
+    /// submitted the nonce-1 state (250_000 / 750_000) at t =
+    /// 1_000_000, so the window runs to 1_000_000 + CHALLENGE_PERIOD.
+    fn pending_channel() -> PaymentChannel {
+        let mut ch = open_channel();
+        let v1 = cosign(&ch, &update(1, 250_000, 750_000));
+        let alice_key = alice().public_key();
+        ch.close_unilateral(&alice_key, &v1, 1_000_000).unwrap();
         ch
     }
 
@@ -1352,5 +1446,219 @@ mod payment_channel_tests {
         assert_eq!(settlement, (300_000, 700_000));
         assert_eq!(ch.state(), ChannelState::Closed);
         assert_eq!(ch.settlement(), Some((300_000, 700_000)));
+    }
+
+    #[test]
+    fn cancel_unilateral_close_rejects_stranger_submitter() {
+        let mut ch = pending_channel();
+        let v2 = cosign(&ch, &update(2, 800_000, 200_000));
+        let mallory_key = mallory().public_key();
+        assert_eq!(
+            ch.cancel_unilateral_close(&mallory_key, &v2, 1_000_500),
+            Err(EscrowError::Unauthorized)
+        );
+        // Authority-first: the channel is untouched by the refusal.
+        assert_eq!(ch.state(), ChannelState::UnilateralClosePending);
+        assert_eq!(ch.balances(), (250_000, 750_000));
+        assert_eq!(ch.nonce(), 1);
+        assert_eq!(ch.challenge_until(), 1_000_000 + CHALLENGE_PERIOD);
+    }
+
+    #[test]
+    fn cancel_unilateral_close_refused_on_open_and_closed_channels() {
+        // Open: there is no pending close to cancel.
+        let mut open = open_channel();
+        let v1 = cosign(&open, &update(1, 500_000, 500_000));
+        let alice_key = alice().public_key();
+        assert_eq!(
+            open.cancel_unilateral_close(&alice_key, &v1, 1_000_500),
+            Err(EscrowError::InvalidChannelState)
+        );
+        assert_eq!(open.state(), ChannelState::Open);
+        // Closed: terminal — the same call is refused.
+        let mut closed = open_channel();
+        let signed = cosign(&closed, &update(1, 300_000, 700_000));
+        closed.close_cooperative(&signed).unwrap();
+        let v2 = cosign(&closed, &update(2, 0, TOTAL));
+        assert_eq!(
+            closed.cancel_unilateral_close(&alice_key, &v2, 1_000_500),
+            Err(EscrowError::InvalidChannelState)
+        );
+        assert_eq!(closed.state(), ChannelState::Closed);
+        assert_eq!(closed.settlement(), Some((300_000, 700_000)));
+    }
+
+    #[test]
+    fn cancel_unilateral_close_refused_after_window_expiry() {
+        let mut ch = pending_channel();
+        let v2 = cosign(&ch, &update(2, 800_000, 200_000));
+        let alice_key = alice().public_key();
+        // At the boundary the window is over — cancellation is the
+        // wrong call, finalize owns the channel now.
+        assert_eq!(
+            ch.cancel_unilateral_close(&alice_key, &v2, 1_000_000 + CHALLENGE_PERIOD),
+            Err(EscrowError::InvalidChannelState)
+        );
+        assert_eq!(ch.state(), ChannelState::UnilateralClosePending);
+        let settlement = ch.finalize(1_000_000 + CHALLENGE_PERIOD).unwrap();
+        assert_eq!(settlement, (250_000, 750_000));
+        assert_eq!(ch.state(), ChannelState::Closed);
+    }
+
+    #[test]
+    fn cancel_unilateral_close_rejects_single_signature_and_tampering() {
+        let mut ch = pending_channel();
+        let alice_key = alice().public_key();
+        // Only Alice signed — one party cannot erase the
+        // counterparty's challenge window.
+        let u = update(2, 800_000, 200_000);
+        let sig_a = sign_channel_update(&alice(), &u, ch.party_a(), ch.party_b(), ch.total());
+        let half = SignedChannelUpdate::new(u, sig_a, [0u8; 64]);
+        assert_eq!(
+            ch.cancel_unilateral_close(&alice_key, &half, 1_000_500),
+            Err(EscrowError::InvalidChannelSignature)
+        );
+        // Tampered balances after both parties signed.
+        let mut tampered = cosign(&ch, &u);
+        tampered.update.balance_a = 1;
+        assert_eq!(
+            ch.cancel_unilateral_close(&alice_key, &tampered, 1_000_500),
+            Err(EscrowError::InvalidChannelSignature)
+        );
+        assert_eq!(ch.state(), ChannelState::UnilateralClosePending);
+        assert_eq!(ch.balances(), (250_000, 750_000));
+        assert_eq!(ch.nonce(), 1);
+    }
+
+    #[test]
+    fn cancel_unilateral_close_rejects_stale_nonce() {
+        let mut ch = pending_channel();
+        let alice_key = alice().public_key();
+        // The pending state itself (nonce 1) is not newer — an update
+        // identical to the submitted state is refused, so there is no
+        // same-value no-op.
+        let replay = cosign(&ch, &update(1, 250_000, 750_000));
+        assert_eq!(
+            ch.cancel_unilateral_close(&alice_key, &replay, 1_000_500),
+            Err(EscrowError::StaleChannelNonce)
+        );
+        assert_eq!(ch.state(), ChannelState::UnilateralClosePending);
+        assert_eq!(ch.nonce(), 1);
+    }
+
+    #[test]
+    fn cancel_unilateral_close_rejects_non_conserving_balances() {
+        let mut ch = pending_channel();
+        let alice_key = alice().public_key();
+        // Minting: sums to total + 1.
+        let mint = cosign(&ch, &update(2, 800_001, 200_000));
+        assert_eq!(
+            ch.cancel_unilateral_close(&alice_key, &mint, 1_000_500),
+            Err(EscrowError::ChannelBalanceMismatch)
+        );
+        // Burning: sums to total - 1.
+        let burn = cosign(&ch, &update(2, 799_999, 200_000));
+        assert_eq!(
+            ch.cancel_unilateral_close(&alice_key, &burn, 1_000_500),
+            Err(EscrowError::ChannelBalanceMismatch)
+        );
+        assert_eq!(ch.state(), ChannelState::UnilateralClosePending);
+        assert_eq!(ch.balances(), (250_000, 750_000));
+        assert_eq!(ch.nonce(), 1);
+    }
+
+    #[test]
+    fn cancel_unilateral_close_returns_channel_to_open() {
+        let mut ch = pending_channel();
+        let alice_key = alice().public_key();
+        let v2 = cosign(&ch, &update(2, 800_000, 200_000));
+        ch.cancel_unilateral_close(&alice_key, &v2, 1_000_500)
+            .unwrap();
+        assert_eq!(ch.state(), ChannelState::Open);
+        assert_eq!(ch.balances(), (800_000, 200_000));
+        assert_eq!(ch.nonce(), 2);
+        // The expired window is cleared, not left dangling.
+        assert_eq!(ch.challenge_until(), 0);
+        assert_eq!(ch.settlement(), None);
+    }
+
+    #[test]
+    fn cancel_unilateral_close_restores_open_semantics() {
+        let mut ch = pending_channel();
+        let alice_key = alice().public_key();
+        let v2 = cosign(&ch, &update(2, 800_000, 200_000));
+        ch.cancel_unilateral_close(&alice_key, &v2, 1_000_500)
+            .unwrap();
+        // Off-chain updates resume with a new nonce strictly +1.
+        let v3 = cosign(&ch, &update(3, 100_000, 900_000));
+        ch.apply_update(&v3).unwrap();
+        assert_eq!(ch.nonce(), 3);
+        assert_eq!(ch.balances(), (100_000, 900_000));
+        // Cooperative close is usable again.
+        let v4 = cosign(&ch, &update(4, 0, TOTAL));
+        let settlement = ch.close_cooperative(&v4).unwrap();
+        assert_eq!(settlement, (0, TOTAL));
+        assert_eq!(ch.state(), ChannelState::Closed);
+    }
+
+    #[test]
+    fn cancel_unilateral_close_refused_once_cancelled() {
+        let mut ch = pending_channel();
+        let alice_key = alice().public_key();
+        let bob_key = bob().public_key();
+        let v2 = cosign(&ch, &update(2, 800_000, 200_000));
+        ch.cancel_unilateral_close(&alice_key, &v2, 1_000_500)
+            .unwrap();
+        // The channel is Open again: a second cancellation, a
+        // dispute, and a finalize are all refused.
+        let v3 = cosign(&ch, &update(3, 100_000, 900_000));
+        assert_eq!(
+            ch.cancel_unilateral_close(&alice_key, &v3, 1_000_600),
+            Err(EscrowError::InvalidChannelState)
+        );
+        assert_eq!(
+            ch.dispute(&bob_key, &v3, 1_000_600),
+            Err(EscrowError::InvalidChannelState)
+        );
+        assert_eq!(
+            ch.finalize(1_000_600),
+            Err(EscrowError::InvalidChannelState)
+        );
+        assert_eq!(ch.state(), ChannelState::Open);
+        assert_eq!(ch.balances(), (800_000, 200_000));
+        assert_eq!(ch.nonce(), 2);
+    }
+
+    #[test]
+    fn cancel_unilateral_close_adopts_newer_state() {
+        let mut ch = pending_channel();
+        let alice_key = alice().public_key();
+        // The parties co-signed a nonce-3 state off-chain after the
+        // nonce-1 close was submitted; cancellation adopts it — the
+        // channel resumes from the newest mutually-signed state, not
+        // the submitted one.
+        let v3 = cosign(&ch, &update(3, 400_000, 600_000));
+        ch.cancel_unilateral_close(&alice_key, &v3, 1_000_500)
+            .unwrap();
+        assert_eq!(ch.state(), ChannelState::Open);
+        assert_eq!(ch.balances(), (400_000, 600_000));
+        assert_eq!(ch.nonce(), 3);
+        assert_eq!(ch.challenge_until(), 0);
+    }
+
+    #[test]
+    fn cancel_unilateral_close_preserves_total_parties_and_period() {
+        let mut ch = pending_channel();
+        let a = alice().public_key();
+        let b = bob().public_key();
+        let alice_key = alice().public_key();
+        let v2 = cosign(&ch, &update(2, 800_000, 200_000));
+        ch.cancel_unilateral_close(&alice_key, &v2, 1_000_500)
+            .unwrap();
+        assert_eq!(ch.total(), TOTAL);
+        assert_eq!(ch.party_a(), &a);
+        assert_eq!(ch.party_b(), &b);
+        assert_eq!(ch.challenge_period(), CHALLENGE_PERIOD);
+        assert_eq!(ch.state(), ChannelState::Open);
     }
 }
