@@ -498,6 +498,14 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // requirement, which disappears with the gate),
         // while plain `release` / `claim` never read the gate.
         | EscrowEventKind::TwapGateDisabled
+        // AV-424: a removed quorum policy moves no funds and
+        // never restates a release already settled — only the
+        // policy flips to `None`, so the `require_release_quorum`
+        // `None` arm passes through at the next call and every
+        // taker release path needs no witness, while the
+        // accumulated attestations die with the policy struct
+        // and the refund paths never read quorum.
+        | EscrowEventKind::QuorumDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1608,6 +1616,14 @@ mod event_sourcing_tests {
         // requirement, which disappears with the gate),
         // while plain `release` / `claim` never read the gate.
         | EscrowEventKind::TwapGateDisabled
+        // AV-424: a removed quorum policy moves no funds and
+        // never restates a release already settled — only the
+        // policy flips to `None`, so the `require_release_quorum`
+        // `None` arm passes through at the next call and every
+        // taker release path needs no witness, while the
+        // accumulated attestations die with the policy struct
+        // and the refund paths never read quorum.
+        | EscrowEventKind::QuorumDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices

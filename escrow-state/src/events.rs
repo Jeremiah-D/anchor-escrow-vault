@@ -483,6 +483,25 @@
 //!   there is no post-funding re-installation
 //!   (`with_twap_gate` / `with_twap_gate_and_staleness` stay
 //!   `Uninitialized`-only).
+//! - `disable_quorum` emits
+//!   [`EscrowEventKind::QuorumDisabled`] on every successful
+//!   disable that actually clears the policy (AV-424) — `from ==
+//!   to ==` the current state, all amounts zero; the policy is read
+//!   from the vault, and `require_release_quorum`'s `None` arm
+//!   passes through at the next call, so every taker release path
+//!   needs no witness, exactly like a never-gated escrow, while a
+//!   release already settled keeps the quorum it settled under and
+//!   the refund paths never read quorum. A failed disable emits
+//!   nothing, and a no-op disable of a never-configured escrow
+//!   emits nothing either. One-way only — there is no post-funding
+//!   re-installation (`with_quorum` stays `Uninitialized`-only).
+//!   The accumulated attestations die with the policy struct. The
+//!   one deliberate departure from the other disable items: quorum
+//!   changes route through the AV-158 delayed-governance mechanism,
+//!   so on a delay-opted-in escrow the direct call is refused and
+//!   the removal moves only through propose/execute
+//!   (`GovernanceAction::DisableQuorum`, kind 19), which emits the
+//!   generic `GovernanceExecuted` instead.
 //! - `amend_deadman_inactivity` emits
 //!   [`EscrowEventKind::DeadmanInactivityAmended`] on every
 //!   successful revision that actually changes the threshold
@@ -1182,6 +1201,7 @@
 //! | PauseAuthorityDisabled (AV-421) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a settlement already made; only the `pause_authority` fact flips to `None`, so the `pause` / `unpause` / `rotate_pause_authority` / `amend_auto_unpause_at` paths read the live binding at the next call — a `pause` after the disable is refused with `InvalidStateTransition` (code 101) exactly like a never-bound escrow, and a settlement already made keeps the switch it settled under; one-way only — there is no post-funding re-binding; deliberately never emitted while paused — disabling under a live pause would strand the escrow paused forever, since `unpause` needs a bound authority |
 //! | PriceGateDisabled (AV-422) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a payout already settled; only the `price_gate` fact flips to `None`, so the `require_price_gate` `None` arm passes through at the next call — a `release_price_gated` / `claim_price_gated` after the disable degrades to plain `release` / `claim` even under a dark feed, and a payout already settled keeps the gate it settled under; plain `release` / `claim` never read the gate and are unaffected; one-way only — there is no post-funding re-installation |
 //! | TwapGateDisabled (AV-423) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a payout already settled; only the `twap_gate` fact flips to `None`, so the `require_twap_gate` `None` arm passes through at the next call — a `release_twap_gated` / `claim_twap_gated` after the disable degrades to plain `release` / `claim` even under a feed whose history no longer covers the full window, and a payout already settled keeps the gate it settled under; plain `release` / `claim` never read the gate and are unaffected; one-way only — there is no post-funding re-installation |
+//! | QuorumDisabled (AV-424) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a payout already settled; only the `quorum` fact flips to `None`, so the `require_release_quorum` `None` arm passes through at the next call — every taker release path after the disable needs no witness, exactly like a never-gated escrow — and the accumulated attestations die with the policy struct, while a release already settled keeps the quorum it settled under and the refund paths never read quorum; one-way only — there is no post-funding re-installation |
 //! | DutchAuctionReserveBpsAmended (AV-277) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a claim already priced; only the floor changes, so the window is untouched, and claim prices through the live floor at the next call, so a claim after the amendment prices against the new floor while a claim already settled keeps the cap it settled under |
 //! | SocialRecoveryThresholdAmended (AV-278) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the threshold changes, so the guardians, the guardian count and the timelock are untouched, and the recovery path compares the live approval count against the live threshold at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new threshold while a request already settled keeps the threshold it settled under |
 //! | SocialRecoveryTimelockAmended (AV-279) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the timelock changes, so the guardians, the guardian count and the threshold are untouched, and the recovery path compares the live timelock against the request's opening timestamp at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new veto window while a request already settled keeps the window it settled under |
@@ -3426,6 +3446,27 @@ pub enum EscrowEventKind {
     /// a gate, or already removed it) emits nothing. One-way
     /// only — there is no post-funding re-installation.
     TwapGateDisabled,
+
+    /// The plain attestor quorum policy was removed after funding
+    /// (AV-424). The `QUORUM_POLICY_LEN`-byte `quorum` region
+    /// clears to `None` in place, so `require_release_quorum`'s
+    /// `None` arm passes through at the next call and every taker
+    /// release path needs no witness — exactly like an escrow that
+    /// never configured a quorum — while a release already settled
+    /// keeps the quorum it settled under and the refund paths never
+    /// read quorum. The accumulated attestations die with the policy
+    /// struct: they only counted toward the removed threshold. A
+    /// distinct kind from the installation (there is no event for
+    /// `with_quorum` — the opt-in is pre-funding configuration, not
+    /// a post-funding revision) so indexers can tell a policy
+    /// removal apart from the setup. The facts are read from the
+    /// vault, so the event needs no extra field. A no-op disable
+    /// (the escrow never configured a policy, or already removed
+    /// it) emits nothing. One-way only — there is no post-funding
+    /// re-installation. The delayed-governance path emits the
+    /// generic `GovernanceExecuted` instead: this kind belongs to
+    /// the direct-path wrapper only.
+    QuorumDisabled,
 }
 
 impl EscrowEventKind {
@@ -4022,6 +4063,10 @@ impl EscrowEventKind {
             // discriminants 0–181 stay stable for already-serialized
             // histories.
             182 => Self::TwapGateDisabled,
+            // AV-424: appended after TwapGateDisabled so
+            // discriminants 0–182 stay stable for already-serialized
+            // histories.
+            183 => Self::QuorumDisabled,
             _ => return None,
         })
     }
@@ -4250,6 +4295,7 @@ impl EscrowEventKind {
             Self::PauseAuthorityDisabled => "pause_authority_disabled",
             Self::PriceGateDisabled => "price_gate_disabled",
             Self::TwapGateDisabled => "twap_gate_disabled",
+            Self::QuorumDisabled => "quorum_disabled",
             Self::SlashDeadlineAmended => "slash_deadline_amended",
             Self::AmountBoundsAmended => "amount_bounds_amended",
             Self::MilestoneLatePenaltyBpsAmended => "milestone_late_penalty_bps_amended",
@@ -4512,6 +4558,7 @@ impl EscrowEventKind {
             "pause_authority_disabled" => Self::PauseAuthorityDisabled,
             "price_gate_disabled" => Self::PriceGateDisabled,
             "twap_gate_disabled" => Self::TwapGateDisabled,
+            "quorum_disabled" => Self::QuorumDisabled,
             "slash_deadline_amended" => Self::SlashDeadlineAmended,
             "amount_bounds_amended" => Self::AmountBoundsAmended,
             "milestone_late_penalty_bps_amended" => Self::MilestoneLatePenaltyBpsAmended,
@@ -7585,6 +7632,49 @@ impl IndexedEscrow {
             None,
             None,
         );
+        }
+        Ok(())
+    }
+
+    /// Remove the plain attestor quorum policy after funding
+    /// (mirrors [`Escrow::disable_quorum`]). Emits `QuorumDisabled`
+    /// only when the policy is actually cleared (`from == to ==`
+    /// the current state — the policy, not the lifecycle state, is
+    /// what changed; all amounts zero, since removing the policy
+    /// moves no funds and never restates a release already settled
+    /// — the taker release paths re-read the live policy at every
+    /// `release` / `claim`, while a release already settled keeps
+    /// the quorum it settled under and the refund paths never read
+    /// quorum). The policy is snapshotted before and after, so the
+    /// event fires exactly on a `Some -> None` transition. A failed
+    /// disable emits nothing, and a no-op disable of a
+    /// never-configured escrow emits nothing either, paralleling
+    /// `disable_twap_gate`'s no-op rule. The delayed-governance
+    /// path does not come through here: `execute_governance` emits
+    /// the generic `GovernanceExecuted` instead, and the quorum
+    /// fact is read from the vault.
+    pub fn disable_quorum(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.quorum();
+        self.inner.disable_quorum(initializer, taker)?;
+        if before.is_some() && self.inner.quorum().is_none() {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::QuorumDisabled,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
         }
         Ok(())
     }
@@ -17372,7 +17462,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17543,7 +17634,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18148,7 +18240,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18231,7 +18324,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18311,7 +18405,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18391,7 +18486,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18471,7 +18567,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18554,7 +18651,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18637,7 +18735,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18717,7 +18816,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18797,7 +18897,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18877,7 +18978,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18957,7 +19059,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19037,7 +19140,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19117,7 +19221,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19201,7 +19306,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19284,7 +19390,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19367,7 +19474,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19450,7 +19558,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19533,7 +19642,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19617,7 +19727,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19701,7 +19812,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19785,7 +19897,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19868,7 +19981,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19908,7 +20022,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19944,7 +20059,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19979,7 +20095,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -20010,7 +20127,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -20042,7 +20160,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -20073,7 +20192,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -20103,7 +20223,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -20132,7 +20253,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -20160,7 +20282,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -20191,7 +20314,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -20291,7 +20415,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
