@@ -415,6 +415,19 @@
 //!   never silently discarded. A failed disable emits nothing,
 //!   and a no-op disable of a never-configured escrow emits
 //!   nothing either.
+//! - `disable_transfer_hook` emits
+//!   [`EscrowEventKind::TransferHookDisabled`] on every
+//!   successful disable that actually clears the binding
+//!   (AV-419) — `from == to ==` the current state, all amounts
+//!   zero; the binding is read from the vault, and the CPI plan
+//!   path is hook-free after the disable, so a plan naming no
+//!   hook builds while a plan naming the old hook fails with
+//!   `SettlementMismatch`, and plain `release` is unaffected.
+//!   Only the escrow-side declaration is cleared — a Token-2022
+//!   hook the mint itself carries still runs on-chain under the
+//!   mint's own configuration. A failed disable emits nothing,
+//!   and a no-op disable of a never-bound escrow emits nothing
+//!   either.
 //! - `amend_deadman_inactivity` emits
 //!   [`EscrowEventKind::DeadmanInactivityAmended`] on every
 //!   successful revision that actually changes the threshold
@@ -1109,6 +1122,7 @@
 //! | ArbiterDisabled (AV-412) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a dispute already settled; only the `arbiter` fact flips to `None`, so the `resolve` / `escalate` paths read the live arbiter at the next call — a `resolve` or `escalate` after the disable is refused with `InvalidArbiter` (code 108), and a dispute already settled keeps the arbiter it settled under |
 //! | DeadmanSwitchDisabled (AV-417) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a claim already settled; both legs flip together (`deadman_heir` to `None`, `deadman_inactivity_secs` to `0`), so the `claim_deadman` / `rotate_deadman_heir` / `amend_deadman_inactivity` paths read the live configuration at the next call — a `claim_deadman` after the disable is refused with `InvalidDeadmanConfig` (code 168), and a claim already settled keeps the heir and threshold it settled under, while an already-satisfied but unexecuted eligibility dies with the disable |
 //! | SocialRecoveryDisabled (AV-418) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a request already settled; only the `recovery` fact flips to `None`, so the `request_recovery` / `approve_recovery` / `execute_recovery` / `veto_recovery` / `rotate_social_recovery_guardian` / `amend_social_recovery_threshold` / `amend_social_recovery_timelock` paths read the live policy at the next call — a recovery call after the disable is refused with `RecoveryNotConfigured` (code 287), and a request already settled keeps the guardians and threshold it settled under, while a pending request refuses the disable with `RecoveryRequestPending` (code 289) until the initializer vetoes it first |
+//! | TransferHookDisabled (AV-419) | 0 | 0 | 0 | 0 — disabling moves no funds and never restates a payout already settled; only the `transfer_hook` fact flips to `None`, so the CPI plan builders read the live binding at the next call — a plan naming no hook builds while a plan naming the old hook fails with `SettlementMismatch`, and plain `release` is unaffected; only the escrow-side declaration is cleared — a Token-2022 hook the mint itself carries still runs on-chain under the mint's own configuration |
 //! | DutchAuctionReserveBpsAmended (AV-277) | 0 | 0 | 0 | 0 — revising moves no funds and never restates a claim already priced; only the floor changes, so the window is untouched, and claim prices through the live floor at the next call, so a claim after the amendment prices against the new floor while a claim already settled keeps the cap it settled under |
 //! | SocialRecoveryThresholdAmended (AV-278) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the threshold changes, so the guardians, the guardian count and the timelock are untouched, and the recovery path compares the live approval count against the live threshold at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new threshold while a request already settled keeps the threshold it settled under |
 //! | SocialRecoveryTimelockAmended (AV-279) | 0 | 0 | 0 | 0 — amending moves no funds and never restates a request already settled; only the timelock changes, so the guardians, the guardian count and the threshold are untouched, and the recovery path compares the live timelock against the request's opening timestamp at the next `request_recovery` / `execute_recovery`, so a request opened after the amendment arms and executes under the new veto window while a request already settled keeps the window it settled under |
@@ -3254,6 +3268,28 @@ pub enum EscrowEventKind {
     /// needs no extra field. A no-op disable (the escrow never
     /// configured a policy, or already removed it) emits nothing.
     SocialRecoveryDisabled,
+    /// AV-419: the Token-2022 transfer-hook binding was removed
+    /// by mutual agreement ([`Escrow::disable_transfer_hook`](crate::Escrow::disable_transfer_hook))
+    /// — both parties signed that the CPI settlement path is
+    /// hook-free again, so the plan builders stop annotating a
+    /// hook program. `from == to ==` the current state (a
+    /// governance revision, not a lifecycle move — like
+    /// [`EscrowEventKind::TransferHookRotated`]); all amounts
+    /// are zero — disabling moves no funds and never restates a
+    /// payout already settled; only the `transfer_hook` fact
+    /// flips to `None`, so the `check_transfer_hook` gate reads
+    /// the live binding at the next plan build — a plan naming
+    /// no hook builds while a plan naming the old hook fails
+    /// with `SettlementMismatch`, and plain `release` is
+    /// unaffected. A distinct kind from `TransferHookRotated`
+    /// (155) so indexers can tell a hook swap apart from a hook
+    /// removal. The facts are read from the vault, so the event
+    /// needs no extra field. A no-op disable (the escrow never
+    /// bound a hook, or already removed it) emits nothing. Only
+    /// the escrow-side declaration is cleared — a Token-2022
+    /// hook the mint itself carries still runs on-chain under
+    /// the mint's own configuration.
+    TransferHookDisabled,
 }
 
 impl EscrowEventKind {
@@ -3830,6 +3866,10 @@ impl EscrowEventKind {
             // discriminants 0–176 stay stable for already-serialized
             // histories.
             177 => Self::SocialRecoveryDisabled,
+            // AV-419: appended after SocialRecoveryDisabled so
+            // discriminants 0–177 stay stable for already-serialized
+            // histories.
+            178 => Self::TransferHookDisabled,
             _ => return None,
         })
     }
@@ -4053,6 +4093,7 @@ impl EscrowEventKind {
             Self::ArbiterDisabled => "arbiter_disabled",
             Self::DeadmanSwitchDisabled => "deadman_switch_disabled",
             Self::SocialRecoveryDisabled => "social_recovery_disabled",
+            Self::TransferHookDisabled => "transfer_hook_disabled",
             Self::SlashDeadlineAmended => "slash_deadline_amended",
             Self::AmountBoundsAmended => "amount_bounds_amended",
             Self::MilestoneLatePenaltyBpsAmended => "milestone_late_penalty_bps_amended",
@@ -4310,6 +4351,7 @@ impl EscrowEventKind {
             "arbiter_disabled" => Self::ArbiterDisabled,
             "deadman_switch_disabled" => Self::DeadmanSwitchDisabled,
             "social_recovery_disabled" => Self::SocialRecoveryDisabled,
+            "transfer_hook_disabled" => Self::TransferHookDisabled,
             "slash_deadline_amended" => Self::SlashDeadlineAmended,
             "amount_bounds_amended" => Self::AmountBoundsAmended,
             "milestone_late_penalty_bps_amended" => Self::MilestoneLatePenaltyBpsAmended,
@@ -8653,6 +8695,47 @@ impl IndexedEscrow {
             None,
             None,
         );
+        }
+        Ok(())
+    }
+
+    /// Disable the bound Token-2022 transfer-hook program after
+    /// funding (mirrors [`Escrow::disable_transfer_hook`]).
+    /// Emits `TransferHookDisabled` only when the hook is
+    /// actually cleared (`from == to ==` the current state — the
+    /// binding, not the lifecycle state, is what changed; all
+    /// amounts zero, since removing the binding moves no funds
+    /// and never restates a payout already settled — a plan
+    /// naming no hook builds after the disable while a plan
+    /// naming the old hook fails with `SettlementMismatch`, and
+    /// plain `release` is unaffected). The binding is
+    /// snapshotted before and after, so the event fires exactly
+    /// on a `Some -> None` transition. A failed disable emits
+    /// nothing, and a no-op disable of a never-bound escrow
+    /// emits nothing either, paralleling
+    /// `disable_social_recovery`'s no-op rule.
+    pub fn disable_transfer_hook(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        at: u64,
+    ) -> Result<(), EscrowError> {
+        let before = self.inner.transfer_hook();
+        self.inner.disable_transfer_hook(initializer, taker)?;
+        if self.inner.transfer_hook() != before {
+            let state = self.inner.state();
+            self.push_event(
+                EscrowEventKind::TransferHookDisabled,
+                state,
+                state,
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
         }
         Ok(())
     }
@@ -16959,7 +17042,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17125,7 +17209,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17725,7 +17810,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17803,7 +17889,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17878,7 +17965,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -17953,7 +18041,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18028,7 +18117,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18106,7 +18196,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18184,7 +18275,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18259,7 +18351,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18334,7 +18427,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18409,7 +18503,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18484,7 +18579,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18559,7 +18655,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18634,7 +18731,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18713,7 +18811,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18791,7 +18890,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18869,7 +18969,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -18947,7 +19048,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19025,7 +19127,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19104,7 +19207,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19183,7 +19287,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19262,7 +19367,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19340,7 +19446,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19375,7 +19482,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19406,7 +19514,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19436,7 +19545,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19462,7 +19572,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19489,7 +19600,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -19515,7 +19627,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -19540,7 +19653,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -19564,7 +19678,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -19587,7 +19702,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -19613,7 +19729,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -19708,7 +19825,8 @@ mod event_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]

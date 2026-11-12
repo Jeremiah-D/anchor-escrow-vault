@@ -20606,6 +20606,92 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Disable the bound Token-2022 transfer-hook program after
+    /// funding (AV-419 — Solana transfer-hook governance): the
+    /// post-funding counterpart to the removal leg of
+    /// [`Escrow::with_transfer_hook`] (`Uninitialized`-only
+    /// initial binding). A deal's hook program may die mid-deal
+    /// — the hook is abandoned, its key is compromised, or no
+    /// replacement program exists — and with the binding in
+    /// place no CPI settlement plan can be built at all (a plan
+    /// naming the old hook dies on-chain against the dead
+    /// program, a plan naming a new hook or no hook is refused
+    /// with `SettlementMismatch`), so the binding itself must
+    /// be removable without cancelling and re-locking the
+    /// escrow.
+    ///
+    /// Governance mirrors [`Escrow::rotate_transfer_hook`]:
+    /// pause first (AV-46), then unconditional dual signature —
+    /// both the *current* initializer and the *current* taker must
+    /// authorize, one party alone (or a stranger pair) is
+    /// [`EscrowError::Unauthorized`] — then the `Funded`-only state
+    /// gate ([`EscrowError::InvalidStateTransition`]). The hook
+    /// program itself does not sign: a lost or compromised hook
+    /// key must not block its own removal (the `rotate_arbiter`
+    /// reasoning). Only an escrow with a hook actually bound has
+    /// anything to remove: an unbound escrow — never bound, or
+    /// already disabled — is a silent no-op success that writes
+    /// nothing and emits nothing (the AV-405 / AV-409 / AV-410
+    /// no-op precedent). The binding flips to `None` in place —
+    /// the 33-byte `Option` region is already resident, so no
+    /// layout change. One-way only — there is no post-funding
+    /// re-binding: `with_transfer_hook` stays `Uninitialized`-only,
+    /// and `rotate_transfer_hook` on an unbound escrow still
+    /// refuses with [`EscrowError::InvalidTransferHook`]
+    /// (fail-closed, unchanged) — unbinding never becomes an
+    /// installation path, since post-funding installation would
+    /// add hook execution the taker never funded under; it is a
+    /// new deal, not a revision (the AV-318 refusal reasoning).
+    /// After disabling, [`cpi::check_transfer_hook`] accepts a
+    /// no-hook plan (`(None, None)`), while a plan naming the old
+    /// hook is refused with `SettlementMismatch` — the declared
+    /// binding moved, so the old plan dies with it, as intended —
+    /// and plain `release` is unaffected (no hook context on the
+    /// SPL path). The mint, the allowlist, and any settled payout
+    /// are untouched. Honest boundary: only the escrow-side
+    /// declaration is cleared — a Token-2022 hook the mint
+    /// itself carries still runs on-chain under the mint's own
+    /// configuration; this restores the escrow's ability to build
+    /// plans, it does not change mint policy. Disabling moves no
+    /// funds, so no AV-36 reentrancy lock is needed (the lock
+    /// only guards the fund-moving paths, the `rotate_arbiter`
+    /// precedent). Orthogonal to [`Escrow::with_transfer_hook`]
+    /// (that is the initial configuration, this item is the
+    /// post-funding removal) and to
+    /// [`Escrow::rotate_transfer_hook`] (that swaps the program,
+    /// this item removes the binding — rotation cannot help when
+    /// there is no replacement program to point at). Emits
+    /// `TransferHookDisabled` on the event layer, except for
+    /// the no-op.
+    pub fn disable_transfer_hook(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the *current*
+        // initializer and the *current* taker must authorize.
+        // The hook program itself does not sign: a lost or
+        // compromised hook key must not block the binding's
+        // removal (the `rotate_arbiter` reasoning).
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // No-op: never bound (or already removed) — removing a
+        // binding that is not declared writes nothing, so the
+        // event layer emits nothing for it.
+        if self.transfer_hook.is_none() {
+            return Ok(());
+        }
+        self.transfer_hook = None;
+        Ok(())
+    }
+
     /// Opt in to a streaming fee on funded time (AV-100).
     /// Builder-style: only valid on an `Uninitialized` escrow, so the
     /// rate is fixed before any funds move — mirroring
@@ -58006,7 +58092,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -72361,7 +72448,8 @@ mod emergency_unlock_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -78217,7 +78305,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -78473,9 +78562,10 @@ mod event_history_tests {
         // `EmergencyUnlockDisabled` (AV-405), 175 is
         // `ArbiterDisabled` (AV-412), 176 is
         // `DeadmanSwitchDisabled` (AV-417), 177 is
-        // `SocialRecoveryDisabled` (AV-418) and 178 is the
+        // `SocialRecoveryDisabled` (AV-418), 178 is
+        // `TransferHookDisabled` (AV-419) and 179 is the
         // first still-unknown byte.
-        for bad in [178u8, 255] {
+        for bad in [179u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -81876,7 +81966,8 @@ mod release_via_intent_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -90104,7 +90195,8 @@ mod disable_dual_control_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -90419,7 +90511,8 @@ mod disable_deadman_switch_tests {
             Some(EscrowEventKind::ArbiterDisabled)
         );
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-418: 177 is SocialRecoveryDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-418: 177 is SocialRecoveryDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-418: 177 is SocialRecoveryDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-418: 177 is SocialRecoveryDisabled
     }
 }
 
@@ -90849,7 +90942,8 @@ mod disable_credential_gate_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -91190,7 +91284,8 @@ mod disable_milestone_verifier_tests {
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -91489,7 +91584,8 @@ mod disable_arbiter_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -93848,7 +93944,8 @@ mod disable_social_recovery_tests {
             EscrowEventKind::from_discriminant(176),
             Some(EscrowEventKind::DeadmanSwitchDisabled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(178), None);
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(179), None);
     }
 }
 
@@ -95487,6 +95584,435 @@ mod rotate_transfer_hook_tests {
         assert_eq!(e.event_count(), before + 2);
         let ev = e.events().last().copied().expect("event pushed");
         assert_eq!(ev.kind, EscrowEventKind::TransferHookRotated);
+    }
+}
+
+mod disable_transfer_hook_tests {
+    use super::*;
+    use crate::cpi::{
+        check_transfer_hook, payout_plan, CpiError, PayoutAddrs, PayoutKind,
+        TransferHookPlan,
+    };
+    use crate::events::IndexedEscrow;
+
+    const H1: [u8; 32] = [0x77; 32];
+    const H2: [u8; 32] = [0x78; 32];
+    const MINT: [u8; 32] = [0xD0; 32];
+    const M2: [u8; 32] = [0xD1; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn init_key() -> SigningKey {
+        SigningKey::from_seed([0x11; 32])
+    }
+
+    fn taker_key() -> SigningKey {
+        SigningKey::from_seed([0x22; 32])
+    }
+
+    fn initializer() -> [u8; 32] {
+        init_key().public_key()
+    }
+
+    fn taker() -> [u8; 32] {
+        taker_key().public_key()
+    }
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_mint_allowlist(&[MINT, M2])
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_transfer_hook(H1)
+            .unwrap();
+        e.fund(initializer(), NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn disputed() -> Escrow {
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_transfer_hook(H1)
+            .unwrap();
+        e.fund(initializer(), NOW).unwrap();
+        e.escalate(initializer(), EXPIRES_AT - 1, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        e
+    }
+
+    fn hook_plan(hook: [u8; 32]) -> TransferHookPlan {
+        TransferHookPlan {
+            program: hook,
+            extra_accounts: vec![
+                AccountMeta {
+                    pubkey: [0x14; 32],
+                    is_signer: false,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: [0x15; 32],
+                    is_signer: false,
+                    is_writable: false,
+                },
+            ],
+        }
+    }
+
+    fn hook_payout_addrs(hook: [u8; 32]) -> PayoutAddrs {
+        PayoutAddrs {
+            source: [0x0B; 32],
+            vault_authority: [0x0A; 32],
+            taker: taker(),
+            taker_leg: [0x0C; 32],
+            fee_leg: [0x09; 32],
+            transfer_hook: Some(hook_plan(hook)),
+            token_program: None,
+        }
+    }
+
+    fn no_hook_payout_addrs() -> PayoutAddrs {
+        PayoutAddrs {
+            source: [0x0B; 32],
+            vault_authority: [0x0A; 32],
+            taker: taker(),
+            taker_leg: [0x0C; 32],
+            fee_leg: [0x09; 32],
+            transfer_hook: None,
+            token_program: None,
+        }
+    }
+
+    #[test]
+    fn stranger_and_single_party_cannot_disable_and_binding_unchanged() {
+        // AV-419: the binding is jointly owned CPI payment
+        // plumbing — one party alone removing it would rewrite
+        // the other's settlement path, so a stranger or a single
+        // party is Unauthorized and the failed call moves nothing.
+        // The hook program itself does not sign: a lost or
+        // compromised hook key must not block its own removal.
+        let mut e = configured();
+        for (init, taker) in [
+            (initializer(), MALLORY),
+            (MALLORY, taker()),
+            (MALLORY, MALLORY),
+            (taker(), initializer()), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_transfer_hook(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(e.transfer_hook(), Some(H1));
+    }
+
+    #[test]
+    fn disable_refused_while_paused() {
+        // AV-419: pause first (AV-46) — a paused escrow fails
+        // fast, before the dual-signature check.
+        let mut e = configured();
+        e.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            e.disable_transfer_hook(initializer(), taker()),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            e.disable_transfer_hook(MALLORY, taker()),
+            Err(EscrowError::Paused),
+            "even a stranger's disable on a paused escrow is Paused"
+        );
+        assert_eq!(e.transfer_hook(), Some(H1), "paused disable writes nothing");
+        e.unpause(PAUSER).unwrap();
+        e.disable_transfer_hook(initializer(), taker()).unwrap();
+        assert!(e.transfer_hook().is_none());
+    }
+
+    #[test]
+    fn disable_refuses_non_funded_states() {
+        // AV-419: Funded-only — the Uninitialized builder owns
+        // the initial binding, Disputed is excluded (the dispute
+        // must settle first), and terminal states have no live
+        // binding left to remove.
+        let mut bare = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_transfer_hook(H1)
+            .unwrap();
+        assert_eq!(
+            bare.disable_transfer_hook(initializer(), taker()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            bare.transfer_hook(),
+            Some(H1),
+            "refused disable writes nothing"
+        );
+        // Disputed: the binding stays while the dispute is in
+        // flight.
+        let mut d = disputed();
+        assert_eq!(
+            d.disable_transfer_hook(initializer(), taker()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.transfer_hook(),
+            Some(H1),
+            "refused disable writes nothing"
+        );
+        // Terminal: a cancelled escrow's binding is history, not
+        // a live configuration to remove.
+        let mut e = configured();
+        e.cancel(initializer(), Some(MINT), initializer(), 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_transfer_hook(initializer(), taker()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.transfer_hook(), Some(H1));
+    }
+
+    #[test]
+    fn unbound_is_a_silent_noop_and_emits_nothing() {
+        // AV-419: removing a binding that was never installed
+        // writes nothing and emits nothing — the `rotate_*`
+        // same-value no-op precedent. That covers both a
+        // never-bound escrow and a second disable after a
+        // successful first one.
+        let mut plain = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap();
+        plain.fund(initializer(), NOW).unwrap();
+        plain.disable_transfer_hook(initializer(), taker()).unwrap();
+        assert!(plain.transfer_hook().is_none());
+
+        let mut plain_ie = IndexedEscrow::wrap(
+            [0xE0; 32],
+            Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_mint(MINT)
+                .unwrap(),
+        );
+        plain_ie.fund(initializer(), 0).unwrap();
+        let _ = plain_ie.drain_events();
+        plain_ie
+            .disable_transfer_hook(initializer(), taker(), 42)
+            .unwrap();
+        assert_eq!(
+            plain_ie.event_count(),
+            0,
+            "never-bound disable emits nothing"
+        );
+
+        let mut ie = IndexedEscrow::wrap([0xE0; 32], configured());
+        let _ = ie.drain_events();
+        ie.disable_transfer_hook(initializer(), taker(), 42)
+            .unwrap();
+        assert_eq!(ie.event_count(), 1, "first disable emits once");
+        ie.disable_transfer_hook(initializer(), taker(), 43)
+            .unwrap();
+        assert_eq!(ie.event_count(), 1, "second disable emits nothing");
+        assert!(ie.inner().transfer_hook().is_none());
+    }
+
+    #[test]
+    fn disable_clears_binding_and_moves_no_funds() {
+        // AV-419: the binding flips to `None` in place — the
+        // 33-byte `Option` region is already resident, so the
+        // disable rewrites it with no layout change, the state
+        // stays Funded, and the locked amount, the mint, and the
+        // allowlist are untouched.
+        let mut e = configured();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let allowlist_before = e.mint_allowlist();
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        e.disable_transfer_hook(initializer(), taker()).unwrap();
+        assert!(e.transfer_hook().is_none());
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.mint(), Some(MINT));
+        assert_eq!(e.mint_allowlist(), allowlist_before);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "hook region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn disable_reopens_no_hook_cpi_plans() {
+        // AV-419: the gate reads the live binding — while bound,
+        // a no-hook plan is refused and the bound-hook plan
+        // builds; after the disable the no-hook plan builds and
+        // a plan naming the old hook dies with the binding, at
+        // both the gate level and the plan-builder level.
+        let mut e = configured();
+        assert_eq!(
+            check_transfer_hook(&e, &None),
+            Err(CpiError::SettlementMismatch)
+        );
+        assert!(check_transfer_hook(&e, &Some(hook_plan(H1))).is_ok());
+        e.disable_transfer_hook(initializer(), taker()).unwrap();
+        let (hook_program, hook_accounts) = check_transfer_hook(&e, &None).unwrap();
+        assert_eq!(hook_program, None);
+        assert!(hook_accounts.is_empty());
+        assert_eq!(
+            check_transfer_hook(&e, &Some(hook_plan(H1))),
+            Err(CpiError::SettlementMismatch)
+        );
+        let (payout, fee) = e
+            .release(initializer(), NOW, 1_000_000, Some(MINT), taker())
+            .unwrap();
+        let plan = payout_plan(
+            PayoutKind::Release,
+            &e,
+            &no_hook_payout_addrs(),
+            payout,
+            fee,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.transfer_hook_program, None);
+        assert!(plan.transfer_hook_accounts.is_empty());
+        assert_eq!(
+            payout_plan(
+                PayoutKind::Release,
+                &e,
+                &hook_payout_addrs(H1),
+                payout,
+                fee,
+                None
+            ),
+            Err(CpiError::SettlementMismatch)
+        );
+    }
+
+    #[test]
+    fn disable_blocks_rotate() {
+        // AV-419: fail-closed, unchanged — a removed binding has
+        // nothing left to rotate, and rotation never re-installs
+        // a hook: the unbind is one-way.
+        let mut e = configured();
+        e.disable_transfer_hook(initializer(), taker()).unwrap();
+        assert_eq!(
+            e.rotate_transfer_hook(initializer(), taker(), H2),
+            Err(EscrowError::InvalidTransferHook)
+        );
+        assert_eq!(
+            e.rotate_transfer_hook(initializer(), taker(), H1),
+            Err(EscrowError::InvalidTransferHook),
+            "rotating back to the old hook is still a refusal, not a rebind"
+        );
+        assert_eq!(
+            e.rotate_transfer_hook(initializer(), taker(), [0u8; 32]),
+            Err(EscrowError::InvalidTransferHook)
+        );
+        assert_eq!(EscrowError::InvalidTransferHook.code(), 157);
+        assert!(e.transfer_hook().is_none());
+    }
+
+    #[test]
+    fn disable_keeps_settled_release() {
+        // AV-419: a payout already settled keeps the hook it
+        // settled under — the disable only governs future plan
+        // builds, and the remainder still releases plainly.
+        let mut e = configured();
+        let (payout, fee) = e
+            .release(initializer(), NOW, 400_000, Some(MINT), taker())
+            .unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.released_amount(), 400_000);
+        e.disable_transfer_hook(initializer(), taker()).unwrap();
+        assert!(e.transfer_hook().is_none());
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.remaining_amount(), 600_000);
+        assert_eq!(
+            e.release(initializer(), NOW, 600_000, Some(MINT), taker())
+                .unwrap(),
+            (600_000, 0)
+        );
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn disable_leaves_plain_release_unaffected() {
+        // AV-419: plain `release` never carried hook context, so
+        // the disable changes nothing for it — it keeps settling
+        // in funded units, unconverted.
+        let mut e = configured();
+        e.disable_transfer_hook(initializer(), taker()).unwrap();
+        assert_eq!(
+            e.release(initializer(), NOW, 1_000_000, Some(MINT), taker())
+                .unwrap(),
+            (1_000_000, 0)
+        );
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn disable_transfer_hook_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-419: the event layer emits exactly one
+        // TransferHookDisabled on an actual clear, and nothing
+        // for a failed call or a no-op.
+        let mut e = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = e.event_count();
+        assert_eq!(
+            e.disable_transfer_hook(MALLORY, taker(), NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.disable_transfer_hook(initializer(), taker(), NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::TransferHookDisabled);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.at, NOW);
+        assert_eq!((ev.amounts.payout, ev.amounts.fee), (0, 0));
+        // A second disable is a no-op: no new event.
+        e.disable_transfer_hook(initializer(), taker(), NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn transfer_hook_disabled_discriminant_is_pinned() {
+        // AV-419: discriminant 178, appended after
+        // SocialRecoveryDisabled — 0–177 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::TransferHookDisabled;
+        assert_eq!(kind.discriminant(), 178);
+        assert_eq!(EscrowEventKind::from_discriminant(178), Some(kind));
+        assert_eq!(kind.name(), "transfer_hook_disabled");
+        assert_eq!(
+            EscrowEventKind::from_name("transfer_hook_disabled"),
+            Some(kind)
+        );
+        assert_eq!(
+            EscrowEventKind::from_discriminant(177),
+            Some(EscrowEventKind::SocialRecoveryDisabled)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(179), None);
     }
 }
 

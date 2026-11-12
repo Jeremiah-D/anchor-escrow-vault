@@ -5850,6 +5850,22 @@ replacement), `Funded`-only, bound-hook-only, zero program refused with
 emits `TransferHookRotated` (discriminant 155) only on an actual change, and
 rewrites the 33-byte hook region in place — no layout change.
 
+After funding, the binding can also be removed entirely via
+`disable_transfer_hook(initializer, taker)` (AV-419): pause first,
+then unconditional dual signature (either party alone is
+`Unauthorized`), `Funded` only. An escrow that never bound a hook —
+or already removed it — is a silent no-op success that emits
+nothing. A real removal emits `TransferHookDisabled` (discriminant
+178) and clears only the escrow-side declaration: the next CPI plan
+build reads the live binding, so a plan naming no hook builds while
+a plan naming the old hook fails with `SettlementMismatch`, and plain
+`release` is unaffected. The removal is one-way — there is no
+post-funding rebind (`with_transfer_hook` stays `Uninitialized`-only,
+and `rotate_transfer_hook` on an unbound escrow still refuses with
+`InvalidTransferHook`), and a Token-2022 hook the mint itself carries
+still runs on-chain under the mint's own configuration: this restores
+the escrow's ability to build plans, it does not change mint policy.
+
 ## Streaming fee on funded time (AV-100)
 
 A flat bps fee prices the *size* of a payout; the streaming fee

@@ -461,6 +461,12 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // policy and is refused with RecoveryNotConfigured, while
         // a pending request refuses the disable itself.
         | EscrowEventKind::SocialRecoveryDisabled
+        // AV-419: a removed transfer-hook binding moves no funds and
+        // never restates a payout already settled — only the binding
+        // flips to None, so the next CPI plan build reads the live
+        // binding: a plan naming no hook builds while a plan naming
+        // the old hook fails with SettlementMismatch.
+        | EscrowEventKind::TransferHookDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1534,6 +1540,12 @@ mod event_sourcing_tests {
         // policy and is refused with RecoveryNotConfigured, while
         // a pending request refuses the disable itself.
         | EscrowEventKind::SocialRecoveryDisabled
+        // AV-419: a removed transfer-hook binding moves no funds and
+        // never restates a payout already settled — only the binding
+        // flips to None, so the next CPI plan build reads the live
+        // binding: a plan naming no hook builds while a plan naming
+        // the old hook fails with SettlementMismatch.
+        | EscrowEventKind::TransferHookDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
