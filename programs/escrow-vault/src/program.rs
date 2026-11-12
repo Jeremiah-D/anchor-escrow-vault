@@ -2471,6 +2471,77 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Amend the social-recovery approval threshold by dual-signed
+    /// governance (AV-425; mirrors
+    /// `Escrow::amend_social_recovery_threshold`). Both the
+    /// initializer and the taker must sign at the program layer —
+    /// the Anchor accounts require both signers, so the on-chain
+    /// call is dual-signed either way (the state machine's AV-276
+    /// gate would accept the initializer alone on a plain escrow).
+    /// Only `Funded`: the terminal states and `Disputed` are
+    /// `InvalidStateTransition` (the builder owns the initial
+    /// threshold). Only an escrow carrying a social-recovery policy
+    /// may amend (`RecoveryNotConfigured`, code 287,
+    /// fail-closed — post-funding installation would add a
+    /// recovery path the taker never funded under). A pending
+    /// recovery request refuses the amendment
+    /// (`RecoveryRequestPending`, code 289 — in-flight requests
+    /// count under the old threshold, so changing it would
+    /// reinterpret already-cast approval votes). A threshold
+    /// outside `1..=guardian_count` is `InvalidSocialRecovery`
+    /// (code 286, the `SocialRecovery::new` gate) leaving the
+    /// original threshold untouched. Amending to the current
+    /// threshold is an idempotent no-op. A paused escrow fails
+    /// fast (`Paused`). Only the threshold changes (the guardians,
+    /// the guardian count and the timelock are untouched, the
+    /// pending request stays empty). The new threshold governs
+    /// from the next `request_recovery` / `execute_recovery`:
+    /// the recovery path compares the live approval count
+    /// against the live threshold at each call, so a request
+    /// opened after the amendment arms and executes under the
+    /// new threshold while a request already settled keeps the
+    /// threshold it settled under. Emits
+    /// `SocialRecoveryThresholdAmended` only on an actual change
+    /// (from == to == the current state), mirroring
+    /// `IndexedEscrow::amend_social_recovery_threshold`.
+    pub fn amend_social_recovery_threshold(
+        ctx: Context<AmendSocialRecoveryThreshold>,
+        new_threshold: u8,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.recovery();
+        escrow
+            .amend_social_recovery_threshold(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_threshold,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites `recovery.threshold` in place in the real build
+        // (the policy region is already resident) — no realloc, no
+        // rent change.
+        if escrow.recovery() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::SocialRecoveryThresholdAmended,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Rotate the live operator grant's delegate key (AV-388; mirrors
     /// `Escrow::rotate_delegation_delegate` — the AV-301 pure-logic
     /// rotation). Either party may rotate — the initializer or the
@@ -9230,6 +9301,11 @@ pub enum EscrowVaultEventKind {
     /// (`Escrow::rotate_social_recovery_guardian`). Mirrors
     /// `escrow_state::EscrowEventKind::SocialRecoveryGuardianRotated`.
     SocialRecoveryGuardianRotated,
+    /// AV-425: the social-recovery approval threshold was amended by
+    /// dual-signed governance
+    /// (`Escrow::amend_social_recovery_threshold`). Mirrors
+    /// `escrow_state::EscrowEventKind::SocialRecoveryThresholdAmended`.
+    SocialRecoveryThresholdAmended,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -9449,6 +9525,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::SocialRecoveryGuardianRotated => {
             EscrowVaultEventKind::SocialRecoveryGuardianRotated
+        }
+        escrow_state::EscrowEventKind::SocialRecoveryThresholdAmended => {
+            EscrowVaultEventKind::SocialRecoveryThresholdAmended
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -10637,6 +10716,26 @@ pub struct RotateSocialRecoveryGuardian<'info> {
     /// Second governance signer: must equal the escrow's taker. The
     /// taker consents to replacing one guardian of the lost-key
     /// recovery policy their funded escrow settles under.
+    pub taker: Signer<'info>,
+}
+
+/// AV-425: accounts for `amend_social_recovery_threshold` — the
+/// social-recovery threshold amendment is dual-signed governance by
+/// the two parties; the guardians themselves do not sign (a lost
+/// guardian key must not block the quorum's own revision). The new
+/// threshold rides as an instruction param, not an account — the
+/// only single-u8-param item in the social-recovery family.
+#[derive(Accounts)]
+pub struct AmendSocialRecoveryThreshold<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to moving the lost-key recovery quorum their
+    /// funded escrow settles under.
     pub taker: Signer<'info>,
 }
 

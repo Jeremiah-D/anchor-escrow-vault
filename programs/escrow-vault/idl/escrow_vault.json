@@ -1168,6 +1168,14 @@
       ]
     },
     {
+      "name": "amend_social_recovery_threshold",
+      "discriminator": [162, 58, 222, 237, 240, 29, 102, 106],
+      "accounts": [],
+      "args": [
+        {"name": "new_threshold", "type": "u8"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
