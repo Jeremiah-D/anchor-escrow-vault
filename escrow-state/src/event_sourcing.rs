@@ -489,6 +489,15 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // gated wrappers degrade to plain `release` / `claim`,
         // while plain `release` / `claim` never read the gate.
         | EscrowEventKind::PriceGateDisabled
+        // AV-423: a removed TWAP gate moves no funds and
+        // never restates a payout already settled — only the
+        // gate flips to `None`, so the `require_twap_gate`
+        // `None` arm passes through at the next call and the
+        // gated wrappers degrade to plain `release` / `claim`
+        // (including the full-window history coverage
+        // requirement, which disappears with the gate),
+        // while plain `release` / `claim` never read the gate.
+        | EscrowEventKind::TwapGateDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1590,6 +1599,15 @@ mod event_sourcing_tests {
         // gated wrappers degrade to plain `release` / `claim`,
         // while plain `release` / `claim` never read the gate.
         | EscrowEventKind::PriceGateDisabled
+        // AV-423: a removed TWAP gate moves no funds and
+        // never restates a payout already settled — only the
+        // gate flips to `None`, so the `require_twap_gate`
+        // `None` arm passes through at the next call and the
+        // gated wrappers degrade to plain `release` / `claim`
+        // (including the full-window history coverage
+        // requirement, which disappears with the gate),
+        // while plain `release` / `claim` never read the gate.
+        | EscrowEventKind::TwapGateDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices

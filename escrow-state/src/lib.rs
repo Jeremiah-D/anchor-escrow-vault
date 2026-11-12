@@ -29995,6 +29995,97 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Remove the TWAP price gate after funding (AV-423 —
+    /// Solana / DeFi): both parties jointly retire the averaged
+    /// market condition, clearing `twap_gate` to `None` in place.
+    ///
+    /// Why: the gate is only as alive as its feed's history. When
+    /// the oracle goes dark, gets censored, or stops publishing
+    /// history covering the full window, every gated release and
+    /// claim fails fast at the front of the gate chain — and
+    /// revision cannot help: [`Escrow::amend_twap_gate`] can only
+    /// retune the direction, target, window and staleness bound,
+    /// never remove the condition itself (a zero window or a zero
+    /// target is refused, an ungated escrow is refused
+    /// fail-closed). A shorter window is no rescue either when the
+    /// feed publishes no history at all. Without removal the
+    /// parties' only exit is cancelling and rebuilding, throwing
+    /// away the funded state. The only way out is removal.
+    ///
+    /// Governance mirrors [`Escrow::amend_twap_gate`]:
+    /// pause first (AV-46), then unconditional dual signature —
+    /// both the *current* initializer and the *current* taker must
+    /// authorize, one party alone (or a stranger pair) is
+    /// [`EscrowError::Unauthorized`] — then the `Funded`-only state
+    /// gate ([`EscrowError::InvalidStateTransition`]). The oracle
+    /// itself does not sign: the gate is a jointly owned settlement
+    /// condition, and the feed being removed cannot block its own
+    /// removal (the `rotate_arbiter` / `disable_transfer_hook`
+    /// "removed object does not sign" reasoning) — a single party
+    /// dropping the gate would strip the other party's market
+    /// protection, so the removal itself needs both signatures.
+    /// Only an escrow with a gate actually configured has anything
+    /// to remove: a gateless escrow — never configured, or already
+    /// removed — is a silent no-op success that writes nothing and
+    /// emits nothing (the AV-405 / AV-409 / AV-410 no-op precedent).
+    /// The 26-byte `twap_gate` region clears in place, so no layout
+    /// change. One-way only — there is no post-funding
+    /// re-installation: [`Escrow::with_twap_gate`] /
+    /// [`Escrow::with_twap_gate_and_staleness`] stay
+    /// `Uninitialized`-only, and `amend_twap_gate` on an ungated
+    /// escrow still refuses with
+    /// [`EscrowError::InvalidTwapGate`] (fail-closed — the removal
+    /// never becomes an installation path).
+    ///
+    /// After disabling, [`Escrow::require_twap_gate`]'s `None` arm
+    /// passes through, so [`Escrow::release_twap_gated`] /
+    /// [`Escrow::claim_twap_gated`] degrade to plain `release` /
+    /// `claim` — the gate-first ordering is unchanged, only the gate
+    /// always passes, and the full-window history-coverage
+    /// requirement disappears with the gate — while plain `release`
+    /// / `claim` never read the gate and are unaffected, and a
+    /// payout already settled keeps the gate it settled under.
+    /// Disabling moves no funds, so no AV-36 reentrancy lock is
+    /// needed (the lock only guards the fund-moving paths, the
+    /// `rotate_arbiter` precedent). Orthogonal to
+    /// [`Escrow::with_twap_gate`] (that is the initial
+    /// configuration, this item is the post-funding removal), to
+    /// [`Escrow::amend_twap_gate`] (that revises the gate's
+    /// parameters, this item is the gate's existence — revision
+    /// cannot help when the feed itself is dead), and to AV-261
+    /// (that is the single-point gate — a separate gate struct and
+    /// region, untouched by this removal). Emits `TwapGateDisabled`
+    /// on the event layer, except for the no-op.
+    pub fn disable_twap_gate(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the *current*
+        // initializer and the *current* taker must authorize.
+        // One party alone dropping the gate would strip the
+        // other party's market protection, so the removal itself
+        // needs both signatures (the `rotate_arbiter` reasoning).
+        // The oracle itself does not sign.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // No-op: never configured (or already removed) — removing a
+        // gate that is not there writes nothing, so the event
+        // layer emits nothing for it.
+        if self.twap_gate.is_none() {
+            return Ok(());
+        }
+        self.twap_gate = None;
+        Ok(())
+    }
+
 
     /// Opt in to a timelock (AV-27). Builder-style: only valid on an
     /// `Uninitialized` escrow, so the unlock timestamp is fixed before
@@ -58361,7 +58452,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(182), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -62113,7 +62205,460 @@ mod disable_price_gate_tests {
             EscrowEventKind::from_discriminant(180),
             Some(EscrowEventKind::PauseAuthorityDisabled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(182), None);
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None);
+    }
+}
+
+// ---------- AV-423: disable_twap_gate ----------
+// A dead TWAP feed must not strand a funded escrow: both parties may
+// jointly retire the TWAP gate, after which the gated wrappers
+// degrade to plain release / claim.
+#[cfg(test)]
+mod disable_twap_gate_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const AMOUNT: u64 = 1_000_000;
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+    const S0: u64 = 10_000; // evaluation slot
+
+    fn floor_gate() -> TwapGate {
+        TwapGate {
+            direction: PriceDirection::AtOrAbove,
+            target: 100_000,
+            window_slots: 100,
+            max_staleness_secs: 300,
+        }
+    }
+
+    fn price_floor_gate() -> PriceGate {
+        PriceGate {
+            direction: PriceDirection::AtOrAbove,
+            target: 100_000,
+            max_staleness_secs: 300,
+        }
+    }
+
+    fn gated_escrow(gate: TwapGate) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_twap_gate_and_staleness(
+                gate.window_slots,
+                gate.target,
+                gate.direction,
+                gate.max_staleness_secs,
+            )
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.twap_gate(), Some(gate));
+        e
+    }
+
+    fn vesting_gated_escrow(gate: TwapGate) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_twap_gate_and_staleness(
+                gate.window_slots,
+                gate.target,
+                gate.direction,
+                gate.max_staleness_secs,
+            )
+            .unwrap()
+            .with_vesting(VestingSchedule::new(T0, T0 + 1000).unwrap())
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn disputed_gated_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_twap_gate_and_staleness(100, 100_000, PriceDirection::AtOrAbove, 300)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        e
+    }
+
+    /// A feed whose history holds `price` for the whole window:
+    /// one sample at the window's left edge.
+    fn constant_feed(price: u64, window_start: u64, observed_at: u64) -> ScriptedPriceFeed {
+        ScriptedPriceFeed::new(
+            PriceQuote { price, observed_at },
+            vec![PriceSample {
+                slot: window_start,
+                price,
+            }],
+        )
+    }
+
+    /// A feed whose history starts mid-window (sample at `S0 - 50`,
+    /// window starts at `S0 - 100`): the uncovered prefix fails the
+    /// full-window coverage requirement, so the gate fails closed.
+    fn thin_history_feed(observed_at: u64) -> ScriptedPriceFeed {
+        ScriptedPriceFeed::new(
+            PriceQuote {
+                price: 120_000,
+                observed_at,
+            },
+            vec![PriceSample {
+                slot: S0 - 50,
+                price: 120_000,
+            }],
+        )
+    }
+
+    #[test]
+    fn stranger_and_single_party_cannot_disable_and_gate_unchanged() {
+        // AV-423: the TWAP gate is a jointly owned market
+        // condition — one party alone dropping it would strip the
+        // other party's protection against a bad-price payout, so
+        // a stranger or a single party is Unauthorized and the
+        // failed call moves nothing. The oracle itself does not
+        // sign.
+        let mut e = gated_escrow(floor_gate());
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_twap_gate(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.twap_gate(),
+            Some(floor_gate()),
+            "failed disable leaves the gate configured"
+        );
+    }
+
+    #[test]
+    fn disable_refused_while_paused() {
+        // AV-423: pause first (AV-46) — a paused escrow fails
+        // fast, before the dual-signature check.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_twap_gate_and_staleness(100, 100_000, PriceDirection::AtOrAbove, 300)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.pause(ALICE, None).unwrap();
+        assert_eq!(
+            e.disable_twap_gate(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            e.disable_twap_gate(MALLORY, BOB),
+            Err(EscrowError::Paused),
+            "even a stranger's disable on a paused escrow is Paused"
+        );
+        assert_eq!(
+            e.twap_gate(),
+            Some(floor_gate()),
+            "paused disable writes nothing"
+        );
+        e.unpause(ALICE).unwrap();
+        e.disable_twap_gate(ALICE, BOB).unwrap();
+        assert_eq!(e.twap_gate(), None);
+    }
+
+    #[test]
+    fn disable_refuses_non_funded_states() {
+        // AV-423: Funded-only — the Uninitialized builder owns the
+        // initial configuration, Activated has not funded yet,
+        // Disputed is excluded (the dispute must settle first),
+        // and terminal states have no live gate left to retire.
+        let mut bare = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_twap_gate_and_staleness(100, 100_000, PriceDirection::AtOrAbove, 300)
+            .unwrap();
+        assert_eq!(
+            bare.disable_twap_gate(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            bare.twap_gate(),
+            Some(floor_gate()),
+            "refused disable writes nothing"
+        );
+        // Activated: both parties signed, funds not yet locked.
+        // (Dual-signed so the activation ceremony runs — a plain
+        // escrow funds straight from `Uninitialized`.)
+        let mut activated = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_twap_gate_and_staleness(100, 100_000, PriceDirection::AtOrAbove, 300)
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.disable_twap_gate(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.twap_gate(), Some(floor_gate()));
+        // Disputed: the gate stays while the dispute is in flight.
+        let mut d = disputed_gated_escrow();
+        assert_eq!(
+            d.disable_twap_gate(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.twap_gate(),
+            Some(floor_gate()),
+            "refused disable writes nothing"
+        );
+        // Terminal: a fully released escrow's gate is history, not
+        // a live condition to retire.
+        let mut e = gated_escrow(floor_gate());
+        e.release(ALICE, T0, AMOUNT, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.disable_twap_gate(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.twap_gate(), Some(floor_gate()));
+    }
+
+    #[test]
+    fn unconfigured_is_a_silent_noop_and_emits_nothing() {
+        // AV-423: removing a gate that was never configured writes
+        // nothing and emits nothing — the `rotate_*` same-value
+        // no-op precedent. That covers both a plain escrow and a
+        // second disable after a successful first one.
+        let mut plain = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, T0).unwrap();
+        plain.disable_twap_gate(ALICE, BOB).unwrap();
+        assert_eq!(plain.twap_gate(), None);
+
+        let mut plain_ie = IndexedEscrow::wrap(
+            [0xE0; 32],
+            Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap(),
+        );
+        plain_ie.fund(ALICE, 0).unwrap();
+        let _ = plain_ie.drain_events();
+        plain_ie.disable_twap_gate(ALICE, BOB, 42).unwrap();
+        assert_eq!(
+            plain_ie.event_count(),
+            0,
+            "never-configured disable emits nothing"
+        );
+
+        let mut ie = IndexedEscrow::wrap([0xE0; 32], gated_escrow(floor_gate()));
+        let _ = ie.drain_events();
+        ie.disable_twap_gate(ALICE, BOB, 42).unwrap();
+        assert_eq!(ie.event_count(), 1, "first disable emits once");
+        ie.disable_twap_gate(ALICE, BOB, 43).unwrap();
+        assert_eq!(ie.event_count(), 1, "second disable emits nothing");
+        assert_eq!(ie.inner().twap_gate(), None);
+    }
+
+    #[test]
+    fn disable_clears_gate_and_moves_no_funds() {
+        // AV-423: the 26-byte `twap_gate` region clears in place,
+        // so the disable rewrites it with no layout change, the
+        // state stays Funded, and the locked amount and the
+        // single-point price gate are untouched.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_price_gate(price_floor_gate())
+            .unwrap()
+            .with_twap_gate_and_staleness(100, 100_000, PriceDirection::AtOrAbove, 300)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let price_before = e.price_gate();
+        assert!(price_before.is_some());
+        assert_eq!(e.remaining_amount(), AMOUNT);
+        e.disable_twap_gate(ALICE, BOB).unwrap();
+        assert_eq!(e.twap_gate(), None);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), AMOUNT);
+        assert_eq!(e.amount(), AMOUNT);
+        assert_eq!(e.price_gate(), price_before, "price gate untouched");
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "gate region cleared in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn disable_under_broken_history_unblocks_gated_release_and_claim() {
+        // AV-423: the whole point — a feed whose history no longer
+        // covers the full window blocks every gated payout while
+        // the gate stands, and the disable is what unblocks them.
+        // Contrast before/after on the same escrow, for both gated
+        // entries.
+        let thin = thin_history_feed(T0);
+        let mut e = gated_escrow(floor_gate());
+        assert_eq!(
+            e.release_twap_gated(ALICE, T0, S0, AMOUNT, None, BOB, &thin),
+            Err(EscrowError::TwapGateNotSatisfied)
+        );
+        assert_eq!(EscrowError::TwapGateNotSatisfied.code(), 186);
+        assert_eq!(e.state(), EscrowState::Funded);
+        e.disable_twap_gate(ALICE, BOB).unwrap();
+        let (payout, fee) = e
+            .release_twap_gated(ALICE, T0, S0, AMOUNT, None, BOB, &thin)
+            .unwrap();
+        assert_eq!((payout, fee), (AMOUNT, 0));
+        assert_eq!(e.state(), EscrowState::Released);
+
+        // The taker's pull path degrades the same way.
+        let mut v = vesting_gated_escrow(floor_gate());
+        let at = T0 + 500; // half vested
+        let thin_claim = thin_history_feed(at);
+        assert_eq!(
+            v.claim_twap_gated(BOB, at, S0, None, BOB, &thin_claim),
+            Err(EscrowError::TwapGateNotSatisfied)
+        );
+        v.disable_twap_gate(ALICE, BOB).unwrap();
+        let (payout, fee) = v.claim_twap_gated(BOB, at, S0, None, BOB, &thin_claim).unwrap();
+        assert_eq!((payout, fee), (AMOUNT / 2, 0));
+        assert_eq!(v.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn disable_is_one_way_amend_and_reinstall_still_refused() {
+        // AV-423: one-way only — `amend_twap_gate` on an ungated
+        // escrow still refuses fail-closed (the removal never
+        // becomes an installation path), and `with_twap_gate`
+        // stays `Uninitialized`-only, so a post-funding
+        // re-installation is refused and the gate stays cleared.
+        let mut e = gated_escrow(floor_gate());
+        e.disable_twap_gate(ALICE, BOB).unwrap();
+        assert_eq!(e.twap_gate(), None);
+        assert_eq!(
+            e.amend_twap_gate(ALICE, BOB, floor_gate()),
+            Err(EscrowError::InvalidTwapGate)
+        );
+        assert_eq!(
+            EscrowError::InvalidTwapGate.code(),
+            187,
+            "error code never renumbers"
+        );
+        assert_eq!(e.twap_gate(), None, "refused amend writes nothing");
+        assert_eq!(
+            e.with_twap_gate(100, 100_000, PriceDirection::AtOrAbove),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.twap_gate(),
+            None,
+            "refused re-installation writes nothing"
+        );
+    }
+
+    #[test]
+    fn disable_keeps_settled_release() {
+        // AV-423: a payout already settled keeps the gate it
+        // settled under — the disable only governs future gated
+        // payouts, and the remainder still releases (now under a
+        // thin-history feed, which would have blocked it before).
+        let mut e = gated_escrow(floor_gate());
+        let good = constant_feed(120_000, S0 - 100, T0);
+        let (payout, fee) = e
+            .release_twap_gated(ALICE, T0, S0, 400_000, None, BOB, &good)
+            .unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.released_amount(), 400_000);
+        e.disable_twap_gate(ALICE, BOB).unwrap();
+        assert_eq!(e.twap_gate(), None);
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.remaining_amount(), 600_000);
+        let thin = thin_history_feed(T0);
+        assert_eq!(
+            e.release_twap_gated(ALICE, T0, S0, 600_000, None, BOB, &thin)
+                .unwrap(),
+            (600_000, 0)
+        );
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn plain_release_and_claim_unaffected_by_disable() {
+        // AV-423: plain `release` / `claim` never read the gate,
+        // so they work identically before and after the disable —
+        // the disable only retires the gated entries' condition.
+        let mut v = vesting_gated_escrow(floor_gate());
+        v.disable_twap_gate(ALICE, BOB).unwrap();
+        assert_eq!(v.twap_gate(), None);
+        let at = T0 + 500; // half vested
+        let (payout, fee) = v.claim(BOB, at, None, BOB).unwrap();
+        assert_eq!((payout, fee), (AMOUNT / 2, 0));
+        let (payout, fee) = v.release(ALICE, at, AMOUNT / 2, None, BOB).unwrap();
+        assert_eq!((payout, fee), (AMOUNT / 2, 0));
+        assert_eq!(v.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn disable_twap_gate_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-423: the event layer emits exactly one
+        // TwapGateDisabled on an actual clear, and nothing for
+        // a failed call or a no-op.
+        let mut e = IndexedEscrow::wrap([0xE0; 32], gated_escrow(floor_gate()));
+        let before = e.event_count();
+        assert_eq!(
+            e.disable_twap_gate(MALLORY, BOB, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.disable_twap_gate(ALICE, BOB, T0).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::TwapGateDisabled);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.at, T0);
+        assert_eq!((ev.amounts.payout, ev.amounts.fee), (0, 0));
+        // A second disable is a no-op: no new event.
+        e.disable_twap_gate(ALICE, BOB, T0).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn twap_gate_disabled_discriminant_is_pinned() {
+        // AV-423: discriminant 182, appended after
+        // PriceGateDisabled — 0–181 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::TwapGateDisabled;
+        assert_eq!(kind.discriminant(), 182);
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(kind));
+        assert_eq!(kind.name(), "twap_gate_disabled");
+        assert_eq!(
+            EscrowEventKind::from_name("twap_gate_disabled"),
+            Some(kind)
+        );
+        assert_eq!(
+            EscrowEventKind::from_discriminant(181),
+            Some(EscrowEventKind::PriceGateDisabled)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(183), None);
     }
 }
 
@@ -73121,7 +73666,8 @@ mod emergency_unlock_tests {
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(182), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -78981,7 +79527,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(182), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -79241,9 +79788,10 @@ mod event_history_tests {
         // `TransferHookDisabled` (AV-419), 179 is
         // `DualSigDisabled` (AV-420), 180 is
         // `PauseAuthorityDisabled` (AV-421), 181 is
-        // `PriceGateDisabled` (AV-422) and 182 is the
+        // `PriceGateDisabled` (AV-422), 182 is
+        // `TwapGateDisabled` (AV-423) and 183 is the
         // first still-unknown byte.
-        for bad in [182u8, 255] {
+        for bad in [183u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -82648,7 +83196,8 @@ mod release_via_intent_tests {
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(182), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -90880,7 +91429,8 @@ mod disable_dual_control_tests {
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(182), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -91199,7 +91749,8 @@ mod disable_deadman_switch_tests {
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-418: 177 is SocialRecoveryDisabled
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(182), None); // AV-418: 177 is SocialRecoveryDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-418: 177 is SocialRecoveryDisabled
     }
 }
 
@@ -91633,7 +92184,8 @@ mod disable_credential_gate_tests {
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(182), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -91978,7 +92530,8 @@ mod disable_milestone_verifier_tests {
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(182), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -92281,7 +92834,8 @@ mod disable_arbiter_tests {
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(182), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -94644,7 +95198,8 @@ mod disable_social_recovery_tests {
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(182), None);
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None);
     }
 }
 
@@ -96714,7 +97269,8 @@ mod disable_transfer_hook_tests {
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(182), None);
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None);
     }
 }
 
@@ -97124,7 +97680,8 @@ mod disable_dual_sig_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(182), None);
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None);
     }
 }
 
@@ -97499,7 +98056,8 @@ mod disable_pause_authority_tests {
             Some(EscrowEventKind::DualSigDisabled)
         );
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(182), None);
+        assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(183), None);
     }
 }
 
