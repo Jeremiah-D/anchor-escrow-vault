@@ -474,6 +474,14 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // unconditional dual-signature paths never read it, so they are
         // unaffected.
         | EscrowEventKind::DualSigDisabled
+        // AV-421: a removed pause authority moves no funds and
+        // never restates a settlement already made — only the
+        // authority flips to `None`, so the `pause` / `unpause` /
+        // `rotate_pause_authority` / `amend_auto_unpause_at`
+        // paths read the live binding at the next call and refuse
+        // with `InvalidStateTransition`, exactly like a
+        // never-bound escrow.
+        | EscrowEventKind::PauseAuthorityDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1560,6 +1568,14 @@ mod event_sourcing_tests {
         // unconditional dual-signature paths never read it, so they are
         // unaffected.
         | EscrowEventKind::DualSigDisabled
+        // AV-421: a removed pause authority moves no funds and
+        // never restates a settlement already made — only the
+        // authority flips to `None`, so the `pause` / `unpause` /
+        // `rotate_pause_authority` / `amend_auto_unpause_at`
+        // paths read the live binding at the next call and refuse
+        // with `InvalidStateTransition`, exactly like a
+        // never-bound escrow.
+        | EscrowEventKind::PauseAuthorityDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices

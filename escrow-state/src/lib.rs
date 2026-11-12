@@ -25390,6 +25390,99 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Remove the emergency-pause authority after funding (AV-421 —
+    /// Solana governance): both parties jointly retire the pause
+    /// switch, clearing `pause_authority` to `None` in place.
+    ///
+    /// Why: the pause switch is a shared emergency brake — while
+    /// it is bound, the operator can freeze every state-changing
+    /// path at any moment. When the operator winds down, the key
+    /// is retired, or the deal enters its final settlement phase,
+    /// a switch that can still freeze the escrow has only grief
+    /// value — and rotation cannot help when there is no successor
+    /// key to hand it to. The only way out is removal.
+    ///
+    /// Governance mirrors [`Escrow::disable_dual_sig`]:
+    /// pause first (AV-46), then unconditional dual signature —
+    /// both the *current* initializer and the *current* taker must
+    /// authorize, one party alone (or a stranger pair) is
+    /// [`EscrowError::Unauthorized`] — then the `Funded`-only state
+    /// gate ([`EscrowError::InvalidStateTransition`]). The pause
+    /// authority itself does not sign: the switch is jointly owned
+    /// emergency power, and the authority being removed cannot
+    /// block its own removal (the `rotate_arbiter` /
+    /// `disable_transfer_hook` "removed object does not sign"
+    /// reasoning) — a single party dropping the switch would strip
+    /// the other party's freeze protection, so the removal itself
+    /// needs both signatures. Only an escrow with a switch actually
+    /// bound has anything to remove: a switch-less escrow — never
+    /// bound, or already removed — is a silent no-op success that
+    /// writes nothing and emits nothing (the AV-405 / AV-409 /
+    /// AV-410 no-op precedent). The 33-byte `pause_authority`
+    /// region clears in place, so no layout change. One-way only —
+    /// there is no post-funding re-binding:
+    /// `with_pause_authority` stays `Uninitialized`-only.
+    ///
+    /// Deliberately *not* usable while paused: disabling under a
+    /// live pause would strand the escrow paused forever —
+    /// [`Escrow::unpause`] needs a bound authority, and `None` is
+    /// [`EscrowError::InvalidStateTransition`]. Rotation is the
+    /// escape hatch for a paused escrow with a lost pause key
+    /// ([`Escrow::rotate_pause_authority`] deliberately works while
+    /// paused); removal is the retirement path for a live escrow,
+    /// so it fails fast with [`EscrowError::Paused`] instead. A
+    /// paused escrow with an armed auto-recovery schedule can
+    /// therefore never reach this call while paused — and an
+    /// unpaused escrow carries no schedule, so there is no
+    /// "paused + armed schedule + removed authority" combination.
+    ///
+    /// After disabling, `pause` / `unpause` /
+    /// [`Escrow::rotate_pause_authority`] /
+    /// [`Escrow::amend_auto_unpause_at`] all refuse with
+    /// [`EscrowError::InvalidStateTransition`] — the same gates as
+    /// an escrow that never bound a switch. Disabling moves no
+    /// funds, so no AV-36 reentrancy lock is needed (the lock only
+    /// guards the fund-moving paths, the `rotate_arbiter`
+    /// precedent). Orthogonal to [`Escrow::with_pause_authority`]
+    /// (that is the initial configuration, this item is the
+    /// post-funding removal), to
+    /// [`Escrow::rotate_pause_authority`] (that swaps the key, this
+    /// item removes the switch — rotation cannot help when there
+    /// is no successor key), and to
+    /// [`Escrow::amend_auto_unpause_at`] (that revises the recovery
+    /// schedule, this item is the switch itself). Emits
+    /// `PauseAuthorityDisabled` on the event layer, except for the
+    /// no-op.
+    pub fn disable_pause_authority(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the *current*
+        // initializer and the *current* taker must authorize.
+        // One party alone dropping the switch would strip the
+        // other party's freeze protection, so the removal itself
+        // needs both signatures (the `rotate_arbiter` reasoning).
+        // The pause authority itself does not sign.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // No-op: never bound (or already removed) — removing a
+        // switch that is not there writes nothing, so the event
+        // layer emits nothing for it.
+        if self.pause_authority.is_none() {
+            return Ok(());
+        }
+        self.pause_authority = None;
+        Ok(())
+    }
+
     /// Rotate the taker (payout counterparty) by dual-signed governance
     /// (AV-52 — Solana governance): the initializer and the *current*
     /// taker jointly designate a new taker; the old key stops being the
@@ -58180,7 +58273,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(181), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -72537,7 +72631,8 @@ mod emergency_unlock_tests {
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(181), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -78395,7 +78490,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(181), None); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -78653,9 +78749,10 @@ mod event_history_tests {
         // `DeadmanSwitchDisabled` (AV-417), 177 is
         // `SocialRecoveryDisabled` (AV-418), 178 is
         // `TransferHookDisabled` (AV-419), 179 is
-        // `DualSigDisabled` (AV-420) and 180 is the
+        // `DualSigDisabled` (AV-420), 180 is
+        // `PauseAuthorityDisabled` (AV-421) and 181 is the
         // first still-unknown byte.
-        for bad in [180u8, 255] {
+        for bad in [181u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -82058,7 +82155,8 @@ mod release_via_intent_tests {
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(181), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -90288,7 +90386,8 @@ mod disable_dual_control_tests {
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(181), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -90605,7 +90704,8 @@ mod disable_deadman_switch_tests {
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-418: 177 is SocialRecoveryDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-418: 177 is SocialRecoveryDisabled
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-418: 177 is SocialRecoveryDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-418: 177 is SocialRecoveryDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(181), None); // AV-418: 177 is SocialRecoveryDisabled
     }
 }
 
@@ -91037,7 +91137,8 @@ mod disable_credential_gate_tests {
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(181), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -91380,7 +91481,8 @@ mod disable_milestone_verifier_tests {
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(181), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -91681,7 +91783,8 @@ mod disable_arbiter_tests {
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(181), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -94042,7 +94145,8 @@ mod disable_social_recovery_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(180), None);
+        assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(181), None);
     }
 }
 
@@ -96110,7 +96214,8 @@ mod disable_transfer_hook_tests {
             Some(EscrowEventKind::SocialRecoveryDisabled)
         );
         assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(180), None);
+        assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(181), None);
     }
 }
 
@@ -96518,7 +96623,382 @@ mod disable_dual_sig_tests {
             EscrowEventKind::from_discriminant(178),
             Some(EscrowEventKind::TransferHookDisabled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(180), None);
+        assert_eq!(EscrowEventKind::from_discriminant(180), Some(EscrowEventKind::PauseAuthorityDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(181), None);
+    }
+}
+
+mod disable_pause_authority_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const MINT: [u8; 32] = [0xD0; 32];
+    const M2: [u8; 32] = [0xD1; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const PAUSER2: [u8; 32] = [0xE1; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn init_key() -> SigningKey {
+        SigningKey::from_seed([0x11; 32])
+    }
+
+    fn taker_key() -> SigningKey {
+        SigningKey::from_seed([0x22; 32])
+    }
+
+    fn initializer() -> [u8; 32] {
+        init_key().public_key()
+    }
+
+    fn taker() -> [u8; 32] {
+        taker_key().public_key()
+    }
+
+    fn funded_pausable() -> Escrow {
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_mint_allowlist(&[MINT, M2])
+            .unwrap();
+        // No `activate` here: activation is a dual-signature
+        // ceremony (`activate` refuses a plain escrow), and this
+        // escrow is not dual-signed — `fund` moves it straight
+        // from `Uninitialized` to `Funded` (the
+        // `pause_rotation_tests` pattern).
+        e.fund(initializer(), NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.pause_authority(), Some(PAUSER));
+        e
+    }
+
+    fn disputed() -> Escrow {
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap();
+        e.activate(initializer()).unwrap();
+        e.activate(taker()).unwrap();
+        e.fund(initializer(), NOW).unwrap();
+        e.escalate(initializer(), EXPIRES_AT - 1, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        e
+    }
+
+    #[test]
+    fn stranger_and_single_party_cannot_disable_and_binding_unchanged() {
+        // AV-421: the pause switch is jointly owned emergency power
+        // — one party alone dropping it would strip the other
+        // party's freeze protection, so a stranger or a single
+        // party is Unauthorized and the failed call moves nothing.
+        // The pause authority itself does not sign.
+        let mut e = funded_pausable();
+        for (init, taker) in [
+            (initializer(), MALLORY),
+            (MALLORY, taker()),
+            (MALLORY, MALLORY),
+            (taker(), initializer()), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_pause_authority(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.pause_authority(),
+            Some(PAUSER),
+            "failed disable leaves the switch bound"
+        );
+    }
+
+    #[test]
+    fn disable_refused_while_paused() {
+        // AV-421: pause first (AV-46) — a paused escrow fails
+        // fast, before the dual-signature check. Disabling under
+        // a live pause would strand the escrow paused forever
+        // (`unpause` needs a bound authority), so unlike rotation
+        // there is no paused escape hatch here.
+        let mut e = funded_pausable();
+        e.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            e.disable_pause_authority(initializer(), taker()),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            e.disable_pause_authority(MALLORY, taker()),
+            Err(EscrowError::Paused),
+            "even a stranger's disable on a paused escrow is Paused"
+        );
+        assert_eq!(
+            e.pause_authority(),
+            Some(PAUSER),
+            "paused disable writes nothing"
+        );
+        e.unpause(PAUSER).unwrap();
+        e.disable_pause_authority(initializer(), taker()).unwrap();
+        assert_eq!(e.pause_authority(), None);
+    }
+
+    #[test]
+    fn disable_refuses_non_funded_states() {
+        // AV-421: Funded-only — the Uninitialized builder owns the
+        // initial binding (and on Uninitialized the disable is
+        // meaningless: both parties together could just re-bind),
+        // Activated has not funded yet, Disputed is excluded (the
+        // dispute must settle first), and terminal states have no
+        // live switch left to retire.
+        let mut bare = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        assert_eq!(
+            bare.disable_pause_authority(initializer(), taker()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            bare.pause_authority(),
+            Some(PAUSER),
+            "refused disable writes nothing"
+        );
+        // Activated: both parties signed, funds not yet locked.
+        // (Dual-signed so the activation ceremony runs — a plain
+        // escrow funds straight from `Uninitialized`.)
+        let mut activated =
+            Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap();
+        activated.activate(initializer()).unwrap();
+        activated.activate(taker()).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.disable_pause_authority(initializer(), taker()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.pause_authority(), Some(PAUSER));
+        // Disputed: the switch stays while the dispute is in
+        // flight.
+        let mut d = disputed();
+        assert_eq!(
+            d.disable_pause_authority(initializer(), taker()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.pause_authority(),
+            Some(PAUSER),
+            "refused disable writes nothing"
+        );
+        // Terminal: a cancelled escrow's switch is history, not a
+        // live brake to retire.
+        let mut e = funded_pausable();
+        e.cancel(initializer(), Some(MINT), initializer(), 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_pause_authority(initializer(), taker()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.pause_authority(), Some(PAUSER));
+    }
+
+    #[test]
+    fn unbound_is_a_silent_noop_and_emits_nothing() {
+        // AV-421: removing a switch that was never bound writes
+        // nothing and emits nothing — the `rotate_*` same-value
+        // no-op precedent. That covers both a plain escrow and a
+        // second disable after a successful first one.
+        let mut plain = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap();
+        plain.fund(initializer(), NOW).unwrap();
+        plain.disable_pause_authority(initializer(), taker()).unwrap();
+        assert_eq!(plain.pause_authority(), None);
+
+        let mut plain_ie = IndexedEscrow::wrap(
+            [0xE0; 32],
+            Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_mint(MINT)
+                .unwrap(),
+        );
+        plain_ie.fund(initializer(), 0).unwrap();
+        let _ = plain_ie.drain_events();
+        plain_ie
+            .disable_pause_authority(initializer(), taker(), 42)
+            .unwrap();
+        assert_eq!(
+            plain_ie.event_count(),
+            0,
+            "never-bound disable emits nothing"
+        );
+
+        let mut ie = IndexedEscrow::wrap([0xE0; 32], funded_pausable());
+        let _ = ie.drain_events();
+        ie.disable_pause_authority(initializer(), taker(), 42).unwrap();
+        assert_eq!(ie.event_count(), 1, "first disable emits once");
+        ie.disable_pause_authority(initializer(), taker(), 43).unwrap();
+        assert_eq!(ie.event_count(), 1, "second disable emits nothing");
+        assert_eq!(ie.inner().pause_authority(), None);
+    }
+
+    #[test]
+    fn disable_clears_authority_and_moves_no_funds() {
+        // AV-421: the 33-byte `pause_authority` region clears in
+        // place, so the disable rewrites it with no layout change,
+        // the state stays Funded, and the locked amount, the mint,
+        // and the allowlist are untouched.
+        let mut e = funded_pausable();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let allowlist_before = e.mint_allowlist();
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        e.disable_pause_authority(initializer(), taker()).unwrap();
+        assert_eq!(e.pause_authority(), None);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.mint(), Some(MINT));
+        assert_eq!(e.mint_allowlist(), allowlist_before);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "authority region cleared in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn disable_blocks_pause_unpause_rotate_and_amend() {
+        // AV-421: after the disable the escrow behaves exactly like
+        // one that never bound a switch — every pause-path call
+        // refuses with InvalidStateTransition.
+        let mut e = funded_pausable();
+        e.disable_pause_authority(initializer(), taker()).unwrap();
+        assert_eq!(e.pause_authority(), None);
+        assert_eq!(
+            e.pause(PAUSER, None),
+            Err(EscrowError::InvalidStateTransition),
+            "pause after disable is refused"
+        );
+        assert_eq!(
+            e.unpause(PAUSER),
+            Err(EscrowError::InvalidStateTransition),
+            "unpause after disable is refused"
+        );
+        assert_eq!(
+            e.rotate_pause_authority(initializer(), PAUSER2),
+            Err(EscrowError::InvalidStateTransition),
+            "rotate after disable is refused"
+        );
+        assert_eq!(
+            e.amend_auto_unpause_at(PAUSER, Some(NOW + 1_000), NOW),
+            Err(EscrowError::InvalidStateTransition),
+            "amend after disable is refused"
+        );
+        assert!(!e.is_paused());
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn disable_is_one_way_with_pause_authority_still_rejected_after_funding() {
+        // AV-421: one-way only — `with_pause_authority` stays
+        // Uninitialized-only, so a post-funding re-binding is
+        // refused and the switch stays cleared.
+        let mut e = funded_pausable();
+        e.disable_pause_authority(initializer(), taker()).unwrap();
+        assert_eq!(e.pause_authority(), None);
+        assert_eq!(
+            e.with_pause_authority(PAUSER2),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.pause_authority(),
+            None,
+            "refused re-binding writes nothing"
+        );
+    }
+
+    #[test]
+    fn disable_keeps_settled_release() {
+        // AV-421: a payout already settled keeps the switch it
+        // settled under — the disable only governs future pause
+        // calls, and the remainder still releases plainly.
+        let mut e = funded_pausable();
+        let (payout, fee) = e
+            .release(initializer(), NOW, 400_000, Some(MINT), taker())
+            .unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.released_amount(), 400_000);
+        e.disable_pause_authority(initializer(), taker()).unwrap();
+        assert_eq!(e.pause_authority(), None);
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.remaining_amount(), 600_000);
+        assert_eq!(
+            e.release(initializer(), NOW, 600_000, Some(MINT), taker())
+                .unwrap(),
+            (600_000, 0)
+        );
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn disable_pause_authority_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-421: the event layer emits exactly one
+        // PauseAuthorityDisabled on an actual clear, and nothing
+        // for a failed call or a no-op.
+        let mut e = IndexedEscrow::wrap([0xE0; 32], funded_pausable());
+        let before = e.event_count();
+        assert_eq!(
+            e.disable_pause_authority(MALLORY, taker(), NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.disable_pause_authority(initializer(), taker(), NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::PauseAuthorityDisabled);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.at, NOW);
+        assert_eq!((ev.amounts.payout, ev.amounts.fee), (0, 0));
+        // A second disable is a no-op: no new event.
+        e.disable_pause_authority(initializer(), taker(), NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn pause_authority_disabled_discriminant_is_pinned() {
+        // AV-421: discriminant 180, appended after
+        // DualSigDisabled — 0–179 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::PauseAuthorityDisabled;
+        assert_eq!(kind.discriminant(), 180);
+        assert_eq!(EscrowEventKind::from_discriminant(180), Some(kind));
+        assert_eq!(kind.name(), "pause_authority_disabled");
+        assert_eq!(
+            EscrowEventKind::from_name("pause_authority_disabled"),
+            Some(kind)
+        );
+        assert_eq!(
+            EscrowEventKind::from_discriminant(179),
+            Some(EscrowEventKind::DualSigDisabled)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(181), None);
     }
 }
 
