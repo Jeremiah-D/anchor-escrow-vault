@@ -488,6 +488,12 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // together, so the next claim reads the live
         // configuration and is refused with InvalidDeadmanConfig.
         | EscrowEventKind::DeadmanSwitchDisabled
+        // AV-418: a removed social-recovery policy moves no funds and
+        // never restates a request already settled — the policy
+        // flips to None, so the next recovery call reads the live
+        // policy and is refused with RecoveryNotConfigured, while
+        // a pending request refuses the disable itself.
+        | EscrowEventKind::SocialRecoveryDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1545,6 +1551,12 @@ mod fee_history_tests {
         // together, so the next claim reads the live
         // configuration and is refused with InvalidDeadmanConfig.
         | EscrowEventKind::DeadmanSwitchDisabled
+        // AV-418: a removed social-recovery policy moves no funds and
+        // never restates a request already settled — the policy
+        // flips to None, so the next recovery call reads the live
+        // policy and is refused with RecoveryNotConfigured, while
+        // a pending request refuses the disable itself.
+        | EscrowEventKind::SocialRecoveryDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices

@@ -23736,6 +23736,111 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Disable the social-recovery policy after funding (AV-418):
+    /// the post-funding counterpart to the removal leg of
+    /// [`Escrow::with_social_recovery`] (`Uninitialized`-only
+    /// initial configuration). Dual-signed governance,
+    /// `Funded`-only, pause first — paralleling
+    /// [`Escrow::rotate_social_recovery_guardian`] (AV-275):
+    /// the guardians themselves do not sign — a lost guardian
+    /// key must not block the policy's removal (the
+    /// `rotate_arbiter` reasoning, applied to the whole policy
+    /// rather than one slot). The removal is a protocol change,
+    /// not a parameter revision, so the AV-276 conditional
+    /// signature gate does not apply: both parties sign
+    /// unconditionally, on a dual-sig escrow and a plain escrow
+    /// alike. A pending recovery request refuses the disable
+    /// with [`EscrowError::RecoveryRequestPending`] — the
+    /// initializer vetoes it first with
+    /// [`Escrow::veto_recovery`], so an in-flight request is
+    /// never silently discarded. Only an escrow with a
+    /// configured policy (`recovery` is `Some`) has anything to
+    /// remove: an unconfigured escrow — never configured, or
+    /// already disabled — is a silent no-op success that writes
+    /// nothing and emits nothing (the AV-405 / AV-409 / AV-410
+    /// no-op precedent — removing a policy that was never
+    /// installed cannot smuggle in a new recovery path, and a
+    /// second disable after a successful first one is the same
+    /// no-op). The policy flips to `None` in place — the
+    /// `Option<SocialRecovery>` region is already resident, so
+    /// no layout change. One-way only — there is no post-funding
+    /// re-installation: `with_social_recovery` stays
+    /// `Uninitialized`-only, so installing a policy after the
+    /// taker funded under policy-less recovery would add an
+    /// initializer-rotation path the taker never funded under —
+    /// it is a new deal, not a revision (the AV-275 refusal
+    /// reasoning). After disabling,
+    /// [`Escrow::request_recovery`] /
+    /// [`Escrow::approve_recovery`] /
+    /// [`Escrow::execute_recovery`] /
+    /// [`Escrow::veto_recovery`] refuse with
+    /// [`EscrowError::RecoveryNotConfigured`] (their existing
+    /// never-configured gate), and
+    /// `rotate_social_recovery_guardian` /
+    /// `amend_social_recovery_threshold` /
+    /// `amend_social_recovery_timelock` refuse the same way
+    /// (fail-closed, unchanged) — the policy is gone, so there
+    /// is nothing left to rotate or revise. A request already
+    /// settled keeps the guardians and threshold it settled
+    /// under, since the request is consumed and the initializer
+    /// already rotated — the disable afterwards only removes
+    /// the policy for future requests. Disabling moves no
+    /// funds, so no AV-36 reentrancy lock is needed (the lock
+    /// only guards the fund-moving paths, the `rotate_arbiter`
+    /// precedent). Orthogonal to
+    /// [`Escrow::with_social_recovery`] (that is the initial
+    /// configuration, this item is the post-funding removal),
+    /// to [`Escrow::rotate_social_recovery_guardian`] (that
+    /// swaps one slot, this item removes the policy — rotation
+    /// cannot help when the guardian quorum itself has been
+    /// captured), to
+    /// [`Escrow::amend_social_recovery_threshold`] (that revises
+    /// the quorum count, this item removes the policy) and to
+    /// [`Escrow::amend_social_recovery_timelock`] (that revises
+    /// the veto window, this item removes the policy). Emits
+    /// `SocialRecoveryDisabled` on the event layer, except for
+    /// the no-op.
+    pub fn disable_social_recovery(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the removal, paralleling
+        // `rotate_social_recovery_guardian`. The guardians
+        // themselves do not sign: a lost guardian key must not
+        // block the policy's removal (the `rotate_arbiter`
+        // reasoning). This is a protocol change, not a parameter
+        // revision, so the AV-276 conditional signature gate
+        // does not apply — both parties sign unconditionally.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // A pending recovery request refuses the disable: the
+        // initializer vetoes it first, so an in-flight request
+        // is never silently discarded. Checked before the no-op
+        // so a configured policy with a live request never
+        // drops the request along with the policy.
+        if let Some(policy) = &self.recovery {
+            if policy.pending().is_some() {
+                return Err(EscrowError::RecoveryRequestPending);
+            }
+        } else {
+            // No-op: never configured (or already removed) —
+            // closing a policy that is not installed writes
+            // nothing, so the event layer emits nothing for it.
+            return Ok(());
+        }
+        self.recovery = None;
+        Ok(())
+    }
+
     /// The dead-man's switch inactivity threshold in seconds, `0`
     /// when the switch is not configured (AV-109).
     pub fn deadman_inactivity_secs(&self) -> u64 {
@@ -57900,7 +58005,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -72254,7 +72360,8 @@ mod emergency_unlock_tests {
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -78109,7 +78216,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -78364,9 +78472,10 @@ mod event_history_tests {
         // `ReleaseIntentsRevoked` (AV-404), 170 is
         // `EmergencyUnlockDisabled` (AV-405), 175 is
         // `ArbiterDisabled` (AV-412), 176 is
-        // `DeadmanSwitchDisabled` (AV-417) and 177 is the
+        // `DeadmanSwitchDisabled` (AV-417), 177 is
+        // `SocialRecoveryDisabled` (AV-418) and 178 is the
         // first still-unknown byte.
-        for bad in [177u8, 255] {
+        for bad in [178u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -81766,7 +81875,8 @@ mod release_via_intent_tests {
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -89993,7 +90103,8 @@ mod disable_dual_control_tests {
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -90307,7 +90418,8 @@ mod disable_deadman_switch_tests {
             EscrowEventKind::from_discriminant(175),
             Some(EscrowEventKind::ArbiterDisabled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(177), None);
+        assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-418: 177 is SocialRecoveryDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-418: 177 is SocialRecoveryDisabled
     }
 }
 
@@ -90736,7 +90848,8 @@ mod disable_credential_gate_tests {
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -91076,7 +91189,8 @@ mod disable_milestone_verifier_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -91374,7 +91488,8 @@ mod disable_arbiter_tests {
             Some(EscrowEventKind::MilestoneVerifierDisabled)
         );
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(178), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -93403,6 +93518,337 @@ mod rotate_social_recovery_guardian_tests {
         e.rotate_social_recovery_guardian(ALICE, BOB, G4, G4, NOW)
             .unwrap();
         assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+}
+
+// ---------- AV-418: disable social-recovery policy after funding ----------
+mod disable_social_recovery_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const G1: [u8; 32] = [0x11; 32];
+    const G2: [u8; 32] = [0x22; 32];
+    const G3: [u8; 32] = [0x33; 32];
+    const NEW_KEY: [u8; 32] = [0x99; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn disputed() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        e.fund(ALICE, NOW).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        e
+    }
+
+    #[test]
+    fn stranger_and_single_party_cannot_disable_and_policy_unchanged() {
+        // AV-418: the policy is jointly owned recovery power —
+        // one party alone removing it would strip the other of
+        // the lost-key fallback, so a stranger or a single party
+        // is Unauthorized and the failed call moves nothing. The
+        // guardians themselves do not sign: a lost guardian key
+        // must not block the policy's removal.
+        let mut e = configured();
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_social_recovery(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        let policy = e.recovery().expect("rejected disable changes nothing");
+        assert_eq!(policy.guardians(), &[G1, G2, G3]);
+        assert_eq!(policy.threshold(), 2);
+        assert_eq!(policy.timelock_secs(), 3_600);
+    }
+
+    #[test]
+    fn disable_refused_while_paused() {
+        // AV-418: pause first (AV-46) — a paused escrow fails
+        // fast, before the dual-signature check.
+        let mut e = configured();
+        e.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            e.disable_social_recovery(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            e.disable_social_recovery(MALLORY, BOB),
+            Err(EscrowError::Paused),
+            "even a stranger's disable on a paused escrow is Paused"
+        );
+        assert!(e.recovery().is_some(), "paused disable writes nothing");
+        e.unpause(PAUSER).unwrap();
+        e.disable_social_recovery(ALICE, BOB).unwrap();
+        assert!(e.recovery().is_none());
+    }
+
+    #[test]
+    fn disable_refuses_non_funded_states() {
+        // AV-418: Funded-only — the Uninitialized builder owns
+        // the initial set, Disputed is excluded (the dispute must
+        // settle first), and terminal states have no live policy
+        // left to remove.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        assert_eq!(
+            bare.disable_social_recovery(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert!(bare.recovery().is_some(), "refused disable writes nothing");
+        // Disputed: the policy stays configured while the dispute
+        // is in flight.
+        let mut d = disputed();
+        assert_eq!(
+            d.disable_social_recovery(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(d.recovery().is_some(), "refused disable writes nothing");
+        assert_eq!(d.recovery().unwrap().guardians(), &[G1, G2, G3]);
+        // Terminal: a cancelled escrow's policy is history, not a
+        // live configuration to remove.
+        let mut e = configured();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_social_recovery(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.recovery().unwrap().guardians(), &[G1, G2, G3]);
+    }
+
+    #[test]
+    fn disable_refuses_pending_request_then_veto_then_disable_succeeds() {
+        // AV-418: an in-flight request is never silently
+        // discarded — the disable refuses it with
+        // RecoveryRequestPending, the initializer vetoes first,
+        // and only then does the disable land. The refused
+        // disable leaves the policy and the request untouched.
+        let mut e = configured();
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        e.approve_recovery(G2).unwrap();
+        assert_eq!(e.recovery().unwrap().approval_count(), 2);
+        assert_eq!(
+            e.disable_social_recovery(ALICE, BOB),
+            Err(EscrowError::RecoveryRequestPending)
+        );
+        assert_eq!(EscrowError::RecoveryRequestPending.code(), 289);
+        let policy = e.recovery().unwrap();
+        assert_eq!(policy.guardians(), &[G1, G2, G3]);
+        assert_eq!(policy.approval_count(), 2);
+        assert_eq!(policy.pending().unwrap().new_authority, NEW_KEY);
+        // The initializer vetoes the request, then the disable
+        // succeeds — and the vetoed request never executes.
+        e.veto_recovery(ALICE).unwrap();
+        assert!(e.recovery().unwrap().pending().is_none());
+        e.disable_social_recovery(ALICE, BOB).unwrap();
+        assert!(e.recovery().is_none());
+        assert_eq!(e.initializer(), ALICE);
+    }
+
+    #[test]
+    fn unconfigured_is_a_silent_noop_and_emits_nothing() {
+        // AV-418: removing a policy that was never installed
+        // writes nothing and emits nothing — the `rotate_*`
+        // same-value no-op precedent. That covers both a
+        // never-configured escrow and a second disable after a
+        // successful first one.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, NOW).unwrap();
+        plain.disable_social_recovery(ALICE, BOB).unwrap();
+        assert!(plain.recovery().is_none());
+
+        let mut plain_ie = IndexedEscrow::wrap(
+            [0xE0; 32],
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap(),
+        );
+        plain_ie.fund(ALICE, 0).unwrap();
+        let _ = plain_ie.drain_events();
+        plain_ie.disable_social_recovery(ALICE, BOB, 42).unwrap();
+        assert_eq!(
+            plain_ie.event_count(),
+            0,
+            "never-configured disable emits nothing"
+        );
+
+        let mut ie = IndexedEscrow::wrap([0xE0; 32], configured());
+        let _ = ie.drain_events();
+        ie.disable_social_recovery(ALICE, BOB, 42).unwrap();
+        assert_eq!(ie.event_count(), 1, "first disable emits once");
+        ie.disable_social_recovery(ALICE, BOB, 43).unwrap();
+        assert_eq!(ie.event_count(), 1, "second disable emits nothing");
+        assert!(ie.inner().recovery().is_none());
+    }
+
+    #[test]
+    fn disable_clears_policy_and_moves_no_funds() {
+        // AV-418: the policy flips to `None` in place — the
+        // `Option<SocialRecovery>` region is already resident,
+        // so the disable rewrites it with no layout change, the
+        // state stays Funded, and the locked amount is untouched.
+        let mut e = configured();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        e.disable_social_recovery(ALICE, BOB).unwrap();
+        assert!(e.recovery().is_none());
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "policy region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn disable_blocks_recovery_flow() {
+        // AV-418: with the policy gone, the whole recovery flow
+        // refuses with its existing never-configured gate — the
+        // same error a never-configured escrow gets.
+        let mut e = configured();
+        e.disable_social_recovery(ALICE, BOB).unwrap();
+        assert_eq!(
+            e.request_recovery(G1, NEW_KEY, NOW),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert_eq!(
+            e.approve_recovery(G1),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert_eq!(
+            e.execute_recovery(NOW),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert_eq!(
+            e.veto_recovery(ALICE),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert_eq!(EscrowError::RecoveryNotConfigured.code(), 287);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn disable_blocks_rotate_and_amend() {
+        // AV-418: fail-closed, unchanged — a removed policy has
+        // nothing left to rotate or revise, and a failed rotate /
+        // amend leaves the cleared policy cleared.
+        let mut e = configured();
+        e.disable_social_recovery(ALICE, BOB).unwrap();
+        assert_eq!(
+            e.rotate_social_recovery_guardian(ALICE, BOB, G2, G3),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert_eq!(
+            e.amend_social_recovery_threshold(ALICE, BOB, 3),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert_eq!(
+            e.amend_social_recovery_timelock(ALICE, BOB, 7_200),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert!(e.recovery().is_none());
+    }
+
+    #[test]
+    fn disable_keeps_settled_recovery() {
+        // AV-418: a request already settled keeps the guardians
+        // and threshold it settled under — the initializer
+        // already rotated, so the disable afterwards only
+        // removes the policy for future requests.
+        let mut e = configured();
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        e.approve_recovery(G2).unwrap();
+        e.execute_recovery(NOW + 3_600).unwrap();
+        assert_eq!(e.initializer(), NEW_KEY);
+        assert!(e.recovery().unwrap().pending().is_none());
+        // The disable is signed by the *current* initializer.
+        e.disable_social_recovery(NEW_KEY, BOB).unwrap();
+        assert!(e.recovery().is_none());
+        assert_eq!(e.initializer(), NEW_KEY);
+        assert_eq!(e.state(), EscrowState::Funded);
+        // And no new recovery can open under the removed policy.
+        assert_eq!(
+            e.request_recovery(G1, ALICE, NOW),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+    }
+
+    #[test]
+    fn disable_social_recovery_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-418: the event layer emits exactly one
+        // SocialRecoveryDisabled on an actual clear, and nothing
+        // for a failed call or a no-op.
+        let mut e = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = e.event_count();
+        assert_eq!(
+            e.disable_social_recovery(ALICE, MALLORY, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.disable_social_recovery(ALICE, BOB, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::SocialRecoveryDisabled);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.at, NOW);
+        assert_eq!((ev.amounts.payout, ev.amounts.fee), (0, 0));
+        // A second disable is a no-op: no new event.
+        e.disable_social_recovery(ALICE, BOB, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn social_recovery_disabled_discriminant_is_pinned() {
+        // AV-418: discriminant 177, appended after
+        // DeadmanSwitchDisabled — 0–176 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::SocialRecoveryDisabled;
+        assert_eq!(kind.discriminant(), 177);
+        assert_eq!(EscrowEventKind::from_discriminant(177), Some(kind));
+        assert_eq!(kind.name(), "social_recovery_disabled");
+        assert_eq!(
+            EscrowEventKind::from_name("social_recovery_disabled"),
+            Some(kind)
+        );
+        assert_eq!(
+            EscrowEventKind::from_discriminant(176),
+            Some(EscrowEventKind::DeadmanSwitchDisabled)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(178), None);
     }
 }
 
