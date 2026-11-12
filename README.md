@@ -171,6 +171,7 @@ Anchor.toml                 # Anchor project config (devnet placeholder)
 | `initialize_quorum(attestors, weights, threshold)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
 | `with_token_weighted_voting(snapshot)` (AV-183) | `Uninitialized`| `Uninitialized` | initializer (once, before funding); the snapshot's frozen token-balance weights land in the quorum slot — `release` needs a `threshold_bps`/10_000 weighted supermajority; mutually exclusive with plain/tiered quorum (`InvalidQuorum`); see "Token-weighted voting (AV-183)" |
 | `initialize_dual_sig()`                     | `Uninitialized`| `Uninitialized` | initializer (once, before funding) |
+| `disable_dual_sig(initializer, taker)` (AV-420) | `Funded` | — (no state change; clears `ACTIVATION_DUAL_SIG_REQUIRED_BIT` in place) | **both** parties must sign (dual-signature governance — one party alone dropping the requirement would strip the other party's revision review, so the removal itself needs both signatures; a stranger or a single party is `Unauthorized`); `Uninitialized`/`Activated`/terminal states and `Disputed` are `InvalidStateTransition`; a paused escrow fails fast (`Paused`); a plain escrow (never opted in, or already disabled) is a silent no-op success that writes nothing and emits nothing; one-way only — `with_dual_sig` stays `Uninitialized`-only, so the requirement can never be re-installed after funding; after the disable the five AV-276 conditional governance gates read the live bit and become initializer-only, while `update_quorum`/`update_attestors`/the `rotate_*` family (unconditional dual signature, never reading the bit) are unaffected, and `slash`'s dual-activation gate lifts with the bit (slash's own caller gate unchanged); a revision already settled keeps the governance it settled under; emits `DualSigDisabled` (discriminant 179), all amounts zero, except for the no-op |
 | `initialize_extension(max_extension_secs)` | `Uninitialized`| `Uninitialized` | initializer (once, before funding); zero bound is `InvalidExpiryExtension`; persists the extension budget (`max_extension_secs`, `extension_count` starts 0) |
 | `extend_expiry(new_expires_at)`             | `Uninitialized`/`Funded` | — (no state change; pushes `expires_at` back) | initializer **only** (`Unauthorized` otherwise, checked before state validity); `Activated`/`Disputed`/terminal states are `InvalidStateTransition`; new deadline must be strictly later and each increment ≤ the bound (saturating counter); extending at/past keeper-eligibility (`now >= expires_at + grace_period`) is `InvalidExpiryExtension`; emits `ExpiryExtended` (old/new deadline, count) |
 | `shorten_expiry(initializer, taker, new_expires_at)` (AV-338) | `Uninitialized`/`Funded` | — (no state change; pulls `expires_at` forward) | **both** parties must sign (dual-signature governance — shortening cuts the taker's funding window and brings forward `cancel_expired` eligibility, so one side alone must not rewrite the other's window; either key mismatching is `Unauthorized`); `Activated`/`Disputed`/terminal states are `InvalidStateTransition`; already expiry-eligible escrows are `InvalidExpiryExtension`; new deadline must be strictly earlier and strictly after `now` (equal is not a restatement, larger is `extend_expiry`'s job, at-or-before `now` would manufacture an immediately expirable escrow); only `expires_at` moves — `extension_count`/`max_extension_secs` untouched (shortening is not an extension); the new deadline governs from the next evaluation (`cancel_expired`/`escalate` read the live value); emits `ExpiryShortened` (discriminant 163) |
@@ -667,6 +668,25 @@ bitmask (bit 0 initializer, bit 1 taker, bit 2 requirement), so it
 survives serialization; `attest` is allowed in `Activated` too, so
 attestors can vote between activation and funding. Composes with the
 quorum builder: activation gates `fund`, quorum gates `release`.
+
+After funding, the requirement itself can be removed with
+`disable_dual_sig(initializer, taker)` (AV-420): pause first, then
+unconditional dual signature (either party alone is `Unauthorized`),
+`Funded` only. An escrow that never opted in — or already removed the
+requirement — is a silent no-op success that emits nothing. A real
+removal clears only the requirement bit (`ACTIVATION_DUAL_SIG_REQUIRED_BIT`)
+in place, emits `DualSigDisabled` (discriminant 179), and downgrades the
+five AV-276 conditional governance gates
+(`update_settlement_mint_allowlist`, `update_mint_allowlist`,
+`amend_social_recovery_threshold`, `amend_social_recovery_timelock`,
+`update_payout_allowlist`) from dual-signed to initializer-only, while
+the unconditional dual-signature paths (`update_quorum`,
+`update_attestors`, the `rotate_*` family) never read the bit and are
+unaffected, and `slash`'s dual-activation gate lifts with the bit
+(slash's own caller gate unchanged). The removal is one-way — there is
+no post-funding re-installation (`with_dual_sig` stays
+`Uninitialized`-only), and a revision already settled keeps the
+governance it settled under.
 
 **Streaming release (linear vesting).** An escrow can attach a vesting
 schedule (`VestingSchedule::new(start, end)`, opt-in on `Uninitialized`,

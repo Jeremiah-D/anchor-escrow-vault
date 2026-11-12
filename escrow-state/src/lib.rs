@@ -11852,6 +11852,92 @@ impl Escrow {
         self.activation & ACTIVATION_TAKER_BIT != 0
     }
 
+    /// Remove the dual-signature governance requirement after funding
+    /// (AV-420 — Solana multisig governance downgrade): the
+    /// post-funding counterpart to the installation leg of
+    /// [`Escrow::with_dual_sig`] (`Uninitialized`-only opt-in). A
+    /// deal's dual-signature revision rule may outlive its usefulness
+    /// mid-deal — the taker's key moves to cold storage, or getting
+    /// both parties to co-sign every allowlist revision costs more
+    /// than the review it buys — and with the requirement bit set
+    /// every conditional governance revision needs both signatures,
+    /// so the requirement itself must be removable without cancelling
+    /// and re-locking the escrow.
+    ///
+    /// Governance mirrors [`Escrow::disable_transfer_hook`]:
+    /// pause first (AV-46), then unconditional dual signature —
+    /// both the *current* initializer and the *current* taker must
+    /// authorize, one party alone (or a stranger pair) is
+    /// [`EscrowError::Unauthorized`] — then the `Funded`-only state
+    /// gate ([`EscrowError::InvalidStateTransition`]). The
+    /// dual-signature requirement is jointly owned revision review:
+    /// a single party dropping it would strip the other party's
+    /// veto over future revisions, so the removal itself needs
+    /// both signatures. Only an escrow with the requirement
+    /// actually opted in has anything to remove: a plain escrow —
+    /// never opted in, or already disabled — is a silent no-op
+    /// success that writes nothing and emits nothing (the AV-405 /
+    /// AV-409 / AV-410 no-op precedent). The bit clears in place —
+    /// the 1-byte `activation` bitmask is already resident, so no
+    /// layout change. One-way only — there is no post-funding
+    /// re-installation: `with_dual_sig` stays `Uninitialized`-only,
+    /// and re-installing would rewrite the governance mode the
+    /// taker funded under (single-party revision back to dual
+    /// signature is a new deal, not a revision — the AV-318
+    /// refusal reasoning).
+    ///
+    /// After disabling, the five AV-276 conditional governance
+    /// gates ([`Escrow::update_settlement_mint_allowlist`],
+    /// [`Escrow::update_mint_allowlist`],
+    /// [`Escrow::amend_social_recovery_threshold`],
+    /// [`Escrow::amend_social_recovery_timelock`],
+    /// [`Escrow::update_payout_allowlist`]) read the live bit and
+    /// become initializer-only, while the unconditional dual-signature
+    /// paths ([`Escrow::update_quorum`],
+    /// [`Escrow::update_attestors`], the `rotate_*` family) never
+    /// read the bit and are unaffected. [`Escrow::slash`]'s
+    /// dual-activation gate (AV-12, defense in depth) lifts with
+    /// the bit — slash's own caller gate is unchanged. A revision
+    /// already settled keeps the governance it settled under.
+    /// Disabling moves no funds, so no AV-36 reentrancy lock is
+    /// needed (the lock only guards the fund-moving paths, the
+    /// `rotate_arbiter` precedent). Orthogonal to
+    /// [`Escrow::with_dual_sig`] (that is the initial
+    /// configuration, this item is the post-funding removal) and
+    /// to [`Escrow::activate`] (that records the pre-funding
+    /// activation signatures, this item retires the post-funding
+    /// revision rule). Emits `DualSigDisabled` on the event
+    /// layer, except for the no-op.
+    pub fn disable_dual_sig(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the *current*
+        // initializer and the *current* taker must authorize.
+        // One party alone dropping the requirement would strip
+        // the other party's revision review, so the removal
+        // itself needs both signatures (the `rotate_arbiter`
+        // reasoning).
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // No-op: never opted in (or already removed) — removing a
+        // requirement that is not declared writes nothing, so the
+        // event layer emits nothing for it.
+        if !self.dual_sig_required() {
+            return Ok(());
+        }
+        self.activation &= !ACTIVATION_DUAL_SIG_REQUIRED_BIT;
+        Ok(())
+    }
+
     // ----- AV-104: authority delegation -----
 
     /// The live operator grant ([`Escrow::delegate_authority`]), if any.
@@ -58093,7 +58179,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -72449,7 +72536,8 @@ mod emergency_unlock_tests {
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -78306,7 +78394,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -78563,9 +78652,10 @@ mod event_history_tests {
         // `ArbiterDisabled` (AV-412), 176 is
         // `DeadmanSwitchDisabled` (AV-417), 177 is
         // `SocialRecoveryDisabled` (AV-418), 178 is
-        // `TransferHookDisabled` (AV-419) and 179 is the
+        // `TransferHookDisabled` (AV-419), 179 is
+        // `DualSigDisabled` (AV-420) and 180 is the
         // first still-unknown byte.
-        for bad in [179u8, 255] {
+        for bad in [180u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -81967,7 +82057,8 @@ mod release_via_intent_tests {
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -90196,7 +90287,8 @@ mod disable_dual_control_tests {
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -90512,7 +90604,8 @@ mod disable_deadman_switch_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-418: 177 is SocialRecoveryDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-418: 177 is SocialRecoveryDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-418: 177 is SocialRecoveryDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-418: 177 is SocialRecoveryDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-418: 177 is SocialRecoveryDisabled
     }
 }
 
@@ -90943,7 +91036,8 @@ mod disable_credential_gate_tests {
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -91285,7 +91379,8 @@ mod disable_milestone_verifier_tests {
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -91585,7 +91680,8 @@ mod disable_arbiter_tests {
         assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(177), Some(EscrowEventKind::SocialRecoveryDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(179), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(180), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -93945,7 +94041,8 @@ mod disable_social_recovery_tests {
             Some(EscrowEventKind::DeadmanSwitchDisabled)
         );
         assert_eq!(EscrowEventKind::from_discriminant(178), Some(EscrowEventKind::TransferHookDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(179), None);
+        assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(180), None);
     }
 }
 
@@ -96012,7 +96109,416 @@ mod disable_transfer_hook_tests {
             EscrowEventKind::from_discriminant(177),
             Some(EscrowEventKind::SocialRecoveryDisabled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(179), None);
+        assert_eq!(EscrowEventKind::from_discriminant(179), Some(EscrowEventKind::DualSigDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(180), None);
+    }
+}
+
+mod disable_dual_sig_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const MINT: [u8; 32] = [0xD0; 32];
+    const M2: [u8; 32] = [0xD1; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const PAUSER: [u8; 32] = [0xDD; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const ADDR_1: [u8; 32] = [0xE1; 32];
+    const ADDR_2: [u8; 32] = [0xE2; 32];
+    const ATTESTOR_1: [u8; 32] = [0xA1; 32];
+    const ATTESTOR_2: [u8; 32] = [0xA2; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_700_000_000;
+
+    fn init_key() -> SigningKey {
+        SigningKey::from_seed([0x11; 32])
+    }
+
+    fn taker_key() -> SigningKey {
+        SigningKey::from_seed([0x22; 32])
+    }
+
+    fn initializer() -> [u8; 32] {
+        init_key().public_key()
+    }
+
+    fn taker() -> [u8; 32] {
+        taker_key().public_key()
+    }
+
+    fn dual_signed_funded() -> Escrow {
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_mint_allowlist(&[MINT, M2])
+            .unwrap();
+        e.activate(initializer()).unwrap();
+        e.activate(taker()).unwrap();
+        assert_eq!(e.state(), EscrowState::Activated);
+        e.fund(initializer(), NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert!(e.dual_sig_required());
+        e
+    }
+
+    fn disputed() -> Escrow {
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap();
+        e.activate(initializer()).unwrap();
+        e.activate(taker()).unwrap();
+        e.fund(initializer(), NOW).unwrap();
+        e.escalate(initializer(), EXPIRES_AT - 1, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        e
+    }
+
+    #[test]
+    fn stranger_and_single_party_cannot_disable_and_requirement_unchanged() {
+        // AV-420: the dual-signature requirement is jointly owned
+        // revision review — one party alone dropping it would strip
+        // the other party's veto over future revisions, so a
+        // stranger or a single party is Unauthorized and the failed
+        // call moves nothing.
+        let mut e = dual_signed_funded();
+        for (init, taker) in [
+            (initializer(), MALLORY),
+            (MALLORY, taker()),
+            (MALLORY, MALLORY),
+            (taker(), initializer()), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_dual_sig(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert!(e.dual_sig_required(), "failed disable leaves the bit set");
+    }
+
+    #[test]
+    fn disable_refused_while_paused() {
+        // AV-420: pause first (AV-46) — a paused escrow fails
+        // fast, before the dual-signature check.
+        let mut e = dual_signed_funded();
+        e.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            e.disable_dual_sig(initializer(), taker()),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            e.disable_dual_sig(MALLORY, taker()),
+            Err(EscrowError::Paused),
+            "even a stranger's disable on a paused escrow is Paused"
+        );
+        assert!(
+            e.dual_sig_required(),
+            "paused disable writes nothing"
+        );
+        e.unpause(PAUSER).unwrap();
+        e.disable_dual_sig(initializer(), taker()).unwrap();
+        assert!(!e.dual_sig_required());
+    }
+
+    #[test]
+    fn disable_refuses_non_funded_states() {
+        // AV-420: Funded-only — the Uninitialized builder owns the
+        // initial opt-in (and on Uninitialized the disable is
+        // meaningless: both parties together could just activate),
+        // Activated has not funded yet, Disputed is excluded (the
+        // dispute must settle first), and terminal states have no
+        // live governance left to downgrade.
+        let mut bare = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        assert_eq!(
+            bare.disable_dual_sig(initializer(), taker()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert!(
+            bare.dual_sig_required(),
+            "refused disable writes nothing"
+        );
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap();
+        activated.activate(initializer()).unwrap();
+        activated.activate(taker()).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.disable_dual_sig(initializer(), taker()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(activated.dual_sig_required());
+        // Disputed: the requirement stays while the dispute is in
+        // flight.
+        let mut d = disputed();
+        assert_eq!(
+            d.disable_dual_sig(initializer(), taker()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(
+            d.dual_sig_required(),
+            "refused disable writes nothing"
+        );
+        // Terminal: a cancelled escrow's governance is history, not
+        // a live requirement to remove.
+        let mut e = dual_signed_funded();
+        e.cancel(initializer(), Some(MINT), initializer(), 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_dual_sig(initializer(), taker()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(e.dual_sig_required());
+    }
+
+    #[test]
+    fn not_opted_in_is_a_silent_noop_and_emits_nothing() {
+        // AV-420: removing a requirement that was never installed
+        // writes nothing and emits nothing — the `rotate_*`
+        // same-value no-op precedent. That covers both a plain
+        // escrow and a second disable after a successful first one.
+        let mut plain = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap();
+        plain.fund(initializer(), NOW).unwrap();
+        plain.disable_dual_sig(initializer(), taker()).unwrap();
+        assert!(!plain.dual_sig_required());
+
+        let mut plain_ie = IndexedEscrow::wrap(
+            [0xE0; 32],
+            Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_mint(MINT)
+                .unwrap(),
+        );
+        plain_ie.fund(initializer(), 0).unwrap();
+        let _ = plain_ie.drain_events();
+        plain_ie
+            .disable_dual_sig(initializer(), taker(), 42)
+            .unwrap();
+        assert_eq!(
+            plain_ie.event_count(),
+            0,
+            "never-opted-in disable emits nothing"
+        );
+
+        let mut ie = IndexedEscrow::wrap([0xE0; 32], dual_signed_funded());
+        let _ = ie.drain_events();
+        ie.disable_dual_sig(initializer(), taker(), 42).unwrap();
+        assert_eq!(ie.event_count(), 1, "first disable emits once");
+        ie.disable_dual_sig(initializer(), taker(), 43).unwrap();
+        assert_eq!(ie.event_count(), 1, "second disable emits nothing");
+        assert!(!ie.inner().dual_sig_required());
+    }
+
+    #[test]
+    fn disable_clears_requirement_and_moves_no_funds() {
+        // AV-420: the bit clears in place — the 1-byte `activation`
+        // bitmask is already resident, so the disable rewrites it
+        // with no layout change, the state stays Funded, and the
+        // locked amount, the mint, and the allowlist are untouched.
+        let mut e = dual_signed_funded();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let allowlist_before = e.mint_allowlist();
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        e.disable_dual_sig(initializer(), taker()).unwrap();
+        assert!(!e.dual_sig_required());
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.mint(), Some(MINT));
+        assert_eq!(e.mint_allowlist(), allowlist_before);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "activation bit rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn disable_lets_initializer_revise_payout_allowlist_alone() {
+        // AV-420: the five AV-276 conditional governance gates read
+        // the live bit — while dual-signed, one party alone is
+        // Unauthorized; after the disable the initializer revises
+        // the payout allowlist alone.
+        let mut e = dual_signed_funded();
+        assert_eq!(
+            e.update_payout_allowlist(initializer(), initializer(), &[ADDR_1]),
+            Err(EscrowError::Unauthorized),
+            "single party cannot revise on a dual-sig escrow"
+        );
+        assert_eq!(e.payout_allowlist(), None);
+        e.disable_dual_sig(initializer(), taker()).unwrap();
+        e.update_payout_allowlist(initializer(), initializer(), &[ADDR_1])
+            .unwrap();
+        assert_eq!(
+            e.payout_allowlist().unwrap().as_slice(),
+            &[ADDR_1],
+            "initializer-only revision lands after the disable"
+        );
+        // A stranger still cannot revise — the downgrade drops the
+        // second signature, not the initializer-only rule.
+        assert_eq!(
+            e.update_payout_allowlist(MALLORY, MALLORY, &[ADDR_2]),
+            Err(EscrowError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn disable_lets_initializer_revise_settlement_mint_allowlist_alone() {
+        // AV-420: same live-bit read for the settlement-mint
+        // allowlist — dual-signed needs both, initializer-only
+        // after the disable.
+        let mut e = dual_signed_funded();
+        assert_eq!(
+            e.update_settlement_mint_allowlist(initializer(), initializer(), &[M2]),
+            Err(EscrowError::Unauthorized),
+            "single party cannot revise on a dual-sig escrow"
+        );
+        e.disable_dual_sig(initializer(), taker()).unwrap();
+        e.update_settlement_mint_allowlist(initializer(), initializer(), &[M2])
+            .unwrap();
+        assert_eq!(
+            e.settlement_mint_allowlist().unwrap().as_slice(),
+            &[M2],
+            "initializer-only revision lands after the disable"
+        );
+    }
+
+    #[test]
+    fn disable_leaves_update_quorum_dual_signed() {
+        // AV-420: `update_quorum` is an unconditional dual-signature
+        // path — it never reads the requirement bit, so the disable
+        // does not touch it. One party alone still cannot move the
+        // threshold after the disable; both parties still can.
+        let mut e = Escrow::initialize(initializer(), taker(), 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_quorum(
+                QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap(),
+            )
+            .unwrap();
+        e.activate(initializer()).unwrap();
+        e.activate(taker()).unwrap();
+        e.fund(initializer(), NOW).unwrap();
+        e.disable_dual_sig(initializer(), taker()).unwrap();
+        assert!(!e.dual_sig_required());
+        assert_eq!(
+            e.update_quorum(initializer(), initializer(), 1),
+            Err(EscrowError::Unauthorized),
+            "update_quorum stays dual-signed after the disable"
+        );
+        assert_eq!(e.quorum().unwrap().threshold(), 2);
+        e.update_quorum(initializer(), taker(), 1).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+    }
+
+    #[test]
+    fn disable_is_one_way_with_dual_sig_still_rejected_after_funding() {
+        // AV-420: one-way only — `with_dual_sig` stays
+        // Uninitialized-only, so a post-funding re-installation is
+        // refused and the bit stays clear.
+        let mut e = dual_signed_funded();
+        e.disable_dual_sig(initializer(), taker()).unwrap();
+        assert!(!e.dual_sig_required());
+        assert_eq!(
+            e.with_dual_sig(),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(
+            !e.dual_sig_required(),
+            "refused re-installation writes nothing"
+        );
+    }
+
+    #[test]
+    fn disable_keeps_settled_release() {
+        // AV-420: a payout already settled keeps the governance it
+        // settled under — the disable only governs future revisions,
+        // and the remainder still releases plainly.
+        let mut e = dual_signed_funded();
+        let (payout, fee) = e
+            .release(initializer(), NOW, 400_000, Some(MINT), taker())
+            .unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.released_amount(), 400_000);
+        e.disable_dual_sig(initializer(), taker()).unwrap();
+        assert!(!e.dual_sig_required());
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.remaining_amount(), 600_000);
+        assert_eq!(
+            e.release(initializer(), NOW, 600_000, Some(MINT), taker())
+                .unwrap(),
+            (600_000, 0)
+        );
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn disable_dual_sig_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-420: the event layer emits exactly one
+        // DualSigDisabled on an actual clear, and nothing for a
+        // failed call or a no-op.
+        let mut e = IndexedEscrow::wrap([0xE0; 32], dual_signed_funded());
+        let before = e.event_count();
+        assert_eq!(
+            e.disable_dual_sig(MALLORY, taker(), NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.disable_dual_sig(initializer(), taker(), NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::DualSigDisabled);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.at, NOW);
+        assert_eq!((ev.amounts.payout, ev.amounts.fee), (0, 0));
+        // A second disable is a no-op: no new event.
+        e.disable_dual_sig(initializer(), taker(), NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn dual_sig_disabled_discriminant_is_pinned() {
+        // AV-420: discriminant 179, appended after
+        // TransferHookDisabled — 0–178 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::DualSigDisabled;
+        assert_eq!(kind.discriminant(), 179);
+        assert_eq!(EscrowEventKind::from_discriminant(179), Some(kind));
+        assert_eq!(kind.name(), "dual_sig_disabled");
+        assert_eq!(
+            EscrowEventKind::from_name("dual_sig_disabled"),
+            Some(kind)
+        );
+        assert_eq!(
+            EscrowEventKind::from_discriminant(178),
+            Some(EscrowEventKind::TransferHookDisabled)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(180), None);
     }
 }
 

@@ -500,6 +500,13 @@ fn fee_kind(kind: EscrowEventKind) -> Option<FeeType> {
         // binding: a plan naming no hook builds while a plan naming
         // the old hook fails with SettlementMismatch.
         | EscrowEventKind::TransferHookDisabled
+        // AV-420: a removed dual-signature requirement moves no funds and
+        // never restates a revision already settled — only the requirement
+        // bit flips to clear, so the five AV-276 conditional governance
+        // gates read the live bit at the next revision while the
+        // unconditional dual-signature paths never read it, so they are
+        // unaffected.
+        | EscrowEventKind::DualSigDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1569,6 +1576,13 @@ mod fee_history_tests {
         // binding: a plan naming no hook builds while a plan naming
         // the old hook fails with SettlementMismatch.
         | EscrowEventKind::TransferHookDisabled
+        // AV-420: a removed dual-signature requirement moves no funds and
+        // never restates a revision already settled — only the requirement
+        // bit flips to clear, so the five AV-276 conditional governance
+        // gates read the live bit at the next revision while the
+        // unconditional dual-signature paths never read it, so they are
+        // unaffected.
+        | EscrowEventKind::DualSigDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
