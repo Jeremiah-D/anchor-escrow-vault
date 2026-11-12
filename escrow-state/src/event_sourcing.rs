@@ -450,6 +450,11 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // arbiter fact flips to None, so the next resolve /
         // escalate reads the live arbiter.
         | EscrowEventKind::ArbiterDisabled
+        // AV-417: a removed dead-man's switch moves no funds and
+        // never restates a claim already settled — both legs flip
+        // together, so the next claim reads the live
+        // configuration and is refused with InvalidDeadmanConfig.
+        | EscrowEventKind::DeadmanSwitchDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1512,6 +1517,11 @@ mod event_sourcing_tests {
         // arbiter fact flips to None, so the next resolve /
         // escalate reads the live arbiter.
         | EscrowEventKind::ArbiterDisabled
+        // AV-417: a removed dead-man's switch moves no funds and
+        // never restates a claim already settled — both legs flip
+        // together, so the next claim reads the live
+        // configuration and is refused with InvalidDeadmanConfig.
+        | EscrowEventKind::DeadmanSwitchDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices

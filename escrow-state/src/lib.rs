@@ -22895,6 +22895,92 @@ let fee = self.charge_protocol_fee(claimable)?;
         Ok(())
     }
 
+    /// Disable the dead-man's switch after funding (AV-417): the
+    /// post-funding counterpart to the removal leg of
+    /// [`Escrow::with_deadman_switch`] (`Uninitialized`-only initial
+    /// configuration). Dual-signed governance, `Funded`-only,
+    /// pause first — paralleling
+    /// [`Escrow::rotate_deadman_heir`]. The heir itself does not
+    /// sign: a lost heir key must not block its own removal (the
+    /// `rotate_arbiter` reasoning — removing the recovery path is
+    /// the two parties' decision, not the heir's). Only an escrow
+    /// whose switch is already configured (see
+    /// [`Escrow::is_deadman_configured`]: a non-zero threshold
+    /// *and* a set heir) has anything to remove: an unconfigured
+    /// escrow is a silent no-op success that writes nothing and
+    /// emits nothing (the `rotate_*` same-value no-op precedent —
+    /// removing a switch that was never installed cannot smuggle
+    /// in a new release path, and a second disable after a
+    /// successful first one is the same no-op). Both legs clear
+    /// together — `deadman_heir = None` *and*
+    /// `deadman_inactivity_secs = 0` — so the escrow reads as
+    /// never-configured afterwards, and `deadman_last_activity`
+    /// is untouched: the clock is left as an audit trail of the
+    /// last real activity, never reset by a governance move that
+    /// takes no clock parameter. One-way only — there is no
+    /// post-funding re-installation: `with_deadman_switch` stays
+    /// `Uninitialized`-only, so installing a switch after the
+    /// taker funded under switch-less recovery would add a
+    /// recovery path the taker never funded under — it is a new
+    /// deal, not a revision (the AV-265 / AV-409 refusal
+    /// reasoning). After disabling, [`Escrow::claim_deadman`]
+    /// refuses with [`EscrowError::InvalidDeadmanConfig`] (its
+    /// existing never-configured gate), `is_deadman_configured()`
+    /// is false, and `rotate_deadman_heir` /
+    /// `amend_deadman_inactivity` refuse with
+    /// `InvalidDeadmanConfig` too (fail-closed, unchanged) — the
+    /// switch is gone, so there is nothing left to rotate or
+    /// revise. An already-satisfied but unexecuted eligibility
+    /// dies with the disable (along `amend_deadman_inactivity`'s
+    /// loosening-revokes-eligibility precedent: the eligibility
+    /// gate reads the live configuration at every
+    /// `claim_deadman`, so the same heir at the same clock no
+    /// longer claims once the switch is gone), while a claim
+    /// already settled keeps the heir and threshold it settled
+    /// under, since the claim is terminal — and a settled claim
+    /// is itself terminal, so the disable refuses it with
+    /// `InvalidStateTransition` rather than rewriting settled
+    /// history. Disabling moves no funds, so no AV-36 reentrancy
+    /// lock is needed (the lock only guards the fund-moving
+    /// paths, the `rotate_arbiter` precedent). Orthogonal to
+    /// [`Escrow::with_deadman_switch`] (that is the initial
+    /// configuration, this item is the post-funding removal),
+    /// to [`Escrow::amend_deadman_inactivity`] (that revises the
+    /// threshold, this item removes the switch) and to
+    /// [`Escrow::rotate_deadman_heir`] (that swaps the heir,
+    /// this item removes the switch — rotation cannot help when
+    /// there is no trustworthy heir left to rotate to). Emits
+    /// `DeadmanSwitchDisabled` on the event layer, except for
+    /// the no-op.
+    pub fn disable_deadman_switch(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both parties must authorize
+        // the removal, paralleling `rotate_deadman_heir`. The
+        // heir itself does not sign: a lost heir key must not
+        // block its own removal (the `rotate_arbiter` reasoning).
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // No-op: never configured (or already removed) — closing
+        // a switch that is not installed writes nothing, so the
+        // event layer emits nothing for it.
+        if !self.is_deadman_configured() {
+            return Ok(());
+        }
+        self.deadman_heir = None;
+        self.deadman_inactivity_secs = 0;
+        Ok(())
+    }
+
     /// Revise the keeper-bounty per-crank amount after funding
     /// (AV-266): the post-funding counterpart to the per-crank
     /// leg of [`Escrow::with_keeper_bounty`] (`Uninitialized`-only
@@ -57813,7 +57899,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -72166,7 +72253,8 @@ mod emergency_unlock_tests {
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(176), None);
+        assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -78020,7 +78108,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled)); // AV-410: 173 is CredentialGateDisabled
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled)); // AV-411: 174 is MilestoneVerifierDisabled
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled)); // AV-412: 175 is ArbiterDisabled
-        assert_eq!(EscrowEventKind::from_discriminant(176), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -78273,10 +78362,11 @@ mod event_history_tests {
         // `MintAllowlistUpdated` (AV-390), 168 is
         // `InsurancePoolAmended` (AV-394), 169 is
         // `ReleaseIntentsRevoked` (AV-404), 170 is
-        // `EmergencyUnlockDisabled` (AV-405), 171 is
-        // `ArbiterDisabled` (AV-412) and 176 is the
+        // `EmergencyUnlockDisabled` (AV-405), 175 is
+        // `ArbiterDisabled` (AV-412), 176 is
+        // `DeadmanSwitchDisabled` (AV-417) and 177 is the
         // first still-unknown byte.
-        for bad in [176u8, 255] {
+        for bad in [177u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -81675,7 +81765,8 @@ mod release_via_intent_tests {
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(176), None);
+        assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -89901,7 +89992,322 @@ mod disable_dual_control_tests {
         assert_eq!(EscrowEventKind::from_discriminant(173), Some(EscrowEventKind::CredentialGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(176), None);
+        assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-417: 176 is DeadmanSwitchDisabled
+    }
+}
+
+// ---------- AV-417: disable dead-man's switch after funding ----------
+mod disable_deadman_switch_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32];
+    const BOB: [u8; 32] = [0xBB; 32];
+    const HEIR: [u8; 32] = [0xEE; 32];
+    const MALLORY: [u8; 32] = [0xCC; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const NOW: u64 = 1_750_000_000;
+    // `fund` anchors the activity clock here; every elapsed-time
+    // figure below measures from this instant.
+    const FUND_AT: u64 = EXPIRES_AT - 3_600;
+
+    fn configured() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap()
+            .with_deadman_switch(3_600, HEIR)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn disputed() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_deadman_switch(3_600, HEIR)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        e
+    }
+
+    #[test]
+    fn stranger_and_single_party_cannot_disable_and_config_unchanged() {
+        // AV-417: the switch is jointly owned recovery power —
+        // one party alone removing it would strip the other of
+        // the inactivity fallback, so a stranger or a single
+        // party is Unauthorized and the failed call moves nothing.
+        let mut e = configured();
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_deadman_switch(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert!(e.is_deadman_configured(), "rejected disable changes nothing");
+        assert_eq!(e.deadman_heir(), Some(HEIR));
+        assert_eq!(e.deadman_inactivity_secs(), 3_600);
+    }
+
+    #[test]
+    fn disable_refused_while_paused() {
+        // AV-417: pause first (AV-46) — a paused escrow fails
+        // fast, before the dual-signature check.
+        let mut e = configured();
+        e.pause([0xDD; 32], None).unwrap();
+        assert_eq!(
+            e.disable_deadman_switch(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            e.disable_deadman_switch(MALLORY, BOB),
+            Err(EscrowError::Paused),
+            "even a stranger's disable on a paused escrow is Paused"
+        );
+        assert!(e.is_deadman_configured(), "paused disable writes nothing");
+        e.unpause([0xDD; 32]).unwrap();
+        e.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert!(!e.is_deadman_configured());
+    }
+
+    #[test]
+    fn disable_refuses_non_funded_states() {
+        // AV-417: Funded-only — the Uninitialized builder owns
+        // the initial set, Disputed is excluded (the dispute must
+        // settle first), and terminal states have no live switch
+        // left to remove.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_deadman_switch(3_600, HEIR)
+            .unwrap();
+        assert_eq!(
+            bare.disable_deadman_switch(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert!(bare.is_deadman_configured(), "refused disable writes nothing");
+        // Disputed: the switch stays configured while the dispute
+        // is in flight.
+        let mut d = disputed();
+        assert_eq!(
+            d.disable_deadman_switch(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(d.is_deadman_configured(), "refused disable writes nothing");
+        assert_eq!(d.deadman_heir(), Some(HEIR));
+        // Terminal: a cancelled escrow's switch is history, not a
+        // live configuration to remove.
+        let mut e = configured();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_deadman_switch(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.deadman_heir(), Some(HEIR));
+        assert_eq!(e.deadman_inactivity_secs(), 3_600);
+    }
+
+    #[test]
+    fn unconfigured_is_a_silent_noop_and_emits_nothing() {
+        // AV-417: removing a switch that was never installed
+        // writes nothing and emits nothing — the `rotate_*`
+        // same-value no-op precedent. That covers both a
+        // never-configured escrow and a second disable after a
+        // successful first one.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        plain.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert!(!plain.is_deadman_configured());
+
+        let mut ie = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], 0)
+            .unwrap();
+        ie.fund(ALICE, 0).unwrap();
+        let _ = ie.drain_events();
+        ie.disable_deadman_switch(ALICE, BOB, 42).unwrap();
+        assert_eq!(ie.event_count(), 0, "never-configured disable emits nothing");
+
+        let mut ie = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], 0)
+            .unwrap()
+            .with_deadman_switch(3_600, HEIR)
+            .unwrap();
+        ie.fund(ALICE, 0).unwrap();
+        let _ = ie.drain_events();
+        ie.disable_deadman_switch(ALICE, BOB, 42).unwrap();
+        assert_eq!(ie.event_count(), 1, "first disable emits once");
+        ie.disable_deadman_switch(ALICE, BOB, 43).unwrap();
+        assert_eq!(ie.event_count(), 1, "second disable emits nothing");
+        assert_eq!(ie.inner().deadman_heir(), None);
+        assert_eq!(ie.inner().deadman_inactivity_secs(), 0);
+    }
+
+    #[test]
+    fn disable_clears_both_legs_and_clock_untouched() {
+        // AV-417: both legs clear together — the heir and the
+        // threshold — so the escrow reads as never-configured
+        // afterwards, while the activity clock is left as an audit
+        // trail and the state stays Funded. Both regions are
+        // already resident, so the disable rewrites them in place
+        // with no layout change.
+        let mut e = configured();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.deadman_last_activity(), FUND_AT);
+        e.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert!(!e.is_deadman_configured());
+        assert_eq!(e.deadman_heir(), None);
+        assert_eq!(e.deadman_inactivity_secs(), 0);
+        assert_eq!(
+            e.deadman_last_activity(),
+            FUND_AT,
+            "the disable takes no clock and never resets the timer"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "switch regions rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn disable_blocks_claim_deadman() {
+        // AV-417: with the switch gone, the claim path refuses
+        // with its existing never-configured gate — the same error
+        // a never-configured escrow gets.
+        let mut e = configured();
+        e.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert_eq!(
+            e.claim_deadman(HEIR, FUND_AT + 3_600),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert_eq!(EscrowError::InvalidDeadmanConfig.code(), 168);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn disable_blocks_rotate_and_amend() {
+        // AV-417: fail-closed, unchanged — a removed switch has
+        // nothing left to rotate or revise, and a failed rotate /
+        // amend leaves the cleared configuration cleared.
+        let mut e = configured();
+        e.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert_eq!(
+            e.rotate_deadman_heir(ALICE, BOB, [0xE1; 32]),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert_eq!(
+            e.amend_deadman_inactivity(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert!(!e.is_deadman_configured());
+        assert_eq!(e.deadman_heir(), None);
+        assert_eq!(e.deadman_inactivity_secs(), 0);
+    }
+
+    #[test]
+    fn eligible_before_disable_no_longer_claimable_after() {
+        // AV-417: an already-satisfied but unexecuted eligibility
+        // dies with the disable — the eligibility gate reads the
+        // live configuration at every claim, so the same heir at
+        // the same clock no longer claims once the switch is gone.
+        // Control first: before the disable the heir claims the
+        // whole lockup at the full threshold.
+        let idle_at = FUND_AT + 3_600;
+        let mut control = configured();
+        assert!(control.is_deadman_eligible(idle_at));
+        assert_eq!(control.claim_deadman(HEIR, idle_at).unwrap(), 1_000_000);
+        assert_eq!(control.state(), EscrowState::Cancelled);
+        // Now the disable: the same heir at the same clock is
+        // refused with the config error, not the elapsed error.
+        let mut e = configured();
+        assert!(e.is_deadman_eligible(idle_at));
+        e.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert!(!e.is_deadman_eligible(idle_at));
+        assert_eq!(
+            e.claim_deadman(HEIR, idle_at),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn disable_keeps_settled_claim() {
+        // AV-417: a claim already settled keeps the heir and
+        // threshold it settled under — the disable refuses the
+        // terminal escrow rather than rewriting settled history.
+        let mut e = configured();
+        let payout = e.claim_deadman(HEIR, FUND_AT + 3_600).unwrap();
+        assert_eq!(payout, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_deadman_switch(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.deadman_heir(), Some(HEIR));
+        assert_eq!(e.deadman_inactivity_secs(), 3_600);
+    }
+
+    #[test]
+    fn disable_deadman_switch_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-417: the event layer emits exactly one
+        // DeadmanSwitchDisabled on an actual clear, and nothing
+        // for a failed call or a no-op.
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0xE0; 32], NOW)
+            .unwrap()
+            .with_deadman_switch(3_600, HEIR)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.disable_deadman_switch(ALICE, MALLORY, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.disable_deadman_switch(ALICE, BOB, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::DeadmanSwitchDisabled);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.at, NOW);
+        assert_eq!((ev.amounts.payout, ev.amounts.fee), (0, 0));
+        // A second disable is a no-op: no new event.
+        e.disable_deadman_switch(ALICE, BOB, NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn deadman_switch_disabled_discriminant_is_pinned() {
+        // AV-417: discriminant 176, appended after
+        // ArbiterDisabled — 0–175 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::DeadmanSwitchDisabled;
+        assert_eq!(kind.discriminant(), 176);
+        assert_eq!(EscrowEventKind::from_discriminant(176), Some(kind));
+        assert_eq!(kind.name(), "deadman_switch_disabled");
+        assert_eq!(
+            EscrowEventKind::from_name("deadman_switch_disabled"),
+            Some(kind)
+        );
+        assert_eq!(
+            EscrowEventKind::from_discriminant(175),
+            Some(EscrowEventKind::ArbiterDisabled)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(177), None);
     }
 }
 
@@ -90329,7 +90735,8 @@ mod disable_credential_gate_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(174), Some(EscrowEventKind::MilestoneVerifierDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(176), None);
+        assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -90668,7 +91075,8 @@ mod disable_milestone_verifier_tests {
             Some(EscrowEventKind::CredentialGateDisabled)
         );
         assert_eq!(EscrowEventKind::from_discriminant(175), Some(EscrowEventKind::ArbiterDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(176), None);
+        assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -90965,7 +91373,8 @@ mod disable_arbiter_tests {
             EscrowEventKind::from_discriminant(174),
             Some(EscrowEventKind::MilestoneVerifierDisabled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(176), None);
+        assert_eq!(EscrowEventKind::from_discriminant(176), Some(EscrowEventKind::DeadmanSwitchDisabled)); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(177), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
