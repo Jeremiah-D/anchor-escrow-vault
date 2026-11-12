@@ -26,6 +26,15 @@
 //!   [`UpgradeAuditEntry`] to a bounded 32-entry ring (the AV-163
 //!   circuit-breaker convention — fixed-size tail, oldest evicts
 //!   first).
+//! - **Renounce (AV-415)**: the current authority may give the
+//!   authority back to nobody via
+//!   [`renounce_upgrade_authority`](UpgradeAuthority::renounce_upgrade_authority),
+//!   the loader's `set_upgrade_authority`-to-`None` terminal step.
+//!   One-way and audited (`UpgradeAuthorityRenounced`, successor slot
+//!   zero); a live proposal blocks it — cancel first. After renounce
+//!   there is no authority to compare against, so propose / amend are
+//!   `Unauthorized` and confirm / cancel are
+//!   `NoUpgradeHandoverPending`; renouncing again is a silent no-op.
 //! - **Keeper drift scan**:
 //!   [`scan_upgrade_authority_drift`] diffs the live authority against
 //!   the operator-approved template and raises a drift alert — the
@@ -54,6 +63,9 @@
 //! - **No multisig quorum.** The handover is a single-authority action
 //!   by design (it mirrors the loader's single-authority model); a
 //!   multisig-gated handover would be a governance layer above this.
+//! - **No un-renounce.** Renouncing the authority (AV-415) is one-way
+//!   by design — the loader has no instruction that restores an
+//!   authority once it is set to `None`; the program becomes immutable.
 
 use super::EscrowError;
 
@@ -73,6 +85,9 @@ pub enum UpgradeAuthorityEventKind {
     HandoverCancelled,
     /// The handover delay was revised by the current authority.
     HandoverDelayAmended,
+    /// The current authority renounced the upgrade authority (AV-415):
+    /// the program is now immutable, with no authority left to move.
+    UpgradeAuthorityRenounced,
 }
 
 /// One structured audit entry: what happened, when, who acted, and
@@ -101,8 +116,9 @@ struct PendingHandover {
 /// The program's upgrade-authority custody with the two-step handover.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeAuthority {
-    /// The live upgrade authority.
-    current: [u8; 32],
+    /// The live upgrade authority; `None` once renounced (AV-415) —
+    /// the program is then immutable and no key may act as authority.
+    current: Option<[u8; 32]>,
     /// The in-flight proposal, if any (at most one — a second proposal
     /// must wait for cancel or confirm).
     pending: Option<PendingHandover>,
@@ -126,7 +142,7 @@ impl UpgradeAuthority {
             return Err(EscrowError::InvalidUpgradeAuthority);
         }
         Ok(UpgradeAuthority {
-            current,
+            current: Some(current),
             pending: None,
             handover_delay_secs,
             audit: [None; MAX_UPGRADE_AUDIT_ENTRIES],
@@ -135,8 +151,8 @@ impl UpgradeAuthority {
         })
     }
 
-    /// The live upgrade authority.
-    pub fn current(&self) -> [u8; 32] {
+    /// The live upgrade authority; `None` once renounced (AV-415).
+    pub fn current(&self) -> Option<[u8; 32]> {
         self.current
     }
 
@@ -167,7 +183,7 @@ impl UpgradeAuthority {
         new_delay_secs: u64,
         now: u64,
     ) -> Result<bool, EscrowError> {
-        if caller != self.current {
+        if Some(caller) != self.current {
             return Err(EscrowError::Unauthorized);
         }
         if new_delay_secs == self.handover_delay_secs {
@@ -178,7 +194,7 @@ impl UpgradeAuthority {
             kind: UpgradeAuthorityEventKind::HandoverDelayAmended,
             at: now,
             actor: caller,
-            successor: self.current,
+            successor: caller,
         });
         Ok(true)
     }
@@ -200,10 +216,10 @@ impl UpgradeAuthority {
         new_authority: [u8; 32],
         now: u64,
     ) -> Result<(), EscrowError> {
-        if caller != self.current {
+        if Some(caller) != self.current {
             return Err(EscrowError::Unauthorized);
         }
-        if new_authority == [0u8; 32] || new_authority == self.current {
+        if new_authority == [0u8; 32] || Some(new_authority) == self.current {
             return Err(EscrowError::InvalidUpgradeAuthority);
         }
         if self.pending.is_some() {
@@ -236,7 +252,7 @@ impl UpgradeAuthority {
         if now < p.proposed_at.saturating_add(self.handover_delay_secs) {
             return Err(EscrowError::UpgradeHandoverDelayNotElapsed);
         }
-        self.current = p.proposed;
+        self.current = Some(p.proposed);
         self.pending = None;
         self.push_audit(UpgradeAuditEntry {
             kind: UpgradeAuthorityEventKind::HandoverConfirmed,
@@ -251,7 +267,7 @@ impl UpgradeAuthority {
     /// live proposal this is a loud refuse, never a silent no-op.
     pub fn cancel_handover(&mut self, caller: [u8; 32], now: u64) -> Result<(), EscrowError> {
         let p = self.pending.ok_or(EscrowError::NoUpgradeHandoverPending)?;
-        if caller != self.current {
+        if Some(caller) != self.current {
             return Err(EscrowError::Unauthorized);
         }
         self.pending = None;
@@ -260,6 +276,44 @@ impl UpgradeAuthority {
             at: now,
             actor: caller,
             successor: p.proposed,
+        });
+        Ok(())
+    }
+
+    /// Renounce the upgrade authority (AV-415): give the authority
+    /// back to nobody, the loader's `set_upgrade_authority`-to-`None`
+    /// terminal step — the program becomes immutable. One-way: there
+    /// is no un-renounce. Only the current authority; a live proposal
+    /// blocks the renounce (cancel it first), otherwise the proposed
+    /// successor could still confirm into a program whose authority
+    /// was already given away. Already renounced is a silent no-op
+    /// `Ok(())` regardless of caller (the AV-413 re-revoke
+    /// convention), checked before the authority check. A successful
+    /// renounce appends an `UpgradeAuthorityRenounced` entry (actor:
+    /// the caller; the successor slot records the zero key — the
+    /// authority in effect after renounce is "none", distinguished
+    /// from a handover by the kind). Check order: renounced, then
+    /// authority, then pending.
+    pub fn renounce_upgrade_authority(
+        &mut self,
+        caller: [u8; 32],
+        now: u64,
+    ) -> Result<(), EscrowError> {
+        if self.current.is_none() {
+            return Ok(());
+        }
+        if Some(caller) != self.current {
+            return Err(EscrowError::Unauthorized);
+        }
+        if self.pending.is_some() {
+            return Err(EscrowError::UpgradeHandoverPending);
+        }
+        self.current = None;
+        self.push_audit(UpgradeAuditEntry {
+            kind: UpgradeAuthorityEventKind::UpgradeAuthorityRenounced,
+            at: now,
+            actor: caller,
+            successor: [0u8; 32],
         });
         Ok(())
     }
@@ -306,16 +360,21 @@ pub struct UpgradeAuthorityDrift {
 /// Keeper entry point: diff the live authority against the
 /// operator-approved template. `None` when they match; `Some` drift
 /// alert otherwise. Pure and read-only (the AV-175 scan convention).
+/// A renounced authority (AV-415) compares as the zero key — the
+/// loader's encoding of "no authority" — so a template expecting a
+/// live key reports drift, and a template expecting the zero key
+/// (an intentionally immutable program) matches.
 pub fn scan_upgrade_authority_drift(
     authority: &UpgradeAuthority,
     expected_authority: [u8; 32],
 ) -> Option<UpgradeAuthorityDrift> {
-    if authority.current() == expected_authority {
+    let actual = authority.current().unwrap_or([0u8; 32]);
+    if actual == expected_authority {
         return None;
     }
     Some(UpgradeAuthorityDrift {
         expected: expected_authority,
-        actual: authority.current(),
+        actual,
         pending_proposal: authority.pending_proposal().map(|(p, _)| p),
     })
 }
@@ -340,7 +399,7 @@ mod upgrade_authority_tests {
             Err(EscrowError::InvalidUpgradeAuthority)
         );
         let a = authority();
-        assert_eq!(a.current(), CURRENT);
+        assert_eq!(a.current(), Some(CURRENT));
         assert_eq!(a.handover_delay_secs(), DELAY);
         assert_eq!(a.pending_proposal(), None);
         assert!(a.audit_log().is_empty());
@@ -352,7 +411,7 @@ mod upgrade_authority_tests {
         a.propose_handover(CURRENT, SUCCESSOR, 1_000).unwrap();
         assert_eq!(a.pending_proposal(), Some((SUCCESSOR, 1_000)));
         // The proposal changes nothing live yet.
-        assert_eq!(a.current(), CURRENT);
+        assert_eq!(a.current(), Some(CURRENT));
         let log = a.audit_log();
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].kind, UpgradeAuthorityEventKind::HandoverProposed);
@@ -407,10 +466,10 @@ mod upgrade_authority_tests {
             a.confirm_handover(SUCCESSOR, 1_000 + DELAY - 1),
             Err(EscrowError::UpgradeHandoverDelayNotElapsed)
         );
-        assert_eq!(a.current(), CURRENT);
+        assert_eq!(a.current(), Some(CURRENT));
         // At exactly the deadline: accepted.
         a.confirm_handover(SUCCESSOR, 1_000 + DELAY).unwrap();
-        assert_eq!(a.current(), SUCCESSOR);
+        assert_eq!(a.current(), Some(SUCCESSOR));
         assert_eq!(a.pending_proposal(), None);
         let log = a.audit_log();
         assert_eq!(log.len(), 2);
@@ -433,7 +492,7 @@ mod upgrade_authority_tests {
             a.confirm_handover(STRANGER, 1_000 + DELAY),
             Err(EscrowError::Unauthorized)
         );
-        assert_eq!(a.current(), CURRENT);
+        assert_eq!(a.current(), Some(CURRENT));
     }
 
     #[test]
@@ -452,7 +511,7 @@ mod upgrade_authority_tests {
         a.propose_handover(CURRENT, SUCCESSOR, 1_000).unwrap();
         a.cancel_handover(CURRENT, 2_000).unwrap();
         assert_eq!(a.pending_proposal(), None);
-        assert_eq!(a.current(), CURRENT);
+        assert_eq!(a.current(), Some(CURRENT));
         let log = a.audit_log();
         assert_eq!(log.len(), 2);
         assert_eq!(log[1].kind, UpgradeAuthorityEventKind::HandoverCancelled);
@@ -543,7 +602,7 @@ mod upgrade_authority_tests {
         assert_eq!(a.handover_delay_secs(), 7_200);
         // Nothing else moves: the authority and the (absent) proposal
         // are untouched, and the drift scan stays quiet.
-        assert_eq!(a.current(), CURRENT);
+        assert_eq!(a.current(), Some(CURRENT));
         assert_eq!(a.pending_proposal(), None);
         assert_eq!(scan_upgrade_authority_drift(&a, CURRENT), None);
         let log = a.audit_log();
@@ -589,7 +648,7 @@ mod upgrade_authority_tests {
         // A proposal may now be accepted in the same instant.
         a.propose_handover(CURRENT, SUCCESSOR, 2_000).unwrap();
         a.confirm_handover(SUCCESSOR, 2_000).unwrap();
-        assert_eq!(a.current(), SUCCESSOR);
+        assert_eq!(a.current(), Some(SUCCESSOR));
     }
 
     #[test]
@@ -606,7 +665,7 @@ mod upgrade_authority_tests {
             a.confirm_handover(SUCCESSOR, 1_000 + DELAY),
             Err(EscrowError::UpgradeHandoverDelayNotElapsed)
         );
-        assert_eq!(a.current(), CURRENT);
+        assert_eq!(a.current(), Some(CURRENT));
         assert_eq!(a.pending_proposal(), Some((SUCCESSOR, 1_000)));
         // Lowering it releases the same proposal early.
         assert_eq!(
@@ -614,7 +673,7 @@ mod upgrade_authority_tests {
             Ok(true)
         );
         a.confirm_handover(SUCCESSOR, 1_000 + 100).unwrap();
-        assert_eq!(a.current(), SUCCESSOR);
+        assert_eq!(a.current(), Some(SUCCESSOR));
         // The amendment entries sit in the audit trail in order.
         let kinds: Vec<_> = a
             .audit_log()
@@ -648,6 +707,162 @@ mod upgrade_authority_tests {
             Ok(true)
         );
         assert_eq!(a.handover_delay_secs(), 7_200);
+    }
+
+    #[test]
+    fn renounce_by_the_current_authority_clears_the_authority_and_audits() {
+        let mut a = authority();
+        a.renounce_upgrade_authority(CURRENT, 1_000).unwrap();
+        assert_eq!(a.current(), None);
+        // The delay is untouched: renounce moves the authority, not
+        // the policy (a pending proposal would have blocked it anyway).
+        assert_eq!(a.handover_delay_secs(), DELAY);
+        assert_eq!(a.pending_proposal(), None);
+        let log = a.audit_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            log[0].kind,
+            UpgradeAuthorityEventKind::UpgradeAuthorityRenounced
+        );
+        assert_eq!(log[0].at, 1_000);
+        assert_eq!(log[0].actor, CURRENT);
+        // The authority in effect after renounce is "none": the
+        // successor slot records the zero key, distinguished from a
+        // handover by the kind.
+        assert_eq!(log[0].successor, [0u8; 32]);
+    }
+
+    #[test]
+    fn renounce_rejects_a_stranger_and_changes_nothing() {
+        let mut a = authority();
+        assert_eq!(
+            a.renounce_upgrade_authority(STRANGER, 1_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(a.current(), Some(CURRENT));
+        assert!(a.audit_log().is_empty());
+    }
+
+    #[test]
+    fn renounce_refused_while_a_proposal_is_live_then_allowed_after_cancel() {
+        let mut a = authority();
+        a.propose_handover(CURRENT, SUCCESSOR, 1_000).unwrap();
+        assert_eq!(
+            a.renounce_upgrade_authority(CURRENT, 2_000),
+            Err(EscrowError::UpgradeHandoverPending)
+        );
+        // The proposal survives the refused renounce.
+        assert_eq!(a.pending_proposal(), Some((SUCCESSOR, 1_000)));
+        assert_eq!(a.current(), Some(CURRENT));
+        // Cancel first, then the renounce goes through.
+        a.cancel_handover(CURRENT, 3_000).unwrap();
+        a.renounce_upgrade_authority(CURRENT, 4_000).unwrap();
+        assert_eq!(a.current(), None);
+    }
+
+    #[test]
+    fn after_renounce_propose_and_amend_are_unauthorized() {
+        let mut a = authority();
+        a.renounce_upgrade_authority(CURRENT, 1_000).unwrap();
+        // No authority is left to compare against — every caller,
+        // including the former authority, is a stranger now.
+        assert_eq!(
+            a.propose_handover(CURRENT, SUCCESSOR, 2_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            a.propose_handover(STRANGER, SUCCESSOR, 2_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            a.amend_handover_delay_secs(CURRENT, 7_200, 2_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(a.current(), None);
+        // Only the renounce itself audited.
+        assert_eq!(a.audit_log().len(), 1);
+    }
+
+    #[test]
+    fn after_renounce_confirm_and_cancel_are_no_upgrade_handover_pending() {
+        let mut a = authority();
+        a.renounce_upgrade_authority(CURRENT, 1_000).unwrap();
+        // A renounced authority can never have a pending proposal.
+        assert_eq!(
+            a.confirm_handover(SUCCESSOR, 2_000),
+            Err(EscrowError::NoUpgradeHandoverPending)
+        );
+        assert_eq!(
+            a.cancel_handover(CURRENT, 2_000),
+            Err(EscrowError::NoUpgradeHandoverPending)
+        );
+        assert_eq!(a.audit_log().len(), 1);
+    }
+
+    #[test]
+    fn renounce_twice_is_a_silent_noop() {
+        let mut a = authority();
+        a.renounce_upgrade_authority(CURRENT, 1_000).unwrap();
+        // Renouncing again is Ok(()) regardless of caller — even a
+        // stranger — and writes no second audit entry.
+        a.renounce_upgrade_authority(CURRENT, 2_000).unwrap();
+        a.renounce_upgrade_authority(STRANGER, 3_000).unwrap();
+        assert_eq!(a.current(), None);
+        assert_eq!(a.audit_log().len(), 1);
+    }
+
+    #[test]
+    fn renounce_keeps_older_audit_entries_and_new_still_rejects_zero() {
+        let mut a = authority();
+        a.propose_handover(CURRENT, SUCCESSOR, 1_000).unwrap();
+        a.cancel_handover(CURRENT, 2_000).unwrap();
+        a.renounce_upgrade_authority(CURRENT, 3_000).unwrap();
+        let kinds: Vec<_> = a.audit_log().iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                UpgradeAuthorityEventKind::HandoverProposed,
+                UpgradeAuthorityEventKind::HandoverCancelled,
+                UpgradeAuthorityEventKind::UpgradeAuthorityRenounced,
+            ]
+        );
+        // Renounce is a lifecycle transition, not a construction state:
+        // building an authority on the zero key is still refused.
+        assert_eq!(
+            UpgradeAuthority::new([0u8; 32], DELAY),
+            Err(EscrowError::InvalidUpgradeAuthority)
+        );
+    }
+
+    #[test]
+    fn after_renounce_propose_successor_gates_are_unreachable() {
+        let mut a = authority();
+        a.renounce_upgrade_authority(CURRENT, 1_000).unwrap();
+        // The zero-key and self-successor gates sit behind the
+        // authority check, which now refuses every caller first.
+        assert_eq!(
+            a.propose_handover(CURRENT, [0u8; 32], 2_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            a.propose_handover(CURRENT, CURRENT, 2_000),
+            Err(EscrowError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn drift_scan_after_renounce_compares_as_the_zero_key() {
+        let mut a = authority();
+        a.renounce_upgrade_authority(CURRENT, 1_000).unwrap();
+        // A template expecting a live key reports drift: the live
+        // authority is now "none".
+        let drift = scan_upgrade_authority_drift(&a, CURRENT).unwrap();
+        assert_eq!(drift.expected, CURRENT);
+        assert_eq!(drift.actual, [0u8; 32]);
+        assert_eq!(drift.pending_proposal, None);
+        // A template expecting the zero key — an intentionally
+        // immutable program — matches.
+        assert_eq!(scan_upgrade_authority_drift(&a, [0u8; 32]), None);
     }
 
     #[test]

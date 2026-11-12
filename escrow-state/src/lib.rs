@@ -49318,7 +49318,7 @@ mod error_code_tests {
         (
             EscrowError::UpgradeHandoverPending,
             243,
-            "UpgradeAuthority::propose_handover while a handover proposal is already live — cancel it first (AV-179)",
+            "UpgradeAuthority::propose_handover while a handover proposal is already live — cancel it first (AV-179); UpgradeAuthority::renounce_upgrade_authority while a handover proposal is already live — cancel it first (AV-415)",
         ),
         // AV-179: appended, never renumbered.
         (
@@ -50723,7 +50723,7 @@ mod error_code_tests {
         assert_eq!(err.code(), 245);
         // At exactly the deadline the accept goes through.
         a.confirm_handover(BOB, 1_000 + 3_600).unwrap();
-        assert_eq!(a.current(), BOB);
+        assert_eq!(a.current(), Some(BOB));
     }
 
     #[test]

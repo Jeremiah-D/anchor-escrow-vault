@@ -9042,6 +9042,24 @@ on-chain record explains who moved the authority or why.
   authority and the pending proposal are untouched, and the drift
   scan compares only the authority, so a delay revision never reads
   as drift.
+- **Renouncing the upgrade authority (AV-415)**:
+  `renounce_upgrade_authority(caller, now)` lets the current
+  authority give the authority back to nobody — the loader's
+  `set_upgrade_authority`-to-`None` terminal step, after which the
+  program is immutable. One-way: there is no un-renounce. A live
+  handover proposal blocks the renounce (`UpgradeHandoverPending` —
+  cancel it first, otherwise the proposed successor could still
+  confirm into a program whose authority was already given away);
+  a stranger is refused with `Unauthorized`. A successful renounce
+  appends an `UpgradeAuthorityRenounced` audit entry (actor: the
+  caller; the successor slot records the zero key, since the authority
+  in effect afterwards is "none"). After renounce, propose / amend are
+  `Unauthorized` (no authority left to compare against) and confirm /
+  cancel are `NoUpgradeHandoverPending` (a renounced authority can
+  never have a pending proposal); renouncing again is a silent no-op.
+  The keeper drift scan compares a renounced authority as the zero
+  key, so a template expecting a live key reports drift and a template
+  expecting the zero key matches. No new error code.
 - **Structured audit**: propose / confirm / cancel append an
   `UpgradeAuditEntry` (kind, timestamp, actor, successor) to a bounded
   32-entry ring — the AV-163 circuit-breaker convention (fixed-size
