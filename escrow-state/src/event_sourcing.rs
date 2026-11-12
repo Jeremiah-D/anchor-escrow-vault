@@ -482,6 +482,13 @@ fn fund_delta(kind: EscrowEventKind, amounts: &EventAmounts) -> (u64, u64, u64) 
         // with `InvalidStateTransition`, exactly like a
         // never-bound escrow.
         | EscrowEventKind::PauseAuthorityDisabled
+        // AV-422: a removed price gate moves no funds and
+        // never restates a payout already settled — only the
+        // gate flips to `None`, so the `require_price_gate`
+        // `None` arm passes through at the next call and the
+        // gated wrappers degrade to plain `release` / `claim`,
+        // while plain `release` / `claim` never read the gate.
+        | EscrowEventKind::PriceGateDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
@@ -1576,6 +1583,13 @@ mod event_sourcing_tests {
         // with `InvalidStateTransition`, exactly like a
         // never-bound escrow.
         | EscrowEventKind::PauseAuthorityDisabled
+        // AV-422: a removed price gate moves no funds and
+        // never restates a payout already settled — only the
+        // gate flips to `None`, so the `require_price_gate`
+        // `None` arm passes through at the next call and the
+        // gated wrappers degrade to plain `release` / `claim`,
+        // while plain `release` / `claim` never read the gate.
+        | EscrowEventKind::PriceGateDisabled
         // AV-277: a revised auction floor moves no funds and never
         // restates a claim already priced — only the floor changes,
         // so the window is untouched, while the next claim prices
