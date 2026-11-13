@@ -42246,6 +42246,20 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "no params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's unconditional dual-signature gate agrees — unlike the amend family's AV-276 gate, there is no plain-escrow initializer-alone shape here at all, paralleling rotate_arbiter, disable_social_recovery and disable_dual_sig); the pause authority itself does not sign (a lost pause key must not block the switch's own removal, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate — disabling under a live pause would strand the escrow paused forever, since unpause needs a bound authority, so rotation is the key-loss escape hatch that works while paused and removal is the retirement path for a live escrow); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed); an escrow that never bound a switch — or already retired it — is a silent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); one-way only — with_pause_authority stays Uninitialized-only, so the switch can never be re-installed after funding; after the disable pause / unpause / rotate_pause_authority / amend_auto_unpause_at refuse with InvalidStateTransition (their existing never-bound gates) while a settlement already made keeps the switch it settled under; emits the PauseAuthorityDisabled indexer event only on an actual change (Some -> None, from == to == the current state); only pause_authority flips to None — no other field moves; no clock/sysvar input to the method; the 33-byte Option region is cleared in place — no layout / rent change",
         },
         InstructionSpec {
+            // AV-431: the dispute-arbiter removal — the
+            // program-level entry point for the AV-412 pure-logic
+            // removal. IDL: discriminator =
+            // sha256("global:disable_arbiter")[..8]
+            // = [63, 220, 164, 8, 124, 233, 25, 195] — the Anchor
+            // instruction discriminator for the
+            // disable_arbiter handler (pinned by the
+            // discriminator test below).
+            name: "disable_arbiter",
+            params: &[],
+            method: "Escrow::disable_arbiter",
+            input_mapping: "no params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's unconditional dual-signature gate agrees — unlike the amend family's AV-276 gate, there is no plain-escrow initializer-alone shape here at all, paralleling rotate_arbiter, disable_social_recovery, disable_dual_sig and disable_pause_authority); the arbiter itself does not sign (a lost arbiter key must not block the forum's own removal, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Uninitialized / Activated / Funded only (InvalidStateTransition otherwise — terminal states and Disputed, never remove the referee mid-arbitration, the dispute must settle first); a panel-mode escrow is a silent no-op (succeeds, writes nothing, emits no event — the panel owns the arbitration role and the single-arbiter slot is already None by mutual exclusion, and unlike rotate_arbiter's panel refusal there is no multisig to bypass since the disable writes no field in panel mode, paralleling rotate_arbiter); an escrow that never bound an arbiter — or already retired it — is a silent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); one-way only — with_arbiter stays Uninitialized-only, so the forum can never be re-installed after funding; after the disable resolve / escalate refuse with InvalidArbiter (code 108, their existing never-bound gates) while a dispute already settled keeps the arbiter it settled under, and the parties fall back to the bilateral exits (mutual_cancel, cancel_expired, a pre-configured trigger_default_judgment, and a plain release of any undisputed remainder); the arbiter_fee_flat / arbiter_fee_bps configuration is untouched (its only consumer is the adjudication settlement path, which already refuses after the disable); emits the ArbiterDisabled indexer event only on an actual change (Some -> None, from == to == the current state); only arbiter flips to None — no other field moves; no clock/sysvar input to the method; the 33-byte Option region is cleared in place — no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43117,6 +43131,9 @@ pub(crate) mod anchor_idl_tests {
             // removal (the AV-421 pure-logic removal wired to
             // the chain).
             "Escrow::disable_pause_authority",
+            // AV-431: the program-level dispute-arbiter removal
+            // (the AV-412 pure-logic removal wired to the chain).
+            "Escrow::disable_arbiter",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -46767,6 +46784,454 @@ pub(crate) mod anchor_idl_tests {
             None,
             "refused re-installation writes nothing"
         );
+    }
+
+    #[test]
+    fn disable_arbiter_maps_to_arbiter_field() {
+        // IDL: disable_arbiter() — no params; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints, not the state machine — and the state
+        // machine's disable gate is unconditionally dual-signed
+        // too, so the program layer and the state machine agree
+        // exactly here (no plain-escrow initializer-alone shape
+        // exists for a removal, paralleling
+        // disable_social_recovery, disable_dual_sig and
+        // disable_pause_authority). The arbiter itself does not
+        // sign. The disable clears only the 33-byte `arbiter`
+        // `Option` region in place — no PARAM_FIELD_MAP entry
+        // (there is no param to map; the whole arbiter region
+        // flips, not one field) — no layout change.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        let configured = || {
+            let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter(ARBITER)
+                .unwrap();
+            e.fund(ALICE, FUND_AT).unwrap();
+            assert_eq!(e.state(), EscrowState::Funded);
+            assert_eq!(e.arbiter(), Some(ARBITER));
+            e
+        };
+        // The INSTRUCTIONS spec entry pins the program-level
+        // wiring: no params, the AV-412 pure-logic method, and
+        // the dual-signer input mapping.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "disable_arbiter")
+            .expect("INSTRUCTIONS carries disable_arbiter");
+        assert_eq!(spec.method, "Escrow::disable_arbiter");
+        assert!(spec.params.is_empty(), "disable takes no params");
+        assert!(
+            spec.input_mapping.contains("no params"),
+            "input_mapping documents the empty param list"
+        );
+        assert!(
+            spec.input_mapping.contains("ArbiterDisabled"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and no args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"disable_arbiter\""),
+            "checked-in IDL carries disable_arbiter"
+        );
+        assert!(
+            idl.contains("[63, 220, 164, 8, 124, 233, 25, 195]"),
+            "checked-in IDL pins the AV-431 discriminator"
+        );
+        // Only the arbiter flips: the state stays Funded, the
+        // locked amount is untouched, and no other field moves.
+        let mut e = configured();
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        e.disable_arbiter(ALICE, BOB).unwrap();
+        assert_eq!(e.arbiter(), None, "arbiter cleared");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        // After the disable the whole dispute surface refuses
+        // fail-closed with InvalidArbiter, exactly like a
+        // never-bound escrow — and re-binding stays refused.
+        assert_eq!(
+            e.resolve(ARBITER, 600_000, NOW, None, None, BOB),
+            Err(EscrowError::InvalidArbiter)
+        );
+        assert_eq!(
+            e.escalate(ALICE, NOW, e.remaining_amount(), None, None, 0),
+            Err(EscrowError::InvalidArbiter)
+        );
+        assert_eq!(EscrowError::InvalidArbiter.code(), 108);
+        assert_eq!(
+            e.with_arbiter(ARBITER),
+            Err(EscrowError::InvalidStateTransition),
+            "one-way: no post-funding re-binding"
+        );
+        assert_eq!(e.arbiter(), None);
+    }
+
+    #[test]
+    fn disable_arbiter_rejects_single_party_and_strangers() {
+        // AV-431: the dispute forum is jointly owned adjudication
+        // power — one party alone removing it would strip the other
+        // party's neutral referee, so a stranger or a single party
+        // is Unauthorized and the failed call moves nothing; the
+        // arbiter itself does not sign, so a lost arbiter key cannot
+        // block the forum's own removal; the dual-signed call then
+        // lands.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+            (ARBITER, BOB), // the arbiter is not a party
+            (ALICE, ARBITER),
+        ] {
+            assert_eq!(
+                e.disable_arbiter(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.arbiter(),
+            Some(ARBITER),
+            "rejected disable writes nothing"
+        );
+        e.disable_arbiter(ALICE, BOB).unwrap();
+        assert_eq!(e.arbiter(), None, "dual-signed disable lands");
+    }
+
+    #[test]
+    fn disable_arbiter_refuses_disputed_terminal_and_paused() {
+        // AV-431: Uninitialized / Activated / Funded may retire the
+        // forum — before funding the binding is still a builder
+        // decision — while Disputed is excluded (the dispute must
+        // settle first) and terminal states have no live dispute
+        // left to referee; the pause guard fires before the
+        // authority and state gates.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        // Uninitialized: the forum is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        bare.disable_arbiter(ALICE, BOB).unwrap();
+        assert_eq!(bare.arbiter(), None);
+        // Activated: both parties signed, funds not yet locked.
+        // (Dual-signed so the activation ceremony runs — a plain
+        // escrow funds straight from `Uninitialized`.)
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        activated.disable_arbiter(ALICE, BOB).unwrap();
+        assert_eq!(activated.arbiter(), None);
+        // Disputed: the referee stays while the dispute is in
+        // flight.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.disable_arbiter(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(d.arbiter(), Some(ARBITER), "disputed disable writes nothing");
+        // Terminal: a cancelled escrow's forum is history, not a
+        // live referee to retire.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_arbiter(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.arbiter(), Some(ARBITER));
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.disable_arbiter(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.disable_arbiter(MALLORY, BOB),
+            Err(EscrowError::Paused),
+            "even a stranger's disable on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.arbiter(),
+            Some(ARBITER),
+            "paused disable writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.disable_arbiter(ALICE, BOB).unwrap();
+        assert_eq!(paused.arbiter(), None);
+    }
+
+    #[test]
+    fn disable_arbiter_noop_on_unbound_escrow() {
+        // AV-431: removing a forum that was never installed writes
+        // nothing — the `rotate_*` same-value no-op precedent.
+        // That covers both a plain escrow and a second disable
+        // after a successful first one.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        plain.disable_arbiter(ALICE, BOB).unwrap();
+        assert_eq!(plain.arbiter(), None);
+        assert_eq!(plain.state(), EscrowState::Funded);
+        assert_eq!(plain.remaining_amount(), 1_000_000);
+        let mut bound = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        bound.fund(ALICE, FUND_AT).unwrap();
+        bound.disable_arbiter(ALICE, BOB).unwrap();
+        assert_eq!(bound.arbiter(), None);
+        bound.disable_arbiter(ALICE, BOB).unwrap();
+        assert_eq!(bound.arbiter(), None, "second disable is a no-op");
+    }
+
+    #[test]
+    fn disable_arbiter_handler_emits_only_on_actual_change() {
+        // AV-431: the program handler mirrors
+        // `IndexedEscrow::disable_arbiter` — the event layer emits
+        // ArbiterDisabled only on an actual change: a real disable
+        // emits, a no-op disable emits nothing, and a failed call
+        // emits nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        let configured = || {
+            let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter(ARBITER)
+                .unwrap();
+            e.fund(ALICE, FUND_AT).unwrap();
+            assert_eq!(e.state(), EscrowState::Funded);
+            e
+        };
+        let mut indexed = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = indexed.event_count();
+        assert_eq!(
+            indexed.disable_arbiter(MALLORY, BOB, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(indexed.event_count(), before, "failed calls emit nothing");
+        indexed.disable_arbiter(ALICE, BOB, NOW).unwrap();
+        assert_eq!(indexed.event_count(), before + 1);
+        let ev = indexed.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::ArbiterDisabled);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        indexed.disable_arbiter(ALICE, BOB, NOW + 10).unwrap();
+        assert_eq!(
+            indexed.event_count(),
+            before + 1,
+            "no-op second disable emits nothing"
+        );
+        let mut plain_ie = IndexedEscrow::wrap(
+            [0xE0; 32],
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap(),
+        );
+        plain_ie.fund(ALICE, 0).unwrap();
+        let _ = plain_ie.drain_events();
+        plain_ie.disable_arbiter(ALICE, BOB, 42).unwrap();
+        assert_eq!(
+            plain_ie.event_count(),
+            0,
+            "never-bound disable emits nothing"
+        );
+    }
+
+    #[test]
+    fn disable_arbiter_is_one_way() {
+        // AV-431: one-way only — `with_arbiter` stays
+        // Uninitialized-only, so a post-funding re-installation is
+        // refused and the forum stays gone.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e.disable_arbiter(ALICE, BOB).unwrap();
+        assert_eq!(e.arbiter(), None);
+        assert_eq!(
+            e.with_arbiter(ARBITER),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.arbiter(),
+            None,
+            "refused re-installation writes nothing"
+        );
+    }
+
+    #[test]
+    fn disable_arbiter_panel_mode_noop_and_voting_unaffected() {
+        // AV-431: in panel mode the single-arbiter slot is already
+        // `None` by mutual exclusion, so the disable writes nothing
+        // and emits nothing — and the panel keeps its forum: two
+        // matching votes still settle the dispute after the no-op.
+        use crate::events::IndexedEscrow;
+        const M1: [u8; 32] = [0xD1; 32];
+        const M2: [u8; 32] = [0xD2; 32];
+        const M3: [u8; 32] = [0xD3; 32];
+        const T0: u64 = 1_700_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.disable_arbiter(ALICE, BOB).unwrap();
+        assert_eq!(e.arbiter(), None);
+        assert!(e.arbiter_panel().is_some(), "panel untouched by the no-op");
+        let mut ie = IndexedEscrow::wrap(
+            [0xE0; 32],
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter_panel(&[M1, M2, M3], 2)
+                .unwrap(),
+        );
+        ie.fund(ALICE, 0).unwrap();
+        let _ = ie.drain_events();
+        ie.disable_arbiter(ALICE, BOB, 42).unwrap();
+        assert_eq!(ie.event_count(), 0, "panel no-op emits nothing");
+        // The panel still settles: two matching votes close the
+        // dispute after the no-op.
+        e.escalate(ALICE, T0 + 10, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert!(e
+            .submit_panel_judgment(M1, 600_000, T0 + 10, None, None, BOB)
+            .unwrap()
+            .is_none());
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert!(e
+            .submit_panel_judgment(M2, 600_000, T0 + 10, None, None, BOB)
+            .unwrap()
+            .is_some());
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn disable_arbiter_disputed_refuses_but_arbiter_still_resolves() {
+        // AV-431: never remove the referee mid-arbitration — the
+        // disable refuses while Disputed, and the configured arbiter
+        // still settles the dispute after the refusal. Note the
+        // settled dispute keeps its arbiter: once `resolve` lands
+        // the escrow is `Settled` (terminal), so a disable after
+        // the settlement refuses with InvalidStateTransition — the
+        // forum removal path stays live only for live escrows, as
+        // a fresh funded escrow below shows.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.disable_arbiter(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(d.arbiter(), Some(ARBITER), "refused disable writes nothing");
+        d.resolve(ARBITER, 600_000, EXPIRES_AT - 1, None, None, BOB)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Settled);
+        assert_eq!(
+            d.disable_arbiter(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition),
+            "settled dispute keeps its arbiter"
+        );
+        // A live funded escrow still retires its forum normally.
+        let mut live = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        live.fund(ALICE, FUND_AT).unwrap();
+        live.disable_arbiter(ALICE, BOB).unwrap();
+        assert_eq!(live.arbiter(), None);
+    }
+
+    #[test]
+    fn disable_arbiter_blocks_forum_but_keeps_mutual_cancel() {
+        // AV-431: with no arbiter bound, the settlement paths refuse
+        // with their existing never-bound gate — the same error a
+        // never-bound escrow gets — but the parties can still walk
+        // away together: mutual cancellation never needed the
+        // arbiter.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e.disable_arbiter(ALICE, BOB).unwrap();
+        assert_eq!(
+            e.resolve(ARBITER, 600_000, NOW, None, None, BOB),
+            Err(EscrowError::InvalidArbiter)
+        );
+        assert_eq!(
+            e.escalate(ALICE, NOW, e.remaining_amount(), None, None, 0),
+            Err(EscrowError::InvalidArbiter)
+        );
+        assert_eq!(EscrowError::InvalidArbiter.code(), 108);
+        assert_eq!(e.state(), EscrowState::Funded);
+        let (initializer_refund, taker_refund) = e
+            .mutual_cancel(MutualCancelAgreement::both(ALICE, BOB), None, NOW)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(initializer_refund, 1_000_000);
+        assert_eq!(taker_refund, 0);
     }
 
     #[test]
@@ -79773,6 +80238,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("disable_pause_authority"),
             [56, 94, 67, 228, 204, 176, 4, 186]
+        );
+    }
+
+    #[test]
+    fn disable_arbiter_instruction_discriminator_is_pinned() {
+        // AV-431. IDL:
+        // sha256("global:disable_arbiter")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("disable_arbiter"),
+            [63, 220, 164, 8, 124, 233, 25, 195]
         );
     }
 
