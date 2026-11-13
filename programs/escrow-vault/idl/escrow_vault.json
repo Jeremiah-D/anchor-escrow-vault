@@ -1184,6 +1184,12 @@
       ]
     },
     {
+      "name": "disable_social_recovery",
+      "discriminator": [186, 198, 29, 84, 110, 167, 233, 208],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

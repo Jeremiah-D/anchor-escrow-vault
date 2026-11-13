@@ -2614,6 +2614,73 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Disable the social-recovery policy by dual-signed
+    /// governance (AV-428; mirrors
+    /// `Escrow::disable_social_recovery`). Both the
+    /// initializer and the taker must sign at the program layer —
+    /// the Anchor accounts require both signers, so the on-chain
+    /// call is dual-signed either way (the state machine's
+    /// unconditional dual-signature gate agrees — unlike the
+    /// amend family's AV-276 conditional gate, there is no
+    /// plain-escrow initializer-alone shape here at all).
+    /// Only `Funded`: the terminal states and `Disputed` are
+    /// `InvalidStateTransition` (the builder owns the initial
+    /// policy). A pending recovery request refuses the disable
+    /// (`RecoveryRequestPending`, code 289 — the initializer
+    /// vetoes it first, so an in-flight request is never
+    /// silently discarded). An escrow with no policy configured
+    /// is a silent no-op success that writes nothing and emits
+    /// nothing. One-way only: there is no post-funding
+    /// re-installation. After the disable, `request_recovery` /
+    /// `approve_recovery` / `execute_recovery` / `veto_recovery`
+    /// / `rotate_social_recovery_guardian` /
+    /// `amend_social_recovery_threshold` /
+    /// `amend_social_recovery_timelock` all refuse with
+    /// `RecoveryNotConfigured` (code 287, fail-closed), while a
+    /// request already settled keeps the guardians and threshold
+    /// it settled under. The guardians themselves do not sign —
+    /// a lost guardian key must not block the policy's removal.
+    /// A paused escrow fails fast (`Paused`). Only the policy
+    /// flips to `None` in place (the `Option<SocialRecovery>`
+    /// region is already resident) — no realloc, no rent
+    /// change. Emits `SocialRecoveryDisabled` only on an actual
+    /// change (`Some -> None`, from == to == the current
+    /// state), mirroring
+    /// `IndexedEscrow::disable_social_recovery`.
+    pub fn disable_social_recovery(ctx: Context<DisableSocialRecovery>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.recovery();
+        escrow
+            .disable_social_recovery(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Clears `recovery` to `None` in place in the real
+        // build (the policy region is already resident) — no
+        // realloc, no rent change.
+        if escrow.recovery() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::SocialRecoveryDisabled,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Rotate the live operator grant's delegate key (AV-388; mirrors
     /// `Escrow::rotate_delegation_delegate` — the AV-301 pure-logic
     /// rotation). Either party may rotate — the initializer or the
@@ -9383,6 +9450,11 @@ pub enum EscrowVaultEventKind {
     /// (`Escrow::amend_social_recovery_timelock`). Mirrors
     /// `escrow_state::EscrowEventKind::SocialRecoveryTimelockAmended`.
     SocialRecoveryTimelockAmended,
+    /// AV-428: the social-recovery policy was removed by
+    /// dual-signed governance
+    /// (`Escrow::disable_social_recovery`). Mirrors
+    /// `escrow_state::EscrowEventKind::SocialRecoveryDisabled`.
+    SocialRecoveryDisabled,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -9608,6 +9680,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::SocialRecoveryTimelockAmended => {
             EscrowVaultEventKind::SocialRecoveryTimelockAmended
+        }
+        escrow_state::EscrowEventKind::SocialRecoveryDisabled => {
+            EscrowVaultEventKind::SocialRecoveryDisabled
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -10836,6 +10911,26 @@ pub struct AmendSocialRecoveryTimelock<'info> {
     /// Second governance signer: must equal the escrow's taker. The
     /// taker consents to moving the lost-key recovery veto window
     /// their funded escrow settles under.
+    pub taker: Signer<'info>,
+}
+
+/// AV-428: accounts for `disable_social_recovery` — the
+/// social-recovery policy removal is dual-signed governance by
+/// the two parties; the guardians themselves do not sign (a lost
+/// guardian key must not block the policy's own removal). The
+/// disable takes no instruction param — the first no-param item
+/// in the social-recovery family.
+#[derive(Accounts)]
+pub struct DisableSocialRecovery<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to removing the lost-key recovery their
+    /// funded escrow settles under.
     pub taker: Signer<'info>,
 }
 

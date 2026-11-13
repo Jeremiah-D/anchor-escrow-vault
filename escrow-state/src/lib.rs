@@ -42204,6 +42204,20 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_timelock_secs <- param (u64); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's AV-276 gate would accept the initializer alone on a plain escrow, but the program layer never offers that shape, paralleling rotate_social_recovery_guardian and amend_social_recovery_threshold); the guardians themselves do not sign (a lost guardian key must not block the veto window's own revision, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); only an escrow with a configured social-recovery policy may amend (RecoveryNotConfigured, code 287, fail-closed — post-funding installation would add a recovery path the taker never funded under); a pending recovery request refuses the amendment (RecoveryRequestPending, code 289 — the in-flight request's veto window already started under the old timelock, so changing it would re-time the remaining wait); the new timelock reuses the SocialRecovery::new gate (any value is valid, including zero, so no value is refused by the gate); amending to the current timelock is an idempotent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); emits the SocialRecoveryTimelockAmended indexer event only on an actual change (from == to == the current state); only recovery.timelock_secs changes — guardians, guardian_count and threshold are untouched and pending stays empty; no clock/sysvar input to the method; the policy region is rewritten in place — no layout / rent change",
         },
         InstructionSpec {
+            // AV-428: the social-recovery policy removal — the
+            // program-level entry point for the AV-418 pure-logic
+            // removal. IDL: discriminator =
+            // sha256("global:disable_social_recovery")[..8]
+            // = [186, 198, 29, 84, 110, 167, 233, 208] — the Anchor
+            // instruction discriminator for the
+            // disable_social_recovery handler (pinned by the
+            // discriminator test below).
+            name: "disable_social_recovery",
+            params: &[],
+            method: "Escrow::disable_social_recovery",
+            input_mapping: "no params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's unconditional dual-signature gate agrees — unlike the amend family's AV-276 gate, there is no plain-escrow initializer-alone shape here at all, paralleling rotate_social_recovery_guardian); the guardians themselves do not sign (a lost guardian key must not block the policy's own removal, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed); a pending recovery request refuses the disable (RecoveryRequestPending, code 289 — the initializer vetoes it first with veto_recovery, so an in-flight request is never silently discarded); an unconfigured escrow — never configured, or already disabled — is a silent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); one-way only — with_social_recovery stays Uninitialized-only, so a removed policy can never be re-installed after funding; after the disable request_recovery / approve_recovery / execute_recovery / veto_recovery / rotate_social_recovery_guardian / amend_social_recovery_threshold / amend_social_recovery_timelock refuse with RecoveryNotConfigured (code 287, fail-closed) while a request already settled keeps the guardians and threshold it settled under; emits the SocialRecoveryDisabled indexer event only on an actual change (Some -> None, from == to == the current state); only recovery flips to None — no other field moves; no clock/sysvar input to the method; the policy region is cleared in place — no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43063,6 +43077,10 @@ pub(crate) mod anchor_idl_tests {
             // amendment (the AV-279 pure-logic amendment wired to
             // the chain).
             "Escrow::amend_social_recovery_timelock",
+            // AV-428: the program-level social-recovery policy
+            // removal (the AV-418 pure-logic removal wired to
+            // the chain).
+            "Escrow::disable_social_recovery",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -45790,6 +45808,245 @@ pub(crate) mod anchor_idl_tests {
             indexed.event_count(),
             before + 1,
             "no-op re-affirmation emits nothing"
+        );
+    }
+
+    #[test]
+    fn disable_social_recovery_maps_to_recovery_field() {
+        // IDL: disable_social_recovery() — no params; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints, not the state machine — and unlike the amend
+        // family's AV-276 gate, the state machine's disable gate is
+        // unconditionally dual-signed too, so the program layer and
+        // the state machine agree exactly here (no plain-escrow
+        // initializer-alone shape exists for a removal). The
+        // disable clears `recovery` to `None` in place — no
+        // PARAM_FIELD_MAP entry (there is no param to map; the
+        // whole policy region flips, not one field) — no layout
+        // change.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const G1: [u8; 32] = [0x11; 32];
+        const G2: [u8; 32] = [0x22; 32];
+        const G3: [u8; 32] = [0x33; 32];
+        const NEW_KEY: [u8; 32] = [0x99; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        let configured = || {
+            let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+                .unwrap();
+            e.fund(ALICE, FUND_AT).unwrap();
+            assert_eq!(e.state(), EscrowState::Funded);
+            e
+        };
+        // The INSTRUCTIONS spec entry pins the program-level
+        // wiring: no params, the AV-418 pure-logic method, and
+        // the dual-signer input mapping.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "disable_social_recovery")
+            .expect("INSTRUCTIONS carries disable_social_recovery");
+        assert_eq!(spec.method, "Escrow::disable_social_recovery");
+        assert!(spec.params.is_empty(), "disable takes no params");
+        assert!(
+            spec.input_mapping.contains("no params"),
+            "input_mapping documents the empty param list"
+        );
+        assert!(
+            spec.input_mapping.contains("SocialRecoveryDisabled"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and no args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"disable_social_recovery\""),
+            "checked-in IDL carries disable_social_recovery"
+        );
+        assert!(
+            idl.contains("[186, 198, 29, 84, 110, 167, 233, 208]"),
+            "checked-in IDL pins the AV-428 discriminator"
+        );
+        // Only the policy flips: the state stays Funded, the
+        // locked amount is untouched, and no other field moves.
+        let mut e = configured();
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        e.disable_social_recovery(ALICE, BOB).unwrap();
+        assert!(e.recovery().is_none(), "policy cleared");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        // Documented failure modes: a stranger or a single party
+        // is Unauthorized — and unlike the amend family, the
+        // plain-escrow initializer alone cannot disable either
+        // (the AV-418 gate is unconditionally dual-signed, so the
+        // program layer and the state machine agree exactly).
+        let mut e = configured();
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_social_recovery(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert!(e.recovery().is_some(), "rejected disable writes nothing");
+        // Funded-only: the Uninitialized builder owns the initial
+        // set, and Disputed is excluded (the dispute must settle
+        // first).
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        assert_eq!(
+            bare.disable_social_recovery(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert!(bare.recovery().is_some());
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.disable_social_recovery(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(d.recovery().is_some(), "disputed disable writes nothing");
+        // An unconfigured escrow is a silent no-op success.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        plain.disable_social_recovery(ALICE, BOB).unwrap();
+        assert!(plain.recovery().is_none());
+        // A live request blocks the disable: its veto window
+        // already started, so the initializer vetoes first and
+        // only then does the disable land — the vetoed request
+        // never executes.
+        let mut pending = configured();
+        pending.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        pending.approve_recovery(G2).unwrap();
+        assert_eq!(pending.recovery().unwrap().approval_count(), 2);
+        assert_eq!(
+            pending.disable_social_recovery(ALICE, BOB),
+            Err(EscrowError::RecoveryRequestPending)
+        );
+        assert_eq!(EscrowError::RecoveryRequestPending.code(), 289);
+        let policy = pending.recovery().unwrap();
+        assert_eq!(policy.guardians(), &[G1, G2, G3]);
+        assert_eq!(policy.approval_count(), 2);
+        assert_eq!(policy.pending().unwrap().new_authority, NEW_KEY);
+        pending.veto_recovery(ALICE).unwrap();
+        assert!(pending.recovery().unwrap().pending().is_none());
+        pending.disable_social_recovery(ALICE, BOB).unwrap();
+        assert!(pending.recovery().is_none());
+        assert_eq!(pending.initializer(), ALICE);
+        // The pause guard fires before the authority and state gates.
+        let mut paused = configured();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.disable_social_recovery(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.disable_social_recovery(MALLORY, BOB),
+            Err(EscrowError::Paused),
+            "even a stranger's disable on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert!(paused.recovery().is_some(), "paused disable writes nothing");
+        paused.unpause(PAUSER).unwrap();
+        paused.disable_social_recovery(ALICE, BOB).unwrap();
+        assert!(paused.recovery().is_none());
+        // After the disable the whole recovery flow refuses
+        // fail-closed with RecoveryNotConfigured, and the rotate /
+        // amend paths refuse the same way.
+        let mut e = configured();
+        e.disable_social_recovery(ALICE, BOB).unwrap();
+        assert_eq!(EscrowError::RecoveryNotConfigured.code(), 287);
+        assert_eq!(
+            e.request_recovery(G1, NEW_KEY, NOW),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert_eq!(
+            e.approve_recovery(G2),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert_eq!(
+            e.execute_recovery(NOW),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert_eq!(
+            e.veto_recovery(ALICE),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert_eq!(
+            e.rotate_social_recovery_guardian(ALICE, BOB, G1, NEW_KEY),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert_eq!(
+            e.amend_social_recovery_threshold(ALICE, BOB, 2),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        assert_eq!(
+            e.amend_social_recovery_timelock(ALICE, BOB, 7_200),
+            Err(EscrowError::RecoveryNotConfigured)
+        );
+        // The event layer emits only on an actual change: a real
+        // disable emits SocialRecoveryDisabled, a no-op disable
+        // emits nothing, and a failed call emits nothing.
+        let mut indexed = IndexedEscrow::wrap([0xE0; 32], configured());
+        let before = indexed.event_count();
+        assert_eq!(
+            indexed.disable_social_recovery(MALLORY, BOB, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(indexed.event_count(), before, "failed calls emit nothing");
+        indexed.disable_social_recovery(ALICE, BOB, NOW).unwrap();
+        assert_eq!(indexed.event_count(), before + 1);
+        let ev = indexed.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::SocialRecoveryDisabled);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        indexed.disable_social_recovery(ALICE, BOB, NOW + 10).unwrap();
+        assert_eq!(
+            indexed.event_count(),
+            before + 1,
+            "no-op second disable emits nothing"
+        );
+        let mut plain_ie = IndexedEscrow::wrap(
+            [0xE0; 32],
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap(),
+        );
+        plain_ie.fund(ALICE, 0).unwrap();
+        let _ = plain_ie.drain_events();
+        plain_ie.disable_social_recovery(ALICE, BOB, 42).unwrap();
+        assert_eq!(
+            plain_ie.event_count(),
+            0,
+            "never-configured disable emits nothing"
         );
     }
 
@@ -78761,6 +79018,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_social_recovery_timelock"),
             [104, 196, 59, 165, 48, 42, 29, 6]
+        );
+    }
+
+    #[test]
+    fn disable_social_recovery_instruction_discriminator_is_pinned() {
+        // AV-428. IDL:
+        // sha256("global:disable_social_recovery")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("disable_social_recovery"),
+            [186, 198, 29, 84, 110, 167, 233, 208]
         );
     }
 
