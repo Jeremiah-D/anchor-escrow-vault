@@ -1313,6 +1313,10 @@ fn write_governance_action(s: &mut String, action: &GovernanceAction) {
         GovernanceAction::DisableQuorum => {
             s.push_str("{\"kind\":\"disable_quorum\"}");
         }
+        // AV-427: unit variant — the kind alone is the whole action.
+        GovernanceAction::DisableTieredQuorum => {
+            s.push_str("{\"kind\":\"disable_tiered_quorum\"}");
+        }
     }
 }
 

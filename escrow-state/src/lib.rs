@@ -5622,10 +5622,10 @@ impl MintAllowlist {
 
 // ---------- AV-158: delayed dual-signed governance ----------
 //
-// The twenty dual-signed config changes (the four AV-158 actions
-// plus the eleven AV-335 actions, the two AV-336 split-shares
-// halves, the one AV-378 action, the one AV-390 action, and the
-// one AV-424 action) can
+// The twenty-one dual-signed config changes (the four AV-158
+// actions plus the eleven AV-335 actions, the two AV-336
+// split-shares halves, the one AV-378 action, the one AV-390
+// action, the one AV-424 action, and the one AV-427 action) can
 // opt in to a two-phase propose → delay → execute/cancel protocol via
 // `Escrow::with_governance_delay`. The delay is the anti-flash-
 // governance rule: a malicious threshold change proposed while an
@@ -5650,7 +5650,8 @@ impl MintAllowlist {
 //   UpdateSettlementMintAllowlist, 13 = UpdateTieredQuorum, 14 =
 //   UpdateArbiterPanelMembers, 15 = AmendPayoutSplitSharesFirst, 16
 //   = AmendPayoutSplitSharesSecond, 17 = AmendPanelThreshold, 18 =
-//   UpdateMintAllowlist, 19 = DisableQuorum) +
+//   UpdateMintAllowlist, 19 = DisableQuorum, 20 =
+//   DisableTieredQuorum) +
 //   [`GOVERNANCE_ACTION_PAYLOAD_LEN`]-byte payload. Per-kind layout:
 //   kind 0: payload[0..8] = new_threshold LE;
 //   kind 1: payload[0..256] = 8 attestor keys, payload[256..320] =
@@ -5684,6 +5685,8 @@ impl MintAllowlist {
 //   kind 18: payload[0..256] = 8 allowlist mints, payload[256] =
 //   live count (0 = clear the allowlist);
 //   kind 19: no payload (unit variant — the disable carries no
+//   params);
+//   kind 20: no payload (unit variant — the disable carries no
 //   params);
 // - `GovernanceProposal`: the action + 32-byte proposer +
 //   8-byte `proposed_at` + 8-byte `delay_secs` (the configured delay
@@ -5818,6 +5821,10 @@ pub enum GovernanceAction {
     /// attestor quorum policy after funding. Unit variant — the
     /// disable carries no params, so it writes no payload.
     DisableQuorum,
+    /// [`Escrow::disable_tiered_quorum`] (AV-427): remove the
+    /// tiered attestor quorum table after funding. Unit variant —
+    /// the disable carries no params, so it writes no payload.
+    DisableTieredQuorum,
 }
 
 /// Serialized length of a [`GovernanceAction`]'s fixed payload: the
@@ -5890,7 +5897,7 @@ impl GovernanceAction {
     /// UpdateSettlementMintAllowlist, 13 = UpdateTieredQuorum, 14 =
     /// UpdateArbiterPanelMembers, 15 = AmendPayoutSplitSharesFirst,
     /// 16 = AmendPayoutSplitSharesSecond, 17 = AmendPanelThreshold,
-    /// 18 = UpdateMintAllowlist, 19 = DisableQuorum.
+    /// 18 = UpdateMintAllowlist, 19 = DisableQuorum, 20 = DisableTieredQuorum.
     pub(crate) fn kind_byte(&self) -> u8 {
         match self {
             GovernanceAction::UpdateQuorum { .. } => 0,
@@ -5913,6 +5920,7 @@ impl GovernanceAction {
             GovernanceAction::AmendPanelThreshold { .. } => 17,
             GovernanceAction::UpdateMintAllowlist { .. } => 18,
             GovernanceAction::DisableQuorum => 19,
+            GovernanceAction::DisableTieredQuorum => 20,
         }
     }
 
@@ -6047,6 +6055,11 @@ impl GovernanceAction {
             // `GOVERNANCE_ACTION_PAYLOAD_LEN` is unchanged, the
             // largest variant still UpdateAttestors.
             GovernanceAction::DisableQuorum => {}
+            // AV-427: unit variant — the disable carries no params,
+            // so it writes no payload; the 321-byte
+            // `GOVERNANCE_ACTION_PAYLOAD_LEN` is unchanged, the
+            // largest variant still UpdateAttestors.
+            GovernanceAction::DisableTieredQuorum => {}
         }
         out
     }
@@ -6266,6 +6279,9 @@ impl GovernanceAction {
             // AV-424: unit variant — no payload to validate, always
             // decodable.
             19 => Some(GovernanceAction::DisableQuorum),
+            // AV-427: unit variant — no payload to validate, always
+            // decodable.
+            20 => Some(GovernanceAction::DisableTieredQuorum),
             _ => None,
         }
     }
@@ -27641,10 +27657,11 @@ let fee = self.charge_protocol_fee(claimable)?;
 
     // ---------- AV-158: delayed dual-signed governance ----------
     //
-    // The twenty dual-signed config changes (the four AV-158
-    // actions plus the eleven AV-335 actions, the two AV-336
-    // split-shares halves, the one AV-378 action, the one
-    // AV-390 action, and the one AV-424 action) can opt in to a
+    // The twenty-one dual-signed config changes (the four
+    // AV-158 actions plus the eleven AV-335 actions, the two
+    // AV-336 split-shares halves, the one AV-378 action, the one
+    // AV-390 action, the one AV-424 action, and the one AV-427
+    // action) can opt in to a
     // two-phase propose → delay → execute/cancel protocol. The delay
     // is the anti-flash-governance rule: a
     // malicious threshold change proposed while an attestor is dark
@@ -27819,7 +27836,7 @@ let fee = self.charge_protocol_fee(claimable)?;
     ///    proposal is stale; the failure clears nothing and the exit
     ///    is [`Escrow::cancel_governance`]. The check is variant-
     ///    agnostic: it runs before the action `match`, so all
-    ///    twenty actions (AV-158 + AV-335 + AV-336 + AV-378 + AV-390 + AV-424) share the
+    ///    twenty-one actions (AV-158 + AV-335 + AV-336 + AV-378 + AV-390 + AV-424 + AV-427) share the
     ///    same expiry.
     pub fn execute_governance(
         &mut self,
@@ -27879,6 +27896,13 @@ let fee = self.charge_protocol_fee(claimable)?;
             // elapsed, with the escrow's own (initializer, taker).
             GovernanceAction::DisableQuorum => {
                 self.disable_quorum_impl(self.initializer, self.taker, true)?;
+            }
+            // AV-427: the tiered removal rides the same delayed
+            // path — the direct call is refused on a delay escrow,
+            // so the disable executes only here, after the delay
+            // elapsed, with the escrow's own (initializer, taker).
+            GovernanceAction::DisableTieredQuorum => {
+                self.disable_tiered_quorum_impl(self.initializer, self.taker, true)?;
             }
             GovernanceAction::UpdateAttestors {
                 attestors,
@@ -28160,7 +28184,10 @@ let fee = self.charge_protocol_fee(claimable)?;
             // and is `Funded`-only, mirroring
             // `disable_quorum_impl` — unlike UpdateQuorum's
             // `Uninitialized` | `Funded`.
-            | GovernanceAction::DisableQuorum => {
+            // AV-427: the tiered removal is `Funded`-only the same
+            // way, mirroring `disable_tiered_quorum_impl`.
+            | GovernanceAction::DisableQuorum
+            | GovernanceAction::DisableTieredQuorum => {
                 matches!(self.state, EscrowState::Funded)
             }
         }
@@ -28186,9 +28213,21 @@ let fee = self.charge_protocol_fee(claimable)?;
             // execute (the impl re-checks the live quorum), so it is
             // refused here. A tiered-only escrow is refused the same
             // way: the tiered gate is a different object, and its
-            // own disable item covers it later.
+            // own disable item (AV-427) covers it.
             GovernanceAction::DisableQuorum => {
                 if self.tiered_quorum.is_some() || self.quorum.is_none() {
+                    return Err(EscrowError::InvalidQuorum);
+                }
+                Ok(())
+            }
+            // AV-427: fail fast at propose time — a tiered removal
+            // proposed on an escrow with no tiered table could never
+            // execute (the impl re-checks the live table), so it is
+            // refused here. A plain-quorum escrow is refused the
+            // same way: the plain gate is a different object, and
+            // its own disable item (AV-424) covers it.
+            GovernanceAction::DisableTieredQuorum => {
+                if self.quorum.is_some() || self.tiered_quorum.is_none() {
                     return Err(EscrowError::InvalidQuorum);
                 }
                 Ok(())
@@ -30208,7 +30247,7 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// [`Escrow::update_attestors`] (that swaps the electorate,
     /// this item removes the gate), and to the tiered quorum (a
     /// separate field and gate, untouched by this removal — its
-    /// own disable item covers it later). Emits `QuorumDisabled`
+    /// own disable item, AV-427, covers it). Emits `QuorumDisabled`
     /// on the event layer, except for the no-op.
     pub fn disable_quorum(
         &mut self,
@@ -30288,6 +30327,174 @@ let fee = self.charge_protocol_fee(claimable)?;
         // The accumulated attestations die with the policy struct:
         // they only counted toward the removed threshold.
         self.quorum = None;
+        Ok(())
+    }
+
+    /// Remove the tiered attestor quorum table after funding (AV-427 —
+    /// Solana / DeFi): both parties jointly retire the amount-tiered
+    /// release gate, clearing `tiered_quorum` to `None` in place.
+    ///
+    /// Why: the tiered quorum is only as alive as its attestors. When
+    /// every attestor in a tier goes dark — keys lost, oracles
+    /// unresponsive — every taker release in that band fails fast at
+    /// the quorum check, and revision cannot help:
+    /// [`Escrow::update_tiered_quorum`] can only retune thresholds
+    /// within `1..=total_weight` (a zero threshold is refused, an
+    /// ungated escrow is refused fail-closed), and
+    /// [`Escrow::update_attestors`] can only swap one live panel
+    /// for another — neither can remove the gate itself, and no
+    /// threshold at or above 1 is reachable when nobody can sign.
+    /// Without removal the parties' only exit is cancelling and
+    /// rebuilding, throwing away the funded state. The only way out
+    /// is removal.
+    ///
+    /// Governance mirrors [`Escrow::update_tiered_quorum_impl`],
+    /// with the same deliberate departure as AV-424's plain removal:
+    /// tiered quorum changes are governed by the AV-158
+    /// delayed-governance mechanism, so this disable routes through
+    /// it — pause first (AV-46), then unconditional dual signature
+    /// — both the *current* initializer and the *current* taker
+    /// must authorize, one party alone (or a stranger pair) is
+    /// [`EscrowError::Unauthorized`] — then the AV-158 routing gate:
+    /// on a delay-opted-in escrow a direct call is refused with
+    /// [`EscrowError::GovernanceActionNotProposed`] and the removal
+    /// moves only through the propose/execute protocol
+    /// (`GovernanceAction::DisableTieredQuorum`, kind 20) — then the
+    /// `Funded`-only state gate
+    /// ([`EscrowError::InvalidStateTransition`]). The attestors
+    /// themselves do not sign: the table is a jointly owned
+    /// settlement condition, and the panel being removed cannot
+    /// block its own removal (the `rotate_arbiter` /
+    /// `disable_transfer_hook` "removed object does not sign"
+    /// reasoning) — a single party dropping the gate would strip
+    /// the other party's release protection, so the removal itself
+    /// needs both signatures. A plain quorum present is
+    /// [`EscrowError::InvalidQuorum`] (fail-closed — plain is a
+    /// different gate object on a separate field; mutual
+    /// exclusivity guarantees the tiered slot is `None` there, so
+    /// the plain policy is never silently discarded with it).
+    /// Only an escrow with a tiered table actually configured has
+    /// anything to remove: a tiered-less escrow — never configured,
+    /// or already removed — is a silent no-op success that writes
+    /// nothing and emits nothing (the AV-405 / AV-409 / AV-410
+    /// no-op precedent). The accumulated attestations are discarded
+    /// with the table struct: they only counted toward the removed
+    /// tier thresholds, so no vote survives the removal.
+    /// The `TIERED_QUORUM_LEN`-byte tiered region clears in place,
+    /// so no layout change. One-way only — there is no post-funding
+    /// re-installation: [`Escrow::with_tiered_quorum`] stays
+    /// `Uninitialized`-only, and `update_tiered_quorum` /
+    /// `update_attestors` on an unconfigured escrow still refuse
+    /// with [`EscrowError::InvalidQuorum`] (fail-closed — the
+    /// removal never becomes an installation path).
+    ///
+    /// After disabling, [`Escrow::require_release_quorum`]'s `None`
+    /// arm passes through, so every taker release path
+    /// (`release`, `release_split`, `release_payout_split`,
+    /// `claim`) needs no witness — exactly like a never-gated
+    /// escrow — while `attest`, `update_tiered_quorum` and
+    /// `update_attestors` refuse with `InvalidQuorum` (unchanged
+    /// fail-closed behavior), a release already settled keeps the
+    /// tier table it settled under, and the refund paths never read
+    /// quorum and are unaffected. In-flight `UpdateTieredQuorum`
+    /// proposals are not silently dropped
+    /// (`propose_governance` directly overwrites in-flight
+    /// proposals, so there is no mutual exclusion to break):
+    /// after the disable, executing such a proposal fails
+    /// `InvalidQuorum` when the impl re-checks the live table,
+    /// with the proposal left in place — the exit is
+    /// `cancel_governance` or proposing a new action to overwrite.
+    /// Disabling moves no funds, so no AV-36 reentrancy lock is
+    /// needed (the lock only guards the fund-moving paths, the
+    /// `rotate_arbiter` precedent). Orthogonal to
+    /// [`Escrow::with_tiered_quorum`] (that is the initial
+    /// configuration, this item is the post-funding removal), to
+    /// [`Escrow::update_tiered_quorum`] (that revises the table,
+    /// this item is the table's existence — revision cannot help
+    /// when the panel itself is gone), to
+    /// [`Escrow::update_attestors`] (that swaps the electorate,
+    /// this item removes the gate), and to the plain quorum (a
+    /// separate field and gate, untouched by this removal — AV-424
+    /// covers its own disable). Emits `TieredQuorumDisabled`
+    /// on the event layer, except for the no-op.
+    pub fn disable_tiered_quorum(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+    ) -> Result<(), EscrowError> {
+        // AV-158: the direct entry always takes `via_delayed = false`
+        // — on a delay-opted-in escrow the table is removed only
+        // through the propose/execute protocol; the delayed
+        // `execute_governance` is the only `via_delayed = true`
+        // caller. Thin by design: one removal implementation, zero
+        // gate drift between the paths.
+        self.disable_tiered_quorum_impl(initializer, taker, false)
+    }
+
+    /// The shared tiered-removal engine behind
+    /// [`Escrow::disable_tiered_quorum`] and
+    /// [`Escrow::execute_governance`] (AV-158 / AV-427).
+    ///
+    /// Carries the exact `disable_tiered_quorum` guard chain (pause,
+    /// dual authority, the governance-delay routing gate, state,
+    /// plain exclusion, tiered configuration) so a delayed execution
+    /// settles bit-identically to a direct one. `via_delayed` is
+    /// `true` only when [`Escrow::execute_governance`] drives the
+    /// call after the delay elapsed; every other caller passes
+    /// `false`.
+    fn disable_tiered_quorum_impl(
+        &mut self,
+        initializer: [u8; 32],
+        taker: [u8; 32],
+        via_delayed: bool,
+    ) -> Result<(), EscrowError> {
+        // AV-46: pause guard first — a paused escrow fails fast.
+        self.require_not_paused()?;
+        // Dual-signature governance: both the *current*
+        // initializer and the *current* taker must authorize.
+        // One party alone dropping the gate would strip the
+        // other party's release protection, so the removal itself
+        // needs both signatures (the `rotate_arbiter` reasoning).
+        // The attestors themselves do not sign.
+        if initializer != self.initializer || taker != self.taker {
+            return Err(EscrowError::Unauthorized);
+        }
+        // AV-158: the governance-delay routing gate — on a
+        // delay-opted-in escrow the table is removed only through
+        // the two-step propose/execute protocol, never a direct
+        // call. Placed right after the authority check (an
+        // unauthorized caller still learns nothing about the
+        // escrow's configuration — mirroring AV-130's dual-control
+        // routing gate) and before the state check. `via_delayed`
+        // is `true` only when `execute_governance` drives the call
+        // after the delay elapsed, so the delayed path passes here
+        // and every direct call is refused with
+        // `GovernanceActionNotProposed`.
+        if !via_delayed && self.governance_delay_secs != 0 {
+            return Err(EscrowError::GovernanceActionNotProposed);
+        }
+        match self.state {
+            EscrowState::Funded => {}
+            _ => return Err(EscrowError::InvalidStateTransition),
+        }
+        // Fail-closed: a plain quorum is a different gate object
+        // on a separate field — its policy must never be silently
+        // discarded with the tiered slot (mutual exclusivity
+        // guarantees the tiered slot is `None` whenever plain is
+        // present, so this arm is the only way a plain escrow
+        // reaches the removal at all).
+        if self.quorum.is_some() {
+            return Err(EscrowError::InvalidQuorum);
+        }
+        // No-op: never configured (or already removed) — removing a
+        // table that is not there writes nothing, so the event
+        // layer emits nothing for it.
+        if self.tiered_quorum.is_none() {
+            return Ok(());
+        }
+        // The accumulated attestations die with the table struct:
+        // they only counted toward the removed tier thresholds.
+        self.tiered_quorum = None;
         Ok(())
     }
 
@@ -59161,7 +59368,8 @@ mod funding_tranche_tests {
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None); // AV-412: 175 is ArbiterDisabled
     }
 
     #[test]
@@ -60883,9 +61091,26 @@ mod governance_delay_tests {
             Some(disable_action),
             "kind 19 round-trip"
         );
+        // AV-427: kind 20 is the tiered removal — a unit variant,
+        // appended after the plain quorum removal, kinds 0–19
+        // unmoved. It writes no payload, so the round-trip is the
+        // kind byte plus an all-zero payload.
+        let disable_tiered_action = GovernanceAction::DisableTieredQuorum;
+        assert_eq!(disable_tiered_action.kind_byte(), 20, "kind 20");
+        let payload = disable_tiered_action.encode_payload();
+        assert_eq!(
+            payload,
+            [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN],
+            "kind 20 payload is empty"
+        );
+        assert_eq!(
+            GovernanceAction::decode(20, &payload),
+            Some(disable_tiered_action),
+            "kind 20 round-trip"
+        );
         // Unknown kinds fail closed.
         let payload = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
-        assert_eq!(GovernanceAction::decode(20, &payload), None);
+        assert_eq!(GovernanceAction::decode(21, &payload), None);
         assert_eq!(GovernanceAction::decode(255, &payload), None);
         // Out-of-range live counts fail closed.
         let mut bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
@@ -61295,9 +61520,10 @@ mod governance_delay_tests {
             );
         }
         // Unknown kinds fail closed. (AV-424: kind 19 is now the
-        // quorum removal, so the first unknown byte moved to 20.)
+        // quorum removal, and AV-427: kind 20 is now the tiered
+        // removal, so the first unknown byte moved to 21.)
         let payload = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
-        assert_eq!(GovernanceAction::decode(20, &payload), None);
+        assert_eq!(GovernanceAction::decode(21, &payload), None);
         assert_eq!(GovernanceAction::decode(255, &payload), None);
         // Out-of-range live counts fail closed.
         let mut bad = [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN];
@@ -62933,7 +63159,8 @@ mod disable_price_gate_tests {
         );
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None);
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None);
     }
 }
 
@@ -63386,7 +63613,8 @@ mod disable_twap_gate_tests {
             Some(EscrowEventKind::PriceGateDisabled)
         );
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None);
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None);
     }
 }
 
@@ -63853,7 +64081,7 @@ mod disable_quorum_tests {
         );
         assert!(e.governance_proposal().is_none());
         // A tiered-only escrow is refused the same way: its gate is
-        // a different object, covered by its own disable item later.
+        // a different object, covered by its own disable item (AV-427).
         let mut t = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
             .unwrap()
             .with_tiered_quorum(tiered())
@@ -63970,7 +64198,615 @@ mod disable_quorum_tests {
             EscrowEventKind::from_discriminant(182),
             Some(EscrowEventKind::TwapGateDisabled)
         );
-        assert_eq!(EscrowEventKind::from_discriminant(184), None);
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None);
+    }
+}
+
+// ---------- AV-427: disable_tiered_quorum ----------
+// A dark tiered panel must not strand a funded escrow: both parties
+// may jointly retire the tiered quorum table, after which the taker
+// release paths need no witness. Tiered quorum changes route through
+// the AV-158 delayed-governance mechanism, so the disable is the
+// second removal in the family with a propose/execute path.
+#[cfg(test)]
+mod disable_tiered_quorum_tests {
+    use super::*;
+    use crate::events::IndexedEscrow;
+
+    const ALICE: [u8; 32] = [0xAA; 32]; // initializer
+    const BOB: [u8; 32] = [0xBB; 32]; // taker
+    const MALLORY: [u8; 32] = [0xCC; 32]; // stranger
+    const ATTESTOR_1: [u8; 32] = [0xA1; 32];
+    const ATTESTOR_2: [u8; 32] = [0xA2; 32];
+    const ATTESTOR_3: [u8; 32] = [0xA3; 32];
+    const ARBITER: [u8; 32] = [0xA8; 32];
+    const AMOUNT: u64 = 1_000_000;
+    const EXPIRES_AT: u64 = 1_800_000_000;
+    const T0: u64 = 1_700_000_000;
+    const NOW: u64 = 1_750_000_000;
+    const DELAY: u64 = 86_400; // 1 day
+
+    fn quorum_2_of_3() -> QuorumPolicy {
+        QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 2).unwrap()
+    }
+
+    fn tiered() -> TieredQuorum {
+        let base =
+            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 1).unwrap();
+        TieredQuorum::new(
+            base,
+            &[
+                Tier { max_amount: 1_000, threshold: 1 },
+                Tier { max_amount: u64::MAX, threshold: 3 },
+            ],
+        )
+        .unwrap()
+    }
+
+    fn tiered_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_tiered_quorum(tiered())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn plain_quorum_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(quorum_2_of_3())
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn disputed_tiered_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_tiered_quorum(tiered())
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        e.activate(ALICE).unwrap();
+        e.activate(BOB).unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.escalate(ALICE, EXPIRES_AT - 1, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        e
+    }
+
+    fn delay_tiered_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_tiered_quorum(tiered())
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    fn delay_plain_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(quorum_2_of_3())
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    fn funded_delay_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn stranger_and_single_party_cannot_disable_and_table_unchanged() {
+        // AV-427: the tier table is a jointly owned release condition —
+        // one party alone dropping it would strip the other party's
+        // protection against an unwitnessed payout, so a stranger or
+        // a single party is Unauthorized and the failed call moves
+        // nothing. The attestors themselves do not sign.
+        let mut e = tiered_escrow();
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_tiered_quorum(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.tiered_quorum(),
+            Some(tiered()),
+            "failed disable leaves the table configured"
+        );
+    }
+
+    #[test]
+    fn disable_refused_while_paused() {
+        // AV-427: pause first (AV-46) — a paused escrow fails
+        // fast, before the dual-signature check.
+        let mut e = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_tiered_quorum(tiered())
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.pause(ALICE, None).unwrap();
+        assert_eq!(
+            e.disable_tiered_quorum(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            e.disable_tiered_quorum(MALLORY, BOB),
+            Err(EscrowError::Paused),
+            "even a stranger's disable on a paused escrow is Paused"
+        );
+        assert_eq!(
+            e.tiered_quorum(),
+            Some(tiered()),
+            "paused disable writes nothing"
+        );
+        e.unpause(ALICE).unwrap();
+        e.disable_tiered_quorum(ALICE, BOB).unwrap();
+        assert_eq!(e.tiered_quorum(), None);
+    }
+
+    #[test]
+    fn disable_refuses_non_funded_states() {
+        // AV-427: Funded-only — the Uninitialized builder owns the
+        // initial configuration, Activated has not funded yet,
+        // Disputed is excluded (the dispute must settle first),
+        // and terminal states have no live table left to retire.
+        let mut bare = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_tiered_quorum(tiered())
+            .unwrap();
+        assert_eq!(
+            bare.disable_tiered_quorum(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            bare.tiered_quorum(),
+            Some(tiered()),
+            "refused disable writes nothing"
+        );
+        // Activated: both parties signed, funds not yet locked.
+        // (Dual-signed so the activation ceremony runs — a plain
+        // escrow funds straight from `Uninitialized`.)
+        let mut activated = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_tiered_quorum(tiered())
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.disable_tiered_quorum(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.tiered_quorum(), Some(tiered()));
+        // Disputed: the table stays while the dispute is in flight.
+        let mut d = disputed_tiered_escrow();
+        assert_eq!(
+            d.disable_tiered_quorum(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.tiered_quorum(),
+            Some(tiered()),
+            "refused disable writes nothing"
+        );
+        // Terminal: a fully released escrow's table is history, not
+        // a live condition to retire.
+        let mut e = tiered_escrow();
+        e.attest(ATTESTOR_1).unwrap();
+        e.attest(ATTESTOR_2).unwrap();
+        e.attest(ATTESTOR_3).unwrap();
+        e.release(ALICE, NOW, AMOUNT, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.disable_tiered_quorum(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.tiered_quorum().unwrap().tiers(),
+            tiered().tiers(),
+            "refused disable leaves the tier table intact"
+        );
+    }
+
+    #[test]
+    fn unconfigured_is_a_silent_noop_and_emits_nothing() {
+        // AV-427: removing a table that was never configured writes
+        // nothing and emits nothing — the `rotate_*` same-value
+        // no-op precedent. That covers both a plain escrow and a
+        // second disable after a successful first one.
+        let mut plain = Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, T0).unwrap();
+        plain.disable_tiered_quorum(ALICE, BOB).unwrap();
+        assert_eq!(plain.tiered_quorum(), None);
+
+        let mut plain_ie = IndexedEscrow::wrap(
+            [0xE0; 32],
+            Escrow::initialize(ALICE, BOB, AMOUNT, EXPIRES_AT).unwrap(),
+        );
+        plain_ie.fund(ALICE, 0).unwrap();
+        let _ = plain_ie.drain_events();
+        plain_ie.disable_tiered_quorum(ALICE, BOB, 42).unwrap();
+        assert_eq!(
+            plain_ie.event_count(),
+            0,
+            "never-configured disable emits nothing"
+        );
+
+        let mut ie = IndexedEscrow::wrap([0xE0; 32], tiered_escrow());
+        let _ = ie.drain_events();
+        ie.disable_tiered_quorum(ALICE, BOB, 42).unwrap();
+        assert_eq!(ie.event_count(), 1, "first disable emits once");
+        ie.disable_tiered_quorum(ALICE, BOB, 43).unwrap();
+        assert_eq!(ie.event_count(), 1, "second disable emits nothing");
+        assert_eq!(ie.inner().tiered_quorum(), None);
+    }
+
+    #[test]
+    fn plain_quorum_escrow_rejects_and_policy_unchanged() {
+        // AV-427: a plain quorum is a different gate object on a
+        // separate field — the tiered-slot removal must never
+        // silently discard its policy. Fail-closed with
+        // `InvalidQuorum`, and the plain gate still governs
+        // afterwards.
+        let mut e = plain_quorum_escrow();
+        assert_eq!(e.tiered_quorum(), None);
+        assert_eq!(
+            e.disable_tiered_quorum(ALICE, BOB),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert_eq!(EscrowError::InvalidQuorum.code(), 104);
+        assert_eq!(
+            e.quorum().unwrap().threshold(),
+            2,
+            "plain policy untouched"
+        );
+        // The 2-of-3 threshold still gates: no attestations, no release.
+        assert_eq!(
+            e.release(ALICE, NOW, AMOUNT, None, BOB),
+            Err(EscrowError::QuorumNotReached)
+        );
+        // And two attestations still satisfy it, proving the policy
+        // survived the refused removal intact.
+        e.attest(ATTESTOR_1).unwrap();
+        e.attest(ATTESTOR_2).unwrap();
+        let (payout, fee) = e.release(ALICE, NOW, AMOUNT, None, BOB).unwrap();
+        assert_eq!((payout, fee), (AMOUNT, 0));
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn disable_clears_table_and_moves_no_funds() {
+        // AV-427: the `TIERED_QUORUM_LEN`-byte tiered region clears
+        // in place, so the disable rewrites it with no layout change,
+        // the state stays Funded, and the locked amount and the
+        // plain-quorum slot are untouched.
+        let mut e = tiered_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.remaining_amount(), AMOUNT);
+        assert_eq!(e.quorum(), None);
+        e.disable_tiered_quorum(ALICE, BOB).unwrap();
+        assert_eq!(e.tiered_quorum(), None);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), AMOUNT);
+        assert_eq!(e.amount(), AMOUNT);
+        assert_eq!(e.quorum(), None, "plain slot untouched");
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "tiered region cleared in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn disable_unblocks_release_without_witness() {
+        // AV-427: the whole point — the top tier (weight 3 for the
+        // full amount) blocks every taker release while the table
+        // stands (no attestations at all), and the disable is what
+        // unblocks it. Contrast before/after on the same escrow.
+        let mut e = tiered_escrow();
+        assert_eq!(
+            e.release(ALICE, NOW, AMOUNT, None, BOB),
+            Err(EscrowError::QuorumNotReached)
+        );
+        assert_eq!(EscrowError::QuorumNotReached.code(), 105);
+        assert_eq!(e.state(), EscrowState::Funded);
+        e.disable_tiered_quorum(ALICE, BOB).unwrap();
+        let (payout, fee) = e.release(ALICE, NOW, AMOUNT, None, BOB).unwrap();
+        assert_eq!((payout, fee), (AMOUNT, 0));
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn accumulated_attestations_are_dead_after_disable() {
+        // AV-427: the votes die with the table struct — three
+        // attestations that satisfied the top tier before the
+        // disable count for nothing after it, because there is no
+        // tier threshold left to count toward. The release succeeds
+        // on no votes at all, and the votes cannot be re-cast.
+        let mut e = tiered_escrow();
+        e.attest(ATTESTOR_1).unwrap();
+        e.attest(ATTESTOR_2).unwrap();
+        e.attest(ATTESTOR_3).unwrap();
+        assert!(e.tiered_quorum().unwrap().is_satisfied_for(AMOUNT));
+        assert_eq!(e.tiered_quorum().unwrap().base().approval_count(), 3);
+        e.disable_tiered_quorum(ALICE, BOB).unwrap();
+        assert_eq!(e.tiered_quorum(), None, "no table readable");
+        assert_eq!(
+            e.attest(ATTESTOR_1),
+            Err(EscrowError::InvalidQuorum),
+            "votes cannot be re-cast onto a removed table"
+        );
+        let (payout, fee) = e.release(ALICE, NOW, AMOUNT, None, BOB).unwrap();
+        assert_eq!((payout, fee), (AMOUNT, 0));
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn after_disable_attest_and_governance_reject_invalid_quorum() {
+        // AV-427: one-way only — `attest`, `update_tiered_quorum`
+        // and `update_attestors` on an unconfigured escrow still
+        // refuse fail-closed (the removal never becomes an
+        // installation path), and `with_tiered_quorum` stays
+        // `Uninitialized`-only, so a post-funding re-installation
+        // is refused and the table stays cleared.
+        let mut e = tiered_escrow();
+        e.disable_tiered_quorum(ALICE, BOB).unwrap();
+        assert_eq!(e.tiered_quorum(), None);
+        assert_eq!(
+            e.attest(ATTESTOR_1),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert_eq!(
+            e.update_tiered_quorum(
+                ALICE,
+                BOB,
+                &[
+                    Tier { max_amount: 1_000, threshold: 1 },
+                    Tier { max_amount: u64::MAX, threshold: 2 },
+                ]
+            ),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert_eq!(
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_2], &[1, 1]),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert_eq!(EscrowError::InvalidQuorum.code(), 104);
+        assert_eq!(
+            e.with_tiered_quorum(tiered()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.tiered_quorum(),
+            None,
+            "refused re-installation writes nothing"
+        );
+    }
+
+    #[test]
+    fn delay_escrow_direct_call_refused_and_table_unchanged() {
+        // AV-427: the deliberate departure from the other disable
+        // items — tiered quorum changes are governed by the AV-158
+        // delayed mechanism, so on a delay-opted-in escrow a direct
+        // call is refused and the removal moves only through
+        // propose/execute.
+        let mut e = delay_tiered_escrow();
+        assert_eq!(
+            e.disable_tiered_quorum(ALICE, BOB),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(EscrowError::GovernanceActionNotProposed.code(), 219);
+        assert_eq!(
+            e.tiered_quorum(),
+            Some(tiered()),
+            "refused direct disable writes nothing"
+        );
+    }
+
+    #[test]
+    fn delay_escrow_execute_before_delay_rejected() {
+        // AV-427: the two-step protocol — propose, then wait out the
+        // full window. Executing one second early is refused and the
+        // proposal stays live for the on-time execution.
+        let mut e = delay_tiered_escrow();
+        e.propose_governance(ALICE, GovernanceAction::DisableTieredQuorum, T0)
+            .unwrap();
+        assert!(e.governance_proposal().is_some());
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + DELAY - 1),
+            Err(EscrowError::GovernanceDelayNotElapsed)
+        );
+        assert_eq!(EscrowError::GovernanceDelayNotElapsed.code(), 218);
+        assert!(
+            e.governance_proposal().is_some(),
+            "early execute leaves the proposal live"
+        );
+        assert_eq!(
+            e.tiered_quorum(),
+            Some(tiered()),
+            "early execute writes nothing"
+        );
+    }
+
+    #[test]
+    fn delay_escrow_execute_after_delay_succeeds() {
+        // AV-427: once the delay elapses, either party may execute —
+        // the delay window was the second signature. The table
+        // clears, the proposal is consumed, and the event layer sees
+        // the generic `GovernanceExecuted` (the per-action
+        // `TieredQuorumDisabled` event belongs to the direct-path
+        // wrapper; the delayed path carries the tiered fact in the
+        // vault).
+        let mut ie = IndexedEscrow::wrap([0xE0; 32], delay_tiered_escrow());
+        let _ = ie.drain_events();
+        ie.propose_governance(ALICE, GovernanceAction::DisableTieredQuorum, T0)
+            .unwrap();
+        assert_eq!(ie.event_count(), 1, "propose emits once");
+        let proposed = ie.events().last().copied().expect("event pushed");
+        assert_eq!(proposed.kind, EscrowEventKind::GovernanceProposed);
+        ie.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(ie.event_count(), 2, "execute emits once");
+        let executed = ie.events().last().copied().expect("event pushed");
+        assert_eq!(executed.kind, EscrowEventKind::GovernanceExecuted);
+        assert_eq!((executed.from, executed.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(executed.at, T0 + DELAY);
+        assert_eq!((executed.amounts.payout, executed.amounts.fee), (0, 0));
+        assert_eq!(ie.inner().tiered_quorum(), None);
+        assert!(ie.inner().governance_proposal().is_none());
+    }
+
+    #[test]
+    fn propose_on_unconfigured_and_plain_only_rejects_invalid_quorum() {
+        // AV-427: fail fast at propose time — a removal proposed on
+        // an escrow with no tiered table could never execute, so it
+        // is refused here instead of after the delay.
+        let mut e = funded_delay_escrow();
+        assert_eq!(e.tiered_quorum(), None);
+        assert_eq!(
+            e.propose_governance(ALICE, GovernanceAction::DisableTieredQuorum, T0),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert!(e.governance_proposal().is_none());
+        // A plain-quorum escrow is refused the same way: its gate is
+        // a different object, covered by its own disable item (AV-424).
+        let mut p = delay_plain_escrow();
+        assert_eq!(
+            p.propose_governance(ALICE, GovernanceAction::DisableTieredQuorum, T0),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert!(p.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn in_flight_table_proposal_fails_at_execute_after_disable() {
+        // AV-427: the removal never touches the proposal slot, so a
+        // table proposal that is live when the tiered quorum
+        // disappears must fail at execute time when the impl
+        // re-checks the live table — with the proposal left in place
+        // (exit: `cancel_governance`, or a fresh proposal to
+        // overwrite). No public-API sequence stages that state:
+        // proposing the removal overwrites the single proposal slot
+        // — so the first half pins the overwrite, and the
+        // execute-time re-check is staged directly.
+        let mut e = delay_tiered_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::update_tiered_quorum(&[
+                Tier { max_amount: 1_000, threshold: 1 },
+                Tier { max_amount: u64::MAX, threshold: 2 },
+            ])
+            .unwrap(),
+            T0,
+        )
+        .unwrap();
+        assert!(e.governance_proposal().is_some());
+        // Proposing the removal replaces the table proposal —
+        // one slot, no mutual exclusion, and the replacement is
+        // explicit (the proposer knows what they overwrote).
+        e.propose_governance(ALICE, GovernanceAction::DisableTieredQuorum, T0)
+            .unwrap();
+        let p = e.governance_proposal().expect("proposal live");
+        assert_eq!(p.action, GovernanceAction::DisableTieredQuorum);
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(e.tiered_quorum(), None);
+        assert!(e.governance_proposal().is_none());
+        // The execute-time backstop: stage a table proposal against
+        // the removed table directly. Executing it fails
+        // `InvalidQuorum` and leaves the proposal live.
+        e.governance_proposal = Some(GovernanceProposal {
+            action: GovernanceAction::update_tiered_quorum(&[
+                Tier { max_amount: 1_000, threshold: 1 },
+                Tier { max_amount: u64::MAX, threshold: 2 },
+            ])
+            .unwrap(),
+            proposed_by: ALICE,
+            proposed_at: T0,
+            delay_secs: DELAY,
+        });
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + DELAY),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert!(
+            e.governance_proposal().is_some(),
+            "failed execute leaves the proposal live"
+        );
+        e.cancel_governance(ALICE).unwrap();
+        assert!(e.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn disable_tiered_quorum_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-427: the event layer emits exactly one
+        // TieredQuorumDisabled on an actual clear, and nothing for a
+        // failed call or a no-op.
+        let mut e = IndexedEscrow::wrap([0xE0; 32], tiered_escrow());
+        let before = e.event_count();
+        assert_eq!(
+            e.disable_tiered_quorum(MALLORY, BOB, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.disable_tiered_quorum(ALICE, BOB, T0).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::TieredQuorumDisabled);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.at, T0);
+        assert_eq!((ev.amounts.payout, ev.amounts.fee), (0, 0));
+        // A second disable is a no-op: no new event.
+        e.disable_tiered_quorum(ALICE, BOB, T0).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn tiered_quorum_disabled_discriminant_is_pinned() {
+        // AV-427: discriminant 184, appended after
+        // QuorumDisabled — 0–183 stay stable for
+        // already-serialized histories.
+        let kind = EscrowEventKind::TieredQuorumDisabled;
+        assert_eq!(kind.discriminant(), 184);
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(kind));
+        assert_eq!(kind.name(), "tiered_quorum_disabled");
+        assert_eq!(
+            EscrowEventKind::from_name("tiered_quorum_disabled"),
+            Some(kind)
+        );
+        assert_eq!(
+            EscrowEventKind::from_discriminant(183),
+            Some(EscrowEventKind::QuorumDisabled)
+        );
+        assert_eq!(EscrowEventKind::from_discriminant(185), None);
     }
 }
 
@@ -74980,7 +75816,8 @@ mod emergency_unlock_tests {
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -80866,7 +81703,8 @@ mod event_history_tests {
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-412: 175 is ArbiterDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None); // AV-412: 175 is ArbiterDisabled
         assert_eq!(EscrowEventKind::from_discriminant(255), None);
     }
 
@@ -81128,9 +81966,10 @@ mod event_history_tests {
         // `PauseAuthorityDisabled` (AV-421), 181 is
         // `PriceGateDisabled` (AV-422), 182 is
         // `TwapGateDisabled` (AV-423), 183 is
-        // `QuorumDisabled` (AV-424) and 184 is the
+        // `QuorumDisabled` (AV-424), 184 is
+        // `TieredQuorumDisabled` (AV-427) and 185 is the
         // first still-unknown byte.
-        for bad in [184u8, 255] {
+        for bad in [185u8, 255] {
             let mut full = account_bytes(&e);
             full[kind_off] = bad;
             assert_eq!(
@@ -84537,7 +85376,8 @@ mod release_via_intent_tests {
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 
     #[test]
@@ -92771,7 +93611,8 @@ mod disable_dual_control_tests {
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -93092,7 +93933,8 @@ mod disable_deadman_switch_tests {
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-418: 177 is SocialRecoveryDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None); // AV-418: 177 is SocialRecoveryDisabled
     }
 }
 
@@ -93528,7 +94370,8 @@ mod disable_credential_gate_tests {
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -93875,7 +94718,8 @@ mod disable_milestone_verifier_tests {
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -94180,7 +95024,8 @@ mod disable_arbiter_tests {
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None); // AV-417: 176 is DeadmanSwitchDisabled
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None); // AV-417: 176 is DeadmanSwitchDisabled
     }
 }
 
@@ -96545,7 +97390,8 @@ mod disable_social_recovery_tests {
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None);
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None);
     }
 }
 
@@ -98617,7 +99463,8 @@ mod disable_transfer_hook_tests {
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None);
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None);
     }
 }
 
@@ -99029,7 +99876,8 @@ mod disable_dual_sig_tests {
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None);
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None);
     }
 }
 
@@ -99406,7 +100254,8 @@ mod disable_pause_authority_tests {
         assert_eq!(EscrowEventKind::from_discriminant(181), Some(EscrowEventKind::PriceGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(182), Some(EscrowEventKind::TwapGateDisabled));
         assert_eq!(EscrowEventKind::from_discriminant(183), Some(EscrowEventKind::QuorumDisabled));
-        assert_eq!(EscrowEventKind::from_discriminant(184), None);
+        assert_eq!(EscrowEventKind::from_discriminant(184), Some(EscrowEventKind::TieredQuorumDisabled));
+        assert_eq!(EscrowEventKind::from_discriminant(185), None);
     }
 }
 
