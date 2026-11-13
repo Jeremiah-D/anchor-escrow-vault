@@ -2681,6 +2681,69 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Disable the dual-signature governance requirement by
+    /// dual-signed governance (AV-429; mirrors
+    /// `Escrow::disable_dual_sig`). Both the initializer and the
+    /// taker must sign at the program layer — the Anchor accounts
+    /// require both signers, so the on-chain call is dual-signed
+    /// either way (the state machine's unconditional dual-signature
+    /// gate agrees — unlike the amend family's AV-276 conditional
+    /// gate, there is no plain-escrow initializer-alone shape here
+    /// at all). Only `Funded`: `Uninitialized`, `Activated`, the
+    /// terminal states and `Disputed` are `InvalidStateTransition`
+    /// (the builder owns the initial opt-in). A plain escrow —
+    /// never opted in, or already disabled — is a silent no-op
+    /// success that writes nothing and emits nothing. One-way only:
+    /// there is no post-funding re-installation. After the disable,
+    /// the five AV-276 conditional governance gates
+    /// (`update_payout_allowlist` / `update_settlement_mint_allowlist`
+    /// / `update_mint_allowlist` / `amend_social_recovery_threshold`
+    /// / `amend_social_recovery_timelock`) read the live bit and
+    /// become initializer-only, while the unconditional
+    /// dual-signature paths (`update_quorum` / `update_attestors` /
+    /// the `rotate_*` family) never read the bit and are unaffected,
+    /// and `slash`'s dual-activation gate lifts with the bit. A
+    /// revision already settled keeps the governance it settled
+    /// under. A paused escrow fails fast (`Paused`). Only the
+    /// `ACTIVATION_DUAL_SIG_REQUIRED_BIT` clears in place — no
+    /// layout change, no rent change. Emits `DualSigDisabled` only
+    /// on an actual change (`true -> false`, from == to == the
+    /// current state), mirroring
+    /// `IndexedEscrow::disable_dual_sig`.
+    pub fn disable_dual_sig(ctx: Context<DisableDualSig>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.dual_sig_required();
+        escrow
+            .disable_dual_sig(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Clears `ACTIVATION_DUAL_SIG_REQUIRED_BIT` in place in the
+        // real build (the 1-byte `activation` bitmask is already
+        // resident) — no realloc, no rent change.
+        if before && !escrow.dual_sig_required() {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::DualSigDisabled,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Rotate the live operator grant's delegate key (AV-388; mirrors
     /// `Escrow::rotate_delegation_delegate` — the AV-301 pure-logic
     /// rotation). Either party may rotate — the initializer or the
@@ -9455,6 +9518,10 @@ pub enum EscrowVaultEventKind {
     /// (`Escrow::disable_social_recovery`). Mirrors
     /// `escrow_state::EscrowEventKind::SocialRecoveryDisabled`.
     SocialRecoveryDisabled,
+    /// AV-429: the dual-signature governance requirement was removed
+    /// by dual-signed governance (`Escrow::disable_dual_sig`).
+    /// Mirrors `escrow_state::EscrowEventKind::DualSigDisabled`.
+    DualSigDisabled,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -9683,6 +9750,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::SocialRecoveryDisabled => {
             EscrowVaultEventKind::SocialRecoveryDisabled
+        }
+        escrow_state::EscrowEventKind::DualSigDisabled => {
+            EscrowVaultEventKind::DualSigDisabled
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -10930,6 +11000,25 @@ pub struct DisableSocialRecovery<'info> {
     pub initializer: Signer<'info>,
     /// Second governance signer: must equal the escrow's taker. The
     /// taker consents to removing the lost-key recovery their
+    /// funded escrow settles under.
+    pub taker: Signer<'info>,
+}
+
+/// AV-429: accounts for `disable_dual_sig` — the dual-signature
+/// requirement removal is dual-signed governance by the two
+/// parties; the requirement itself has no third-party key to sign.
+/// The disable takes no instruction param — the second no-param
+/// disable_* item, after AV-428's `disable_social_recovery`.
+#[derive(Accounts)]
+pub struct DisableDualSig<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to dropping the dual-signature review their
     /// funded escrow settles under.
     pub taker: Signer<'info>,
 }
