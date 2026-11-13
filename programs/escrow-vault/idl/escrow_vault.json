@@ -1214,6 +1214,12 @@
       "args": []
     },
     {
+      "name": "disable_twap_gate",
+      "discriminator": [11, 231, 82, 208, 57, 50, 69, 58],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
