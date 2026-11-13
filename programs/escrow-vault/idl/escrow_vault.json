@@ -1196,6 +1196,12 @@
       "args": []
     },
     {
+      "name": "disable_pause_authority",
+      "discriminator": [56, 94, 67, 228, 204, 176, 4, 186],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
