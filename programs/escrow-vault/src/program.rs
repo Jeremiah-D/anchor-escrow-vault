@@ -2884,6 +2884,71 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Disable the oracle price gate by dual-signed governance (AV-432;
+    /// mirrors `Escrow::disable_price_gate`). Both the initializer and
+    /// the taker must sign at the program layer — the Anchor accounts
+    /// require both signers, so the on-chain call is dual-signed
+    /// either way (the state machine's unconditional dual-signature
+    /// gate agrees — unlike the amend family's AV-276 conditional
+    /// gate, there is no plain-escrow initializer-alone shape here
+    /// at all, paralleling rotate_arbiter and
+    /// disable_social_recovery / disable_dual_sig /
+    /// disable_pause_authority / disable_arbiter). The oracle itself
+    /// does not sign — a dead feed must not block the gate's own
+    /// removal. Only `Funded`: `Uninitialized`, `Activated`, the
+    /// terminal states and `Disputed` are `InvalidStateTransition`
+    /// (resolve first — the dispute settles under the gate it
+    /// started under). An escrow that never configured a gate — or
+    /// already retired it — is a silent no-op success that writes
+    /// nothing and emits nothing. One-way only: there is no
+    /// post-funding re-installation (`with_price_gate` stays
+    /// `Uninitialized`-only, and `amend_price_gate` on an ungated
+    /// escrow still refuses `InvalidPriceGate` fail-closed). After
+    /// the disable, `release_price_gated` / `claim_price_gated`
+    /// degrade to plain `release` / `claim` (the program routes to
+    /// the gated entry only while `price_gate` is `Some`, and the
+    /// live gate reads `None` afterwards), so a payout a dead feed
+    /// blocked settles the next day, while a payout already settled
+    /// keeps the gate it settled under. A paused escrow fails fast
+    /// (`Paused`). Only the 18-byte `Option` region clears in
+    /// place — no layout change, no rent change. Emits
+    /// `PriceGateDisabled` only on an actual change (`Some -> None`,
+    /// from == to == the current state), mirroring
+    /// `IndexedEscrow::disable_price_gate`.
+    pub fn disable_price_gate(ctx: Context<DisablePriceGate>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.price_gate();
+        escrow
+            .disable_price_gate(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Clears `price_gate` to `None` in place in the real build
+        // (the 18-byte `Option` region is already resident) — no
+        // realloc, no rent change.
+        if before.is_some() && escrow.price_gate().is_none() {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::PriceGateDisabled,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Rotate the live operator grant's delegate key (AV-388; mirrors
     /// `Escrow::rotate_delegation_delegate` — the AV-301 pure-logic
     /// rotation). Either party may rotate — the initializer or the
@@ -9671,6 +9736,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::disable_arbiter`). Mirrors
     /// `escrow_state::EscrowEventKind::ArbiterDisabled`.
     ArbiterDisabled,
+    /// AV-432: the oracle price gate was removed by dual-signed
+    /// governance (`Escrow::disable_price_gate`). Mirrors
+    /// `escrow_state::EscrowEventKind::PriceGateDisabled`.
+    PriceGateDisabled,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -9908,6 +9977,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::ArbiterDisabled => {
             EscrowVaultEventKind::ArbiterDisabled
+        }
+        escrow_state::EscrowEventKind::PriceGateDisabled => {
+            EscrowVaultEventKind::PriceGateDisabled
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -11216,6 +11288,28 @@ pub struct DisableArbiter<'info> {
     pub initializer: Signer<'info>,
     /// Second governance signer: must equal the escrow's taker. The
     /// taker consents to retiring the dispute forum their escrow
+    /// settles under.
+    pub taker: Signer<'info>,
+}
+
+/// AV-432: accounts for `disable_price_gate` — the oracle-gate
+/// removal is dual-signed governance by the two parties; the
+/// oracle itself does not sign (a dead feed must not block the
+/// gate's own removal). The disable takes no instruction param
+/// — the fifth no-param disable_* item, after AV-428's
+/// `disable_social_recovery`, AV-429's `disable_dual_sig`,
+/// AV-430's `disable_pause_authority` and AV-431's
+/// `disable_arbiter`.
+#[derive(Accounts)]
+pub struct DisablePriceGate<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to retiring the market condition their escrow
     /// settles under.
     pub taker: Signer<'info>,
 }

@@ -1208,6 +1208,12 @@
       "args": []
     },
     {
+      "name": "disable_price_gate",
+      "discriminator": [238, 134, 207, 84, 251, 123, 72, 92],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
