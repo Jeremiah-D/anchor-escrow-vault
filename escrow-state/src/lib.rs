@@ -42358,6 +42358,20 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "no params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's unconditional dual-signature gate agrees — unlike the amend family's AV-276 gate, there is no plain-escrow initializer-alone shape here at all, paralleling rotate_arbiter, disable_social_recovery, disable_dual_sig, disable_pause_authority, disable_arbiter, disable_price_gate, disable_twap_gate, disable_credential_gate, disable_milestone_verifier, disable_deadman_switch and disable_dual_control); the hook program itself does not sign (a dead hook program with no successor must not block the binding's own removal, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed, resolve first — the dispute settles under the binding it started under); an escrow that never bound a hook — or already removed it — is a silent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); one-way only — with_transfer_hook stays Uninitialized-only, so the binding can never be re-installed after funding; rotate_transfer_hook refuses InvalidTransferHook (code 157) on the unbound escrow (fail-closed); after the disable a hook-free CPI plan builds (check_transfer_hook (None, None) is Ok) while a plan naming the old hook refuses SettlementMismatch, and plain release is unaffected (it never carried hook context), while a release already settled keeps the hook it settled under; only the escrow-side declaration clears — a Token-2022 hook the mint itself carries still runs on-chain under the mint's own configuration, so the disable restores the escrow's ability to build plans without changing mint policy; emits the TransferHookDisabled indexer event only on an actual change (a bound hook -> None, from == to == the current state); only the 33-byte hook region clears to None in place — no other field moves; no clock/sysvar input to the method; no layout / rent change",
         },
         InstructionSpec {
+            // AV-439: the plain attestor quorum policy removal —
+            // the program-level entry point for the AV-424 pure-logic
+            // removal. IDL: discriminator =
+            // sha256("global:disable_quorum")[..8]
+            // = [192, 75, 140, 108, 31, 112, 82, 24] — the Anchor
+            // instruction discriminator for the
+            // disable_quorum handler (pinned by the
+            // discriminator test below).
+            name: "disable_quorum",
+            params: &[],
+            method: "Escrow::disable_quorum",
+            input_mapping: "no params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's unconditional dual-signature gate agrees — unlike the amend family's AV-276 gate, there is no plain-escrow initializer-alone shape here at all, paralleling rotate_arbiter, disable_social_recovery, disable_dual_sig, disable_pause_authority, disable_arbiter, disable_price_gate, disable_twap_gate, disable_credential_gate, disable_milestone_verifier, disable_deadman_switch, disable_dual_control and disable_transfer_hook); the attestors themselves do not sign (a dark panel with no successor must not block the policy's own removal, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed, resolve first — the dispute settles under the policy it started under); a tiered-only escrow is InvalidQuorum (fail-closed — tiered is a different gate object, covered by its own disable item, AV-427 / AV-440); an escrow that never configured a plain policy — or already removed it — is a silent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); one-way only — with_quorum stays Uninitialized-only, so the policy can never be re-installed after funding; update_quorum / update_attestors refuse InvalidQuorum (code 104) on the unconfigured escrow (fail-closed); after the disable require_release_quorum's None arm passes through, so every taker release path needs no witness — exactly like a never-gated escrow — while attest refuses InvalidQuorum, and a release already settled keeps the quorum it settled under; the one departure from the other disable items is the delay routing — on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219) and the removal moves only through the propose/execute protocol (GovernanceAction::DisableQuorum, kind 19; executing before the delay elapses is GovernanceDelayNotElapsed, code 218, and the delayed path emits the generic GovernanceExecuted event); emits the QuorumDisabled indexer event only on an actual change (a configured policy -> None, from == to == the current state); only the QUORUM_POLICY_LEN-byte policy region clears to None in place — no other field moves; no clock/sysvar input to the method; no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43255,6 +43269,10 @@ pub(crate) mod anchor_idl_tests {
             // binding removal (the AV-419 pure-logic removal wired
             // to the chain).
             "Escrow::disable_transfer_hook",
+            // AV-439: the program-level plain attestor quorum policy
+            // removal (the AV-424 pure-logic removal wired to the
+            // chain).
+            "Escrow::disable_quorum",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -50541,6 +50559,439 @@ pub(crate) mod anchor_idl_tests {
         );
         assert_eq!(e.state(), EscrowState::Released);
         assert_eq!(e.transfer_hook(), None, "binding stays gone");
+    }
+
+    fn quorum_bound_escrow() -> Escrow {
+        // A Funded escrow with a live 2-of-3 plain attestor quorum
+        // policy: attestors [0xA1; 32] / [0xA2; 32] / [0xA3; 32],
+        // threshold 2, funded at 1_600_000_000.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(
+                QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 2)
+                    .unwrap(),
+            )
+            .unwrap();
+        e.fund(ALICE, 1_600_000_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.quorum().unwrap().threshold(), 2);
+        e
+    }
+
+    fn tiered_quorum() -> TieredQuorum {
+        let base =
+            QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 1).unwrap();
+        TieredQuorum::new(
+            base,
+            &[
+                Tier { max_amount: 1_000, threshold: 1 },
+                Tier { max_amount: u64::MAX, threshold: 3 },
+            ],
+        )
+        .unwrap()
+    }
+
+    fn delay_quorum_escrow() -> Escrow {
+        // A Funded quorum escrow that opted into the AV-158
+        // governance delay: direct quorum changes are refused and
+        // move only through propose/execute.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(
+                QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 2)
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_governance_delay(86_400)
+            .unwrap();
+        e.fund(ALICE, 1_700_000_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn disable_quorum_maps_to_quorum_field() {
+        // IDL: disable_quorum() — no params; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints, not the state machine — and the state
+        // machine's disable gate is unconditionally dual-signed
+        // too, so the program layer and the state machine agree
+        // exactly here (no plain-escrow initializer-alone shape
+        // exists for a removal, paralleling
+        // disable_social_recovery, disable_dual_sig,
+        // disable_pause_authority, disable_arbiter,
+        // disable_price_gate, disable_twap_gate,
+        // disable_credential_gate, disable_milestone_verifier,
+        // disable_deadman_switch, disable_dual_control and
+        // disable_transfer_hook). The attestors themselves do not
+        // sign. The disable clears the policy — no PARAM_FIELD_MAP
+        // entry (there is no param to map; the whole policy flips,
+        // not one field) — no layout change. The INSTRUCTIONS spec
+        // entry pins the program-level wiring: no params, the
+        // AV-424 pure-logic method, and the dual-signer input
+        // mapping.
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "disable_quorum")
+            .expect("INSTRUCTIONS carries disable_quorum");
+        assert_eq!(spec.method, "Escrow::disable_quorum");
+        assert!(spec.params.is_empty(), "disable takes no params");
+        assert!(
+            spec.input_mapping.contains("no params"),
+            "input_mapping documents the empty param list"
+        );
+        assert!(
+            spec.input_mapping.contains("QuorumDisabled"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and no args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"disable_quorum\""),
+            "checked-in IDL carries disable_quorum"
+        );
+        assert!(
+            idl.contains("[192, 75, 140, 108, 31, 112, 82, 24]"),
+            "checked-in IDL pins the AV-439 discriminator"
+        );
+        // The policy clears to None, the state stays Funded, the
+        // locked amount is untouched.
+        let mut e = quorum_bound_escrow();
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.fund_at(), FUND_AT);
+        e.disable_quorum(ALICE, BOB).unwrap();
+        assert_eq!(e.quorum(), None, "policy cleared");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        // After the disable the policy is gone for good: attesting,
+        // revising the threshold and swapping the electorate all
+        // refuse fail-closed with InvalidQuorum, and re-installing
+        // stays refused.
+        assert_eq!(
+            e.attest(ATTESTOR_1),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert_eq!(
+            e.update_quorum(ALICE, BOB, 1),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert_eq!(
+            e.update_attestors(ALICE, BOB, &[ATTESTOR_1, ATTESTOR_2], &[1, 1]),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert_eq!(EscrowError::InvalidQuorum.code(), 104);
+        assert_eq!(
+            e.with_quorum(
+                QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 2)
+                    .unwrap()
+            ),
+            Err(EscrowError::InvalidStateTransition),
+            "one-way: no post-funding re-installation"
+        );
+        assert_eq!(e.quorum(), None);
+        // And the point of the removal: a 2-of-3 gate blocked every
+        // taker release while the panel stood, and the disable
+        // unblocks it — the release needs no witness afterwards.
+        let mut gated = quorum_bound_escrow();
+        assert_eq!(
+            gated.release(ALICE, NOW, 1_000_000, None, BOB),
+            Err(EscrowError::QuorumNotReached)
+        );
+        assert_eq!(EscrowError::QuorumNotReached.code(), 105);
+        gated.disable_quorum(ALICE, BOB).unwrap();
+        let (payout, fee) = gated.release(ALICE, NOW, 1_000_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (1_000_000, 0));
+        assert_eq!(gated.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn disable_quorum_rejects_single_party_and_strangers() {
+        // AV-439: the quorum is a jointly owned release condition —
+        // one party alone dropping it would strip the other party's
+        // protection against an unwitnessed payout, so a stranger or
+        // a single party is Unauthorized and the failed call moves
+        // nothing; the attestors themselves do not sign, so a lost
+        // panel key cannot block the policy's own removal; the
+        // dual-signed call then lands.
+        let mut e = quorum_bound_escrow();
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_quorum(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.quorum().unwrap().threshold(),
+            2,
+            "rejected disable writes nothing"
+        );
+        e.disable_quorum(ALICE, BOB).unwrap();
+        assert_eq!(
+            e.quorum(),
+            None,
+            "dual-signed disable lands"
+        );
+    }
+
+    #[test]
+    fn disable_quorum_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-439: only a Funded escrow may remove its quorum policy
+        // — the policy is the release condition the taker funded
+        // under, so before funding the opt-in is still a builder
+        // decision that must not be silently dropped, and after
+        // funding the policy stays until the parties jointly retire
+        // it. The pause guard fires before the authority and state
+        // gates.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const PAUSER: [u8; 32] = [0xA6; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        // Uninitialized: the policy is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(
+                QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 2)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            bare.disable_quorum(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.quorum().unwrap().threshold(), 2);
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_quorum(
+                    QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 2)
+                        .unwrap(),
+                )
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.disable_quorum(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.quorum().unwrap().threshold(), 2);
+        // Disputed: the policy stays while the dispute is in
+        // flight — the dispute settles under the policy it started
+        // under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_quorum(
+                QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 2)
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        d.activate(ALICE).unwrap();
+        d.activate(BOB).unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.disable_quorum(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.quorum().unwrap().threshold(),
+            2,
+            "disputed disable writes nothing"
+        );
+        // Terminal: a cancelled escrow's policy is history, not a
+        // live configuration to remove.
+        let mut e = quorum_bound_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_quorum(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.quorum().unwrap().threshold(), 2);
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_quorum(
+                    QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3], &[1, 1, 1], 2)
+                        .unwrap(),
+                )
+                .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.disable_quorum(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.disable_quorum(MALLORY, BOB),
+            Err(EscrowError::Paused),
+            "even a stranger's disable on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.quorum().unwrap().threshold(),
+            2,
+            "paused disable writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.disable_quorum(ALICE, BOB).unwrap();
+        assert_eq!(paused.quorum(), None);
+    }
+
+    #[test]
+    fn disable_quorum_refuses_tiered_only_and_delay_opted_in_direct_call() {
+        // AV-439: two fail-closed departures from the plain removal.
+        // A tiered quorum is a different gate object on a separate
+        // field — the plain-slot removal must never silently discard
+        // its table (AV-427 / AV-440 cover the tiered removal). And
+        // quorum changes route through the AV-158 delayed-governance
+        // mechanism, so on a delay-opted-in escrow the direct call
+        // is refused and the removal moves only through
+        // propose/execute.
+        const NOW: u64 = 1_750_000_000;
+        // Tiered-only: refused, table intact, tier gate still governs.
+        let mut t = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_tiered_quorum(tiered_quorum())
+            .unwrap();
+        t.fund(ALICE, NOW - 150_000_000).unwrap();
+        assert_eq!(t.quorum(), None);
+        assert_eq!(
+            t.disable_quorum(ALICE, BOB),
+            Err(EscrowError::InvalidQuorum)
+        );
+        assert_eq!(EscrowError::InvalidQuorum.code(), 104);
+        assert!(
+            t.tiered_quorum().is_some(),
+            "tiered table untouched"
+        );
+        // The tier-1 threshold (weight 1 for amounts <= 1_000) still
+        // gates: no attestations, no release.
+        assert_eq!(
+            t.release(ALICE, NOW, 500, None, BOB),
+            Err(EscrowError::QuorumNotReached)
+        );
+        // And one attestation still satisfies tier 1, proving the
+        // table survived the refused removal intact.
+        t.attest(ATTESTOR_1).unwrap();
+        let (payout, fee) = t.release(ALICE, NOW, 500, None, BOB).unwrap();
+        assert_eq!((payout, fee), (500, 0));
+        assert_eq!(t.state(), EscrowState::Funded);
+        // Delay-opted-in: the direct call is refused and the policy
+        // is unchanged — the removal moves only through
+        // propose/execute (GovernanceAction::DisableQuorum, kind 19).
+        let mut delayed = delay_quorum_escrow();
+        assert_eq!(
+            delayed.disable_quorum(ALICE, BOB),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(EscrowError::GovernanceActionNotProposed.code(), 219);
+        assert_eq!(
+            delayed.quorum().unwrap().threshold(),
+            2,
+            "refused direct disable writes nothing"
+        );
+    }
+
+    #[test]
+    fn disable_quorum_noop_on_unbound_escrow() {
+        // AV-439: removing a policy that was never installed writes
+        // nothing — the `rotate_*` same-value no-op precedent.
+        // That covers both a plain escrow and a second disable
+        // after a successful first one.
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        plain.disable_quorum(ALICE, BOB).unwrap();
+        assert_eq!(plain.quorum(), None);
+        assert_eq!(plain.state(), EscrowState::Funded);
+        assert_eq!(plain.remaining_amount(), 1_000_000);
+        let mut bound = quorum_bound_escrow();
+        bound.disable_quorum(ALICE, BOB).unwrap();
+        assert_eq!(bound.quorum(), None);
+        bound.disable_quorum(ALICE, BOB).unwrap();
+        assert_eq!(
+            bound.quorum(),
+            None,
+            "second disable is a no-op"
+        );
+    }
+
+    #[test]
+    fn disable_quorum_handler_emits_only_on_actual_change() {
+        // AV-439: the program handler mirrors
+        // `IndexedEscrow::disable_quorum` — the event layer emits
+        // QuorumDisabled only on an actual change: a real disable
+        // emits, a no-op disable emits nothing, and a failed call
+        // emits nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const NOW: u64 = 1_700_000_000;
+        let mut indexed =
+            IndexedEscrow::wrap([0xE0; 32], quorum_bound_escrow());
+        let before = indexed.event_count();
+        assert_eq!(
+            indexed.disable_quorum(MALLORY, BOB, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            indexed.event_count(),
+            before,
+            "failed calls emit nothing"
+        );
+        indexed.disable_quorum(ALICE, BOB, NOW).unwrap();
+        assert_eq!(indexed.event_count(), before + 1);
+        let ev = indexed.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::QuorumDisabled);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        indexed.disable_quorum(ALICE, BOB, NOW + 10).unwrap();
+        assert_eq!(
+            indexed.event_count(),
+            before + 1,
+            "no-op second disable emits nothing"
+        );
+        let mut plain_ie = IndexedEscrow::wrap(
+            [0xE0; 32],
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap(),
+        );
+        plain_ie.fund(ALICE, 0).unwrap();
+        let _ = plain_ie.drain_events();
+        plain_ie.disable_quorum(ALICE, BOB, 42).unwrap();
+        assert_eq!(
+            plain_ie.event_count(),
+            0,
+            "never-configured disable emits nothing"
+        );
     }
 
     #[test]
@@ -83643,6 +84094,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("disable_transfer_hook"),
             [146, 172, 197, 98, 208, 4, 181, 42]
+        );
+    }
+
+    #[test]
+    fn disable_quorum_instruction_discriminator_is_pinned() {
+        // AV-439. IDL:
+        // sha256("global:disable_quorum")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("disable_quorum"),
+            [192, 75, 140, 108, 31, 112, 82, 24]
         );
     }
 

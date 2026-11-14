@@ -1250,6 +1250,12 @@
       "args": []
     },
     {
+      "name": "disable_quorum",
+      "discriminator": [192, 75, 140, 108, 31, 112, 82, 24],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
