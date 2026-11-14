@@ -1226,6 +1226,12 @@
       "args": []
     },
     {
+      "name": "disable_milestone_verifier",
+      "discriminator": [13, 37, 79, 239, 230, 171, 66, 214],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
