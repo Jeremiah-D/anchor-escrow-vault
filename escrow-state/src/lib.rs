@@ -42330,6 +42330,20 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "no params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's unconditional dual-signature gate agrees — unlike the amend family's AV-276 gate, there is no plain-escrow initializer-alone shape here at all, paralleling rotate_arbiter, disable_social_recovery, disable_dual_sig, disable_pause_authority, disable_arbiter, disable_price_gate, disable_twap_gate, disable_credential_gate and disable_milestone_verifier); the heir itself does not sign (a lost heir key must not block the switch's own removal, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed, resolve first — the dispute settles under the switch it started under); an escrow that never configured a switch — or already retired it — is a silent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); one-way only — with_deadman_switch stays Uninitialized-only, so the switch can never be re-installed after funding; rotate_deadman_heir and amend_deadman_inactivity refuse InvalidDeadmanConfig (code 168) on the unconfigured escrow (fail-closed); after the disable claim_deadman refuses InvalidDeadmanConfig (code 168, its existing never-configured gate) and an already-satisfied but unexecuted eligibility dies with the disable, while a claim already settled keeps the heir and threshold it settled under; emits the DeadmanSwitchDisabled indexer event only on an actual change (both legs clear together, from == to == the current state); both deadman_heir and deadman_inactivity_secs clear — deadman_last_activity is untouched (left as an audit trail); no clock/sysvar input to the method; the two switch regions are cleared in place — no layout / rent change",
         },
         InstructionSpec {
+            // AV-437: the dual-control release protocol removal — the
+            // program-level entry point for the AV-409 pure-logic
+            // removal. IDL: discriminator =
+            // sha256("global:disable_dual_control")[..8]
+            // = [160, 156, 92, 237, 153, 175, 224, 10] — the Anchor
+            // instruction discriminator for the
+            // disable_dual_control handler (pinned by the
+            // discriminator test below).
+            name: "disable_dual_control",
+            params: &[],
+            method: "Escrow::disable_dual_control",
+            input_mapping: "no params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's unconditional dual-signature gate agrees — unlike the amend family's AV-276 gate, there is no plain-escrow initializer-alone shape here at all, paralleling rotate_arbiter, disable_social_recovery, disable_dual_sig, disable_pause_authority, disable_arbiter, disable_price_gate, disable_twap_gate, disable_credential_gate, disable_milestone_verifier and disable_deadman_switch); the checker itself does not sign (a shut-down checker service with no successor must not block the protocol's own removal, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed, resolve first — the dispute settles under the protocol it started under); a live declaration blocks the disable (DualControlIntentExists, code 189 — confirm, cancel, or let it expire first); an escrow that never opted into dual control — or already retired it — is a silent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); one-way only — with_dual_control stays Uninitialized-only, so the protocol can never be re-installed after funding; rotate_dual_control_checker refuses InvalidDualControl (code 188) on the unconfigured escrow (fail-closed); after the disable a direct release settles again (the release_impl gate reads the live checker) while initiate_release refuses InvalidDualControl (code 188, its existing never-opted-in gate), and with no live intent confirm_release / cancel_release refuse as usual, while a release already settled keeps the checker it settled under; emits the DualControlDisabled indexer event only on an actual change (a configured checker -> None, from == to == the current state); only the 33-byte checker region clears to None in place — no other field moves; no clock/sysvar input to the method; no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43219,6 +43233,10 @@ pub(crate) mod anchor_idl_tests {
             // AV-436: the program-level dead-man's switch removal
             // (the AV-417 pure-logic removal wired to the chain).
             "Escrow::disable_deadman_switch",
+            // AV-437: the program-level dual-control release protocol
+            // removal (the AV-409 pure-logic removal wired to the
+            // chain).
+            "Escrow::disable_dual_control",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -49489,6 +49507,488 @@ pub(crate) mod anchor_idl_tests {
         live.disable_deadman_switch(ALICE, BOB).unwrap();
         assert_eq!(live.deadman_heir(), None);
         assert_eq!(live.deadman_inactivity_secs(), 0);
+    }
+
+    fn dual_control_configured_escrow() -> Escrow {
+        // A Funded escrow with a live dual-control protocol: checker
+        // [0xC0; 32], funded at 1_600_000_000.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_control([0xC0; 32])
+            .unwrap();
+        e.fund(ALICE, 1_600_000_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.dual_control_checker(), Some([0xC0; 32]));
+        e
+    }
+
+    #[test]
+    fn disable_dual_control_maps_to_dual_control_fields() {
+        // IDL: disable_dual_control() — no params; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints, not the state machine — and the state
+        // machine's disable gate is unconditionally dual-signed
+        // too, so the program layer and the state machine agree
+        // exactly here (no plain-escrow initializer-alone shape
+        // exists for a removal, paralleling
+        // disable_social_recovery, disable_dual_sig,
+        // disable_pause_authority, disable_arbiter,
+        // disable_price_gate, disable_twap_gate,
+        // disable_credential_gate, disable_milestone_verifier and
+        // disable_deadman_switch). The checker itself does not
+        // sign. The disable clears the checker key — no
+        // PARAM_FIELD_MAP entry (there is no param to map; the
+        // whole protocol flips, not one field) — no layout
+        // change. The INSTRUCTIONS spec entry pins the
+        // program-level wiring: no params, the AV-409 pure-logic
+        // method, and the dual-signer input mapping.
+        const CHECKER: [u8; 32] = [0xC0; 32];
+        const NEW_CHECKER: [u8; 32] = [0xC1; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "disable_dual_control")
+            .expect("INSTRUCTIONS carries disable_dual_control");
+        assert_eq!(spec.method, "Escrow::disable_dual_control");
+        assert!(spec.params.is_empty(), "disable takes no params");
+        assert!(
+            spec.input_mapping.contains("no params"),
+            "input_mapping documents the empty param list"
+        );
+        assert!(
+            spec.input_mapping.contains("DualControlDisabled"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and no args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"disable_dual_control\""),
+            "checked-in IDL carries disable_dual_control"
+        );
+        assert!(
+            idl.contains("[160, 156, 92, 237, 153, 175, 224, 10]"),
+            "checked-in IDL pins the AV-437 discriminator"
+        );
+        // The checker clears to None, the state stays Funded, the
+        // locked amount is untouched.
+        let mut e = dual_control_configured_escrow();
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.fund_at(), FUND_AT);
+        e.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(e.dual_control_checker(), None, "checker cleared");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        // After the disable the protocol is gone for good: rotating
+        // the checker refuses fail-closed with InvalidDualControl,
+        // exactly like a never-opted-in escrow — and re-installing
+        // stays refused.
+        assert_eq!(
+            e.rotate_dual_control_checker(ALICE, BOB, NEW_CHECKER),
+            Err(EscrowError::InvalidDualControl)
+        );
+        assert_eq!(EscrowError::InvalidDualControl.code(), 188);
+        assert_eq!(
+            e.with_dual_control(CHECKER),
+            Err(EscrowError::InvalidStateTransition),
+            "one-way: no post-funding re-installation"
+        );
+        assert_eq!(e.dual_control_checker(), None);
+    }
+
+    #[test]
+    fn disable_dual_control_rejects_single_party_and_strangers() {
+        // AV-437: the checker is jointly owned release-approval
+        // power — one party alone removing it would strip the other
+        // party's maker counter-signature, so a stranger or a single
+        // party is Unauthorized and the failed call moves nothing; the
+        // checker itself does not sign, so a lost checker key cannot
+        // block the protocol's own removal; the dual-signed call then
+        // lands.
+        const CHECKER: [u8; 32] = [0xC0; 32];
+        let mut e = dual_control_configured_escrow();
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_dual_control(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.dual_control_checker(),
+            Some(CHECKER),
+            "rejected disable writes nothing"
+        );
+        e.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(
+            e.dual_control_checker(),
+            None,
+            "dual-signed disable lands"
+        );
+    }
+
+    #[test]
+    fn disable_dual_control_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-437: only a Funded escrow may retire its release
+        // protocol — the protocol is the maker-checker approval the
+        // taker funded under, so before funding the opt-in is still a
+        // builder decision that must not be silently dropped, and
+        // after funding the protocol stays until the parties jointly
+        // retire it. The pause guard fires before the authority and
+        // state gates.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const PAUSER: [u8; 32] = [0xA6; 32];
+        const CHECKER: [u8; 32] = [0xC0; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        // Uninitialized: the protocol is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_control(CHECKER)
+            .unwrap();
+        assert_eq!(
+            bare.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.dual_control_checker(), Some(CHECKER));
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_dual_control(CHECKER)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.dual_control_checker(), Some(CHECKER));
+        // Disputed: the maker-checker approval stays while the
+        // dispute is in flight — the dispute settles under the
+        // protocol it started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_dual_control(CHECKER)
+            .unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.dual_control_checker(),
+            Some(CHECKER),
+            "disputed disable writes nothing"
+        );
+        // Terminal: a cancelled escrow's protocol is history, not a
+        // live release path to retire.
+        let mut e = dual_control_configured_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.dual_control_checker(), Some(CHECKER));
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_dual_control(CHECKER)
+                .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.disable_dual_control(MALLORY, BOB),
+            Err(EscrowError::Paused),
+            "even a stranger's disable on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.dual_control_checker(),
+            Some(CHECKER),
+            "paused disable writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(paused.dual_control_checker(), None);
+    }
+
+    #[test]
+    fn disable_dual_control_noop_on_unconfigured_escrow() {
+        // AV-437: removing a protocol that was never installed writes
+        // nothing — the `rotate_*` same-value no-op precedent.
+        // That covers both a plain escrow and a second disable
+        // after a successful first one.
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut plain =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        plain.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(plain.dual_control_checker(), None);
+        assert_eq!(plain.state(), EscrowState::Funded);
+        assert_eq!(plain.remaining_amount(), 1_000_000);
+        let mut configured = dual_control_configured_escrow();
+        configured.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(configured.dual_control_checker(), None);
+        configured.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(
+            configured.dual_control_checker(),
+            None,
+            "second disable is a no-op"
+        );
+    }
+
+    #[test]
+    fn disable_dual_control_handler_emits_only_on_actual_change() {
+        // AV-437: the program handler mirrors
+        // `IndexedEscrow::disable_dual_control` — the event layer emits
+        // DualControlDisabled only on an actual change: a real disable
+        // emits, a no-op disable emits nothing, and a failed call
+        // emits nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const NOW: u64 = 1_700_000_000;
+        let mut indexed =
+            IndexedEscrow::wrap([0xE0; 32], dual_control_configured_escrow());
+        let before = indexed.event_count();
+        assert_eq!(
+            indexed.disable_dual_control(MALLORY, BOB, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            indexed.event_count(),
+            before,
+            "failed calls emit nothing"
+        );
+        indexed.disable_dual_control(ALICE, BOB, NOW).unwrap();
+        assert_eq!(indexed.event_count(), before + 1);
+        let ev = indexed.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::DualControlDisabled);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        indexed.disable_dual_control(ALICE, BOB, NOW + 10).unwrap();
+        assert_eq!(
+            indexed.event_count(),
+            before + 1,
+            "no-op second disable emits nothing"
+        );
+        let mut plain_ie = IndexedEscrow::wrap(
+            [0xE0; 32],
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap(),
+        );
+        plain_ie.fund(ALICE, 0).unwrap();
+        let _ = plain_ie.drain_events();
+        plain_ie.disable_dual_control(ALICE, BOB, 42).unwrap();
+        assert_eq!(
+            plain_ie.event_count(),
+            0,
+            "never-opted-in disable emits nothing"
+        );
+    }
+
+    #[test]
+    fn disable_dual_control_is_one_way() {
+        // AV-437: one-way only — `with_dual_control` stays
+        // Uninitialized-only, so a post-funding re-installation is
+        // refused and the protocol stays gone; rotation stays
+        // fail-closed on the unconfigured escrow.
+        const CHECKER: [u8; 32] = [0xC0; 32];
+        const NEW_CHECKER: [u8; 32] = [0xC1; 32];
+        let mut e = dual_control_configured_escrow();
+        e.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(e.dual_control_checker(), None);
+        assert_eq!(
+            e.with_dual_control(CHECKER),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.rotate_dual_control_checker(ALICE, BOB, NEW_CHECKER),
+            Err(EscrowError::InvalidDualControl),
+            "rotation stays fail-closed on the unconfigured escrow"
+        );
+        assert_eq!(e.dual_control_checker(), None);
+    }
+
+    #[test]
+    fn disable_dual_control_live_intent_blocks_until_settled_or_expired() {
+        // AV-437: a live declaration pins the protocol — removing it
+        // now would hand an unseen declaration to a checker who never
+        // saw it. Confirm, cancel, or let it expire first; each path
+        // unpins the protocol and the disable then lands. The event
+        // layer agrees: a blocked disable emits nothing.
+        use crate::events::IndexedEscrow;
+        const CHECKER: [u8; 32] = [0xC0; 32];
+        const NOW: u64 = 1_750_000_000;
+        const TTL: u64 = 3_600;
+        // Confirm settles the declaration, then the disable lands.
+        let mut e = dual_control_configured_escrow();
+        e.initiate_release(ALICE, NOW, 400_000, None, BOB, TTL)
+            .unwrap();
+        assert!(e.dual_control_intent().is_some());
+        assert_eq!(
+            e.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::DualControlIntentExists)
+        );
+        assert_eq!(EscrowError::DualControlIntentExists.code(), 189);
+        assert_eq!(
+            e.dual_control_checker(),
+            Some(CHECKER),
+            "blocked disable writes nothing"
+        );
+        let (payout, _) = e.confirm_release(CHECKER, NOW + 100).unwrap();
+        assert_eq!(payout, 400_000);
+        assert_eq!(e.dual_control_intent(), None);
+        e.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(e.dual_control_checker(), None);
+        assert_eq!(e.released_amount(), 400_000);
+        // Cancel unpins too.
+        let mut c = dual_control_configured_escrow();
+        c.initiate_release(ALICE, NOW, 400_000, None, BOB, TTL)
+            .unwrap();
+        assert_eq!(
+            c.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::DualControlIntentExists)
+        );
+        c.cancel_release(ALICE, NOW + 100).unwrap();
+        assert_eq!(c.dual_control_intent(), None);
+        c.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(c.dual_control_checker(), None);
+        // Expiry unpins too: confirming at the deadline clears the
+        // stale declaration (`now == intent_expires_at` is already
+        // expired), and the disable then lands.
+        let mut x = dual_control_configured_escrow();
+        x.initiate_release(ALICE, NOW, 400_000, None, BOB, TTL)
+            .unwrap();
+        assert_eq!(
+            x.confirm_release(CHECKER, NOW + TTL),
+            Err(EscrowError::DualControlExpired)
+        );
+        assert_eq!(x.dual_control_intent(), None);
+        x.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(x.dual_control_checker(), None);
+        // The event layer agrees: a blocked disable emits nothing.
+        let mut indexed =
+            IndexedEscrow::wrap([0xE0; 32], dual_control_configured_escrow());
+        indexed
+            .initiate_release(ALICE, NOW, None, BOB, 400_000, TTL)
+            .unwrap();
+        let before = indexed.event_count();
+        assert_eq!(
+            indexed.disable_dual_control(ALICE, BOB, NOW),
+            Err(EscrowError::DualControlIntentExists)
+        );
+        assert_eq!(
+            indexed.event_count(),
+            before,
+            "blocked disable emits nothing"
+        );
+    }
+
+    #[test]
+    fn disable_dual_control_disputed_refuses_and_settled_keeps_checker() {
+        // AV-437: never remove the maker-checker approval
+        // mid-dispute — the disable refuses while Disputed, and the
+        // dispute still settles under the protocol it started under.
+        // Note the settled dispute keeps its checker: once `resolve`
+        // lands the escrow is `Settled` (terminal), so a disable
+        // after the settlement refuses with
+        // InvalidStateTransition — the protocol-removal path stays
+        // live only for live escrows, as a fresh funded escrow below
+        // shows. (There is no Disputed -> Funded path: `resolve`
+        // always settles, so "resolve then disable" cannot succeed
+        // on the same escrow.)
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const CHECKER: [u8; 32] = [0xC0; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_dual_control(CHECKER)
+            .unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.dual_control_checker(),
+            Some(CHECKER),
+            "disputed disable writes nothing"
+        );
+        d.resolve(ARBITER, 600_000, EXPIRES_AT - 1, None, None, BOB)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Settled);
+        assert_eq!(
+            d.disable_dual_control(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition),
+            "settled dispute keeps its checker"
+        );
+        // A live funded escrow still retires its protocol normally.
+        let mut live = dual_control_configured_escrow();
+        live.disable_dual_control(ALICE, BOB).unwrap();
+        assert_eq!(live.dual_control_checker(), None);
+    }
+
+    #[test]
+    fn disable_dual_control_restores_direct_release_and_blocks_initiate() {
+        // AV-437: once the protocol is gone, a direct release
+        // settles again while the two-step entry points refuse
+        // with their existing never-opted-in gate.
+        const CHECKER: [u8; 32] = [0xC0; 32];
+        const NOW: u64 = 1_750_000_000;
+        const TTL: u64 = 3_600;
+        let mut e = dual_control_configured_escrow();
+        e.disable_dual_control(ALICE, BOB).unwrap();
+        let (payout, fee) = e.release(ALICE, NOW, 400_000, None, BOB).unwrap();
+        assert_eq!(payout, 400_000);
+        assert_eq!(fee, 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            e.initiate_release(ALICE, NOW, 100_000, None, BOB, TTL),
+            Err(EscrowError::InvalidDualControl)
+        );
+        assert_eq!(EscrowError::InvalidDualControl.code(), 188);
+        assert_eq!(
+            e.confirm_release(CHECKER, NOW),
+            Err(EscrowError::InvalidDualControl)
+        );
+        assert_eq!(
+            e.cancel_release(ALICE, NOW),
+            Err(EscrowError::InvalidDualControl)
+        );
     }
 
     #[test]
@@ -82567,6 +83067,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("disable_deadman_switch"),
             [255, 20, 228, 12, 175, 149, 125, 241]
+        );
+    }
+
+    #[test]
+    fn disable_dual_control_instruction_discriminator_is_pinned() {
+        // AV-437. IDL:
+        // sha256("global:disable_dual_control")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("disable_dual_control"),
+            [160, 156, 92, 237, 153, 175, 224, 10]
         );
     }
 
