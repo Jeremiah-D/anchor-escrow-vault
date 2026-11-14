@@ -3156,6 +3156,79 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Disable the dead-man's switch by dual-signed governance (AV-436;
+    /// mirrors `Escrow::disable_deadman_switch`). Both the initializer and
+    /// the taker must sign at the program layer — the Anchor accounts
+    /// require both signers, so the on-chain call is dual-signed
+    /// either way (the state machine's unconditional dual-signature
+    /// gate agrees — unlike the amend family's AV-276 conditional
+    /// gate, there is no plain-escrow initializer-alone shape here
+    /// at all, paralleling rotate_arbiter and
+    /// disable_social_recovery / disable_dual_sig /
+    /// disable_pause_authority / disable_arbiter /
+    /// disable_price_gate / disable_twap_gate /
+    /// disable_credential_gate / disable_milestone_verifier). The heir
+    /// itself does not sign — a lost heir key must not block the
+    /// switch's own removal. Only `Funded`:
+    /// `Uninitialized`, `Activated`, the terminal states and
+    /// `Disputed` are `InvalidStateTransition` (resolve first —
+    /// the dispute settles under the switch it started under). An
+    /// escrow that never configured a switch — or already retired
+    /// it — is a silent no-op success that writes nothing and emits
+    /// nothing. One-way only: there is no post-funding
+    /// re-installation (`with_deadman_switch` stays
+    /// `Uninitialized`-only, and `rotate_deadman_heir` /
+    /// `amend_deadman_inactivity` refuse `InvalidDeadmanConfig`
+    /// on the unconfigured escrow, fail-closed). After the disable,
+    /// `claim_deadman` refuses `InvalidDeadmanConfig` (code 168,
+    /// its existing never-configured gate) — and an already-satisfied
+    /// but unexecuted eligibility dies with the disable, so the same
+    /// heir at the same clock no longer claims, while a claim
+    /// already settled keeps the heir and threshold it settled
+    /// under. A paused escrow fails fast (`Paused`). Both legs clear
+    /// together in place — `deadman_heir` to `None` and
+    /// `deadman_inactivity_secs` to `0` — while
+    /// `deadman_last_activity` is untouched, left as an audit trail;
+    /// no layout change, no rent change. Emits
+    /// `DeadmanSwitchDisabled` only on an actual change (a
+    /// configured switch -> unconfigured, from == to == the
+    /// current state), mirroring
+    /// `IndexedEscrow::disable_deadman_switch`.
+    pub fn disable_deadman_switch(ctx: Context<DisableDeadmanSwitch>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.is_deadman_configured();
+        escrow
+            .disable_deadman_switch(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Clears both legs together in place in the real build
+        // (the heir and threshold regions are already resident) — no
+        // realloc, no rent change. `deadman_last_activity` is left
+        // untouched as an audit trail.
+        if before && !escrow.is_deadman_configured() {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::DeadmanSwitchDisabled,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Rotate the live operator grant's delegate key (AV-388; mirrors
     /// `Escrow::rotate_delegation_delegate` — the AV-301 pure-logic
     /// rotation). Either party may rotate — the initializer or the
@@ -9959,6 +10032,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::disable_milestone_verifier`). Mirrors
     /// `escrow_state::EscrowEventKind::MilestoneVerifierDisabled`.
     MilestoneVerifierDisabled,
+    /// AV-436: the dead-man's switch was removed by dual-signed
+    /// governance (`Escrow::disable_deadman_switch`). Mirrors
+    /// `escrow_state::EscrowEventKind::DeadmanSwitchDisabled`.
+    DeadmanSwitchDisabled,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -10208,6 +10285,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::MilestoneVerifierDisabled => {
             EscrowVaultEventKind::MilestoneVerifierDisabled
+        }
+        escrow_state::EscrowEventKind::DeadmanSwitchDisabled => {
+            EscrowVaultEventKind::DeadmanSwitchDisabled
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -11608,6 +11688,30 @@ pub struct DisableMilestoneVerifier<'info> {
     /// Second governance signer: must equal the escrow's taker. The
     /// taker consents to retiring the third-party attestation
     /// requirement their milestone releases settle under.
+    pub taker: Signer<'info>,
+}
+
+/// AV-436: accounts for `disable_deadman_switch` — the dead-man's switch
+/// removal is dual-signed governance by the two parties; the
+/// heir itself does not sign (a lost heir key must not block the
+/// switch's own removal). The disable takes no instruction param —
+/// the ninth no-param disable_* item, after AV-428's
+/// `disable_social_recovery`, AV-429's `disable_dual_sig`, AV-430's
+/// `disable_pause_authority`, AV-431's `disable_arbiter`, AV-432's
+/// `disable_price_gate`, AV-433's `disable_twap_gate`, AV-434's
+/// `disable_credential_gate` and AV-435's
+/// `disable_milestone_verifier`.
+#[derive(Accounts)]
+pub struct DisableDeadmanSwitch<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to retiring the inactivity recovery their
+    /// escrow settles under.
     pub taker: Signer<'info>,
 }
 

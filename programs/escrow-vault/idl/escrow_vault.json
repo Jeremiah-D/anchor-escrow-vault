@@ -1232,6 +1232,12 @@
       "args": []
     },
     {
+      "name": "disable_deadman_switch",
+      "discriminator": [255, 20, 228, 12, 175, 149, 125, 241],
+      "accounts": [],
+      "args": []
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

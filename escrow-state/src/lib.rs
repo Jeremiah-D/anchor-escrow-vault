@@ -42316,6 +42316,20 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "no params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's unconditional dual-signature gate agrees — unlike the amend family's AV-276 gate, there is no plain-escrow initializer-alone shape here at all, paralleling rotate_arbiter, disable_social_recovery, disable_dual_sig, disable_pause_authority, disable_arbiter, disable_price_gate, disable_twap_gate and disable_credential_gate); the milestone verifier itself does not sign (a shut-down verifier service must not block the gate's own removal, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed, resolve first — the dispute settles under the gate it started under); an escrow that never bound a gate — or already retired it — is a silent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); one-way only — with_milestone_verifier stays Uninitialized-only, so the gate can never be re-installed after funding, and there is no amend_milestone_verifier family to fail closed against; after the disable a plain release_milestone settles again (the release_milestone_inner gate reads the live verifier) while release_milestone_verified refuses MilestoneVerifierNotBound (code 325), and an attestation signed by the old verifier stops verifying the moment the gate is removed; emits the MilestoneVerifierDisabled indexer event only on an actual change (a non-zero verifier -> the zero key, from == to == the current state); only milestone_verifier flips to the zero key — no other field moves; no clock/sysvar input to the method; the 32-byte verifier region is cleared in place — no layout / rent change",
         },
         InstructionSpec {
+            // AV-436: the dead-man's switch removal — the
+            // program-level entry point for the AV-417 pure-logic
+            // removal. IDL: discriminator =
+            // sha256("global:disable_deadman_switch")[..8]
+            // = [255, 20, 228, 12, 175, 149, 125, 241] — the Anchor
+            // instruction discriminator for the
+            // disable_deadman_switch handler (pinned by the
+            // discriminator test below).
+            name: "disable_deadman_switch",
+            params: &[],
+            method: "Escrow::disable_deadman_switch",
+            input_mapping: "no params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's unconditional dual-signature gate agrees — unlike the amend family's AV-276 gate, there is no plain-escrow initializer-alone shape here at all, paralleling rotate_arbiter, disable_social_recovery, disable_dual_sig, disable_pause_authority, disable_arbiter, disable_price_gate, disable_twap_gate, disable_credential_gate and disable_milestone_verifier); the heir itself does not sign (a lost heir key must not block the switch's own removal, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed, resolve first — the dispute settles under the switch it started under); an escrow that never configured a switch — or already retired it — is a silent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); one-way only — with_deadman_switch stays Uninitialized-only, so the switch can never be re-installed after funding; rotate_deadman_heir and amend_deadman_inactivity refuse InvalidDeadmanConfig (code 168) on the unconfigured escrow (fail-closed); after the disable claim_deadman refuses InvalidDeadmanConfig (code 168, its existing never-configured gate) and an already-satisfied but unexecuted eligibility dies with the disable, while a claim already settled keeps the heir and threshold it settled under; emits the DeadmanSwitchDisabled indexer event only on an actual change (both legs clear together, from == to == the current state); both deadman_heir and deadman_inactivity_secs clear — deadman_last_activity is untouched (left as an audit trail); no clock/sysvar input to the method; the two switch regions are cleared in place — no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43202,6 +43216,9 @@ pub(crate) mod anchor_idl_tests {
             // AV-435: the program-level milestone-verifier removal
             // (the AV-411 pure-logic removal wired to the chain).
             "Escrow::disable_milestone_verifier",
+            // AV-436: the program-level dead-man's switch removal
+            // (the AV-417 pure-logic removal wired to the chain).
+            "Escrow::disable_deadman_switch",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -49029,6 +49046,449 @@ pub(crate) mod anchor_idl_tests {
         let mut live = milestone_verified_escrow();
         live.disable_milestone_verifier(ALICE, BOB).unwrap();
         assert_eq!(live.milestone_verifier(), [0u8; 32]);
+    }
+
+    fn deadman_configured_escrow() -> Escrow {
+        // A Funded escrow with a live dead-man's switch: threshold
+        // 3_600 seconds, heir [0xEE; 32], funded at 1_600_000_000
+        // (the activity clock anchors at funding time, so the
+        // switch is claimable at 1_600_003_600).
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_deadman_switch(3_600, [0xEE; 32])
+            .unwrap();
+        e.fund(ALICE, 1_600_000_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert!(e.is_deadman_configured());
+        e
+    }
+
+    #[test]
+    fn disable_deadman_switch_maps_to_deadman_fields() {
+        // IDL: disable_deadman_switch() — no params; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints, not the state machine — and the state
+        // machine's disable gate is unconditionally dual-signed
+        // too, so the program layer and the state machine agree
+        // exactly here (no plain-escrow initializer-alone shape
+        // exists for a removal, paralleling
+        // disable_social_recovery, disable_dual_sig,
+        // disable_pause_authority, disable_arbiter,
+        // disable_price_gate, disable_twap_gate,
+        // disable_credential_gate and
+        // disable_milestone_verifier). The heir itself does not
+        // sign. The disable clears both legs together — no
+        // PARAM_FIELD_MAP entry (there is no param to map; the
+        // whole switch flips, not one field) — no layout
+        // change. The INSTRUCTIONS spec entry pins the
+        // program-level wiring: no params, the AV-417 pure-logic
+        // method, and the dual-signer input mapping.
+        const HEIR: [u8; 32] = [0xEE; 32];
+        const NEW_HEIR: [u8; 32] = [0xE1; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "disable_deadman_switch")
+            .expect("INSTRUCTIONS carries disable_deadman_switch");
+        assert_eq!(spec.method, "Escrow::disable_deadman_switch");
+        assert!(spec.params.is_empty(), "disable takes no params");
+        assert!(
+            spec.input_mapping.contains("no params"),
+            "input_mapping documents the empty param list"
+        );
+        assert!(
+            spec.input_mapping.contains("DeadmanSwitchDisabled"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and no args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"disable_deadman_switch\""),
+            "checked-in IDL carries disable_deadman_switch"
+        );
+        assert!(
+            idl.contains("[255, 20, 228, 12, 175, 149, 125, 241]"),
+            "checked-in IDL pins the AV-436 discriminator"
+        );
+        // Both legs clear together: the heir drops to None and the
+        // threshold to zero, the state stays Funded, the locked
+        // amount is untouched — and the activity clock is left
+        // alone as an audit trail.
+        let mut e = deadman_configured_escrow();
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.deadman_last_activity(), FUND_AT);
+        e.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert_eq!(e.deadman_heir(), None, "heir leg cleared");
+        assert_eq!(
+            e.deadman_inactivity_secs(),
+            0,
+            "threshold leg cleared"
+        );
+        assert!(!e.is_deadman_configured());
+        assert_eq!(
+            e.deadman_last_activity(),
+            FUND_AT,
+            "clock untouched"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        // After the disable the switch is gone for good: rotating
+        // the heir or revising the threshold refuses fail-closed
+        // with InvalidDeadmanConfig, exactly like a
+        // never-configured escrow — and re-installing stays refused.
+        assert_eq!(
+            e.rotate_deadman_heir(ALICE, BOB, NEW_HEIR),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert_eq!(EscrowError::InvalidDeadmanConfig.code(), 168);
+        assert_eq!(
+            e.amend_deadman_inactivity(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert_eq!(
+            e.with_deadman_switch(3_600, HEIR),
+            Err(EscrowError::InvalidStateTransition),
+            "one-way: no post-funding re-installation"
+        );
+        assert_eq!(e.deadman_heir(), None);
+        assert_eq!(e.deadman_inactivity_secs(), 0);
+    }
+
+    #[test]
+    fn disable_deadman_switch_rejects_single_party_and_strangers() {
+        // AV-436: the switch is jointly owned recovery power — one
+        // party alone removing it would strip the other party's
+        // inactivity fallback, so a stranger or a single party is
+        // Unauthorized and the failed call moves nothing; the heir
+        // itself does not sign, so a lost heir key cannot block
+        // the switch's own removal; the dual-signed call then lands.
+        const HEIR: [u8; 32] = [0xEE; 32];
+        let mut e = deadman_configured_escrow();
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_deadman_switch(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.deadman_heir(),
+            Some(HEIR),
+            "rejected disable writes nothing"
+        );
+        assert_eq!(e.deadman_inactivity_secs(), 3_600);
+        e.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert_eq!(
+            e.deadman_heir(),
+            None,
+            "dual-signed disable lands"
+        );
+        assert_eq!(e.deadman_inactivity_secs(), 0);
+    }
+
+    #[test]
+    fn disable_deadman_switch_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-436: only a Funded escrow may retire its switch — the
+        // switch is the inactivity recovery the taker funded
+        // under, so before funding the binding is still a builder
+        // decision that must not be silently dropped, and after
+        // funding the switch stays until the parties jointly retire
+        // it. The pause guard fires before the authority and state
+        // gates.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const HEIR: [u8; 32] = [0xEE; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        // Uninitialized: the switch is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_deadman_switch(3_600, HEIR)
+            .unwrap();
+        assert_eq!(
+            bare.disable_deadman_switch(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.deadman_heir(), Some(HEIR));
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_deadman_switch(3_600, HEIR)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.disable_deadman_switch(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.deadman_heir(), Some(HEIR));
+        // Disputed: the inactivity recovery stays while the
+        // dispute is in flight — the dispute settles under the
+        // switch it started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_deadman_switch(3_600, HEIR)
+            .unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.disable_deadman_switch(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.deadman_heir(),
+            Some(HEIR),
+            "disputed disable writes nothing"
+        );
+        // Terminal: a cancelled escrow's switch is history, not a
+        // live recovery path to retire.
+        let mut e = deadman_configured_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_deadman_switch(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.deadman_heir(), Some(HEIR));
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_deadman_switch(3_600, HEIR)
+                .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.disable_deadman_switch(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.disable_deadman_switch(MALLORY, BOB),
+            Err(EscrowError::Paused),
+            "even a stranger's disable on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.deadman_heir(),
+            Some(HEIR),
+            "paused disable writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert_eq!(paused.deadman_heir(), None);
+    }
+
+    #[test]
+    fn disable_deadman_switch_noop_on_unconfigured_escrow() {
+        // AV-436: removing a switch that was never installed writes
+        // nothing — the `rotate_*` same-value no-op precedent.
+        // That covers both a plain escrow and a second disable
+        // after a successful first one.
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut plain =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        plain.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert!(!plain.is_deadman_configured());
+        assert_eq!(plain.state(), EscrowState::Funded);
+        assert_eq!(plain.remaining_amount(), 1_000_000);
+        let mut configured = deadman_configured_escrow();
+        configured.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert_eq!(configured.deadman_heir(), None);
+        configured.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert_eq!(
+            configured.deadman_heir(),
+            None,
+            "second disable is a no-op"
+        );
+        assert_eq!(configured.deadman_inactivity_secs(), 0);
+    }
+
+    #[test]
+    fn disable_deadman_switch_handler_emits_only_on_actual_change() {
+        // AV-436: the program handler mirrors
+        // `IndexedEscrow::disable_deadman_switch` — the event layer emits
+        // DeadmanSwitchDisabled only on an actual change: a real disable
+        // emits, a no-op disable emits nothing, and a failed call
+        // emits nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const NOW: u64 = 1_700_000_000;
+        let mut indexed =
+            IndexedEscrow::wrap([0xE0; 32], deadman_configured_escrow());
+        let before = indexed.event_count();
+        assert_eq!(
+            indexed.disable_deadman_switch(MALLORY, BOB, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            indexed.event_count(),
+            before,
+            "failed calls emit nothing"
+        );
+        indexed.disable_deadman_switch(ALICE, BOB, NOW).unwrap();
+        assert_eq!(indexed.event_count(), before + 1);
+        let ev = indexed.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::DeadmanSwitchDisabled);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        indexed.disable_deadman_switch(ALICE, BOB, NOW + 10).unwrap();
+        assert_eq!(
+            indexed.event_count(),
+            before + 1,
+            "no-op second disable emits nothing"
+        );
+        let mut plain_ie = IndexedEscrow::wrap(
+            [0xE0; 32],
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap(),
+        );
+        plain_ie.fund(ALICE, 0).unwrap();
+        let _ = plain_ie.drain_events();
+        plain_ie.disable_deadman_switch(ALICE, BOB, 42).unwrap();
+        assert_eq!(
+            plain_ie.event_count(),
+            0,
+            "never-configured disable emits nothing"
+        );
+    }
+
+    #[test]
+    fn disable_deadman_switch_is_one_way() {
+        // AV-436: one-way only — `with_deadman_switch` stays
+        // Uninitialized-only, so a post-funding re-installation is
+        // refused and the switch stays gone; rotate and amend stay
+        // fail-closed on the unconfigured escrow.
+        const HEIR: [u8; 32] = [0xEE; 32];
+        const NEW_HEIR: [u8; 32] = [0xE1; 32];
+        let mut e = deadman_configured_escrow();
+        e.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert_eq!(e.deadman_heir(), None);
+        assert_eq!(
+            e.with_deadman_switch(3_600, HEIR),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.rotate_deadman_heir(ALICE, BOB, NEW_HEIR),
+            Err(EscrowError::InvalidDeadmanConfig),
+            "rotation stays fail-closed on the unconfigured escrow"
+        );
+        assert_eq!(
+            e.amend_deadman_inactivity(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert_eq!(
+            e.deadman_heir(),
+            None,
+            "refused re-installation writes nothing"
+        );
+        assert_eq!(e.deadman_inactivity_secs(), 0);
+    }
+
+    #[test]
+    fn disable_deadman_switch_claim_refuses_after_disable() {
+        // AV-436: the disable is the escape hatch for a switch
+        // whose heir can no longer be trusted — or whose key is
+        // lost. Before the disable the heir claims once the
+        // threshold elapses; after the disable the same heir at
+        // the same clock is refused with InvalidDeadmanConfig —
+        // an already-satisfied but unexecuted eligibility dies
+        // with the switch, while a claim already settled keeps
+        // the heir and threshold it settled under.
+        const HEIR: [u8; 32] = [0xEE; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        const CLAIM_AT: u64 = FUND_AT + 3_600; // exactly elapsed
+        // Contrast: the configured switch claims at the threshold.
+        let mut e = deadman_configured_escrow();
+        assert!(e.is_deadman_eligible(CLAIM_AT));
+        let payout = e.claim_deadman(HEIR, CLAIM_AT).unwrap();
+        assert_eq!(payout, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        // After the disable the same heir at the same clock is
+        // refused — the eligibility died with the switch.
+        let mut d = deadman_configured_escrow();
+        assert!(d.is_deadman_eligible(CLAIM_AT));
+        d.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert!(!d.is_deadman_eligible(CLAIM_AT));
+        assert_eq!(
+            d.claim_deadman(HEIR, CLAIM_AT),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert_eq!(EscrowError::InvalidDeadmanConfig.code(), 168);
+        assert_eq!(d.state(), EscrowState::Funded);
+        assert_eq!(d.remaining_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn disable_deadman_switch_disputed_refuses_and_settled_keeps_switch() {
+        // AV-436: never remove the inactivity recovery
+        // mid-dispute — the disable refuses while Disputed, and the
+        // dispute still settles under the switch it started under.
+        // Note the settled dispute keeps its switch: once `resolve`
+        // lands the escrow is `Settled` (terminal), so a disable
+        // after the settlement refuses with
+        // InvalidStateTransition — the switch-removal path stays live
+        // only for live escrows, as a fresh funded escrow below
+        // shows.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const HEIR: [u8; 32] = [0xEE; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_deadman_switch(3_600, HEIR)
+            .unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.disable_deadman_switch(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.deadman_heir(),
+            Some(HEIR),
+            "disputed disable writes nothing"
+        );
+        assert_eq!(d.deadman_inactivity_secs(), 3_600);
+        d.resolve(ARBITER, 600_000, EXPIRES_AT - 1, None, None, BOB)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Settled);
+        assert_eq!(
+            d.disable_deadman_switch(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition),
+            "settled dispute keeps its switch"
+        );
+        // A live funded escrow still retires its switch normally.
+        let mut live = deadman_configured_escrow();
+        live.disable_deadman_switch(ALICE, BOB).unwrap();
+        assert_eq!(live.deadman_heir(), None);
+        assert_eq!(live.deadman_inactivity_secs(), 0);
     }
 
     #[test]
@@ -82095,6 +82555,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("disable_milestone_verifier"),
             [13, 37, 79, 239, 230, 171, 66, 214]
+        );
+    }
+
+    #[test]
+    fn disable_deadman_switch_instruction_discriminator_is_pinned() {
+        // AV-436. IDL:
+        // sha256("global:disable_deadman_switch")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("disable_deadman_switch"),
+            [255, 20, 228, 12, 175, 149, 125, 241]
         );
     }
 
