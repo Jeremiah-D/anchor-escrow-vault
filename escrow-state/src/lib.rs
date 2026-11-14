@@ -42344,6 +42344,20 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "no params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's unconditional dual-signature gate agrees — unlike the amend family's AV-276 gate, there is no plain-escrow initializer-alone shape here at all, paralleling rotate_arbiter, disable_social_recovery, disable_dual_sig, disable_pause_authority, disable_arbiter, disable_price_gate, disable_twap_gate, disable_credential_gate, disable_milestone_verifier and disable_deadman_switch); the checker itself does not sign (a shut-down checker service with no successor must not block the protocol's own removal, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed, resolve first — the dispute settles under the protocol it started under); a live declaration blocks the disable (DualControlIntentExists, code 189 — confirm, cancel, or let it expire first); an escrow that never opted into dual control — or already retired it — is a silent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); one-way only — with_dual_control stays Uninitialized-only, so the protocol can never be re-installed after funding; rotate_dual_control_checker refuses InvalidDualControl (code 188) on the unconfigured escrow (fail-closed); after the disable a direct release settles again (the release_impl gate reads the live checker) while initiate_release refuses InvalidDualControl (code 188, its existing never-opted-in gate), and with no live intent confirm_release / cancel_release refuse as usual, while a release already settled keeps the checker it settled under; emits the DualControlDisabled indexer event only on an actual change (a configured checker -> None, from == to == the current state); only the 33-byte checker region clears to None in place — no other field moves; no clock/sysvar input to the method; no layout / rent change",
         },
         InstructionSpec {
+            // AV-438: the Token-2022 transfer-hook binding removal —
+            // the program-level entry point for the AV-419 pure-logic
+            // removal. IDL: discriminator =
+            // sha256("global:disable_transfer_hook")[..8]
+            // = [146, 172, 197, 98, 208, 4, 181, 42] — the Anchor
+            // instruction discriminator for the
+            // disable_transfer_hook handler (pinned by the
+            // discriminator test below).
+            name: "disable_transfer_hook",
+            params: &[],
+            method: "Escrow::disable_transfer_hook",
+            input_mapping: "no params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both parties must sign at the program layer (the Anchor accounts require both signers, so the on-chain call is dual-signed either way; the state machine's unconditional dual-signature gate agrees — unlike the amend family's AV-276 gate, there is no plain-escrow initializer-alone shape here at all, paralleling rotate_arbiter, disable_social_recovery, disable_dual_sig, disable_pause_authority, disable_arbiter, disable_price_gate, disable_twap_gate, disable_credential_gate, disable_milestone_verifier, disable_deadman_switch and disable_dual_control); the hook program itself does not sign (a dead hook program with no successor must not block the binding's own removal, the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed, resolve first — the dispute settles under the binding it started under); an escrow that never bound a hook — or already removed it — is a silent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); one-way only — with_transfer_hook stays Uninitialized-only, so the binding can never be re-installed after funding; rotate_transfer_hook refuses InvalidTransferHook (code 157) on the unbound escrow (fail-closed); after the disable a hook-free CPI plan builds (check_transfer_hook (None, None) is Ok) while a plan naming the old hook refuses SettlementMismatch, and plain release is unaffected (it never carried hook context), while a release already settled keeps the hook it settled under; only the escrow-side declaration clears — a Token-2022 hook the mint itself carries still runs on-chain under the mint's own configuration, so the disable restores the escrow's ability to build plans without changing mint policy; emits the TransferHookDisabled indexer event only on an actual change (a bound hook -> None, from == to == the current state); only the 33-byte hook region clears to None in place — no other field moves; no clock/sysvar input to the method; no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43237,6 +43251,10 @@ pub(crate) mod anchor_idl_tests {
             // removal (the AV-409 pure-logic removal wired to the
             // chain).
             "Escrow::disable_dual_control",
+            // AV-438: the program-level Token-2022 transfer-hook
+            // binding removal (the AV-419 pure-logic removal wired
+            // to the chain).
+            "Escrow::disable_transfer_hook",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -49989,6 +50007,540 @@ pub(crate) mod anchor_idl_tests {
             e.cancel_release(ALICE, NOW),
             Err(EscrowError::InvalidDualControl)
         );
+    }
+
+    fn transfer_hook_bound_escrow() -> Escrow {
+        // A Funded escrow with a live Token-2022 transfer-hook
+        // binding: hook [0x77; 32] on mint [0xD0; 32], funded at
+        // 1_600_000_000.
+        const HOOK: [u8; 32] = [0x77; 32];
+        const MINT: [u8; 32] = [0xD0; 32];
+        const M2: [u8; 32] = [0xD1; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint_allowlist(&[MINT, M2])
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_transfer_hook(HOOK)
+            .unwrap();
+        e.fund(ALICE, 1_600_000_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.transfer_hook(), Some(HOOK));
+        e
+    }
+
+    #[test]
+    fn disable_transfer_hook_maps_to_transfer_hook_field() {
+        // IDL: disable_transfer_hook() — no params; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints, not the state machine — and the state
+        // machine's disable gate is unconditionally dual-signed
+        // too, so the program layer and the state machine agree
+        // exactly here (no plain-escrow initializer-alone shape
+        // exists for a removal, paralleling
+        // disable_social_recovery, disable_dual_sig,
+        // disable_pause_authority, disable_arbiter,
+        // disable_price_gate, disable_twap_gate,
+        // disable_credential_gate, disable_milestone_verifier,
+        // disable_deadman_switch and disable_dual_control). The
+        // hook program itself does not sign. The disable clears
+        // the binding — no PARAM_FIELD_MAP entry (there is no
+        // param to map; the whole binding flips, not one field) —
+        // no layout change. The INSTRUCTIONS spec entry pins the
+        // program-level wiring: no params, the AV-419 pure-logic
+        // method, and the dual-signer input mapping.
+        const HOOK: [u8; 32] = [0x77; 32];
+        const NEW_HOOK: [u8; 32] = [0x78; 32];
+        const MINT: [u8; 32] = [0xD0; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "disable_transfer_hook")
+            .expect("INSTRUCTIONS carries disable_transfer_hook");
+        assert_eq!(spec.method, "Escrow::disable_transfer_hook");
+        assert!(spec.params.is_empty(), "disable takes no params");
+        assert!(
+            spec.input_mapping.contains("no params"),
+            "input_mapping documents the empty param list"
+        );
+        assert!(
+            spec.input_mapping.contains("TransferHookDisabled"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and no args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"disable_transfer_hook\""),
+            "checked-in IDL carries disable_transfer_hook"
+        );
+        assert!(
+            idl.contains("[146, 172, 197, 98, 208, 4, 181, 42]"),
+            "checked-in IDL pins the AV-438 discriminator"
+        );
+        // The binding clears to None, the state stays Funded, the
+        // locked amount is untouched.
+        let mut e = transfer_hook_bound_escrow();
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.fund_at(), FUND_AT);
+        e.disable_transfer_hook(ALICE, BOB).unwrap();
+        assert_eq!(e.transfer_hook(), None, "binding cleared");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        // After the disable the binding is gone for good: rotating
+        // the hook refuses fail-closed with InvalidTransferHook,
+        // exactly like a never-bound escrow — and re-binding
+        // stays refused.
+        assert_eq!(
+            e.rotate_transfer_hook(ALICE, BOB, NEW_HOOK),
+            Err(EscrowError::InvalidTransferHook)
+        );
+        assert_eq!(EscrowError::InvalidTransferHook.code(), 157);
+        assert_eq!(
+            e.with_transfer_hook(HOOK),
+            Err(EscrowError::InvalidStateTransition),
+            "one-way: no post-funding re-binding"
+        );
+        assert_eq!(e.transfer_hook(), None);
+        assert_eq!(e.mint(), Some(MINT));
+    }
+
+    #[test]
+    fn disable_transfer_hook_rejects_single_party_and_strangers() {
+        // AV-438: the binding is jointly owned CPI payment
+        // plumbing — one party alone removing it would rewrite the
+        // other party's settlement path, so a stranger or a single
+        // party is Unauthorized and the failed call moves nothing;
+        // the hook program itself does not sign, so a lost hook
+        // key cannot block the binding's own removal; the
+        // dual-signed call then lands.
+        const HOOK: [u8; 32] = [0x77; 32];
+        let mut e = transfer_hook_bound_escrow();
+        for (init, taker) in [
+            (ALICE, MALLORY),
+            (MALLORY, BOB),
+            (MALLORY, MALLORY),
+            (BOB, ALICE), // swapped: keys must match their roles
+        ] {
+            assert_eq!(
+                e.disable_transfer_hook(init, taker),
+                Err(EscrowError::Unauthorized),
+                "init={init:?} taker={taker:?}"
+            );
+        }
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.transfer_hook(),
+            Some(HOOK),
+            "rejected disable writes nothing"
+        );
+        e.disable_transfer_hook(ALICE, BOB).unwrap();
+        assert_eq!(
+            e.transfer_hook(),
+            None,
+            "dual-signed disable lands"
+        );
+    }
+
+    #[test]
+    fn disable_transfer_hook_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-438: only a Funded escrow may remove its hook
+        // binding — the binding is the CPI payment plumbing the
+        // taker funded under, so before funding the opt-in is still
+        // a builder decision that must not be silently dropped, and
+        // after funding the binding stays until the parties jointly
+        // retire it. The pause guard fires before the authority and
+        // state gates.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const PAUSER: [u8; 32] = [0xA6; 32];
+        const HOOK: [u8; 32] = [0x77; 32];
+        const MINT: [u8; 32] = [0xD0; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        // Uninitialized: the binding is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_transfer_hook(HOOK)
+            .unwrap();
+        assert_eq!(
+            bare.disable_transfer_hook(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.transfer_hook(), Some(HOOK));
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_mint(MINT)
+                .unwrap()
+                .with_transfer_hook(HOOK)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.disable_transfer_hook(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.transfer_hook(), Some(HOOK));
+        // Disputed: the binding stays while the dispute is in
+        // flight — the dispute settles under the binding it
+        // started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_transfer_hook(HOOK)
+            .unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.disable_transfer_hook(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.transfer_hook(),
+            Some(HOOK),
+            "disputed disable writes nothing"
+        );
+        // Terminal: a cancelled escrow's binding is history, not a
+        // live configuration to remove.
+        let mut e = transfer_hook_bound_escrow();
+        e.cancel(ALICE, Some(MINT), ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.disable_transfer_hook(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.transfer_hook(), Some(HOOK));
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_mint(MINT)
+                .unwrap()
+                .with_transfer_hook(HOOK)
+                .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.disable_transfer_hook(ALICE, BOB),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.disable_transfer_hook(MALLORY, BOB),
+            Err(EscrowError::Paused),
+            "even a stranger's disable on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.transfer_hook(),
+            Some(HOOK),
+            "paused disable writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.disable_transfer_hook(ALICE, BOB).unwrap();
+        assert_eq!(paused.transfer_hook(), None);
+    }
+
+    #[test]
+    fn disable_transfer_hook_noop_on_unbound_escrow() {
+        // AV-438: removing a binding that was never installed writes
+        // nothing — the `rotate_*` same-value no-op precedent.
+        // That covers both a plain escrow and a second disable
+        // after a successful first one.
+        const MINT: [u8; 32] = [0xD0; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        plain.disable_transfer_hook(ALICE, BOB).unwrap();
+        assert_eq!(plain.transfer_hook(), None);
+        assert_eq!(plain.state(), EscrowState::Funded);
+        assert_eq!(plain.remaining_amount(), 1_000_000);
+        let mut bound = transfer_hook_bound_escrow();
+        bound.disable_transfer_hook(ALICE, BOB).unwrap();
+        assert_eq!(bound.transfer_hook(), None);
+        bound.disable_transfer_hook(ALICE, BOB).unwrap();
+        assert_eq!(
+            bound.transfer_hook(),
+            None,
+            "second disable is a no-op"
+        );
+    }
+
+    #[test]
+    fn disable_transfer_hook_handler_emits_only_on_actual_change() {
+        // AV-438: the program handler mirrors
+        // `IndexedEscrow::disable_transfer_hook` — the event layer
+        // emits TransferHookDisabled only on an actual change: a
+        // real disable emits, a no-op disable emits nothing, and a
+        // failed call emits nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const NOW: u64 = 1_700_000_000;
+        const MINT: [u8; 32] = [0xD0; 32];
+        let mut indexed =
+            IndexedEscrow::wrap([0xE0; 32], transfer_hook_bound_escrow());
+        let before = indexed.event_count();
+        assert_eq!(
+            indexed.disable_transfer_hook(MALLORY, BOB, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            indexed.event_count(),
+            before,
+            "failed calls emit nothing"
+        );
+        indexed.disable_transfer_hook(ALICE, BOB, NOW).unwrap();
+        assert_eq!(indexed.event_count(), before + 1);
+        let ev = indexed.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::TransferHookDisabled);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        indexed.disable_transfer_hook(ALICE, BOB, NOW + 10).unwrap();
+        assert_eq!(
+            indexed.event_count(),
+            before + 1,
+            "no-op second disable emits nothing"
+        );
+        let mut plain_ie = IndexedEscrow::wrap(
+            [0xE0; 32],
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_mint(MINT)
+                .unwrap(),
+        );
+        plain_ie.fund(ALICE, 0).unwrap();
+        let _ = plain_ie.drain_events();
+        plain_ie.disable_transfer_hook(ALICE, BOB, 42).unwrap();
+        assert_eq!(
+            plain_ie.event_count(),
+            0,
+            "never-bound disable emits nothing"
+        );
+    }
+
+    #[test]
+    fn disable_transfer_hook_is_one_way() {
+        // AV-438: one-way only — `with_transfer_hook` stays
+        // Uninitialized-only, so a post-funding re-binding is
+        // refused and the binding stays gone; rotation stays
+        // fail-closed on the unbound escrow.
+        const HOOK: [u8; 32] = [0x77; 32];
+        const NEW_HOOK: [u8; 32] = [0x78; 32];
+        let mut e = transfer_hook_bound_escrow();
+        e.disable_transfer_hook(ALICE, BOB).unwrap();
+        assert_eq!(e.transfer_hook(), None);
+        assert_eq!(
+            e.with_transfer_hook(HOOK),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.rotate_transfer_hook(ALICE, BOB, NEW_HOOK),
+            Err(EscrowError::InvalidTransferHook),
+            "rotation stays fail-closed on the unbound escrow"
+        );
+        assert_eq!(e.transfer_hook(), None);
+    }
+
+    #[test]
+    fn disable_transfer_hook_disputed_refuses_and_settled_keeps_binding() {
+        // AV-438: never remove the hook binding mid-dispute — the
+        // disable refuses while Disputed, and the dispute still
+        // settles under the binding it started under. Note the
+        // settled dispute keeps its binding: once `resolve` lands
+        // the escrow is `Settled` (terminal), so a disable after
+        // the settlement refuses with InvalidStateTransition — the
+        // binding-removal path stays live only for live escrows, as
+        // a fresh funded escrow below shows. (There is no Disputed
+        // -> Funded path: `resolve` always settles, so "resolve
+        // then disable" cannot succeed on the same escrow.)
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const HOOK: [u8; 32] = [0x77; 32];
+        const MINT: [u8; 32] = [0xD0; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_mint(MINT)
+            .unwrap()
+            .with_transfer_hook(HOOK)
+            .unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.disable_transfer_hook(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.transfer_hook(),
+            Some(HOOK),
+            "disputed disable writes nothing"
+        );
+        d.resolve(ARBITER, 600_000, EXPIRES_AT - 1, Some(MINT), None, BOB)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Settled);
+        assert_eq!(
+            d.disable_transfer_hook(ALICE, BOB),
+            Err(EscrowError::InvalidStateTransition),
+            "settled dispute keeps its binding"
+        );
+        // A live funded escrow still removes its binding normally.
+        let mut live = transfer_hook_bound_escrow();
+        live.disable_transfer_hook(ALICE, BOB).unwrap();
+        assert_eq!(live.transfer_hook(), None);
+    }
+
+    #[test]
+    fn disable_transfer_hook_reopens_no_hook_cpi_plans() {
+        // AV-438: the gate reads the live binding — while bound, a
+        // no-hook plan is refused and the bound-hook plan builds;
+        // after the disable the no-hook plan builds and a plan
+        // naming the old hook dies with the binding, at both the
+        // gate level and the plan-builder level.
+        use crate::cpi::{
+            check_transfer_hook, payout_plan, AccountMeta, CpiError,
+            PayoutAddrs, PayoutKind, TransferHookPlan,
+        };
+        const HOOK: [u8; 32] = [0x77; 32];
+        const MINT: [u8; 32] = [0xD0; 32];
+        const NOW: u64 = 1_700_000_000;
+        fn hook_plan(hook: [u8; 32]) -> TransferHookPlan {
+            TransferHookPlan {
+                program: hook,
+                extra_accounts: vec![
+                    AccountMeta {
+                        pubkey: [0x14; 32],
+                        is_signer: false,
+                        is_writable: true,
+                    },
+                    AccountMeta {
+                        pubkey: [0x15; 32],
+                        is_signer: false,
+                        is_writable: false,
+                    },
+                ],
+            }
+        }
+        fn hook_payout_addrs(hook: [u8; 32]) -> PayoutAddrs {
+            PayoutAddrs {
+                source: [0x0B; 32],
+                vault_authority: [0x0A; 32],
+                taker: BOB,
+                taker_leg: [0x0C; 32],
+                fee_leg: [0x09; 32],
+                transfer_hook: Some(hook_plan(hook)),
+                token_program: None,
+            }
+        }
+        fn no_hook_payout_addrs() -> PayoutAddrs {
+            PayoutAddrs {
+                source: [0x0B; 32],
+                vault_authority: [0x0A; 32],
+                taker: BOB,
+                taker_leg: [0x0C; 32],
+                fee_leg: [0x09; 32],
+                transfer_hook: None,
+                token_program: None,
+            }
+        }
+        let mut e = transfer_hook_bound_escrow();
+        assert_eq!(
+            check_transfer_hook(&e, &None),
+            Err(CpiError::SettlementMismatch)
+        );
+        assert!(check_transfer_hook(&e, &Some(hook_plan(HOOK))).is_ok());
+        e.disable_transfer_hook(ALICE, BOB).unwrap();
+        let (hook_program, hook_accounts) =
+            check_transfer_hook(&e, &None).unwrap();
+        assert_eq!(hook_program, None);
+        assert!(hook_accounts.is_empty());
+        assert_eq!(
+            check_transfer_hook(&e, &Some(hook_plan(HOOK))),
+            Err(CpiError::SettlementMismatch)
+        );
+        let (payout, fee) = e
+            .release(ALICE, NOW, 1_000_000, Some(MINT), BOB)
+            .unwrap();
+        let plan = payout_plan(
+            PayoutKind::Release,
+            &e,
+            &no_hook_payout_addrs(),
+            payout,
+            fee,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.transfer_hook_program, None);
+        assert!(plan.transfer_hook_accounts.is_empty());
+        assert_eq!(
+            payout_plan(
+                PayoutKind::Release,
+                &e,
+                &hook_payout_addrs(HOOK),
+                payout,
+                fee,
+                None
+            ),
+            Err(CpiError::SettlementMismatch)
+        );
+    }
+
+    #[test]
+    fn disable_transfer_hook_keeps_mint_allowlist_and_settled_release() {
+        // AV-438: the binding flips to `None` in place — the
+        // 33-byte `Option` region is already resident, so the
+        // disable rewrites it with no layout change, the state
+        // stays Funded, and the mint, the allowlist, and a payout
+        // already settled are untouched — and the remainder still
+        // releases plainly afterwards.
+        const HOOK: [u8; 32] = [0x77; 32];
+        const MINT: [u8; 32] = [0xD0; 32];
+        const NOW: u64 = 1_700_000_000;
+        let mut e = transfer_hook_bound_escrow();
+        let allowlist_before = e.mint_allowlist();
+        let (payout, fee) = e
+            .release(ALICE, NOW, 400_000, Some(MINT), BOB)
+            .unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.released_amount(), 400_000);
+        e.disable_transfer_hook(ALICE, BOB).unwrap();
+        assert!(e.transfer_hook().is_none());
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.remaining_amount(), 600_000);
+        assert_eq!(e.mint(), Some(MINT));
+        assert_eq!(e.mint_allowlist(), allowlist_before);
+        assert_eq!(
+            e.release(ALICE, NOW, 600_000, Some(MINT), BOB).unwrap(),
+            (600_000, 0)
+        );
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(e.transfer_hook(), None, "binding stays gone");
     }
 
     #[test]
@@ -83079,6 +83631,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("disable_dual_control"),
             [160, 156, 92, 237, 153, 175, 224, 10]
+        );
+    }
+
+    #[test]
+    fn disable_transfer_hook_instruction_discriminator_is_pinned() {
+        // AV-438. IDL:
+        // sha256("global:disable_transfer_hook")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("disable_transfer_hook"),
+            [146, 172, 197, 98, 208, 4, 181, 42]
         );
     }
 

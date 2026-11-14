@@ -5925,6 +5925,19 @@ and `rotate_transfer_hook` on an unbound escrow still refuses with
 still runs on-chain under the mint's own configuration: this restores
 the escrow's ability to build plans, it does not change mint policy.
 
+AV-438 adds the program-level `disable_transfer_hook()` instruction
+(discriminator [146, 172, 197, 98, 208, 4, 181, 42]) — the program's
+eleventh disable_* instruction — dual-signed by initializer + taker at
+the program layer (both signers required by the Anchor accounts; the
+hook program itself does not sign, so a dead hook key never blocks its
+own removal), `Funded`-only, refused while paused or `Disputed`,
+unbound no-op that emits nothing; it emits `TransferHookDisabled`
+(discriminant 178) only on an actual clear, the 33-byte hook region
+clears in place, and a hook-free CPI plan builds after the disable
+while a plan naming the old hook refuses `SettlementMismatch`. Only
+the escrow-side declaration clears — a Token-2022 hook the mint
+itself carries still runs on-chain under the mint's own configuration.
+
 ## Streaming fee on funded time (AV-100)
 
 A flat bps fee prices the *size* of a payout; the streaming fee
