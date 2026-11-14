@@ -3533,6 +3533,74 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Disable the emergency timelock-unlock governance by dual-signed
+    /// governance (AV-441; mirrors `Escrow::disable_emergency_unlock`).
+    /// Both the initializer and the taker must sign at the program
+    /// layer — the Anchor accounts require both signers, so the
+    /// on-chain call is dual-signed either way (the state machine's
+    /// unconditional dual-signature gate agrees — unlike the amend
+    /// family's AV-276 conditional gate, there is no plain-escrow
+    /// initializer-alone shape here at all, paralleling
+    /// rotate_arbiter and disable_social_recovery /
+    /// disable_dual_sig / disable_pause_authority / disable_arbiter /
+    /// disable_price_gate / disable_twap_gate /
+    /// disable_credential_gate / disable_milestone_verifier /
+    /// disable_deadman_switch / disable_dual_control /
+    /// disable_transfer_hook / disable_quorum /
+    /// disable_tiered_quorum). Only `Funded`:
+    /// `Uninitialized`, `Activated`, the terminal states and
+    /// `Disputed` are `InvalidStateTransition`. An escrow that never
+    /// opted into the emergency unlock — or already disabled it — is
+    /// a silent no-op success that writes nothing and emits nothing.
+    /// One-way only: there is no post-funding re-opt-in
+    /// (`with_emergency_unlock` stays `Uninitialized`-only), so the
+    /// escape hatch can never be re-installed after funding. After
+    /// the disable, `emergency_unlock` refuses
+    /// `InvalidStateTransition` (its existing opt-in gate), while a
+    /// release after the disable still waits for the AV-27/AV-64
+    /// timelock and settles exactly as before. Unlike the quorum
+    /// removals there is no delay routing here: emergency-unlock
+    /// governance has no `GovernanceAction` variant, so the direct
+    /// call is the only entry point. A paused escrow fails fast
+    /// (`Paused`). Only the `emergency_unlock` flag flips to `false`
+    /// in place — no layout change, no rent change. Emits
+    /// `EmergencyUnlockDisabled` only on an actual change (an opted-in
+    /// flag -> cleared, from == to == the current state), mirroring
+    /// `IndexedEscrow::disable_emergency_unlock`.
+    pub fn disable_emergency_unlock(ctx: Context<DisableEmergencyUnlock>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.emergency_unlock_enabled();
+        escrow
+            .disable_emergency_unlock(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Flips the one-byte `emergency_unlock` flag in place in the
+        // real build (the flag is already resident) — no realloc, no
+        // rent change.
+        if before && !escrow.emergency_unlock_enabled() {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::EmergencyUnlockDisabled,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Rotate the live operator grant's delegate key (AV-388; mirrors
     /// `Escrow::rotate_delegation_delegate` — the AV-301 pure-logic
     /// rotation). Either party may rotate — the initializer or the
@@ -10356,6 +10424,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::disable_tiered_quorum`). Mirrors
     /// `escrow_state::EscrowEventKind::TieredQuorumDisabled`.
     TieredQuorumDisabled,
+    /// AV-441: the emergency timelock-unlock governance was removed by
+    /// dual-signed governance (`Escrow::disable_emergency_unlock`).
+    /// Mirrors `escrow_state::EscrowEventKind::EmergencyUnlockDisabled`.
+    EmergencyUnlockDisabled,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -10620,6 +10692,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::TieredQuorumDisabled => {
             EscrowVaultEventKind::TieredQuorumDisabled
+        }
+        escrow_state::EscrowEventKind::EmergencyUnlockDisabled => {
+            EscrowVaultEventKind::EmergencyUnlockDisabled
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -12149,6 +12224,33 @@ pub struct DisableTieredQuorum<'info> {
     /// Second governance signer: must equal the escrow's taker. The
     /// taker consents to removing the tiered attestor quorum table
     /// their escrow's releases settle under.
+    pub taker: Signer<'info>,
+}
+
+/// AV-441: accounts for `disable_emergency_unlock` — the emergency
+/// timelock-unlock governance's removal is dual-signed governance by
+/// the two parties; the escape hatch is jointly owned, so one party
+/// alone closing it would strip the other of the early-unlock right.
+/// The disable takes no instruction param — the fourteenth no-param
+/// disable_* item, after AV-428's `disable_social_recovery`, AV-429's
+/// `disable_dual_sig`, AV-430's `disable_pause_authority`, AV-431's
+/// `disable_arbiter`, AV-432's `disable_price_gate`, AV-433's
+/// `disable_twap_gate`, AV-434's `disable_credential_gate`, AV-435's
+/// `disable_milestone_verifier`, AV-436's `disable_deadman_switch`,
+/// AV-437's `disable_dual_control`, AV-438's
+/// `disable_transfer_hook`, AV-439's `disable_quorum` and AV-440's
+/// `disable_tiered_quorum`.
+#[derive(Accounts)]
+pub struct DisableEmergencyUnlock<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// First governance signer: must equal the escrow's initializer.
+    /// Both parties must sign — one alone (or a stranger pair) is
+    /// `Unauthorized`.
+    pub initializer: Signer<'info>,
+    /// Second governance signer: must equal the escrow's taker. The
+    /// taker consents to shutting the escape hatch their escrow's
+    /// early unlock settles under.
     pub taker: Signer<'info>,
 }
 
