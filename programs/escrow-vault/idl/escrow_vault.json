@@ -1268,6 +1268,14 @@
       "args": []
     },
     {
+      "name": "revoke_release_intents",
+      "discriminator": [239, 149, 35, 241, 172, 94, 171, 209],
+      "accounts": [],
+      "args": [
+        {"name": "up_to_nonce", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

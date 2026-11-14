@@ -3601,6 +3601,70 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revoke outstanding gasless-release intents by initializer-only
+    /// governance (AV-442; mirrors `Escrow::revoke_release_intents`).
+    /// Only the initializer signs at the program layer — the Anchor
+    /// accounts require the initializer signer, and the state
+    /// machine's initializer-only gate agrees (only the key that
+    /// signed the intents may void them; the taker does not sign, and
+    /// a stranger is `Unauthorized`). `Uninitialized`, `Activated`,
+    /// `Funded` and `Disputed` may revoke (a dispute does not freeze
+    /// the initializer's own intent bookkeeping — the contested pool
+    /// stays locked by `resolve`, this only voids intents); the
+    /// terminal states and `CounterOffered` are
+    /// `InvalidStateTransition`. The watermark only ever rises: a
+    /// cutoff at or below the live watermark is a silent no-op
+    /// success that writes nothing and emits nothing. Above the
+    /// watermark the cutoff becomes the new watermark, and from then
+    /// on `release_via_intent` refuses every revoked intent with
+    /// `IntentNonceReused` (code 182), while an intent above the new
+    /// watermark releases exactly as before and a nonce already
+    /// consumed by a successful release stays consumed. There is no
+    /// delay routing here: intent revocation has no
+    /// `GovernanceAction` variant, so the direct call is the only
+    /// entry point. A paused escrow fails fast (`Paused`). Only the
+    /// `last_intent_nonce` watermark moves in place — no layout
+    /// change, no rent change, no funds move. Emits
+    /// `ReleaseIntentsRevoked` only when the watermark actually rises
+    /// (from == to == the current state), mirroring
+    /// `IndexedEscrow::revoke_release_intents`.
+    pub fn revoke_release_intents(
+        ctx: Context<RevokeReleaseIntents>,
+        up_to_nonce: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.last_intent_nonce();
+        escrow
+            .revoke_release_intents(
+                ctx.accounts.initializer.key().to_bytes(),
+                up_to_nonce,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Raises the `last_intent_nonce` watermark in place in the
+        // real build (the watermark is already resident) — no
+        // realloc, no rent change.
+        if escrow.last_intent_nonce() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::ReleaseIntentsRevoked,
+                state,
+                state,
+                0,
+                0,
+                0,
+                Clock::get()?.unix_timestamp as u64,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Rotate the live operator grant's delegate key (AV-388; mirrors
     /// `Escrow::rotate_delegation_delegate` — the AV-301 pure-logic
     /// rotation). Either party may rotate — the initializer or the
@@ -10428,6 +10492,10 @@ pub enum EscrowVaultEventKind {
     /// dual-signed governance (`Escrow::disable_emergency_unlock`).
     /// Mirrors `escrow_state::EscrowEventKind::EmergencyUnlockDisabled`.
     EmergencyUnlockDisabled,
+    /// AV-442: outstanding gasless-release intents were revoked by
+    /// initializer-only governance (`Escrow::revoke_release_intents`).
+    /// Mirrors `escrow_state::EscrowEventKind::ReleaseIntentsRevoked`.
+    ReleaseIntentsRevoked,
     /// AV-60: the initializer partially cancelled the escrow
     /// (`Escrow::cancel_partial`) — a tranche of the lockup refunded
     /// while the escrow stays `Funded`. `from == to == Funded`;
@@ -10695,6 +10763,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::EmergencyUnlockDisabled => {
             EscrowVaultEventKind::EmergencyUnlockDisabled
+        }
+        escrow_state::EscrowEventKind::ReleaseIntentsRevoked => {
+            EscrowVaultEventKind::ReleaseIntentsRevoked
         }
         escrow_state::EscrowEventKind::PartiallyCancelled => {
             EscrowVaultEventKind::PartiallyCancelled
@@ -12252,6 +12323,22 @@ pub struct DisableEmergencyUnlock<'info> {
     /// taker consents to shutting the escape hatch their escrow's
     /// early unlock settles under.
     pub taker: Signer<'info>,
+}
+
+/// AV-442: accounts for `revoke_release_intents` — revoking gasless
+/// release intents is initializer-only governance by the key that
+/// signed the intents; the taker does not sign (the intents are the
+/// initializer's own signed authorizations, and voiding them moves
+/// no funds). The revocation takes one instruction param — the
+/// `up_to_nonce` cutoff — riding as an arg, not an account.
+#[derive(Accounts)]
+pub struct RevokeReleaseIntents<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The governance signer: must equal the escrow's initializer.
+    /// Only the key that signed the intents may void them — a
+    /// stranger (or the taker) is `Unauthorized`.
+    pub initializer: Signer<'info>,
 }
 
 /// AV-388: accounts for `rotate_delegation_delegate` — the
