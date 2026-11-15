@@ -42418,6 +42418,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "up_to_nonce <- param; initializer <- accounts.initializer (signer) — initializer-only governance (only the key that signed the intents may void them; the taker does not sign, a stranger is Unauthorized); a paused escrow fails fast (Paused, before the authority gate); Uninitialized, Activated, Funded and Disputed may revoke (InvalidStateTransition otherwise — the terminal states and CounterOffered, where there is no live intent left to void); the watermark only ever rises — up_to_nonce <= last_intent_nonce is a silent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); above the watermark the cutoff becomes the new watermark, and from then on release_via_intent refuses every revoked intent with IntentNonceReused (code 182) while an intent above the new watermark releases exactly as before, and a nonce already consumed by a successful release stays consumed (revocation never rewinds); revoking moves no funds, so no AV-36 reentrancy lock is needed; unlike the quorum removals there is no delay routing — intent revocation has no GovernanceAction variant, so the direct call is the only entry point; emits the ReleaseIntentsRevoked indexer event only when the watermark actually rises (from == to == the current state); only the last_intent_nonce watermark moves in place — no other field moves; no clock/sysvar input to the method; no layout / rent change",
         },
         InstructionSpec {
+            // AV-443: revise the delivery-confirmation deadline
+            // after funding — the program-level entry point for the
+            // AV-244 pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_delivery_deadline")[..8] =
+            // [86, 142, 176, 58, 194, 167, 101, 222] — the Anchor
+            // instruction discriminator for the
+            // amend_delivery_deadline handler (pinned by the
+            // discriminator test below).
+            name: "amend_delivery_deadline",
+            params: &[(
+                "deadline_at",
+                "u64",
+                "instruction param; the new delivery-confirmation deadline as a unix timestamp — 0 is rejected (AmountMismatch, code 102): 0 is the \"no deadline attached\" sentinel, not a deadline, so there is no cancel-deadline path",
+            )],
+            method: "Escrow::amend_delivery_deadline",
+            input_mapping: "deadline_at <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed; the builder owns the initial deadline terms); no delay path covers this method — GovernanceAction has no AmendDeliveryDeadline variant, so the direct call is the only entry point and no delayed handler is staged; deadline_at == 0 is AmountMismatch (code 102); an escrow with no deadline gains one on first amendment; re-affirming the current deadline is a no-op (succeeds, writes nothing, emits no event); only delivery_deadline_at changes — late_delivery_penalty_bps and delivery_late are untouched, so a delivery already confirmed keeps its first-won stamp and amounts already released are never restated, while confirmations after the amendment are judged against the new deadline (confirm_delivery_at reads the live field at every call); emits the DeliveryDeadlineAmended indexer event only on an actual change (from == to == the current state); the delivery_deadline_at tail field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43331,6 +43349,9 @@ pub(crate) mod anchor_idl_tests {
             // revocation (the AV-404 pure-logic revocation wired
             // to the chain).
             "Escrow::revoke_release_intents",
+            // AV-443: the program-level delivery-deadline revision
+            // (the AV-244 pure-logic revision wired to the chain).
+            "Escrow::amend_delivery_deadline",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -43685,6 +43706,10 @@ pub(crate) mod anchor_idl_tests {
                 // last_intent_nonce watermark; every signed-but-
                 // unsubmitted intent at or below it is voided.
                 &"revoke_release_intents",
+                // AV-443: the deadline-revision value (u64) — the new
+                // delivery-confirmation deadline as a unix timestamp;
+                // 0 is rejected (the "no deadline" sentinel).
+                &"amend_delivery_deadline",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -52124,6 +52149,215 @@ pub(crate) mod anchor_idl_tests {
         );
     }
 
+    // ----- AV-443: program-level delivery-deadline amendment -----
+
+    fn deadline_funded_escrow() -> Escrow {
+        // AV-443 helper: a funded escrow with a delivery deadline
+        // and a late-delivery penalty rate configured — the same
+        // shape the AV-244 pure-logic tests build.
+        const T0: u64 = 1_700_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_delivery_deadline(T0 + 1000)
+            .unwrap()
+            .with_late_delivery_penalty_bps(1000)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_delivery_deadline_maps_param_to_delivery_deadline() {
+        // IDL: amend_delivery_deadline(deadline_at: u64) —
+        // deadline_at <- param; initializer <- accounts.initializer
+        // (signer) AND taker <- accounts.taker (signer), enforced
+        // by the Anchor account constraints and the state machine's
+        // dual-signature gate. The param rewrites the same vault
+        // field the `with_delivery_deadline` builder populates (see
+        // PARAM_FIELD_MAP) — no layout change. The INSTRUCTIONS
+        // spec entry pins the program-level wiring: one u64 param,
+        // the AV-244 pure-logic method, and the dual-signed
+        // input mapping.
+        const T0: u64 = 1_700_000_000;
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_delivery_deadline")
+            .expect("INSTRUCTIONS carries amend_delivery_deadline");
+        assert_eq!(spec.method, "Escrow::amend_delivery_deadline");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "deadline_at");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("DeliveryDeadlineAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the u64 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_delivery_deadline\""),
+            "checked-in IDL carries amend_delivery_deadline"
+        );
+        assert!(
+            idl.contains("[86, 142, 176, 58, 194, 167, 101, 222]"),
+            "checked-in IDL pins the AV-443 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"deadline_at\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the deadline_at arg"
+        );
+        // The deadline moves, the state stays Funded, the amounts
+        // and the penalty rate are untouched.
+        let mut e = deadline_funded_escrow();
+        assert_eq!(e.delivery_deadline_at(), Some(T0 + 1000));
+        e.amend_delivery_deadline(ALICE, BOB, T0 + 100).unwrap();
+        assert_eq!(e.delivery_deadline_at(), Some(T0 + 100), "deadline revised");
+        assert_eq!(e.late_delivery_penalty_bps(), 1000, "penalty rate untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn amend_delivery_deadline_rejects_stranger_and_single_signer() {
+        // AV-443: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // move the other's confirmation bar.
+        const T0: u64 = 1_700_000_000;
+        let mut e = deadline_funded_escrow();
+        assert_eq!(
+            e.amend_delivery_deadline(ALICE, ALICE, T0 + 2000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_delivery_deadline(MALLORY, BOB, T0 + 2000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_delivery_deadline(MALLORY, MALLORY, T0 + 2000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.delivery_deadline_at(),
+            Some(T0 + 1000),
+            "failed revisions write nothing"
+        );
+        e.amend_delivery_deadline(ALICE, BOB, T0 + 2000).unwrap();
+        assert_eq!(e.delivery_deadline_at(), Some(T0 + 2000));
+    }
+
+    #[test]
+    fn amend_delivery_deadline_rejects_non_funded() {
+        // AV-443: Funded-only — the Uninitialized builder owns the
+        // initial deadline terms.
+        const T0: u64 = 1_700_000_000;
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_delivery_deadline(T0 + 1000)
+            .unwrap();
+        assert_eq!(
+            bare.amend_delivery_deadline(ALICE, BOB, T0 + 2000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(bare.delivery_deadline_at(), Some(T0 + 1000));
+    }
+
+    #[test]
+    fn amend_delivery_deadline_rejects_paused() {
+        // AV-443: the pause guard fires before the authority and
+        // state gates — a paused escrow fails fast.
+        const T0: u64 = 1_700_000_000;
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_delivery_deadline(T0 + 1000)
+            .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_delivery_deadline(ALICE, BOB, T0 + 2000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(paused.delivery_deadline_at(), Some(T0 + 1000));
+    }
+
+    #[test]
+    fn amend_delivery_deadline_rejects_zero_and_leaves_deadline_untouched() {
+        // AV-443: zero is the "no deadline" sentinel, not a
+        // deadline — the builder's rejection, and a failed
+        // amendment writes nothing (so there is no
+        // cancel-deadline path in this item).
+        const T0: u64 = 1_700_000_000;
+        let mut e = deadline_funded_escrow();
+        assert_eq!(
+            e.amend_delivery_deadline(ALICE, BOB, 0),
+            Err(EscrowError::AmountMismatch)
+        );
+        assert_eq!(EscrowError::AmountMismatch.code(), 102);
+        assert_eq!(e.delivery_deadline_at(), Some(T0 + 1000));
+    }
+
+    #[test]
+    fn amend_delivery_deadline_handler_emits_only_on_actual_change() {
+        // AV-443: the program handler mirrors
+        // `IndexedEscrow::amend_delivery_deadline` — a real revision
+        // emits DeliveryDeadlineAmended (from == to == the current
+        // state, all amounts zero), while re-affirming the current
+        // deadline leaves `delivery_deadline_at()` unchanged, which
+        // is exactly the handler's no-emit condition (the handler
+        // compares before/after and stays silent on equality).
+        // A delivery already confirmed keeps its first-won stamp
+        // either way: moving the deadline can neither rewrite an
+        // on-time confirmation late nor wash a late one clean.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const T0: u64 = 1_700_000_000;
+        const NOW: u64 = 1_700_000_000;
+        let mut indexed =
+            IndexedEscrow::wrap([0xE0; 32], deadline_funded_escrow());
+        let before = indexed.event_count();
+        indexed
+            .amend_delivery_deadline(ALICE, BOB, T0 + 100, NOW)
+            .unwrap();
+        assert_eq!(indexed.event_count(), before + 1);
+        let ev = indexed.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::DeliveryDeadlineAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the current deadline changes nothing
+        // observable — the handler's before/after comparison sees
+        // equality and emits nothing.
+        let mut e = deadline_funded_escrow();
+        e.amend_delivery_deadline(ALICE, BOB, T0 + 1000).unwrap();
+        assert_eq!(e.delivery_deadline_at(), Some(T0 + 1000));
+        assert_eq!(e.state(), EscrowState::Funded);
+        // An on-time confirmation stays on time after the deadline
+        // is pulled in before its confirmation time, and a late
+        // one stays late after the deadline is pushed out past it.
+        let mut on_time = deadline_funded_escrow();
+        on_time.confirm_delivery_at(BOB, T0 + 500).unwrap();
+        assert!(!on_time.delivery_late());
+        on_time.amend_delivery_deadline(ALICE, BOB, T0 + 100).unwrap();
+        assert!(!on_time.delivery_late());
+        assert!(on_time.delivery_confirmed());
+        let mut late = deadline_funded_escrow();
+        late.confirm_delivery_at(BOB, T0 + 1500).unwrap();
+        assert!(late.delivery_late());
+        late.amend_delivery_deadline(ALICE, BOB, T0 + 2000).unwrap();
+        assert!(late.delivery_late());
+        assert!(late.delivery_confirmed());
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -55488,6 +55722,20 @@ pub(crate) mod anchor_idl_tests {
         // advances the watermark to the intent's nonce (strictly
         // increasing), and `initialize` still zeroes it.
         ("revoke_release_intents", "up_to_nonce", "last_intent_nonce"),
+        // AV-443: the post-funding deadline revision rewrites the
+        // same tail field in place — a second param source for
+        // `delivery_deadline_at`, like `amend_arbiter_fee`'s legs.
+        // The field's initial value comes from the
+        // `with_delivery_deadline` builder param (Uninitialized
+        // only); this entry documents the revision source. Only the
+        // deadline moves — the penalty rate and the late flag are
+        // untouched, and a 0 deadline is rejected outright (the "no
+        // deadline" sentinel, never a value).
+        (
+            "amend_delivery_deadline",
+            "deadline_at",
+            "delivery_deadline_at",
+        ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
         // for `delegation` (the whole grant region, like
@@ -56139,18 +56387,6 @@ pub(crate) mod anchor_idl_tests {
              the grant by revoke_delegation, expiry-less re-grant and \
              party rotation; read by require_scoped_authority as the \
              operator gate",
-        ),
-        // AV-216: the delivery deadline — zeroed by `initialize`
-        // (no deadline attached); set by `with_delivery_deadline`
-        // (Uninitialized only, non-zero timestamp); read by
-        // `confirm_delivery_at` as the lateness clock. Same
-        // field-source rationale as the credential issuer above:
-        // no instruction param writes this field.
-        (
-            "delivery_deadline_at",
-            "zeroed by initialize; set by with_delivery_deadline \
-             (Uninitialized only, non-zero timestamp); read by \
-             confirm_delivery_at as the lateness clock",
         ),
         // AV-216: the late-delivery penalty rate — zeroed by
         // `initialize` (no late penalty); set by
@@ -85271,6 +85507,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("revoke_release_intents"),
             [239, 149, 35, 241, 172, 94, 171, 209]
+        );
+    }
+
+    #[test]
+    fn amend_delivery_deadline_instruction_discriminator_is_pinned() {
+        // AV-443. IDL:
+        // sha256("global:amend_delivery_deadline")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_delivery_deadline"),
+            [86, 142, 176, 58, 194, 167, 101, 222]
         );
     }
 

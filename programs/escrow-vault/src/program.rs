@@ -6593,6 +6593,66 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the delivery-confirmation deadline after funding (AV-443;
+    /// mirrors `Escrow::amend_delivery_deadline`). Unconditional
+    /// dual-signature governance: both initializer and taker sign —
+    /// one party alone cannot move the other's confirmation bar,
+    /// paralleling `amend_arbiter_fee`. `Funded` only — the builder
+    /// owns the initial deadline terms. A paused escrow fails fast
+    /// (`Paused`, before the authority gate). `deadline_at == 0` is
+    /// `AmountMismatch` (code 102): `0` is the "no deadline attached"
+    /// sentinel, so there is no cancel-deadline path in this item.
+    /// No delay path covers this method — `GovernanceAction` has no
+    /// `AmendDeliveryDeadline` variant, so the direct call is the
+    /// only entry point. Emits `DeliveryDeadlineAmended` (from == to
+    /// == the current state) only on an actual change; a same-deadline
+    /// no-op stays silent (mirrors `rotate_taker`). Only
+    /// `delivery_deadline_at` changes — the penalty rate and the
+    /// `delivery_late` stamp are untouched, so a delivery already
+    /// confirmed keeps its first-won stamp and amounts already
+    /// released are never restated; confirmations after the amendment
+    /// are judged against the new deadline.
+    pub fn amend_delivery_deadline(
+        ctx: Context<AmendDeliveryDeadline>,
+        deadline_at: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.delivery_deadline_at();
+        escrow
+            .amend_delivery_deadline(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                deadline_at,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `delivery_deadline_at` tail field in place in
+        // the real build (the deadline field is always present, zeroed
+        // when unconfigured) — no realloc. Only the deadline moves;
+        // the state is untouched.
+        // Emits only on an actual change; a same-deadline no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.delivery_deadline_at() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::DeliveryDeadlineAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -10333,6 +10393,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::amend_arbiter_fee`). Mirrors
     /// `escrow_state::EscrowEventKind::ArbiterFeeAmended`.
     ArbiterFeeAmended,
+    /// AV-443: the delivery-confirmation deadline was revised by
+    /// owner governance (`Escrow::amend_delivery_deadline`). Mirrors
+    /// `escrow_state::EscrowEventKind::DeliveryDeadlineAmended`.
+    DeliveryDeadlineAmended,
     /// AV-401: the protocol fee rate and ceiling were revised by
     /// owner governance (`Escrow::amend_protocol_fee`). Mirrors
     /// `escrow_state::EscrowEventKind::ProtocolFeeAmended`.
@@ -10664,6 +10728,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
             EscrowVaultEventKind::PayoutSplitSharesAmended
         }
         escrow_state::EscrowEventKind::ArbiterFeeAmended => EscrowVaultEventKind::ArbiterFeeAmended,
+        escrow_state::EscrowEventKind::DeliveryDeadlineAmended => {
+            EscrowVaultEventKind::DeliveryDeadlineAmended
+        }
         escrow_state::EscrowEventKind::ProtocolFeeAmended => {
             EscrowVaultEventKind::ProtocolFeeAmended
         }
@@ -13551,6 +13618,21 @@ pub struct AmendPayoutSplitShares<'info> {
 /// enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendArbiterFee<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-443: accounts for `amend_delivery_deadline` — the
+/// delivery-deadline revision is unconditional dual-signature
+/// governance: both initializer and taker sign (the state machine
+/// enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendDeliveryDeadline<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

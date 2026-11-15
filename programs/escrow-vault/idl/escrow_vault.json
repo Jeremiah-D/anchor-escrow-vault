@@ -1276,6 +1276,14 @@
       ]
     },
     {
+      "name": "amend_delivery_deadline",
+      "discriminator": [86, 142, 176, 58, 194, 167, 101, 222],
+      "accounts": [],
+      "args": [
+        {"name": "deadline_at", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
