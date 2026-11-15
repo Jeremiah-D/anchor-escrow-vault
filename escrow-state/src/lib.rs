@@ -42436,6 +42436,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "deadline_at <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, terminal states and Disputed; the builder owns the initial deadline terms); no delay path covers this method — GovernanceAction has no AmendDeliveryDeadline variant, so the direct call is the only entry point and no delayed handler is staged; deadline_at == 0 is AmountMismatch (code 102); an escrow with no deadline gains one on first amendment; re-affirming the current deadline is a no-op (succeeds, writes nothing, emits no event); only delivery_deadline_at changes — late_delivery_penalty_bps and delivery_late are untouched, so a delivery already confirmed keeps its first-won stamp and amounts already released are never restated, while confirmations after the amendment are judged against the new deadline (confirm_delivery_at reads the live field at every call); emits the DeliveryDeadlineAmended indexer event only on an actual change (from == to == the current state); the delivery_deadline_at tail field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-444: revise the late-delivery penalty rate after
+            // funding — the program-level entry point for the AV-245
+            // pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_late_delivery_penalty_bps")[..8]
+            // = [99, 4, 32, 200, 129, 53, 38, 220] — the Anchor
+            // instruction discriminator for the
+            // amend_late_delivery_penalty_bps handler (pinned by the
+            // discriminator test below).
+            name: "amend_late_delivery_penalty_bps",
+            params: &[(
+                "bps",
+                "u16",
+                "instruction param; the new late-delivery penalty rate in basis points — 0 is legal (no late penalty from here on, the builder's zero semantics); above 10_000 bps is rejected (InvalidPenalty, code 117)",
+            )],
+            method: "Escrow::amend_late_delivery_penalty_bps",
+            input_mapping: "bps <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial rate terms); no delay path covers this method — GovernanceAction has no AmendLateDeliveryPenaltyBps variant, so the direct call is the only entry point and no delayed handler is staged; bps > 10_000 is InvalidPenalty (code 117, the AV-206 validator); 0 is a legal value meaning no late penalty from here on; re-affirming the current rate is a no-op (succeeds, writes nothing, emits no event); only late_delivery_penalty_bps changes — delivery_deadline_at and delivery_late are untouched, so a delivery already confirmed keeps its first-won stamp and amounts already released are never restated, while a late-stamped but not-yet-released delivery reprices at the amended rate (late_delivery_penalty reads the live field at settlement time, and release and release_milestone share that helper); emits the LateDeliveryPenaltyAmended indexer event only on an actual change (from == to == the current state); the late_delivery_penalty_bps tail field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43352,6 +43370,10 @@ pub(crate) mod anchor_idl_tests {
             // AV-443: the program-level delivery-deadline revision
             // (the AV-244 pure-logic revision wired to the chain).
             "Escrow::amend_delivery_deadline",
+            // AV-444: the program-level late-delivery penalty-rate
+            // revision (the AV-245 pure-logic revision wired to the
+            // chain).
+            "Escrow::amend_late_delivery_penalty_bps",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -43710,6 +43732,11 @@ pub(crate) mod anchor_idl_tests {
                 // delivery-confirmation deadline as a unix timestamp;
                 // 0 is rejected (the "no deadline" sentinel).
                 &"amend_delivery_deadline",
+                // AV-444: the penalty-rate-revision value (u16) — the
+                // new late-delivery penalty rate in basis points; 0 is
+                // legal (no late penalty from here on), above 10_000
+                // is rejected (InvalidPenalty, code 117).
+                &"amend_late_delivery_penalty_bps",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -52358,6 +52385,346 @@ pub(crate) mod anchor_idl_tests {
         assert!(late.delivery_confirmed());
     }
 
+    fn late_confirmed_penalty_escrow() -> Escrow {
+        // The deadline-funded escrow, late-stamped: the taker
+        // confirmed after the T0 + 1000 deadline, so the 10% rate
+        // prices every release until the rate is amended.
+        const T0: u64 = 1_700_000_000;
+        let mut e = deadline_funded_escrow();
+        e.confirm_delivery_at(BOB, T0 + 1500).unwrap();
+        assert!(e.delivery_late());
+        e
+    }
+
+    #[test]
+    fn amend_late_delivery_penalty_bps_maps_param_to_rate_field() {
+        // IDL: amend_late_delivery_penalty_bps(bps: u16) —
+        // bps <- param; initializer <- accounts.initializer
+        // (signer) AND taker <- accounts.taker (signer), enforced
+        // by the Anchor account constraints and the state machine's
+        // dual-signature gate. The param rewrites the same vault
+        // field the `with_late_delivery_penalty_bps` builder
+        // populates (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // one u16 param, the AV-245 pure-logic method, and the
+        // dual-signed input mapping.
+        const T0: u64 = 1_700_000_000;
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_late_delivery_penalty_bps")
+            .expect("INSTRUCTIONS carries amend_late_delivery_penalty_bps");
+        assert_eq!(spec.method, "Escrow::amend_late_delivery_penalty_bps");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "bps");
+        assert_eq!(spec.params[0].1, "u16");
+        assert!(
+            spec.input_mapping.contains("LateDeliveryPenaltyAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the u16 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_late_delivery_penalty_bps\""),
+            "checked-in IDL carries amend_late_delivery_penalty_bps"
+        );
+        assert!(
+            idl.contains("[99, 4, 32, 200, 129, 53, 38, 220]"),
+            "checked-in IDL pins the AV-444 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"bps\", \"type\": \"u16\"}"),
+            "checked-in IDL carries the bps arg"
+        );
+        // The rate moves, the state stays Funded, the amounts and
+        // the deadline are untouched.
+        let mut e = deadline_funded_escrow();
+        assert_eq!(e.late_delivery_penalty_bps(), 1000);
+        e.amend_late_delivery_penalty_bps(ALICE, BOB, 2000)
+            .unwrap();
+        assert_eq!(e.late_delivery_penalty_bps(), 2000, "rate revised");
+        assert_eq!(e.delivery_deadline_at(), Some(T0 + 1000), "deadline untouched");
+        assert!(!e.delivery_late());
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn amend_late_delivery_penalty_bps_rejects_single_party_and_strangers() {
+        // AV-444: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // reprice the other's late penalty.
+        let mut e = deadline_funded_escrow();
+        assert_eq!(
+            e.amend_late_delivery_penalty_bps(ALICE, ALICE, 2000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_late_delivery_penalty_bps(MALLORY, BOB, 2000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_late_delivery_penalty_bps(MALLORY, MALLORY, 2000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.late_delivery_penalty_bps(),
+            1000,
+            "failed revisions write nothing"
+        );
+        e.amend_late_delivery_penalty_bps(ALICE, BOB, 2000)
+            .unwrap();
+        assert_eq!(e.late_delivery_penalty_bps(), 2000);
+    }
+
+    #[test]
+    fn amend_late_delivery_penalty_bps_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-444: Funded-only — the Uninitialized builder owns the
+        // initial rate terms, and a live dispute or a terminal
+        // escrow settles under the rate it started under. The pause
+        // guard fires before the authority and state gates.
+        const T0: u64 = 1_700_000_000;
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        // Uninitialized: the rate is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_late_delivery_penalty_bps(1000)
+            .unwrap();
+        assert_eq!(
+            bare.amend_late_delivery_penalty_bps(ALICE, BOB, 2000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.late_delivery_penalty_bps(), 1000);
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_late_delivery_penalty_bps(1000)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_late_delivery_penalty_bps(ALICE, BOB, 2000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.late_delivery_penalty_bps(), 1000);
+        // Disputed: the penalty rate stays while the dispute is in
+        // flight — the dispute settles under the rate it started
+        // under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_delivery_deadline(T0 + 1000)
+            .unwrap()
+            .with_late_delivery_penalty_bps(1000)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        d.activate(ALICE).unwrap();
+        d.activate(BOB).unwrap();
+        d.fund(ALICE, T0).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_late_delivery_penalty_bps(ALICE, BOB, 2000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.late_delivery_penalty_bps(),
+            1000,
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's rate is history, not a
+        // live price to retune.
+        let mut e = deadline_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_late_delivery_penalty_bps(ALICE, BOB, 2000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.late_delivery_penalty_bps(), 1000);
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_delivery_deadline(T0 + 1000)
+                .unwrap()
+                .with_late_delivery_penalty_bps(1000)
+                .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_late_delivery_penalty_bps(ALICE, BOB, 2000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_late_delivery_penalty_bps(MALLORY, BOB, 2000),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(paused.late_delivery_penalty_bps(), 1000);
+    }
+
+    #[test]
+    fn amend_late_delivery_penalty_bps_rejects_above_10000_bps() {
+        // AV-444: above 10_000 bps is not a rate — the builder's
+        // rejection (the AV-206 validator), and a failed amendment
+        // writes nothing. The 10_000 boundary itself is legal.
+        let mut e = deadline_funded_escrow();
+        assert_eq!(
+            e.amend_late_delivery_penalty_bps(ALICE, BOB, 10_001),
+            Err(EscrowError::InvalidPenalty)
+        );
+        assert_eq!(EscrowError::InvalidPenalty.code(), 117);
+        assert_eq!(e.late_delivery_penalty_bps(), 1000);
+        e.amend_late_delivery_penalty_bps(ALICE, BOB, 10_000)
+            .unwrap();
+        assert_eq!(e.late_delivery_penalty_bps(), 10_000);
+    }
+
+    #[test]
+    fn amend_late_delivery_penalty_bps_accepts_zero_as_no_penalty() {
+        // AV-444: zero is a legal rate meaning "no late penalty
+        // from here on" (the builder's zero semantics) — a
+        // late-stamped release after the amendment settles in full.
+        const T0: u64 = 1_700_000_000;
+        let mut e = late_confirmed_penalty_escrow();
+        e.amend_late_delivery_penalty_bps(ALICE, BOB, 0)
+            .unwrap();
+        assert_eq!(e.late_delivery_penalty_bps(), 0);
+        assert_eq!(e.delivery_deadline_at(), Some(T0 + 1000));
+        assert!(e.delivery_late());
+        let (payout, fee) = e.release(ALICE, T0 + 1600, 100_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (100_000, 0));
+        assert_eq!(e.penalty_paid(), 0);
+    }
+
+    #[test]
+    fn amend_late_delivery_penalty_bps_reprices_unreleased_late_delivery() {
+        // AV-444: late-stamped but unreleased — the release prices
+        // from the amended rate, not the rate in force at
+        // confirmation: 20% of 100_000, not 10%.
+        const T0: u64 = 1_700_000_000;
+        let mut e = late_confirmed_penalty_escrow();
+        e.amend_late_delivery_penalty_bps(ALICE, BOB, 2000)
+            .unwrap();
+        assert_eq!(e.late_delivery_penalty_bps(), 2000);
+        assert_eq!(e.delivery_deadline_at(), Some(T0 + 1000));
+        assert!(e.delivery_late());
+        assert_eq!(e.state(), EscrowState::Funded);
+        let (payout, fee) = e.release(ALICE, T0 + 1600, 100_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (80_000, 0));
+        assert_eq!(e.released_amount(), 80_000);
+        assert_eq!(e.penalty_paid(), 20_000);
+    }
+
+    #[test]
+    fn amend_late_delivery_penalty_bps_never_restates_released_amounts() {
+        // AV-444: the first release settles under the old 10% rate
+        // (4000 on 40_000); only the still-locked remainder reprices
+        // at the amended 50% rate (30_000 on 60_000). No refund, no
+        // restatement of the settled penalty.
+        const T0: u64 = 1_700_000_000;
+        let mut e = late_confirmed_penalty_escrow();
+        let (payout, _) = e.release(ALICE, T0 + 1600, 40_000, None, BOB).unwrap();
+        assert_eq!(payout, 36_000);
+        assert_eq!(e.penalty_paid(), 4000);
+        e.amend_late_delivery_penalty_bps(ALICE, BOB, 5000)
+            .unwrap();
+        let (payout, _) = e.release(ALICE, T0 + 1700, 60_000, None, BOB).unwrap();
+        assert_eq!(payout, 30_000);
+        assert_eq!(e.released_amount(), 66_000);
+        assert_eq!(e.penalty_paid(), 34_000);
+    }
+
+    #[test]
+    fn amend_late_delivery_penalty_bps_noop_on_same_rate() {
+        // AV-444: re-affirming the current rate is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = deadline_funded_escrow();
+        e.amend_late_delivery_penalty_bps(ALICE, BOB, 1000)
+            .unwrap();
+        assert_eq!(e.late_delivery_penalty_bps(), 1000);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.penalty_paid(), 0);
+    }
+
+    #[test]
+    fn amend_late_delivery_penalty_bps_handler_emits_only_on_actual_change() {
+        // AV-444: the program handler mirrors
+        // `IndexedEscrow::amend_late_delivery_penalty_bps` — a real
+        // revision emits LateDeliveryPenaltyAmended (from == to ==
+        // the current state, all amounts zero), while re-affirming
+        // the current rate leaves `late_delivery_penalty_bps()`
+        // unchanged, which is exactly the handler's no-emit
+        // condition (the handler compares before/after and stays
+        // silent on equality).
+        // A delivery already confirmed keeps its first-won stamp
+        // either way: moving the rate can neither rewrite an
+        // on-time confirmation late nor wash a late one clean.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const T0: u64 = 1_700_000_000;
+        const NOW: u64 = 1_700_000_000;
+        let mut indexed =
+            IndexedEscrow::wrap([0xE0; 32], deadline_funded_escrow());
+        let before = indexed.event_count();
+        indexed
+            .amend_late_delivery_penalty_bps(ALICE, BOB, 2000, NOW)
+            .unwrap();
+        assert_eq!(indexed.event_count(), before + 1);
+        let ev = indexed.events().last().unwrap();
+        assert_eq!(ev.kind, EscrowEventKind::LateDeliveryPenaltyAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the current rate changes nothing
+        // observable — the handler's before/after comparison sees
+        // equality and emits nothing.
+        let mut e = deadline_funded_escrow();
+        e.amend_late_delivery_penalty_bps(ALICE, BOB, 1000)
+            .unwrap();
+        assert_eq!(e.late_delivery_penalty_bps(), 1000);
+        assert_eq!(e.state(), EscrowState::Funded);
+        // An on-time confirmation stays on time after the rate is
+        // retuned, and a late one stays late.
+        let mut on_time = deadline_funded_escrow();
+        on_time.confirm_delivery_at(BOB, T0 + 500).unwrap();
+        assert!(!on_time.delivery_late());
+        on_time
+            .amend_late_delivery_penalty_bps(ALICE, BOB, 2000)
+            .unwrap();
+        assert!(!on_time.delivery_late());
+        assert!(on_time.delivery_confirmed());
+        let mut late = deadline_funded_escrow();
+        late.confirm_delivery_at(BOB, T0 + 1500).unwrap();
+        assert!(late.delivery_late());
+        late.amend_late_delivery_penalty_bps(ALICE, BOB, 2000)
+            .unwrap();
+        assert!(late.delivery_late());
+        assert!(late.delivery_confirmed());
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -55736,6 +56103,21 @@ pub(crate) mod anchor_idl_tests {
             "deadline_at",
             "delivery_deadline_at",
         ),
+        // AV-444: the post-funding penalty-rate revision rewrites
+        // the same tail field in place — a second param source for
+        // `late_delivery_penalty_bps`, like `amend_arbiter_fee`'s
+        // legs. The field's initial value comes from the
+        // `with_late_delivery_penalty_bps` builder param
+        // (Uninitialized only); this entry documents the revision
+        // source. Only the rate moves — the deadline and the late
+        // flag are untouched, and a 0 rate is legal (no penalty from
+        // here on) while anything above 10_000 bps is rejected
+        // (InvalidPenalty, code 117).
+        (
+            "amend_late_delivery_penalty_bps",
+            "bps",
+            "late_delivery_penalty_bps",
+        ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
         // for `delegation` (the whole grant region, like
@@ -56388,18 +56770,15 @@ pub(crate) mod anchor_idl_tests {
              party rotation; read by require_scoped_authority as the \
              operator gate",
         ),
-        // AV-216: the late-delivery penalty rate — zeroed by
-        // `initialize` (no late penalty); set by
-        // `with_late_delivery_penalty_bps` (Uninitialized only,
-        // 0–10_000 bps); read by `release` /
-        // `release_milestone` as the penalty price. Same
-        // field-source rationale as above.
-        (
-            "late_delivery_penalty_bps",
-            "zeroed by initialize; set by with_late_delivery_penalty_bps \
-             (Uninitialized only, 0-10_000 bps); read by release / \
-             release_milestone as the penalty price",
-        ),
+        // AV-216: the late-delivery penalty rate was a field source
+        // (`0` by `initialize`; set by
+        // `with_late_delivery_penalty_bps`, Uninitialized only; read
+        // by `release` / `release_milestone` as the penalty price)
+        // until AV-444 added the `amend_late_delivery_penalty_bps`
+        // instruction param that rewrites it — the field is now
+        // param-sourced (see PARAM_FIELD_MAP), like
+        // `delivery_deadline_at`, so it is not listed here: every
+        // field gets exactly one source kind.
         // AV-216: the late flag — `false` at `initialize`; set
         // only by `confirm_delivery_at` when the timed
         // confirmation lands after the deadline; never cleared
@@ -85519,6 +85898,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_delivery_deadline"),
             [86, 142, 176, 58, 194, 167, 101, 222]
+        );
+    }
+
+    #[test]
+    fn amend_late_delivery_penalty_bps_instruction_discriminator_is_pinned() {
+        // AV-444. IDL:
+        // sha256("global:amend_late_delivery_penalty_bps")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_late_delivery_penalty_bps"),
+            [99, 4, 32, 200, 129, 53, 38, 220]
         );
     }
 

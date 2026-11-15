@@ -6653,6 +6653,68 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the late-delivery penalty rate after funding (AV-444;
+    /// mirrors `Escrow::amend_late_delivery_penalty_bps`).
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign — one party alone cannot reprice the other's late
+    /// penalty, paralleling `amend_arbiter_fee`. `Funded` only — the
+    /// builder owns the initial rate terms. A paused escrow fails
+    /// fast (`Paused`, before the authority gate). `bps > 10_000` is
+    /// `InvalidPenalty` (code 117): `0` is a legal value meaning "no
+    /// late penalty from here on" (the builder's zero semantics), so
+    /// there is no cancel-penalty rejection in this item. No delay
+    /// path covers this method — `GovernanceAction` has no
+    /// `AmendLateDeliveryPenaltyBps` variant, so the direct call is
+    /// the only entry point. Emits `LateDeliveryPenaltyAmended`
+    /// (from == to == the current state) only on an actual change; a
+    /// same-rate no-op stays silent (mirrors `rotate_taker`). Only
+    /// `late_delivery_penalty_bps` changes — the deadline and the
+    /// `delivery_late` stamp are untouched, so a late-stamped but
+    /// not-yet-released delivery reprices at the new rate (`release`
+    /// and `release_milestone` share the live-rate helper) while
+    /// amounts already released and penalties already banked are
+    /// never restated.
+    pub fn amend_late_delivery_penalty_bps(
+        ctx: Context<AmendLateDeliveryPenaltyBps>,
+        bps: u16,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.late_delivery_penalty_bps();
+        escrow
+            .amend_late_delivery_penalty_bps(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                bps,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `late_delivery_penalty_bps` tail field in
+        // place in the real build (the rate field is always present,
+        // zeroed when unconfigured) — no realloc. Only the rate
+        // moves; the state is untouched.
+        // Emits only on an actual change; a same-rate no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.late_delivery_penalty_bps() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::LateDeliveryPenaltyAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -10397,6 +10459,10 @@ pub enum EscrowVaultEventKind {
     /// owner governance (`Escrow::amend_delivery_deadline`). Mirrors
     /// `escrow_state::EscrowEventKind::DeliveryDeadlineAmended`.
     DeliveryDeadlineAmended,
+    /// AV-444: the late-delivery penalty rate was revised by owner
+    /// governance (`Escrow::amend_late_delivery_penalty_bps`). Mirrors
+    /// `escrow_state::EscrowEventKind::LateDeliveryPenaltyAmended`.
+    LateDeliveryPenaltyAmended,
     /// AV-401: the protocol fee rate and ceiling were revised by
     /// owner governance (`Escrow::amend_protocol_fee`). Mirrors
     /// `escrow_state::EscrowEventKind::ProtocolFeeAmended`.
@@ -10730,6 +10796,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         escrow_state::EscrowEventKind::ArbiterFeeAmended => EscrowVaultEventKind::ArbiterFeeAmended,
         escrow_state::EscrowEventKind::DeliveryDeadlineAmended => {
             EscrowVaultEventKind::DeliveryDeadlineAmended
+        }
+        escrow_state::EscrowEventKind::LateDeliveryPenaltyAmended => {
+            EscrowVaultEventKind::LateDeliveryPenaltyAmended
         }
         escrow_state::EscrowEventKind::ProtocolFeeAmended => {
             EscrowVaultEventKind::ProtocolFeeAmended
@@ -13633,6 +13702,21 @@ pub struct AmendArbiterFee<'info> {
 /// enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendDeliveryDeadline<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-444: accounts for `amend_late_delivery_penalty_bps` — the
+/// late-delivery penalty-rate revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendLateDeliveryPenaltyBps<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
