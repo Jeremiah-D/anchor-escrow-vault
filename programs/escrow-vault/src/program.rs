@@ -6715,6 +6715,72 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the milestone late-penalty rate after funding (AV-445;
+    /// mirrors `Escrow::amend_milestone_late_penalty_bps`).
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign — one party alone cannot reprice the other's late
+    /// tranche penalty, paralleling `amend_arbiter_fee`. `Funded`
+    /// only — the builder owns the initial rate terms. A paused
+    /// escrow fails fast (`Paused`, before the authority gate). Only
+    /// an escrow that already carries a milestone due-date table may
+    /// revise — a plan-less or table-less escrow is
+    /// `InvalidMilestones` (code 110): amendment never installs
+    /// penalty semantics on a table-less escrow after funding.
+    /// `bps > 10_000` is `InvalidPenalty` (code 117): `0` is a legal
+    /// value meaning "no milestone late penalty from here on" (the
+    /// builder's zero semantics), so there is no cancel-penalty
+    /// rejection in this item. No delay path covers this method —
+    /// `GovernanceAction` has no `AmendMilestoneLatePenaltyBps`
+    /// variant, so the direct call is the only entry point. Emits
+    /// `MilestoneLatePenaltyBpsAmended` (from == to == the current
+    /// state) only on an actual change; a same-rate no-op stays
+    /// silent (mirrors `rotate_taker`). Only
+    /// `milestone_late_penalty_bps` changes — the due-date table and
+    /// the settled tranches are untouched, so an unreleased late
+    /// tranche reprices at the new rate (`release_milestone` reads
+    /// the live rate) while penalties already banked are never
+    /// restated.
+    pub fn amend_milestone_late_penalty_bps(
+        ctx: Context<AmendMilestoneLatePenaltyBps>,
+        bps: u16,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.milestone_late_penalty_bps();
+        escrow
+            .amend_milestone_late_penalty_bps(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                bps,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `milestone_late_penalty_bps` tail field in
+        // place in the real build (the rate field is always present,
+        // zeroed when unconfigured) — no realloc. Only the rate
+        // moves; the state is untouched.
+        // Emits only on an actual change; a same-rate no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.milestone_late_penalty_bps() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::MilestoneLatePenaltyBpsAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -10463,6 +10529,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::amend_late_delivery_penalty_bps`). Mirrors
     /// `escrow_state::EscrowEventKind::LateDeliveryPenaltyAmended`.
     LateDeliveryPenaltyAmended,
+    /// AV-445: the milestone late-penalty rate was revised by owner
+    /// governance (`Escrow::amend_milestone_late_penalty_bps`). Mirrors
+    /// `escrow_state::EscrowEventKind::MilestoneLatePenaltyBpsAmended`.
+    MilestoneLatePenaltyBpsAmended,
     /// AV-401: the protocol fee rate and ceiling were revised by
     /// owner governance (`Escrow::amend_protocol_fee`). Mirrors
     /// `escrow_state::EscrowEventKind::ProtocolFeeAmended`.
@@ -10799,6 +10869,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::LateDeliveryPenaltyAmended => {
             EscrowVaultEventKind::LateDeliveryPenaltyAmended
+        }
+        escrow_state::EscrowEventKind::MilestoneLatePenaltyBpsAmended => {
+            EscrowVaultEventKind::MilestoneLatePenaltyBpsAmended
         }
         escrow_state::EscrowEventKind::ProtocolFeeAmended => {
             EscrowVaultEventKind::ProtocolFeeAmended
@@ -13717,6 +13790,21 @@ pub struct AmendDeliveryDeadline<'info> {
 /// state machine enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendLateDeliveryPenaltyBps<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-445: accounts for `amend_milestone_late_penalty_bps` — the
+/// milestone late-penalty-rate revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendMilestoneLatePenaltyBps<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
