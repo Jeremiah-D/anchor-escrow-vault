@@ -6846,6 +6846,73 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the keeper-bounty per-crank amount after funding (AV-447;
+    /// mirrors `Escrow::amend_keeper_bounty_per_crank`). Unconditional
+    /// dual-signature governance: both initializer and taker sign — one
+    /// party alone cannot reprice the keeper incentive on the other's
+    /// funds, paralleling `amend_amount_bounds`. `Funded` only — the
+    /// builder owns the initial bounty terms. A paused escrow fails
+    /// fast (`Paused`, before the authority gate). Only an escrow
+    /// whose bounty is already configured (`keeper_bounty_per_crank`
+    /// non-zero) may revise — an unconfigured escrow is
+    /// `InvalidKeeperBounty` (code 357): amendment never installs a
+    /// bounty on a bounty-less escrow after funding. `per_crank == 0`
+    /// is a legal value that closes future payouts, and closing is
+    /// terminal through this path — a closed escrow reads as
+    /// unconfigured, so reopening is refused by the same fail-closed
+    /// gate. No delay path covers this method — `GovernanceAction`
+    /// has no `AmendKeeperBountyPerCrank` variant, so the direct
+    /// call is the only entry point. Emits
+    /// `KeeperBountyPerCrankAmended` (from == to == the current
+    /// state) only on an actual change; a same-amount no-op stays
+    /// silent (mirrors `rotate_taker`). Only
+    /// `keeper_bounty_per_crank` changes — `keeper_bounty_pool` and
+    /// bounty already paid are untouched, so an exhausted pool still
+    /// pays `0` after any revision and the revision itself never
+    /// revives the bounty; the new amount governs from the next
+    /// `crank_expired` (which reads the live amount at payment
+    /// time) while a crank already settled keeps the amount it
+    /// settled under.
+    pub fn amend_keeper_bounty_per_crank(
+        ctx: Context<AmendKeeperBountyPerCrank>,
+        per_crank: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.keeper_bounty_per_crank();
+        escrow
+            .amend_keeper_bounty_per_crank(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                per_crank,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `keeper_bounty_per_crank` tail field in place
+        // — no realloc. Only the amount moves; the state is
+        // untouched.
+        // Emits only on an actual change; a same-amount no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.keeper_bounty_per_crank() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::KeeperBountyPerCrankAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -10602,6 +10669,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::amend_funding_plan_max_tranches`). Mirrors
     /// `escrow_state::EscrowEventKind::FundingPlanMaxTranchesAmended`.
     FundingPlanMaxTranchesAmended,
+    /// AV-447: the keeper-bounty per-crank amount was revised by owner
+    /// governance (`Escrow::amend_keeper_bounty_per_crank`). Mirrors
+    /// `escrow_state::EscrowEventKind::KeeperBountyPerCrankAmended`.
+    KeeperBountyPerCrankAmended,
     /// AV-401: the protocol fee rate and ceiling were revised by
     /// owner governance (`Escrow::amend_protocol_fee`). Mirrors
     /// `escrow_state::EscrowEventKind::ProtocolFeeAmended`.
@@ -10944,6 +11015,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::FundingPlanMaxTranchesAmended => {
             EscrowVaultEventKind::FundingPlanMaxTranchesAmended
+        }
+        escrow_state::EscrowEventKind::KeeperBountyPerCrankAmended => {
+            EscrowVaultEventKind::KeeperBountyPerCrankAmended
         }
         escrow_state::EscrowEventKind::ProtocolFeeAmended => {
             EscrowVaultEventKind::ProtocolFeeAmended
@@ -13892,6 +13966,21 @@ pub struct AmendMilestoneLatePenaltyBps<'info> {
 /// state machine enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendFundingPlanMaxTranches<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-447: accounts for `amend_keeper_bounty_per_crank` — the
+/// keeper-bounty per-crank revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendKeeperBountyPerCrank<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

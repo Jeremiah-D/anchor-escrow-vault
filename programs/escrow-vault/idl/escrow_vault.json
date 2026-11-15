@@ -1308,6 +1308,14 @@
       ]
     },
     {
+      "name": "amend_keeper_bounty_per_crank",
+      "discriminator": [251, 75, 110, 129, 13, 53, 197, 26],
+      "accounts": [],
+      "args": [
+        {"name": "per_crank", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
