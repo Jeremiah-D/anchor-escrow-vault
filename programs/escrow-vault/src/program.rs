@@ -6781,6 +6781,71 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the funding plan's tranche budget after funding (AV-446;
+    /// mirrors `Escrow::amend_funding_plan_max_tranches`).
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign — one party alone cannot move the tranche budget
+    /// on the other's funds, paralleling `amend_amount_bounds`.
+    /// `Funded` only — the builder owns the initial plan terms. A
+    /// paused escrow fails fast (`Paused`, before the authority
+    /// gate). Only an escrow that already carries a funding plan may
+    /// revise — a plan-less escrow is `InvalidFundingPlan` (code
+    /// 173): amendment never installs a tranched plan on a
+    /// plan-less escrow after funding. `max_tranches == 0` is
+    /// `InvalidFundingPlan` (the `FundingPlan::new` gate, unchanged:
+    /// there is no "close the plan" semantics — shrinking the budget
+    /// to `tranches_used` exhausts the plan instead), and a budget
+    /// below `tranches_used` is refused with the same error. No
+    /// delay path covers this method — `GovernanceAction` has no
+    /// `AmendFundingPlanMaxTranches` variant, so the direct call is
+    /// the only entry point. Emits `FundingPlanMaxTranchesAmended`
+    /// (from == to == the current state) only on an actual change;
+    /// a same-budget no-op stays silent (mirrors `rotate_taker`).
+    /// Only `max_tranches` changes — `total_amount`,
+    /// `funded_total` and `tranches_used` are untouched, so a
+    /// funded tranche keeps the budget it funded under and the new
+    /// budget governs from the next `fund_tranche` (which reads the
+    /// live budget on every deposit).
+    pub fn amend_funding_plan_max_tranches(
+        ctx: Context<AmendFundingPlanMaxTranches>,
+        max_tranches: u8,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.funding_plan().map(|plan| plan.max_tranches());
+        escrow
+            .amend_funding_plan_max_tranches(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                max_tranches,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `max_tranches` field of the resident funding
+        // plan in place — no realloc. Only the budget moves; the
+        // state is untouched.
+        // Emits only on an actual change; a same-budget no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.funding_plan().map(|plan| plan.max_tranches()) != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::FundingPlanMaxTranchesAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -10533,6 +10598,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::amend_milestone_late_penalty_bps`). Mirrors
     /// `escrow_state::EscrowEventKind::MilestoneLatePenaltyBpsAmended`.
     MilestoneLatePenaltyBpsAmended,
+    /// AV-446: the funding plan's tranche budget was revised by owner
+    /// governance (`Escrow::amend_funding_plan_max_tranches`). Mirrors
+    /// `escrow_state::EscrowEventKind::FundingPlanMaxTranchesAmended`.
+    FundingPlanMaxTranchesAmended,
     /// AV-401: the protocol fee rate and ceiling were revised by
     /// owner governance (`Escrow::amend_protocol_fee`). Mirrors
     /// `escrow_state::EscrowEventKind::ProtocolFeeAmended`.
@@ -10872,6 +10941,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::MilestoneLatePenaltyBpsAmended => {
             EscrowVaultEventKind::MilestoneLatePenaltyBpsAmended
+        }
+        escrow_state::EscrowEventKind::FundingPlanMaxTranchesAmended => {
+            EscrowVaultEventKind::FundingPlanMaxTranchesAmended
         }
         escrow_state::EscrowEventKind::ProtocolFeeAmended => {
             EscrowVaultEventKind::ProtocolFeeAmended
@@ -13805,6 +13877,21 @@ pub struct AmendLateDeliveryPenaltyBps<'info> {
 /// state machine enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendMilestoneLatePenaltyBps<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-446: accounts for `amend_funding_plan_max_tranches` — the
+/// funding-plan tranche-budget revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendFundingPlanMaxTranches<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

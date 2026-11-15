@@ -1300,6 +1300,14 @@
       ]
     },
     {
+      "name": "amend_funding_plan_max_tranches",
+      "discriminator": [73, 165, 30, 199, 185, 22, 108, 65],
+      "accounts": [],
+      "args": [
+        {"name": "max_tranches", "type": "u8"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
