@@ -7097,6 +7097,68 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise one milestone tranche's claim deadline after funding (AV-451;
+    /// mirrors `Escrow::amend_milestone_claim_deadline`). Unconditional
+    /// dual-signature governance: both initializer and taker sign — one
+    /// party alone cannot move the other's claim window, paralleling
+    /// `amend_release_cooling`. `Funded` only — the builder owns the
+    /// initial deadline set. A paused escrow fails fast (`Paused`, before
+    /// the authority gate). No plan attached, or a tranche at or past the
+    /// plan's count, is `InvalidMilestones` (code 110). `0` is legal (it
+    /// clears the tranche's deadline, the builder's "never attached"
+    /// sentinel). No delay path covers this method — `GovernanceAction`
+    /// has no `AmendMilestoneClaimDeadline` variant, so the direct call
+    /// is the only entry point. Emits `MilestoneClaimDeadlineAmended`
+    /// (from == to == the current state) only on an actual change; a
+    /// same-deadline no-op stays silent (mirrors `rotate_taker`). Only
+    /// `milestone_claim_deadlines[tranche]` changes — the plan amounts,
+    /// the due dates, the other tranches' deadlines, and the settled
+    /// amounts are untouched; the claim gate reads the deadline live, so
+    /// extending rescues a tranche that would have expired, shortening
+    /// expires it sooner, and clearing removes the gate, while a tranche
+    /// already claimed or skipped keeps its settlement and an unconfirmed
+    /// tranche still needs its confirmations first.
+    pub fn amend_milestone_claim_deadline(
+        ctx: Context<AmendMilestoneClaimDeadline>,
+        tranche: u8,
+        deadline_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.milestone_claim_deadline_at(tranche as usize);
+        escrow
+            .amend_milestone_claim_deadline(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                tranche,
+                deadline_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `milestone_claim_deadlines[tranche]` slot in place — no realloc.
+        // Only that tranche's deadline moves; the state is untouched.
+        // Emits only on an actual change; a same-deadline no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.milestone_claim_deadline_at(tranche as usize) != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::MilestoneClaimDeadlineAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -14217,6 +14279,21 @@ pub struct AmendPenaltyBps<'info> {
 /// state machine enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendReleaseCooling<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-451: accounts for `amend_milestone_claim_deadline` — the
+/// milestone-tranche claim-deadline revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendMilestoneClaimDeadline<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

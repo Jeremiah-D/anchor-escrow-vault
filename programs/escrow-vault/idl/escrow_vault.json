@@ -1340,6 +1340,15 @@
       ]
     },
     {
+      "name": "amend_milestone_claim_deadline",
+      "discriminator": [122, 160, 143, 218, 5, 208, 110, 110],
+      "accounts": [],
+      "args": [
+        {"name": "tranche", "type": "u8"},
+        {"name": "deadline_secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

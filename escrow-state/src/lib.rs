@@ -42562,6 +42562,31 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "cooling_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial window terms); no delay path covers this method — GovernanceAction has no AmendReleaseCooling variant, so the direct call is the only entry point and no delayed handler is staged; no value rejection — any u64 is a legal window (the gate adds with saturating_add) and 0 is legal (cooling off, the builder's zero semantics); no configuration precondition — an unconfigured escrow gains a window on first amendment; re-affirming the current window is a no-op (succeeds, writes nothing, emits no event); only release_cooling_secs changes — release_intent_at is untouched, so a live announced intent is re-measured against the new window (is_release_cooling_eligible reads the live field) while a vetoed intent stays vetoed (veto clears the intent; this item writes the window only), so lengthening a window pushes an announced but not-yet-elapsed intent out, shortening it pulls it in, and amending to 0 opens release immediately, while amounts already released are never restated; emits the ReleaseCoolingAmended indexer event only on an actual change (from == to == the current state); the release_cooling_secs tail field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-451: revise one milestone tranche's claim deadline
+            // after funding — the program-level entry point for the
+            // AV-247 pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_milestone_claim_deadline")[..8]
+            // = [122, 160, 143, 218, 5, 208, 110, 110] — the Anchor
+            // instruction discriminator for the
+            // amend_milestone_claim_deadline handler (pinned by the
+            // discriminator test below).
+            name: "amend_milestone_claim_deadline",
+            params: &[
+                (
+                    "tranche",
+                    "u8",
+                    "instruction param; the milestone tranche whose claim deadline moves — a selector into the milestone_claim_deadlines table (see PARAM_FIELD_MAP); a tranche at or past the plan's count is InvalidMilestones (code 110)",
+                ),
+                (
+                    "deadline_secs",
+                    "u64",
+                    "instruction param; the new absolute claim deadline as a unix timestamp in seconds — 0 is legal (it clears the tranche's deadline, the \"never attached\" sentinel, unlike the builder which rejects 0)",
+                ),
+            ],
+            method: "Escrow::amend_milestone_claim_deadline",
+            input_mapping: "tranche <- param (u8); deadline_secs <- param (u64); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial deadline set); no delay path covers this method — GovernanceAction has no AmendMilestoneClaimDeadline variant, so the direct call is the only entry point and no delayed handler is staged; no plan attached, or a tranche at or past the plan's count, is InvalidMilestones (code 110, the builder's plan-shape rejection); 0 is a legal value that clears the tranche's deadline (the \"never attached\" sentinel); re-affirming the current deadline is a no-op (succeeds, writes nothing, emits no event); only milestone_claim_deadlines[tranche] changes — the plan amounts, the due dates, the other tranches' deadlines, and the settled amounts are untouched, so the claim gate reads the deadline live (release_milestone consults milestone_claim_deadline_at at claim time) — extending rescues a tranche that would have expired under the old window, shortening expires it sooner, and clearing removes the gate entirely, while a tranche already claimed or already skipped keeps its settlement and an unconfirmed tranche still needs its confirmations first (the confirmation gate runs before the deadline gate); emits the MilestoneClaimDeadlineAmended indexer event only on an actual change (from == to == the current state); the milestone_claim_deadlines[tranche] slot is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43503,6 +43528,10 @@ pub(crate) mod anchor_idl_tests {
             // AV-450: the program-level release-cooling-window revision
             // (the AV-246 pure-logic revision wired to the chain).
             "Escrow::amend_release_cooling",
+            // AV-451: the program-level milestone-tranche claim-deadline
+            // revision (the AV-247 pure-logic revision wired to the
+            // chain).
+            "Escrow::amend_milestone_claim_deadline",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -43630,7 +43659,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-447 adds `amend_keeper_bounty_per_crank`;
         // AV-448 adds `amend_slash_deadline`;
         // AV-449 adds `amend_penalty_bps`;
-        // AV-450 adds `amend_release_cooling`.)
+        // AV-450 adds `amend_release_cooling`;
+        // AV-451 adds `amend_milestone_claim_deadline`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -43909,6 +43939,16 @@ pub(crate) mod anchor_idl_tests {
                 // announced intent is re-measured against the new
                 // window while a vetoed intent stays vetoed.
                 &"amend_release_cooling",
+                // AV-451: the deadline-revision pair — the tranche
+                // selector (u8, which slot of the
+                // milestone_claim_deadlines table moves) + the new
+                // absolute claim deadline (u64); 0 is legal (it
+                // clears the tranche's deadline, the "never
+                // attached" sentinel), and a plan-less escrow or an
+                // out-of-range tranche is refused (InvalidMilestones,
+                // code 110) while the other tranches' deadlines and
+                // the settled amounts are untouched.
+                &"amend_milestone_claim_deadline",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -55081,6 +55121,361 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(e.release_intent_at(), None);
     }
 
+    // AV-451: the program-level milestone-tranche claim-deadline
+    // revision — the AV-247 pure-logic revision wired to the chain.
+    const CLAIM_DEADLINE: u64 = 1_750_000_000;
+
+    fn claim_deadline_funded_escrow() -> Escrow {
+        // AV-451 helper: a funded escrow with a two-tranche
+        // milestone plan and a claim deadline on tranche 0 — the
+        // same shape the AV-247 pure-logic tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap()
+            .with_milestone_claim_deadline(0, CLAIM_DEADLINE)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_maps_param_to_deadline_field() {
+        // IDL: amend_milestone_claim_deadline(tranche: u8,
+        // deadline_secs: u64) — tranche <- param (the slot of the
+        // milestone_claim_deadlines table that moves);
+        // deadline_secs <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the selected
+        // `milestone_claim_deadlines[tranche]` slot in place (see
+        // PARAM_FIELD_MAP) — no layout change. The INSTRUCTIONS
+        // spec entry pins the program-level wiring: one u8 selector
+        // + one u64 deadline, the AV-247 pure-logic method, and the
+        // dual-signed input mapping.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_milestone_claim_deadline")
+            .expect("INSTRUCTIONS carries amend_milestone_claim_deadline");
+        assert_eq!(spec.method, "Escrow::amend_milestone_claim_deadline");
+        assert_eq!(spec.params.len(), 2);
+        assert_eq!(spec.params[0].0, "tranche");
+        assert_eq!(spec.params[0].1, "u8");
+        assert_eq!(spec.params[1].0, "deadline_secs");
+        assert_eq!(spec.params[1].1, "u64");
+        assert!(
+            spec.input_mapping.contains("MilestoneClaimDeadlineAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the two args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_milestone_claim_deadline\""),
+            "checked-in IDL carries amend_milestone_claim_deadline"
+        );
+        assert!(
+            idl.contains("[122, 160, 143, 218, 5, 208, 110, 110]"),
+            "checked-in IDL pins the AV-451 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"tranche\", \"type\": \"u8\"}"),
+            "checked-in IDL carries the tranche arg"
+        );
+        assert!(
+            idl.contains("{\"name\": \"deadline_secs\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the deadline_secs arg"
+        );
+        // Only the selected slot moves: the other tranche's
+        // deadline, the state and the layout are untouched.
+        let mut e = claim_deadline_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.milestone_claim_deadline_at(0), Some(CLAIM_DEADLINE));
+        assert_eq!(e.milestone_claim_deadline_at(1), None);
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, CLAIM_DEADLINE + 1000)
+            .unwrap();
+        assert_eq!(
+            e.milestone_claim_deadline_at(0),
+            Some(CLAIM_DEADLINE + 1000),
+            "selected slot revised"
+        );
+        assert_eq!(
+            e.milestone_claim_deadline_at(1),
+            None,
+            "other tranche untouched"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "deadline slot rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_rejects_single_party_and_strangers() {
+        // AV-451: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // move the other's claim window.
+        let mut e = claim_deadline_funded_escrow();
+        assert_eq!(
+            e.amend_milestone_claim_deadline(ALICE, ALICE, 0, CLAIM_DEADLINE + 1000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_milestone_claim_deadline(MALLORY, BOB, 0, CLAIM_DEADLINE + 1000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_milestone_claim_deadline(MALLORY, MALLORY, 0, CLAIM_DEADLINE + 1000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.milestone_claim_deadline_at(0),
+            Some(CLAIM_DEADLINE),
+            "failed revisions write nothing"
+        );
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, CLAIM_DEADLINE + 1000)
+            .unwrap();
+        assert_eq!(
+            e.milestone_claim_deadline_at(0),
+            Some(CLAIM_DEADLINE + 1000)
+        );
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-451: Funded-only — the Uninitialized builder owns the
+        // initial deadline set, and a live dispute or a terminal
+        // escrow settles under the deadline it started under. The
+        // pause guard fires before the authority and state gates.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const T0: u64 = 1_700_000_000;
+        // Uninitialized: the deadline is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap()
+            .with_milestone_claim_deadline(0, CLAIM_DEADLINE)
+            .unwrap();
+        assert_eq!(
+            bare.amend_milestone_claim_deadline(ALICE, BOB, 0, CLAIM_DEADLINE + 1000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.milestone_claim_deadline_at(0), Some(CLAIM_DEADLINE));
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+                .unwrap()
+                .with_milestone_claim_deadline(0, CLAIM_DEADLINE)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_milestone_claim_deadline(ALICE, BOB, 0, CLAIM_DEADLINE + 1000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.milestone_claim_deadline_at(0), Some(CLAIM_DEADLINE));
+        // Disputed: the deadline stays while the dispute is in
+        // flight — the dispute settles under the deadline it started
+        // under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap()
+            .with_milestone_claim_deadline(0, CLAIM_DEADLINE)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        d.activate(ALICE).unwrap();
+        d.activate(BOB).unwrap();
+        d.fund(ALICE, T0).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_milestone_claim_deadline(ALICE, BOB, 0, CLAIM_DEADLINE + 1000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.milestone_claim_deadline_at(0),
+            Some(CLAIM_DEADLINE),
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's deadline is history, not a
+        // live window to retune.
+        let mut e = claim_deadline_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_milestone_claim_deadline(ALICE, BOB, 0, CLAIM_DEADLINE + 1000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.milestone_claim_deadline_at(0), Some(CLAIM_DEADLINE));
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+                .unwrap()
+                .with_milestone_claim_deadline(0, CLAIM_DEADLINE)
+                .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_milestone_claim_deadline(ALICE, BOB, 0, CLAIM_DEADLINE + 1000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_milestone_claim_deadline(MALLORY, BOB, 0, CLAIM_DEADLINE + 1000),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.milestone_claim_deadline_at(0),
+            Some(CLAIM_DEADLINE),
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused
+            .amend_milestone_claim_deadline(ALICE, BOB, 0, CLAIM_DEADLINE + 1000)
+            .unwrap();
+        assert_eq!(
+            paused.milestone_claim_deadline_at(0),
+            Some(CLAIM_DEADLINE + 1000)
+        );
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_refuses_planless_escrow() {
+        // AV-451: no milestone plan attached is a plan-shape error
+        // — there is no deadline table to write into, and a failed
+        // amendment writes nothing.
+        let mut no_plan = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        no_plan.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(no_plan.state(), EscrowState::Funded);
+        assert_eq!(
+            no_plan.amend_milestone_claim_deadline(ALICE, BOB, 0, CLAIM_DEADLINE),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(EscrowError::InvalidMilestones.code(), 110);
+        assert_eq!(no_plan.milestone_claim_deadline_at(0), None);
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_refuses_tranche_out_of_range() {
+        // AV-451: a tranche at or past the plan's count has no
+        // deadline slot to write — the builder's rejection, and a
+        // failed amendment leaves every tranche's deadline untouched.
+        let mut e = claim_deadline_funded_escrow();
+        assert_eq!(
+            e.amend_milestone_claim_deadline(ALICE, BOB, 2, CLAIM_DEADLINE + 1000),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(
+            e.amend_milestone_claim_deadline(ALICE, BOB, 255, CLAIM_DEADLINE + 1000),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(EscrowError::InvalidMilestones.code(), 110);
+        assert_eq!(e.milestone_claim_deadline_at(0), Some(CLAIM_DEADLINE));
+        assert_eq!(e.milestone_claim_deadline_at(1), None);
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_accepts_zero_as_cleared_deadline() {
+        // AV-451: zero clears the tranche's deadline (the "never
+        // attached" sentinel) — a claim long past the old deadline
+        // settles as if no deadline had ever been attached.
+        let mut e = claim_deadline_funded_escrow();
+        confirm_milestone_both(&mut e, 0);
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, 0).unwrap();
+        assert_eq!(e.milestone_claim_deadline_at(0), None);
+        assert_eq!(e.milestone_claim_deadline_at(1), None);
+        let (payout, fee) = e
+            .release_milestone(ALICE, CLAIM_DEADLINE + 1, 0, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.released_amount(), 400_000);
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_extends_live_claim_window() {
+        // AV-451: vested under the old deadline, the tranche would
+        // expire at CLAIM_DEADLINE+1 — extending to
+        // CLAIM_DEADLINE+1000 rescues it: a claim at
+        // CLAIM_DEADLINE+500 settles in full, and the other
+        // tranche's deadline is untouched.
+        let mut e = claim_deadline_funded_escrow();
+        confirm_milestone_both(&mut e, 0);
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, CLAIM_DEADLINE + 1000)
+            .unwrap();
+        assert_eq!(
+            e.milestone_claim_deadline_at(0),
+            Some(CLAIM_DEADLINE + 1000)
+        );
+        assert_eq!(e.milestone_claim_deadline_at(1), None);
+        let (payout, fee) = e
+            .release_milestone(ALICE, CLAIM_DEADLINE + 500, 0, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.released_amount(), 400_000);
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_program_unconfirmed_tranche_still_needs_confirmation() {
+        // AV-451: the confirmation gate runs before the deadline
+        // gate — amending an unconfirmed tranche's deadline never
+        // waives confirmation (the pure-logic
+        // amend_milestone_claim_deadline_never_waives_confirmation
+        // case, re-pinned at the program level).
+        let mut e = claim_deadline_funded_escrow();
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, CLAIM_DEADLINE + 1000)
+            .unwrap();
+        assert_eq!(
+            e.milestone_claim_deadline_at(0),
+            Some(CLAIM_DEADLINE + 1000)
+        );
+        assert_eq!(
+            e.release_milestone(ALICE, CLAIM_DEADLINE + 500, 0, None, BOB),
+            Err(EscrowError::MilestoneNotConfirmed)
+        );
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_noop_on_same_deadline() {
+        // AV-451: re-affirming the current deadline is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = claim_deadline_funded_escrow();
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, CLAIM_DEADLINE)
+            .unwrap();
+        assert_eq!(e.milestone_claim_deadline_at(0), Some(CLAIM_DEADLINE));
+        assert_eq!(e.milestone_claim_deadline_at(1), None);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -58571,6 +58966,30 @@ pub(crate) mod anchor_idl_tests {
             "cooling_secs",
             "release_cooling_secs",
         ),
+        // AV-451: the post-funding milestone-tranche claim-deadline
+        // revision rewrites the selected slot of the resident
+        // `milestone_claim_deadlines` table in place — the `tranche`
+        // param selects the slot (the confirm_milestone `index`
+        // precedent) and the `deadline_secs` param is the new value.
+        // The table's initial values come from the
+        // `with_milestone_claim_deadline` builder (Uninitialized
+        // only, one deadline per tranche); this entry documents the
+        // revision source. Only the selected slot moves — the plan
+        // amounts, the due dates, the other tranches' deadlines and
+        // the settled amounts are untouched, and a 0 deadline is
+        // legal (it clears the slot, the "never attached" sentinel)
+        // while a plan-less escrow or an out-of-range tranche is
+        // refused (InvalidMilestones, code 110).
+        (
+            "amend_milestone_claim_deadline",
+            "tranche",
+            "milestone_claim_deadlines",
+        ),
+        (
+            "amend_milestone_claim_deadline",
+            "deadline_secs",
+            "milestone_claim_deadlines",
+        ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
         // for `delegation` (the whole grant region, like
@@ -59301,20 +59720,15 @@ pub(crate) mod anchor_idl_tests {
              cancel, expire_cancel_locked and resolve when the \
              chain breaks",
         ),
-        // AV-225: per-tranche claim deadlines — zeroed by
-        // `initialize` (no deadline attached); set per tranche by
-        // `with_milestone_claim_deadline` (Uninitialized only,
-        // non-zero absolute unix timestamp); read by
-        // `release_milestone` as the claim cutoff — a vested
-        // tranche claimed past it is rejected and returns to
-        // remainder. Same field-source rationale as above.
-        (
-            "milestone_claim_deadlines",
-            "Zeroed by initialize; set per tranche by \
-             with_milestone_claim_deadline (Uninitialized only, \
-             non-zero deadline); read by release_milestone as the \
-             claim cutoff",
-        ),
+        // AV-451: no field source for `milestone_claim_deadlines` —
+        // the field is param-sourced (see PARAM_FIELD_MAP): the
+        // AV-451 revision maps both its params here, and the AV-225
+        // builder's role (zeroed by `initialize`; set per tranche
+        // by `with_milestone_claim_deadline`, Uninitialized only,
+        // non-zero deadline; read by `release_milestone` as the
+        // claim cutoff) is documented on that map entry. The
+        // release_cooling_secs precedent: a builder + revision pair
+        // documents the field through the map alone.
         // AV-228: the funding start window — zeroed by
         // `initialize` (no window attached); set by
         // `with_funding_start` (Uninitialized only, zero = no
@@ -88434,6 +88848,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_release_cooling"),
             [244, 245, 106, 14, 20, 217, 126, 200]
+        );
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_instruction_discriminator_is_pinned() {
+        // AV-451. IDL:
+        // sha256("global:amend_milestone_claim_deadline")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_milestone_claim_deadline"),
+            [122, 160, 143, 218, 5, 208, 110, 110]
         );
     }
 

@@ -10918,7 +10918,11 @@ impl IndexedEscrow {
     /// already claimed or skipped keeps its settlement). The
     /// amended deadline is read from the vault, so the event needs
     /// no extra field. A failed amendment emits nothing: the core
-    /// call returns before any event is pushed.
+    /// call returns before any event is pushed. A same-deadline
+    /// re-affirmation is a no-op that emits nothing (the
+    /// before/after comparison, paralleling
+    /// `amend_release_cooling` — the program handler does the same
+    /// check at the Anchor layer).
     pub fn amend_milestone_claim_deadline(
         &mut self,
         initializer: [u8; 32],
@@ -10928,20 +10932,23 @@ impl IndexedEscrow {
         at: u64,
     ) -> Result<(), EscrowError> {
         let from = self.inner.state();
+        let before = self.inner.milestone_claim_deadline_at(tranche as usize);
         self.inner
             .amend_milestone_claim_deadline(initializer, taker, tranche, deadline_secs)?;
-        self.push_event(
-            EscrowEventKind::MilestoneClaimDeadlineAmended,
-            from,
-            self.inner.state(),
-            EventAmounts::none(),
-            at,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        if self.inner.milestone_claim_deadline_at(tranche as usize) != before {
+            self.push_event(
+                EscrowEventKind::MilestoneClaimDeadlineAmended,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
         Ok(())
     }
 
@@ -17681,6 +17688,48 @@ mod event_tests {
         e.amend_release_cooling(ALICE, BOB, 600, T0 + 3)
             .unwrap();
         assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_milestone_claim_deadline_emits_only_on_change() {
+        // AV-451: the IndexedEscrow wrapper emits
+        // MilestoneClaimDeadlineAmended only when the deadline
+        // actually changes — a failed amendment emits nothing and a
+        // same-deadline re-affirmation is a silent no-op (the
+        // program handler's before/after comparison does the same
+        // at the Anchor layer).
+        const DEADLINE: u64 = 1_750_000_000;
+        let mut e = milestone_indexed()
+            .with_milestone_claim_deadline(0, DEADLINE)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_milestone_claim_deadline(ALICE, ALICE, 0, DEADLINE + 1000, T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        assert_eq!(
+            e.amend_milestone_claim_deadline(ALICE, BOB, 2, DEADLINE + 1000, T0 + 2),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(e.event_count(), before, "out-of-range emits nothing");
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, DEADLINE + 1000, T0 + 2)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::MilestoneClaimDeadlineAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same deadline is a no-op: no new event.
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, DEADLINE + 1000, T0 + 3)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        // Clearing the deadline is a change: it emits again.
+        e.amend_milestone_claim_deadline(ALICE, BOB, 0, 0, T0 + 4)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 2);
     }
 
     #[test]
