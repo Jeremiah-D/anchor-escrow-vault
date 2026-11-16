@@ -42508,6 +42508,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "per_crank <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial bounty terms); no delay path covers this method — GovernanceAction has no AmendKeeperBountyPerCrank variant, so the direct call is the only entry point and no delayed handler is staged; only an escrow whose bounty is already configured (keeper_bounty_per_crank non-zero) may revise — an escrow with a zero per-crank amount is InvalidKeeperBounty (code 357, fail-closed: post-funding installation would add a bounty the taker never funded under, so a bounty can never be installed after funding, and this covers the with_keeper_bounty(pool, 0) disabled shape too); 0 is a legal value that closes future payouts, and closing is terminal through this path — a closed escrow reads as unconfigured, so a later revision back to a non-zero amount is refused with the same fail-closed error (reopening would be a new installation, not a revision); re-affirming the current amount is a no-op (succeeds, writes nothing, emits no event); only keeper_bounty_per_crank changes — keeper_bounty_pool is untouched (the pool is a consumable balance, the revision never tops it up) and bounty already paid is untouched, so an exhausted pool still pays 0 after any revision and the revision itself never revives the bounty; the payout path reads the live amount at payment time (keeper_bounty_payable() = min(per_crank, pool)), so the new amount governs from the next crank_expired — raising it raises the next payout up to the pool, lowering it lowers the next payout, and a crank already settled keeps the amount it settled under; emits the KeeperBountyPerCrankAmended indexer event only on an actual change (from == to == the current state); the keeper_bounty_per_crank tail field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-448: revise the flat slash deadline after
+            // funding — the program-level entry point for the AV-267
+            // pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_slash_deadline")[..8]
+            // = [45, 45, 61, 135, 193, 215, 37, 42] — the Anchor
+            // instruction discriminator for the
+            // amend_slash_deadline handler (pinned by the
+            // discriminator test below).
+            name: "amend_slash_deadline",
+            params: &[(
+                "deadline",
+                "u64",
+                "instruction param; the new flat slash deadline as a unix timestamp — 0 is legal (it makes the escrow immediately slashable, the builder's zero-deadline semantics) and re-affirming the current deadline is a no-op",
+            )],
+            method: "Escrow::amend_slash_deadline",
+            input_mapping: "deadline <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial slash terms); no delay path covers this method — GovernanceAction has no AmendSlashDeadline variant, so the direct call is the only entry point and no delayed handler is staged; only an escrow carrying flat slash terms may revise — an escrow with no terms is SlashNotEligible (code 143, fail-closed: post-funding installation would add a penalty clause the taker never funded under, so slash terms can never be installed after funding); a ladder escrow is refused with InvalidSlashLadder (code 184, its deadlines live in the rung table and belong to amend_slash_ladder, so a flat revision here would create a second, competing deadline); an escrow whose one-shot slash already executed (penalty_paid > 0, or pool_slashed > 0 on the AV-106 insurance-pool path) is refused with SlashNotEligible (code 143, the one-shot is consumed, so a revised deadline has no slash left to govern); a zero deadline is a legal revision meaning immediately slashable (the builder's semantics, unchanged); re-affirming the current deadline is a no-op (succeeds, writes nothing, emits no event); only slash_terms.slash_deadline changes — slash_terms.penalty_account and penalty_paid already banked are untouched, so a slash already settled keeps the deadline it settled under and a settled penalty is never restated, while the slash path reads the live deadline at the next eligibility check (now >= slash_deadline), so tightening can make an unexecuted default slashable at once while loosening can defer an already-satisfied but unexecuted eligibility; emits the SlashDeadlineAmended indexer event only on an actual change (from == to == the current state); the slash_deadline tail field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43440,6 +43458,9 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-266 pure-logic revision wired to the
             // chain).
             "Escrow::amend_keeper_bounty_per_crank",
+            // AV-448: the program-level flat slash-deadline revision
+            // (the AV-267 pure-logic revision wired to the chain).
+            "Escrow::amend_slash_deadline",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -43564,7 +43585,8 @@ pub(crate) mod anchor_idl_tests {
         // `configure_social_recovery` and `request_recovery`, AV-196
         // adds `configure_jury`, AV-205 adds
         // `initialize_max_release_cap` and `update_release_cap`,
-        // AV-447 adds `amend_keeper_bounty_per_crank`.)
+        // AV-447 adds `amend_keeper_bounty_per_crank`;
+        // AV-448 adds `amend_slash_deadline`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -43819,6 +43841,14 @@ pub(crate) mod anchor_idl_tests {
                 // refused outright (InvalidFundingPlan, code 173).
                 &"amend_funding_plan_max_tranches",
                 &"amend_keeper_bounty_per_crank",
+                // AV-448: the deadline-revision value (u64) — the new
+                // flat slash deadline as a unix timestamp; 0 is legal
+                // (immediately slashable, the builder's zero-deadline
+                // semantics), and a ladder escrow is refused
+                // (InvalidSlashLadder, code 184) while a terms-less or
+                // already-slashed escrow is refused (SlashNotEligible,
+                // code 143).
+                &"amend_slash_deadline",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -54004,6 +54034,395 @@ pub(crate) mod anchor_idl_tests {
         );
     }
 
+    // ----- AV-448: program-level flat slash-deadline amendment -----
+
+    fn slash_deadline_funded_escrow(deadline: u64) -> Escrow {
+        // AV-448 helper: a funded escrow with flat slash terms
+        // configured (penalty account PENALTY, the given deadline) —
+        // the same shape the AV-267 pure-logic tests build.
+        const PENALTY: [u8; 32] = [0x50; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, deadline)
+            .unwrap()
+            .with_pause_authority([0xDD; 32])
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn amend_slash_deadline_maps_param_to_deadline_field() {
+        // IDL: amend_slash_deadline(deadline: u64) —
+        // deadline <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `slash_deadline` field of the
+        // resident flat slash terms in place (see PARAM_FIELD_MAP)
+        // — no layout change. The INSTRUCTIONS spec entry pins the
+        // program-level wiring: one u64 param, the AV-267 pure-logic
+        // method, and the dual-signed input mapping.
+        const DEADLINE: u64 = 1_700_000_000;
+        const PENALTY: [u8; 32] = [0x50; 32];
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_slash_deadline")
+            .expect("INSTRUCTIONS carries amend_slash_deadline");
+        assert_eq!(spec.method, "Escrow::amend_slash_deadline");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "deadline");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("SlashDeadlineAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the u64 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_slash_deadline\""),
+            "checked-in IDL carries amend_slash_deadline"
+        );
+        assert!(
+            idl.contains("[45, 45, 61, 135, 193, 215, 37, 42]"),
+            "checked-in IDL pins the AV-448 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"deadline\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the deadline arg"
+        );
+        // Only the deadline moves: the penalty account, the banked
+        // penalty, the state and the layout are untouched.
+        let mut e = slash_deadline_funded_escrow(DEADLINE);
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(
+            e.slash_terms().expect("terms attached").slash_deadline,
+            DEADLINE
+        );
+        e.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000)
+            .unwrap();
+        let terms = e.slash_terms().expect("terms still attached");
+        assert_eq!(terms.slash_deadline, DEADLINE + 100_000, "deadline revised");
+        assert_eq!(terms.penalty_account, PENALTY, "penalty account untouched");
+        assert_eq!(e.penalty_paid(), 0, "no penalty banked yet");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "deadline field rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_slash_deadline_rejects_single_party_and_strangers() {
+        // AV-448: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // move the default penalty's trigger on the other's funds.
+        const DEADLINE: u64 = 1_700_000_000;
+        let mut e = slash_deadline_funded_escrow(DEADLINE);
+        assert_eq!(
+            e.amend_slash_deadline(ALICE, ALICE, DEADLINE + 100_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_slash_deadline(MALLORY, BOB, DEADLINE + 100_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_slash_deadline(MALLORY, MALLORY, DEADLINE + 100_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.slash_terms().expect("terms attached").slash_deadline,
+            DEADLINE,
+            "failed revisions write nothing"
+        );
+        e.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000)
+            .unwrap();
+        assert_eq!(
+            e.slash_terms().expect("terms attached").slash_deadline,
+            DEADLINE + 100_000
+        );
+    }
+
+    #[test]
+    fn amend_slash_deadline_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-448: Funded-only — the Uninitialized builder owns the
+        // initial slash terms, and a live dispute or a terminal
+        // escrow settles under the deadline it started under. The pause
+        // guard fires before the authority and state gates.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const DEADLINE: u64 = 1_700_000_000;
+        const PENALTY: [u8; 32] = [0x50; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        // Uninitialized: the deadline is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        assert_eq!(
+            bare.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            bare.slash_terms().expect("terms attached").slash_deadline,
+            DEADLINE
+        );
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap();
+        activated = activated
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            activated.slash_terms().expect("terms attached").slash_deadline,
+            DEADLINE
+        );
+        // Disputed: the deadline stays while the dispute is in
+        // flight — the dispute settles under the deadline it started
+        // under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        d = d.with_slash_terms(PENALTY, DEADLINE).unwrap();
+        d = d.with_arbiter(ARBITER).unwrap();
+        d.activate(ALICE).unwrap();
+        d.activate(BOB).unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.slash_terms().expect("terms attached").slash_deadline,
+            DEADLINE,
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's deadline is history, not a
+        // live trigger to reprice.
+        let mut e = slash_deadline_funded_escrow(DEADLINE);
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.slash_terms().expect("terms attached").slash_deadline,
+            DEADLINE
+        );
+        // The pause guard fires before the authority gate.
+        let mut paused = slash_deadline_funded_escrow(DEADLINE);
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_slash_deadline(MALLORY, BOB, DEADLINE + 100_000),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.slash_terms().expect("terms attached").slash_deadline,
+            DEADLINE
+        );
+    }
+
+    #[test]
+    fn amend_slash_deadline_refuses_ladder_escrow() {
+        // AV-448: a ladder escrow's deadlines live in the rung table
+        // and belong to `amend_slash_ladder` — the flat path refuses
+        // with the ladder's own error, not the generic one.
+        const DEADLINE: u64 = 1_700_000_000;
+        const PENALTY: [u8; 32] = [0x50; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut ladder = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_ladder(PENALTY, &[(1_000, 500), (2_000, 1_000)])
+            .unwrap();
+        ladder.fund(ALICE, FUND_AT).unwrap();
+        assert!(ladder.slash_ladder().is_some());
+        assert_eq!(
+            ladder.amend_slash_deadline(ALICE, BOB, DEADLINE),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        assert_eq!(EscrowError::InvalidSlashLadder.code(), 184);
+        assert!(ladder.slash_ladder().is_some(), "ladder table untouched");
+        assert!(ladder.slash_terms().is_none());
+        assert_eq!(ladder.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_slash_deadline_refuses_termsless_escrow() {
+        // AV-448: amendment never installs slash terms on a
+        // terms-less escrow — the terms must be configured before
+        // funding, and a failed revision leaves the escrow
+        // terms-less.
+        const DEADLINE: u64 = 1_700_000_000;
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut plain =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        assert!(plain.slash_terms().is_none());
+        assert_eq!(
+            plain.amend_slash_deadline(ALICE, BOB, DEADLINE),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert_eq!(EscrowError::SlashNotEligible.code(), 143);
+        assert!(plain.slash_terms().is_none());
+        assert_eq!(plain.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_slash_deadline_refuses_already_slashed_escrow() {
+        // AV-448: one-shot consumed — a slash already executed
+        // (penalty banked) leaves no future slash for a revised
+        // deadline to govern, and a failed revision writes nothing.
+        const DEADLINE: u64 = 1_700_000_000;
+        const PENALTY: [u8; 32] = [0x50; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        let mut slashed = slash_deadline_funded_escrow(DEADLINE);
+        slashed.slash(ALICE, 100_000, None, DEADLINE).unwrap();
+        assert_eq!(slashed.penalty_paid(), 100_000);
+        assert_eq!(slashed.state(), EscrowState::Funded);
+        assert_eq!(
+            slashed.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert_eq!(
+            slashed.slash_terms().expect("terms attached").slash_deadline,
+            DEADLINE,
+            "failed revision writes nothing"
+        );
+        assert_eq!(slashed.penalty_paid(), 100_000);
+        // The AV-106 pooled path counts as consumed too: the
+        // penalty lands in the pool (`pool_slashed`), while
+        // `penalty_paid` stays zero — still a spent one-shot.
+        let mut pooled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_insurance_pool()
+            .unwrap();
+        pooled.fund(ALICE, FUND_AT).unwrap();
+        pooled.slash(ALICE, 100_000, None, DEADLINE).unwrap();
+        assert_eq!(pooled.penalty_paid(), 0);
+        assert!(pooled.pool_slashed() > 0);
+        assert_eq!(
+            pooled.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert_eq!(
+            pooled.slash_terms().expect("terms attached").slash_deadline,
+            DEADLINE
+        );
+    }
+
+    #[test]
+    fn amend_slash_deadline_tightening_makes_default_slashable_at_once() {
+        // AV-448: the slash path reads the live deadline at the next
+        // eligibility check — tightening makes an unexecuted default
+        // slashable at once, while loosening defers an
+        // already-satisfied but unexecuted eligibility.
+        const DEADLINE: u64 = 1_700_000_000;
+        let mut e = slash_deadline_funded_escrow(DEADLINE);
+        let early = DEADLINE - 50_000;
+        assert!(!e.is_slash_eligible(early));
+        assert_eq!(
+            e.slash(ALICE, 100_000, None, early),
+            Err(EscrowError::SlashNotEligible)
+        );
+        // Tighten to 1_600_000_000: the same instant now clears the
+        // bar — the new deadline governs from the next eligibility
+        // check, no restatement of anything else.
+        e.amend_slash_deadline(ALICE, BOB, 1_600_000_000).unwrap();
+        assert!(e.is_slash_eligible(early));
+        assert_eq!(e.slash(ALICE, 100_000, None, early).unwrap(), 100_000);
+        assert_eq!(e.penalty_paid(), 100_000);
+        // Loosening defers an already-satisfied but unexecuted
+        // eligibility: deadline 1_700_000_000 is satisfied at
+        // 1_750_000_000, but moving it to 1_800_000_000 revokes
+        // that eligibility until the new deadline arrives.
+        let mut e = slash_deadline_funded_escrow(DEADLINE);
+        let late = DEADLINE + 50_000;
+        assert!(e.is_slash_eligible(late));
+        e.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000).unwrap();
+        assert!(!e.is_slash_eligible(late));
+        assert_eq!(
+            e.slash(ALICE, 100_000, None, late),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert!(e.is_slash_eligible(DEADLINE + 100_000));
+        assert_eq!(
+            e.slash(ALICE, 100_000, None, DEADLINE + 100_000).unwrap(),
+            100_000
+        );
+    }
+
+    #[test]
+    fn amend_slash_deadline_never_restates_settled_slash() {
+        // AV-448: a slash already settled keeps the deadline it
+        // settled under — the settled penalty is never clawed back
+        // or topped up by a later revision, and the banked penalty
+        // stands. (The one-shot is consumed, so the revision itself
+        // is refused with SlashNotEligible.)
+        const DEADLINE: u64 = 1_700_000_000;
+        let mut e = slash_deadline_funded_escrow(DEADLINE);
+        assert_eq!(e.slash(ALICE, 100_000, None, DEADLINE).unwrap(), 100_000);
+        assert_eq!(e.penalty_paid(), 100_000, "the settled slash paid out");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            e.amend_slash_deadline(ALICE, BOB, DEADLINE + 100_000),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert_eq!(
+            e.slash_terms().expect("terms attached").slash_deadline,
+            DEADLINE,
+            "the settled deadline is never restated"
+        );
+        assert_eq!(e.penalty_paid(), 100_000, "the settled penalty stands");
+    }
+
+    #[test]
+    fn amend_slash_deadline_noop_on_same_deadline() {
+        // AV-448: re-affirming the current deadline is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        const DEADLINE: u64 = 1_700_000_000;
+        const PENALTY: [u8; 32] = [0x50; 32];
+        let mut e = slash_deadline_funded_escrow(DEADLINE);
+        e.amend_slash_deadline(ALICE, BOB, DEADLINE).unwrap();
+        let terms = e.slash_terms().expect("terms still attached");
+        assert_eq!(terms.slash_deadline, DEADLINE);
+        assert_eq!(terms.penalty_account, PENALTY);
+        assert_eq!(e.penalty_paid(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -57446,6 +57865,23 @@ pub(crate) mod anchor_idl_tests {
             "per_crank",
             "keeper_bounty_per_crank",
         ),
+        // AV-448: the post-funding flat slash-deadline revision
+        // rewrites the `slash_terms.slash_deadline` sub-field in
+        // place — a second param source for the deadline, like
+        // `rotate_slash_penalty_account`'s account leg. The field's
+        // initial value comes from the `with_slash_terms` builder
+        // params (Uninitialized only); this entry documents the
+        // revision source. Only the deadline moves — the penalty
+        // account and penalty already paid are untouched, and a 0
+        // deadline is legal (immediately slashable) while a ladder
+        // escrow is refused (InvalidSlashLadder, code 184) and a
+        // terms-less or already-slashed escrow is refused
+        // (SlashNotEligible, code 143).
+        (
+            "amend_slash_deadline",
+            "deadline",
+            "slash_terms.slash_deadline",
+        ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
         // for `delegation` (the whole grant region, like
@@ -58253,12 +58689,13 @@ pub(crate) mod anchor_idl_tests {
                 // target) plus its penalty-account sub-field, for
                 // dotted param mappings like
                 // `slash_terms.penalty_account` (the flat
-                // penalty-account rotation's target). The deadline
-                // sub-field has no program instruction
-                // (`amend_slash_deadline` is pure-logic only), so it
-                // stays folded into the whole region.
+                // penalty-account rotation's target). AV-448 adds
+                // the deadline sub-field, for the dotted param
+                // mapping `slash_terms.slash_deadline` (the flat
+                // slash-deadline revision's target).
                 paths.push(name);
                 paths.push("slash_terms.penalty_account");
+                paths.push("slash_terms.slash_deadline");
             } else if *name == "slash_ladder" {
                 // AV-386: the whole ladder region (the builder's
                 // target) plus its penalty-account sub-field, for
@@ -87272,6 +87709,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_keeper_bounty_per_crank"),
             [251, 75, 110, 129, 13, 53, 197, 26]
+        );
+    }
+
+    #[test]
+    fn amend_slash_deadline_instruction_discriminator_is_pinned() {
+        // AV-448. IDL:
+        // sha256("global:amend_slash_deadline")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_slash_deadline"),
+            [45, 45, 61, 135, 193, 215, 37, 42]
         );
     }
 

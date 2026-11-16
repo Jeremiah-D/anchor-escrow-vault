@@ -6913,6 +6913,74 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the flat slash deadline after funding (AV-448;
+    /// mirrors `Escrow::amend_slash_deadline`). Unconditional
+    /// dual-signature governance: both initializer and taker sign — one
+    /// party alone cannot move the default penalty's trigger on the
+    /// other's funds, paralleling `amend_amount_bounds`. `Funded` only —
+    /// the builder owns the initial slash terms. A paused escrow fails
+    /// fast (`Paused`, before the authority gate). Only an escrow
+    /// carrying flat slash terms may revise — an escrow with no terms
+    /// is `SlashNotEligible` (fail-closed: post-funding installation
+    /// would add a penalty clause the taker never funded under). A
+    /// ladder escrow is `InvalidSlashLadder` (its deadlines live in the
+    /// rung table and belong to `amend_slash_ladder`, so a flat revision
+    /// here would create a second, competing deadline). An escrow whose
+    /// one-shot slash already executed (`penalty_paid > 0`, or
+    /// `pool_slashed > 0` on the AV-106 insurance-pool path) is
+    /// `SlashNotEligible` (the one-shot is consumed, so a revised
+    /// deadline has no slash left to govern). No delay path covers this
+    /// method — `GovernanceAction` has no `AmendSlashDeadline` variant,
+    /// so the direct call is the only entry point. Emits
+    /// `SlashDeadlineAmended` (from == to == the current state) only on
+    /// an actual change; a same-deadline no-op stays silent (mirrors
+    /// `rotate_taker`). Only `slash_terms.slash_deadline` changes —
+    /// `penalty_account` and penalty already paid are untouched, so a
+    /// slash already settled keeps the deadline it settled under; the
+    /// slash path reads the live deadline at the next eligibility check,
+    /// so tightening can make an unexecuted default slashable at once
+    /// while loosening can defer an already-satisfied but unexecuted
+    /// eligibility.
+    pub fn amend_slash_deadline(
+        ctx: Context<AmendSlashDeadline>,
+        deadline: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.slash_terms().map(|terms| terms.slash_deadline);
+        escrow
+            .amend_slash_deadline(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                deadline,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `slash_deadline` field of the resident flat
+        // slash terms in place — no realloc. Only the deadline moves;
+        // the state is untouched.
+        // Emits only on an actual change; a same-deadline no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.slash_terms().map(|terms| terms.slash_deadline) != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::SlashDeadlineAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -10673,6 +10741,10 @@ pub enum EscrowVaultEventKind {
     /// governance (`Escrow::amend_keeper_bounty_per_crank`). Mirrors
     /// `escrow_state::EscrowEventKind::KeeperBountyPerCrankAmended`.
     KeeperBountyPerCrankAmended,
+    /// AV-448: the flat slash deadline was revised by owner
+    /// governance (`Escrow::amend_slash_deadline`). Mirrors
+    /// `escrow_state::EscrowEventKind::SlashDeadlineAmended`.
+    SlashDeadlineAmended,
     /// AV-401: the protocol fee rate and ceiling were revised by
     /// owner governance (`Escrow::amend_protocol_fee`). Mirrors
     /// `escrow_state::EscrowEventKind::ProtocolFeeAmended`.
@@ -11018,6 +11090,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::KeeperBountyPerCrankAmended => {
             EscrowVaultEventKind::KeeperBountyPerCrankAmended
+        }
+        escrow_state::EscrowEventKind::SlashDeadlineAmended => {
+            EscrowVaultEventKind::SlashDeadlineAmended
         }
         escrow_state::EscrowEventKind::ProtocolFeeAmended => {
             EscrowVaultEventKind::ProtocolFeeAmended
@@ -13981,6 +14056,21 @@ pub struct AmendFundingPlanMaxTranches<'info> {
 /// state machine enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendKeeperBountyPerCrank<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-448: accounts for `amend_slash_deadline` — the
+/// flat-slash-deadline revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendSlashDeadline<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
