@@ -1324,6 +1324,14 @@
       ]
     },
     {
+      "name": "amend_penalty_bps",
+      "discriminator": [21, 58, 97, 2, 44, 130, 5, 104],
+      "accounts": [],
+      "args": [
+        {"name": "penalty_bps", "type": "u16"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

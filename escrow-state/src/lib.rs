@@ -42526,6 +42526,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "deadline <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial slash terms); no delay path covers this method — GovernanceAction has no AmendSlashDeadline variant, so the direct call is the only entry point and no delayed handler is staged; only an escrow carrying flat slash terms may revise — an escrow with no terms is SlashNotEligible (code 143, fail-closed: post-funding installation would add a penalty clause the taker never funded under, so slash terms can never be installed after funding); a ladder escrow is refused with InvalidSlashLadder (code 184, its deadlines live in the rung table and belong to amend_slash_ladder, so a flat revision here would create a second, competing deadline); an escrow whose one-shot slash already executed (penalty_paid > 0, or pool_slashed > 0 on the AV-106 insurance-pool path) is refused with SlashNotEligible (code 143, the one-shot is consumed, so a revised deadline has no slash left to govern); a zero deadline is a legal revision meaning immediately slashable (the builder's semantics, unchanged); re-affirming the current deadline is a no-op (succeeds, writes nothing, emits no event); only slash_terms.slash_deadline changes — slash_terms.penalty_account and penalty_paid already banked are untouched, so a slash already settled keeps the deadline it settled under and a settled penalty is never restated, while the slash path reads the live deadline at the next eligibility check (now >= slash_deadline), so tightening can make an unexecuted default slashable at once while loosening can defer an already-satisfied but unexecuted eligibility; emits the SlashDeadlineAmended indexer event only on an actual change (from == to == the current state); the slash_deadline tail field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-449: revise the base penalty rate after
+            // funding — the program-level entry point for the AV-259
+            // pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_penalty_bps")[..8]
+            // = [21, 58, 97, 2, 44, 130, 5, 104] — the Anchor
+            // instruction discriminator for the
+            // amend_penalty_bps handler (pinned by the
+            // discriminator test below).
+            name: "amend_penalty_bps",
+            params: &[(
+                "penalty_bps",
+                "u16",
+                "instruction param; the new base anti-griefing penalty rate in basis points — 0 is legal (it switches the penalty off, the builder's zero semantics, not a refund); above 10_000 bps is rejected (InvalidPenalty, code 117)",
+            )],
+            method: "Escrow::amend_penalty_bps",
+            input_mapping: "penalty_bps <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial rate terms); no delay path covers this method — GovernanceAction has no AmendPenaltyBps variant, so the direct call is the only entry point and no delayed handler is staged; penalty_bps > 10_000 is InvalidPenalty (code 117, the AV-206 validator); 0 is a legal value meaning no expiry-cancel penalty from here on; re-affirming the current rate is a no-op (succeeds, writes nothing, emits no event); only penalty_bps changes — the AV-115 escalation rate/cap and the meter origin (expires_at + grace) are untouched, so a cancel already settled keeps the penalty it charged and a settled penalty is never restated, while the cancel gate reads the live base rate at the next cancel_expired (effective_penalty_bps() / expiry_cancel_penalty_at() price from the live field, with the escalation headroom recomputed as cap - new base), so the new rate governs from the next expiry cancel; emits the BasePenaltyAmended indexer event only on an actual change (from == to == the current state); the penalty_bps tail field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43461,6 +43479,9 @@ pub(crate) mod anchor_idl_tests {
             // AV-448: the program-level flat slash-deadline revision
             // (the AV-267 pure-logic revision wired to the chain).
             "Escrow::amend_slash_deadline",
+            // AV-449: the program-level base-penalty-rate revision
+            // (the AV-259 pure-logic revision wired to the chain).
+            "Escrow::amend_penalty_bps",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -43586,7 +43607,8 @@ pub(crate) mod anchor_idl_tests {
         // adds `configure_jury`, AV-205 adds
         // `initialize_max_release_cap` and `update_release_cap`,
         // AV-447 adds `amend_keeper_bounty_per_crank`;
-        // AV-448 adds `amend_slash_deadline`.)
+        // AV-448 adds `amend_slash_deadline`;
+        // AV-449 adds `amend_penalty_bps`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -43849,6 +43871,14 @@ pub(crate) mod anchor_idl_tests {
                 // already-slashed escrow is refused (SlashNotEligible,
                 // code 143).
                 &"amend_slash_deadline",
+                // AV-449: the base-rate-revision value (u16) — the
+                // new base anti-griefing penalty rate in basis
+                // points; 0 is legal (no expiry-cancel penalty from
+                // here on, the builder's zero semantics), above
+                // 10_000 is rejected (InvalidPenalty, code 117),
+                // and the escalation rate/cap and the meter origin
+                // are untouched.
+                &"amend_penalty_bps",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -54423,6 +54453,305 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(e.state(), EscrowState::Funded);
     }
 
+    fn penalty_bps_funded_escrow() -> Escrow {
+        // AV-449 helper: a funded escrow with a base anti-griefing
+        // penalty rate configured — the same shape the AV-259
+        // pure-logic tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_penalty_bps_maps_param_to_rate_field() {
+        // IDL: amend_penalty_bps(penalty_bps: u16) —
+        // penalty_bps <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `penalty_bps` field of the vault
+        // in place (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // one u16 param, the AV-259 pure-logic method, and the
+        // dual-signed input mapping.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_penalty_bps")
+            .expect("INSTRUCTIONS carries amend_penalty_bps");
+        assert_eq!(spec.method, "Escrow::amend_penalty_bps");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "penalty_bps");
+        assert_eq!(spec.params[0].1, "u16");
+        assert!(
+            spec.input_mapping.contains("BasePenaltyAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the u16 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_penalty_bps\""),
+            "checked-in IDL carries amend_penalty_bps"
+        );
+        assert!(
+            idl.contains("[21, 58, 97, 2, 44, 130, 5, 104]"),
+            "checked-in IDL pins the AV-449 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"penalty_bps\", \"type\": \"u16\"}"),
+            "checked-in IDL carries the penalty_bps arg"
+        );
+        // Only the rate moves: the escalation schedule, the meter
+        // origin, the state and the layout are untouched.
+        let mut e = penalty_bps_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.penalty_bps(), 250);
+        assert_eq!(e.effective_penalty_bps(EXPIRES_AT), 250);
+        e.amend_penalty_bps(ALICE, BOB, 500).unwrap();
+        assert_eq!(e.penalty_bps(), 500, "rate revised");
+        assert_eq!(
+            e.effective_penalty_bps(EXPIRES_AT),
+            500,
+            "live meter repriced"
+        );
+        assert_eq!(
+            e.penalty_escalation_rate_bps(),
+            0,
+            "escalation rate untouched"
+        );
+        assert_eq!(
+            e.penalty_escalation_cap_bps(),
+            0,
+            "escalation cap untouched"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "rate field rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_penalty_bps_rejects_single_party_and_strangers() {
+        // AV-449: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // retune the other's expiry-cancel price.
+        let mut e = penalty_bps_funded_escrow();
+        assert_eq!(
+            e.amend_penalty_bps(ALICE, ALICE, 500),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_penalty_bps(MALLORY, BOB, 500),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_penalty_bps(MALLORY, MALLORY, 500),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(e.penalty_bps(), 250, "failed revisions write nothing");
+        e.amend_penalty_bps(ALICE, BOB, 500).unwrap();
+        assert_eq!(e.penalty_bps(), 500);
+    }
+
+    #[test]
+    fn amend_penalty_bps_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-449: Funded-only — the Uninitialized builder owns the
+        // initial rate terms, and a live dispute or a terminal
+        // escrow settles under the rate it started under. The pause
+        // guard fires before the authority and state gates.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const T0: u64 = 1_700_000_000;
+        // Uninitialized: the rate is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap();
+        assert_eq!(
+            bare.amend_penalty_bps(ALICE, BOB, 500),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.penalty_bps(), 250);
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_penalty_bps(250)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_penalty_bps(ALICE, BOB, 500),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.penalty_bps(), 250);
+        // Disputed: the penalty rate stays while the dispute is in
+        // flight — the dispute settles under the rate it started
+        // under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        d.activate(ALICE).unwrap();
+        d.activate(BOB).unwrap();
+        d.fund(ALICE, T0).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_penalty_bps(ALICE, BOB, 500),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(d.penalty_bps(), 250, "disputed revision writes nothing");
+        // Terminal: a cancelled escrow's rate is history, not a
+        // live price to retune.
+        let mut e = penalty_bps_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_penalty_bps(ALICE, BOB, 500),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.penalty_bps(), 250);
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_penalty_bps(250)
+                .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_penalty_bps(ALICE, BOB, 500),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_penalty_bps(MALLORY, BOB, 500),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(paused.penalty_bps(), 250);
+    }
+
+    #[test]
+    fn amend_penalty_bps_rejects_above_10000_bps() {
+        // AV-449: above 10_000 bps is not a rate — the builder's
+        // rejection (the AV-206 validator), and a failed amendment
+        // writes nothing. The 10_000 boundary itself is legal.
+        let mut e = penalty_bps_funded_escrow();
+        assert_eq!(
+            e.amend_penalty_bps(ALICE, BOB, 10_001),
+            Err(EscrowError::InvalidPenalty)
+        );
+        assert_eq!(EscrowError::InvalidPenalty.code(), 117);
+        assert_eq!(e.penalty_bps(), 250);
+        e.amend_penalty_bps(ALICE, BOB, 10_000).unwrap();
+        assert_eq!(e.penalty_bps(), 10_000);
+    }
+
+    #[test]
+    fn amend_penalty_bps_accepts_zero_as_no_penalty() {
+        // AV-449: zero is a legal rate meaning "no expiry-cancel
+        // penalty from here on" (the builder's zero semantics) — an
+        // expiry cancel after the amendment refunds in full.
+        let mut e = penalty_bps_funded_escrow();
+        e.amend_penalty_bps(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.penalty_bps(), 0);
+        assert_eq!(e.effective_penalty_bps(EXPIRES_AT), 0);
+        let (refund, _, penalty) =
+            e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!((refund, penalty), (1_000_000, 0));
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
+    #[test]
+    fn amend_penalty_bps_reprices_next_expiry_cancel_only() {
+        // AV-449: the cancel gate reads the live base rate at every
+        // cancel_expired — a cancel before the amendment prices at
+        // the old 250 bps (25_000 on 1_000_000), while a cancel
+        // after it prices at the amended 500 bps (50_000). The
+        // escalation schedule and the meter origin never move.
+        let mut before = penalty_bps_funded_escrow();
+        let (refund, _, penalty) =
+            before.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!((refund, penalty), (975_000, 25_000));
+        let mut e = penalty_bps_funded_escrow();
+        e.amend_penalty_bps(ALICE, BOB, 500).unwrap();
+        assert_eq!(e.penalty_bps(), 500);
+        assert_eq!(
+            e.penalty_escalation_rate_bps(),
+            0,
+            "the schedule is untouched"
+        );
+        assert_eq!(
+            e.penalty_escalation_cap_bps(),
+            0,
+            "the cap is untouched"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        let (refund, _, penalty) =
+            e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!((refund, penalty), (950_000, 50_000));
+    }
+
+    #[test]
+    fn amend_penalty_bps_never_restates_settled_cancel() {
+        // AV-449: a cancel already settled keeps the penalty it
+        // charged — the settled split is never clawed back or
+        // topped up by a later revision. (The escrow is terminal,
+        // so the revision itself is refused with
+        // InvalidStateTransition.)
+        let mut e = penalty_bps_funded_escrow();
+        let (refund, _, penalty) =
+            e.cancel_expired(BOB, EXPIRES_AT, None, ALICE).unwrap();
+        assert_eq!((refund, penalty), (975_000, 25_000), "the settled cancel paid out");
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_penalty_bps(ALICE, BOB, 500),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.penalty_bps(),
+            250,
+            "the settled rate is never restated"
+        );
+    }
+
+    #[test]
+    fn amend_penalty_bps_noop_on_same_rate() {
+        // AV-449: re-affirming the current rate is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = penalty_bps_funded_escrow();
+        e.amend_penalty_bps(ALICE, BOB, 250).unwrap();
+        assert_eq!(e.penalty_bps(), 250);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.penalty_paid(), 0);
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -57881,6 +58210,21 @@ pub(crate) mod anchor_idl_tests {
             "amend_slash_deadline",
             "deadline",
             "slash_terms.slash_deadline",
+        ),
+        // AV-449: the post-funding base-penalty-rate revision
+        // rewrites the same tail field in place — a second param
+        // source for `penalty_bps`, like `amend_arbiter_fee`'s
+        // legs. The field's initial value comes from the
+        // `with_penalty_bps` builder param (Uninitialized only);
+        // this entry documents the revision source. Only the rate
+        // moves — the escalation schedule and the meter origin are
+        // untouched, and a 0 rate is legal (no expiry-cancel
+        // penalty from here on) while anything above 10_000 bps is
+        // rejected (InvalidPenalty, code 117).
+        (
+            "amend_penalty_bps",
+            "penalty_bps",
+            "penalty_bps",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -87721,6 +88065,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_slash_deadline"),
             [45, 45, 61, 135, 193, 215, 37, 42]
+        );
+    }
+
+    #[test]
+    fn amend_penalty_bps_instruction_discriminator_is_pinned() {
+        // AV-449. IDL:
+        // sha256("global:amend_penalty_bps")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_penalty_bps"),
+            [21, 58, 97, 2, 44, 130, 5, 104]
         );
     }
 

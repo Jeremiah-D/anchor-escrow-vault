@@ -6981,6 +6981,65 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the base penalty rate after funding (AV-449;
+    /// mirrors `Escrow::amend_penalty_bps`). Unconditional
+    /// dual-signature governance: both initializer and taker sign — one
+    /// party alone cannot retune the other's expiry-cancel price,
+    /// paralleling `amend_amount_bounds`. `Funded` only —
+    /// the builder owns the initial rate. A paused escrow fails
+    /// fast (`Paused`, before the authority gate). A rate above
+    /// 10_000 bps is `InvalidPenalty` (the builder's gate, unchanged —
+    /// the rate can never exceed 100%); `0` is legal (it switches the
+    /// penalty off, the builder's zero semantics, not a refund).
+    /// No delay path covers this method — `GovernanceAction` has no
+    /// `AmendPenaltyBps` variant, so the direct call is the only entry
+    /// point. Emits `BasePenaltyAmended` (from == to == the current
+    /// state) only on an actual change; a same-rate no-op stays silent
+    /// (mirrors `rotate_taker`). Only `penalty_bps` changes — the
+    /// AV-115 escalation rate/cap and the meter origin (`expires_at` +
+    /// grace) are untouched, so a cancel already settled keeps the
+    /// penalty it charged; the cancel gate reads the live base rate at
+    /// the next `cancel_expired`, so the new rate governs from the next
+    /// expiry cancel.
+    pub fn amend_penalty_bps(
+        ctx: Context<AmendPenaltyBps>,
+        penalty_bps: u16,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.penalty_bps();
+        escrow
+            .amend_penalty_bps(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                penalty_bps,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `penalty_bps` field in place — no realloc.
+        // Only the rate moves; the state is untouched.
+        // Emits only on an actual change; a same-rate no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.penalty_bps() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::BasePenaltyAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -14071,6 +14130,21 @@ pub struct AmendKeeperBountyPerCrank<'info> {
 /// state machine enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendSlashDeadline<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-449: accounts for `amend_penalty_bps` — the
+/// base-penalty-rate revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendPenaltyBps<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
