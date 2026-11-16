@@ -10876,7 +10876,11 @@ impl IndexedEscrow {
     /// window, while a vetoed intent stays vetoed). The amended
     /// window is read from the vault, so the event needs no extra
     /// field. A failed amendment emits nothing: the core call
-    /// returns before any event is pushed.
+    /// returns before any event is pushed. A same-window
+    /// re-affirmation is a no-op that emits nothing (the
+    /// before/after comparison, paralleling
+    /// `amend_penalty_bps` — the program handler does the same
+    /// check at the Anchor layer).
     pub fn amend_release_cooling(
         &mut self,
         initializer: [u8; 32],
@@ -10885,20 +10889,23 @@ impl IndexedEscrow {
         at: u64,
     ) -> Result<(), EscrowError> {
         let from = self.inner.state();
+        let before = self.inner.release_cooling_secs();
         self.inner
             .amend_release_cooling(initializer, taker, cooling_secs)?;
-        self.push_event(
-            EscrowEventKind::ReleaseCoolingAmended,
-            from,
-            self.inner.state(),
-            EventAmounts::none(),
-            at,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        if self.inner.release_cooling_secs() != before {
+            self.push_event(
+                EscrowEventKind::ReleaseCoolingAmended,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
         Ok(())
     }
 
@@ -17645,6 +17652,35 @@ mod event_tests {
             .find(|h| h.kind == EscrowEventKind::ReleaseIntentVetoed)
             .expect("veto recorded in the ring");
         assert_eq!(entry.actor, Some(BOB[..8].try_into().unwrap()));
+    }
+
+    #[test]
+    fn amend_release_cooling_emits_only_on_change() {
+        // AV-450: the IndexedEscrow wrapper emits
+        // ReleaseCoolingAmended only when the window actually
+        // changes — a failed amendment emits nothing and a
+        // same-window re-affirmation is a silent no-op (the
+        // program handler's before/after comparison does the same
+        // at the Anchor layer).
+        let mut e = funded(1_000_000);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_release_cooling(ALICE, ALICE, 600, T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_release_cooling(ALICE, BOB, 600, T0 + 2)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::ReleaseCoolingAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same window is a no-op: no new event.
+        e.amend_release_cooling(ALICE, BOB, 600, T0 + 3)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
     }
 
     #[test]

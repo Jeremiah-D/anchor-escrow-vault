@@ -1332,6 +1332,14 @@
       ]
     },
     {
+      "name": "amend_release_cooling",
+      "discriminator": [244, 245, 106, 14, 20, 217, 126, 200],
+      "accounts": [],
+      "args": [
+        {"name": "cooling_secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

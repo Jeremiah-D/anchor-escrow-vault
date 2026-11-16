@@ -42544,6 +42544,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "penalty_bps <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial rate terms); no delay path covers this method — GovernanceAction has no AmendPenaltyBps variant, so the direct call is the only entry point and no delayed handler is staged; penalty_bps > 10_000 is InvalidPenalty (code 117, the AV-206 validator); 0 is a legal value meaning no expiry-cancel penalty from here on; re-affirming the current rate is a no-op (succeeds, writes nothing, emits no event); only penalty_bps changes — the AV-115 escalation rate/cap and the meter origin (expires_at + grace) are untouched, so a cancel already settled keeps the penalty it charged and a settled penalty is never restated, while the cancel gate reads the live base rate at the next cancel_expired (effective_penalty_bps() / expiry_cancel_penalty_at() price from the live field, with the escalation headroom recomputed as cap - new base), so the new rate governs from the next expiry cancel; emits the BasePenaltyAmended indexer event only on an actual change (from == to == the current state); the penalty_bps tail field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-450: revise the release cooling window after
+            // funding — the program-level entry point for the AV-246
+            // pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_release_cooling")[..8]
+            // = [244, 245, 106, 14, 20, 217, 126, 200] — the Anchor
+            // instruction discriminator for the
+            // amend_release_cooling handler (pinned by the
+            // discriminator test below).
+            name: "amend_release_cooling",
+            params: &[(
+                "cooling_secs",
+                "u64",
+                "instruction param; the new release cooling window in seconds — any u64 is legal (the gate adds with saturating_add) and 0 is legal (it switches the cooling off, the builder's zero semantics, not a refund)",
+            )],
+            method: "Escrow::amend_release_cooling",
+            input_mapping: "cooling_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial window terms); no delay path covers this method — GovernanceAction has no AmendReleaseCooling variant, so the direct call is the only entry point and no delayed handler is staged; no value rejection — any u64 is a legal window (the gate adds with saturating_add) and 0 is legal (cooling off, the builder's zero semantics); no configuration precondition — an unconfigured escrow gains a window on first amendment; re-affirming the current window is a no-op (succeeds, writes nothing, emits no event); only release_cooling_secs changes — release_intent_at is untouched, so a live announced intent is re-measured against the new window (is_release_cooling_eligible reads the live field) while a vetoed intent stays vetoed (veto clears the intent; this item writes the window only), so lengthening a window pushes an announced but not-yet-elapsed intent out, shortening it pulls it in, and amending to 0 opens release immediately, while amounts already released are never restated; emits the ReleaseCoolingAmended indexer event only on an actual change (from == to == the current state); the release_cooling_secs tail field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43482,6 +43500,9 @@ pub(crate) mod anchor_idl_tests {
             // AV-449: the program-level base-penalty-rate revision
             // (the AV-259 pure-logic revision wired to the chain).
             "Escrow::amend_penalty_bps",
+            // AV-450: the program-level release-cooling-window revision
+            // (the AV-246 pure-logic revision wired to the chain).
+            "Escrow::amend_release_cooling",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -43608,7 +43629,8 @@ pub(crate) mod anchor_idl_tests {
         // `initialize_max_release_cap` and `update_release_cap`,
         // AV-447 adds `amend_keeper_bounty_per_crank`;
         // AV-448 adds `amend_slash_deadline`;
-        // AV-449 adds `amend_penalty_bps`.)
+        // AV-449 adds `amend_penalty_bps`;
+        // AV-450 adds `amend_release_cooling`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -43879,6 +43901,14 @@ pub(crate) mod anchor_idl_tests {
                 // and the escalation rate/cap and the meter origin
                 // are untouched.
                 &"amend_penalty_bps",
+                // AV-450: the cooling-window-revision value (u64) — the
+                // new release cooling window in seconds; any u64 is
+                // legal (the gate adds with saturating_add) and 0 is
+                // legal (cooling off, the builder's zero semantics),
+                // and the intent timestamp is untouched, so a live
+                // announced intent is re-measured against the new
+                // window while a vetoed intent stays vetoed.
+                &"amend_release_cooling",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -54752,6 +54782,305 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(e.penalty_paid(), 0);
     }
 
+    fn release_cooling_funded_escrow() -> Escrow {
+        // AV-450 helper: a funded escrow with a release cooling
+        // window configured — the same shape the AV-246 pure-logic
+        // tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_release_cooling(60)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    fn announced_release_cooling_escrow(cooling: u64) -> Escrow {
+        // AV-450 helper: a funded escrow with a live announced
+        // release intent under the given window, announced at the
+        // funding time — the same shape the AV-246 pure-logic
+        // tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_release_cooling(cooling)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e.announce_release(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.release_intent_at(), Some(EXPIRES_AT - 3_600));
+        e
+    }
+
+    #[test]
+    fn amend_release_cooling_maps_param_to_cooling_field() {
+        // IDL: amend_release_cooling(cooling_secs: u64) —
+        // cooling_secs <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `release_cooling_secs` field of
+        // the vault in place (see PARAM_FIELD_MAP) — no layout
+        // change. The INSTRUCTIONS spec entry pins the
+        // program-level wiring: one u64 param, the AV-246
+        // pure-logic method, and the dual-signed input mapping.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_release_cooling")
+            .expect("INSTRUCTIONS carries amend_release_cooling");
+        assert_eq!(spec.method, "Escrow::amend_release_cooling");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "cooling_secs");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("ReleaseCoolingAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the u64 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_release_cooling\""),
+            "checked-in IDL carries amend_release_cooling"
+        );
+        assert!(
+            idl.contains("[244, 245, 106, 14, 20, 217, 126, 200]"),
+            "checked-in IDL pins the AV-450 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"cooling_secs\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the cooling_secs arg"
+        );
+        // Only the window moves: the intent timestamp, the state
+        // and the layout are untouched.
+        let mut e = release_cooling_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.release_cooling_secs(), 60);
+        assert_eq!(e.release_intent_at(), None);
+        e.amend_release_cooling(ALICE, BOB, 600).unwrap();
+        assert_eq!(e.release_cooling_secs(), 600, "window revised");
+        assert_eq!(
+            e.release_intent_at(),
+            None,
+            "no intent was announced"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "window field rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_release_cooling_rejects_single_party_and_strangers() {
+        // AV-450: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // lengthen or shorten the other's veto window.
+        let mut e = release_cooling_funded_escrow();
+        assert_eq!(
+            e.amend_release_cooling(ALICE, ALICE, 600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_release_cooling(MALLORY, BOB, 600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_release_cooling(MALLORY, MALLORY, 600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.release_cooling_secs(),
+            60,
+            "failed revisions write nothing"
+        );
+        e.amend_release_cooling(ALICE, BOB, 600).unwrap();
+        assert_eq!(e.release_cooling_secs(), 600);
+    }
+
+    #[test]
+    fn amend_release_cooling_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-450: Funded-only — the Uninitialized builder owns the
+        // initial window terms, and a live dispute or a terminal
+        // escrow settles under the window it started under. The pause
+        // guard fires before the authority and state gates.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const T0: u64 = 1_700_000_000;
+        // Uninitialized: the window is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_release_cooling(60)
+            .unwrap();
+        assert_eq!(
+            bare.amend_release_cooling(ALICE, BOB, 600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.release_cooling_secs(), 60);
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_release_cooling(60)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_release_cooling(ALICE, BOB, 600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.release_cooling_secs(), 60);
+        // Disputed: the window stays while the dispute is in
+        // flight — the dispute settles under the window it started
+        // under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_release_cooling(60)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        d.activate(ALICE).unwrap();
+        d.activate(BOB).unwrap();
+        d.fund(ALICE, T0).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_release_cooling(ALICE, BOB, 600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.release_cooling_secs(),
+            60,
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's window is history, not a
+        // live veto to retune.
+        let mut e = release_cooling_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_release_cooling(ALICE, BOB, 600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.release_cooling_secs(), 60);
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_release_cooling(60)
+                .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_release_cooling(ALICE, BOB, 600),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_release_cooling(MALLORY, BOB, 600),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(paused.release_cooling_secs(), 60);
+    }
+
+    #[test]
+    fn amend_release_cooling_accepts_zero_as_cooling_off() {
+        // AV-450: zero is a legal window meaning "cooling off"
+        // (the builder's zero semantics) — an intent announced
+        // under a 3600s window becomes eligible at once.
+        const A: u64 = EXPIRES_AT - 3_600;
+        let mut e = announced_release_cooling_escrow(3600);
+        assert!(!e.is_release_cooling_eligible(A + 60));
+        e.amend_release_cooling(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.release_cooling_secs(), 0);
+        assert!(e.is_release_cooling_eligible(A));
+        let (payout, fee) = e.release(ALICE, A + 1, 100_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (100_000, 0));
+        assert_eq!(e.released_amount(), 100_000);
+    }
+
+    #[test]
+    fn amend_release_cooling_lengthens_live_intent_window() {
+        // AV-450: announced under a 60s window, eligible at A+60 —
+        // then the parties lengthen to 600s: the same intent is
+        // re-measured live, so release at A+60 is refused and
+        // release at A+600 settles. The intent timestamp itself
+        // never moves.
+        const A: u64 = EXPIRES_AT - 3_600;
+        let mut e = announced_release_cooling_escrow(60);
+        assert!(e.is_release_cooling_eligible(A + 60));
+        e.amend_release_cooling(ALICE, BOB, 600).unwrap();
+        assert_eq!(e.release_cooling_secs(), 600);
+        assert_eq!(e.release_intent_at(), Some(A));
+        assert!(!e.is_release_cooling_eligible(A + 60));
+        assert_eq!(
+            e.release(ALICE, A + 60, 100_000, None, BOB),
+            Err(EscrowError::ReleaseCoolingNotElapsed)
+        );
+        assert!(e.is_release_cooling_eligible(A + 600));
+        let (payout, fee) = e.release(ALICE, A + 600, 100_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (100_000, 0));
+        assert_eq!(e.released_amount(), 100_000);
+    }
+
+    #[test]
+    fn amend_release_cooling_gives_unconfigured_escrow_a_window() {
+        // AV-450: no configuration precondition — announcing with
+        // no cooling still records the intent (harmless bookkeeping
+        // under AV-112), and the first amendment turns it into a
+        // live window measured from the original announcement.
+        const A: u64 = EXPIRES_AT - 3_600;
+        let mut e = announced_release_cooling_escrow(0);
+        assert!(e.is_release_cooling_eligible(A));
+        e.amend_release_cooling(ALICE, BOB, 600).unwrap();
+        assert!(!e.is_release_cooling_eligible(A + 60));
+        assert!(e.is_release_cooling_eligible(A + 600));
+        assert_eq!(e.release_intent_at(), Some(A));
+    }
+
+    #[test]
+    fn amend_release_cooling_never_resurrects_vetoed_intent() {
+        // AV-450: veto clears the intent; amending the window
+        // writes the window only, so the escrow stays
+        // cooling-gated until a fresh announcement restarts the
+        // window.
+        const A: u64 = EXPIRES_AT - 3_600;
+        let mut e = announced_release_cooling_escrow(60);
+        e.veto_release(BOB, A + 10).unwrap();
+        assert_eq!(e.release_intent_at(), None);
+        e.amend_release_cooling(ALICE, BOB, 600).unwrap();
+        assert_eq!(e.release_intent_at(), None);
+        assert!(!e.is_release_cooling_eligible(A + 600));
+    }
+
+    #[test]
+    fn amend_release_cooling_noop_on_same_window() {
+        // AV-450: re-affirming the current window is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = release_cooling_funded_escrow();
+        e.amend_release_cooling(ALICE, BOB, 60).unwrap();
+        assert_eq!(e.release_cooling_secs(), 60);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.release_intent_at(), None);
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -58225,6 +58554,22 @@ pub(crate) mod anchor_idl_tests {
             "amend_penalty_bps",
             "penalty_bps",
             "penalty_bps",
+        ),
+        // AV-450: the post-funding release-cooling-window revision
+        // rewrites the same tail field in place — a second param
+        // source for `release_cooling_secs`, like
+        // `amend_arbiter_fee`'s legs. The field's initial value
+        // comes from the `with_release_cooling` builder param
+        // (Uninitialized only); this entry documents the revision
+        // source. Only the window moves — the intent timestamp is
+        // untouched, so a live announced intent is re-measured
+        // against the new window while a vetoed intent stays
+        // vetoed, and any u64 is legal (0 switches the cooling
+        // off).
+        (
+            "amend_release_cooling",
+            "cooling_secs",
+            "release_cooling_secs",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -88077,6 +88422,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_penalty_bps"),
             [21, 58, 97, 2, 44, 130, 5, 104]
+        );
+    }
+
+    #[test]
+    fn amend_release_cooling_instruction_discriminator_is_pinned() {
+        // AV-450. IDL:
+        // sha256("global:amend_release_cooling")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_release_cooling"),
+            [244, 245, 106, 14, 20, 217, 126, 200]
         );
     }
 

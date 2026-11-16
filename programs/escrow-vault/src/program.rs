@@ -7040,6 +7040,63 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the release cooling window after funding (AV-450;
+    /// mirrors `Escrow::amend_release_cooling`). Unconditional
+    /// dual-signature governance: both initializer and taker sign — one
+    /// party alone cannot lengthen or shorten the other's veto window,
+    /// paralleling `amend_amount_bounds`. `Funded` only —
+    /// the builder owns the initial window. A paused escrow fails
+    /// fast (`Paused`, before the authority gate). Any `u64` is a
+    /// legal window (the gate adds with `saturating_add`); `0` is
+    /// legal (it switches the cooling off, the builder's zero
+    /// semantics, not a refund). No delay path covers this method —
+    /// `GovernanceAction` has no `AmendReleaseCooling` variant, so the
+    /// direct call is the only entry point. Emits
+    /// `ReleaseCoolingAmended` (from == to == the current state) only
+    /// on an actual change; a same-window no-op stays silent
+    /// (mirrors `rotate_taker`). Only `release_cooling_secs` changes —
+    /// the intent timestamp (`release_intent_at`) is untouched, so a
+    /// live announced intent is re-measured against the new window at
+    /// the next `release`, while a vetoed intent stays vetoed.
+    pub fn amend_release_cooling(
+        ctx: Context<AmendReleaseCooling>,
+        cooling_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.release_cooling_secs();
+        escrow
+            .amend_release_cooling(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                cooling_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `release_cooling_secs` field in place — no realloc.
+        // Only the window moves; the state is untouched.
+        // Emits only on an actual change; a same-window no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.release_cooling_secs() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ReleaseCoolingAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -14145,6 +14202,21 @@ pub struct AmendSlashDeadline<'info> {
 /// state machine enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendPenaltyBps<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-450: accounts for `amend_release_cooling` — the
+/// release-cooling-window revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendReleaseCooling<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
