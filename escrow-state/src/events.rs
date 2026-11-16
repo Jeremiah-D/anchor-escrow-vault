@@ -10961,7 +10961,11 @@ impl IndexedEscrow {
     /// extensions already made keep their deadline and count).
     /// The amended cap is read from the vault, so the event needs
     /// no extra field. A failed amendment emits nothing: the core
-    /// call returns before any event is pushed.
+    /// call returns before any event is pushed. A same-cap
+    /// re-affirmation is a no-op that emits nothing (the
+    /// before/after comparison, paralleling
+    /// `amend_release_cooling` — the program handler does the same
+    /// check at the Anchor layer).
     pub fn amend_max_extension_secs(
         &mut self,
         initializer: [u8; 32],
@@ -10970,20 +10974,23 @@ impl IndexedEscrow {
         at: u64,
     ) -> Result<(), EscrowError> {
         let from = self.inner.state();
+        let before = self.inner.max_extension_secs();
         self.inner
             .amend_max_extension_secs(initializer, taker, max_extension_secs)?;
-        self.push_event(
-            EscrowEventKind::MaxExtensionAmended,
-            from,
-            self.inner.state(),
-            EventAmounts::none(),
-            at,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        if self.inner.max_extension_secs() != before {
+            self.push_event(
+                EscrowEventKind::MaxExtensionAmended,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
         Ok(())
     }
 
@@ -17728,6 +17735,44 @@ mod event_tests {
         assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
         // Clearing the deadline is a change: it emits again.
         e.amend_milestone_claim_deadline(ALICE, BOB, 0, 0, T0 + 4)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 2);
+    }
+
+    #[test]
+    fn amend_max_extension_secs_emits_only_on_change() {
+        // AV-452: the IndexedEscrow wrapper emits
+        // MaxExtensionAmended only when the cap actually changes —
+        // a failed amendment emits nothing and a same-cap
+        // re-affirmation is a silent no-op (the program handler's
+        // before/after comparison does the same at the Anchor
+        // layer).
+        const CAP: u64 = 86_400;
+        let mut e = IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, ESCROW_ID, T0)
+            .unwrap()
+            .with_max_extension_secs(CAP)
+            .unwrap();
+        e.fund(ALICE, T0 + 1).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_max_extension_secs(ALICE, ALICE, 3_600, T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_max_extension_secs(ALICE, BOB, 3_600, T0 + 2)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::MaxExtensionAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same cap is a no-op: no new event.
+        e.amend_max_extension_secs(ALICE, BOB, 3_600, T0 + 3)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        // Closing the cap with 0 is a change: it emits again.
+        e.amend_max_extension_secs(ALICE, BOB, 0, T0 + 4)
             .unwrap();
         assert_eq!(e.event_count(), before + 2);
     }

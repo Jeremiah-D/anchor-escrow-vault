@@ -7159,6 +7159,64 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the per-extension expiry-increase cap after funding (AV-452;
+    /// mirrors `Escrow::amend_max_extension_secs`). Unconditional
+    /// dual-signature governance: both initializer and taker sign — one
+    /// party alone cannot loosen or tighten the other's extension bound,
+    /// paralleling `amend_release_cooling`. `Funded` only — the builder owns the
+    /// initial cap set. A paused escrow fails fast (`Paused`, before
+    /// the authority gate). No value rejection — any u64 is a legal cap, and
+    /// `0` closes future extensions (the `extend_expiry` zero-cap
+    /// rejection). No delay path covers this method — `GovernanceAction`
+    /// has no `AmendMaxExtensionSecs` variant, so the direct call
+    /// is the only entry point. Emits `MaxExtensionAmended`
+    /// (from == to == the current state) only on an actual change; a
+    /// same-cap no-op stays silent (mirrors `rotate_taker`). Only
+    /// `max_extension_secs` changes — `expires_at` and
+    /// `extension_count` are untouched, so extensions already made
+    /// keep their deadline moves and their count; the next extension
+    /// is judged against the live cap, so tightening rejects
+    /// increments that fit the old bound, loosening admits increments
+    /// the old bound refused, and closing refuses every increment.
+    pub fn amend_max_extension_secs(
+        ctx: Context<AmendMaxExtensionSecs>,
+        max_extension_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.max_extension_secs();
+        escrow
+            .amend_max_extension_secs(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                max_extension_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `max_extension_secs` tail field in place — no realloc.
+        // Only the cap moves; the state is untouched.
+        // Emits only on an actual change; a same-cap no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.max_extension_secs() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::MaxExtensionAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -14294,6 +14352,21 @@ pub struct AmendReleaseCooling<'info> {
 /// state machine enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendMilestoneClaimDeadline<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-452: accounts for `amend_max_extension_secs` — the
+/// per-extension expiry-increase cap revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendMaxExtensionSecs<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
