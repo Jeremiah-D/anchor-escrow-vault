@@ -1357,6 +1357,14 @@
       ]
     },
     {
+      "name": "amend_claim_cooldown",
+      "discriminator": [163, 244, 230, 199, 238, 166, 210, 25],
+      "accounts": [],
+      "args": [
+        {"name": "slots", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

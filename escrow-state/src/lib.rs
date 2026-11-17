@@ -42605,6 +42605,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "max_extension_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial cap set); no delay path covers this method — GovernanceAction has no AmendMaxExtensionSecs variant, so the direct call is the only entry point and no delayed handler is staged; no value rejection — any u64 is a legal cap and 0 is legal (it closes future extensions, the extend_expiry zero-cap rejection); re-affirming the current cap is a no-op (succeeds, writes nothing, emits no event); only max_extension_secs changes — expires_at and extension_count are untouched, so extensions already made keep their deadline moves and their count, while the next extension is judged against the live cap (extend_expiry reads the field at call time) — tightening rejects increments that fit the old bound, loosening admits increments the old bound refused, and closing refuses every increment; emits the MaxExtensionAmended indexer event only on an actual change (from == to == the current state); the max_extension_secs tail field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-453: revise the per-taker claim cooldown after
+            // funding — the program-level entry point for the
+            // AV-243 pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_claim_cooldown")[..8]
+            // = [163, 244, 230, 199, 238, 166, 210, 25] — the Anchor
+            // instruction discriminator for the
+            // amend_claim_cooldown handler (pinned by the
+            // discriminator test below).
+            name: "amend_claim_cooldown",
+            params: &[(
+                "slots",
+                "u64",
+                "instruction param; the new minimum slot distance between two taker claims — any u64 is a legal window (no value rejection) and 0 is legal (it disables the cooldown, the builder's zero sentinel)",
+            )],
+            method: "Escrow::amend_claim_cooldown",
+            input_mapping: "slots <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial cooldown set); no delay path covers this method — GovernanceAction has no AmendClaimCooldown variant, so the direct call is the only entry point and no delayed handler is staged; no value rejection — any u64 is a legal window and 0 is legal (it disables the cooldown, the builder's zero sentinel); no configuration precondition — an unconfigured escrow simply gains a cooldown on first amendment; re-affirming the current cooldown is a no-op (succeeds, writes nothing, emits no event); only claim_cooldown_slots changes — last_claim_slot is untouched, so the next claim's eligibility is recomputed live from the new value (claim_cooldown_eligible_at computes last_claim_slot + claim_cooldown_slots at call time) while a taker who never claimed stays eligible for the first claim, and the vesting claim gate stacks unchanged through the same claim_cooldown_gated path; emits the ClaimCooldownAmended indexer event only on an actual change (from == to == the current state); the claim_cooldown_slots tail field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43554,6 +43572,10 @@ pub(crate) mod anchor_idl_tests {
             // cap revision (the AV-248 pure-logic revision wired to
             // the chain).
             "Escrow::amend_max_extension_secs",
+            // AV-453: the program-level per-taker claim-cooldown
+            // revision (the AV-243 pure-logic revision wired to
+            // the chain).
+            "Escrow::amend_claim_cooldown",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -43683,7 +43705,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-449 adds `amend_penalty_bps`;
         // AV-450 adds `amend_release_cooling`;
         // AV-451 adds `amend_milestone_claim_deadline`;
-        // AV-452 adds `amend_max_extension_secs`.)
+        // AV-452 adds `amend_max_extension_secs`;
+        // AV-453 adds `amend_claim_cooldown`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -43980,6 +44003,13 @@ pub(crate) mod anchor_idl_tests {
                 // so extensions already made keep their deadline
                 // moves and their count.
                 &"amend_max_extension_secs",
+                // AV-453: the cooldown-revision value (u64) — the
+                // new minimum slot distance between two taker claims;
+                // any u64 is legal and 0 is legal (it disables the
+                // cooldown, the builder's zero sentinel), and
+                // last_claim_slot is untouched, so the next claim's
+                // eligibility is recomputed live from the new value.
+                &"amend_claim_cooldown",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -55805,6 +55835,341 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(e.released_amount(), 0);
     }
 
+    // AV-453: the program-level per-taker claim-cooldown revision —
+    // the AV-243 pure-logic revision wired to the chain.
+    const CLAIM_COOLDOWN: u64 = 100; // slots between taker claims
+    const CLAIM_FUND_SLOT: u64 = 50_000;
+    const CLAIM_T0: u64 = 1_700_000_000;
+
+    fn cooldown_funded_escrow() -> Escrow {
+        // AV-453 helper: a funded vesting escrow with a 100-slot
+        // claim cooldown — the same shape the AV-243 pure-logic
+        // tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_claim_cooldown(CLAIM_COOLDOWN)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(CLAIM_T0, CLAIM_T0 + 1000).unwrap())
+            .unwrap();
+        e.fund_with_slot(ALICE, CLAIM_T0, CLAIM_FUND_SLOT).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_claim_cooldown_maps_param_to_cooldown_field() {
+        // IDL: amend_claim_cooldown(slots: u64) —
+        // slots <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `claim_cooldown_slots` tail field
+        // in place (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // one u64 window and the AV-243 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_claim_cooldown")
+            .expect("INSTRUCTIONS carries amend_claim_cooldown");
+        assert_eq!(spec.method, "Escrow::amend_claim_cooldown");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "slots");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("ClaimCooldownAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the one arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_claim_cooldown\""),
+            "checked-in IDL carries amend_claim_cooldown"
+        );
+        assert!(
+            idl.contains("[163, 244, 230, 199, 238, 166, 210, 25]"),
+            "checked-in IDL pins the AV-453 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"slots\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the slots arg"
+        );
+        // Only the cooldown moves: the last claim slot, the state
+        // and the layout are untouched.
+        let mut e = cooldown_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.claim_cooldown_slots(), CLAIM_COOLDOWN);
+        e.amend_claim_cooldown(ALICE, BOB, 200).unwrap();
+        assert_eq!(e.claim_cooldown_slots(), 200, "cooldown revised");
+        assert_eq!(e.last_claim_slot(), None);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "cooldown field rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_claim_cooldown_rejects_single_party_and_strangers() {
+        // AV-453: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // tighten or loosen the other's claim throttle.
+        let mut e = cooldown_funded_escrow();
+        assert_eq!(
+            e.amend_claim_cooldown(ALICE, ALICE, 200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_claim_cooldown(MALLORY, BOB, 200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_claim_cooldown(MALLORY, MALLORY, 200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.claim_cooldown_slots(),
+            CLAIM_COOLDOWN,
+            "failed revisions write nothing"
+        );
+        e.amend_claim_cooldown(ALICE, BOB, 200).unwrap();
+        assert_eq!(e.claim_cooldown_slots(), 200);
+    }
+
+    #[test]
+    fn amend_claim_cooldown_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-453: Funded-only — the Uninitialized builder owns the
+        // initial cooldown set, and a live dispute or a terminal
+        // escrow settles under the cooldown it started under. The
+        // pause guard fires before the authority and state gates.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const T0: u64 = 1_700_000_000;
+        // Uninitialized: the cooldown is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_claim_cooldown(CLAIM_COOLDOWN)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(T0, T0 + 1000).unwrap())
+            .unwrap();
+        assert_eq!(
+            bare.amend_claim_cooldown(ALICE, BOB, 200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.claim_cooldown_slots(), CLAIM_COOLDOWN);
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_claim_cooldown(CLAIM_COOLDOWN)
+                .unwrap()
+                .with_vesting(VestingSchedule::new(T0, T0 + 1000).unwrap())
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_claim_cooldown(ALICE, BOB, 200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.claim_cooldown_slots(), CLAIM_COOLDOWN);
+        // Disputed: the cooldown stays while the dispute is in
+        // flight — the dispute settles under the cooldown it started
+        // under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_claim_cooldown(CLAIM_COOLDOWN)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(T0, T0 + 1000).unwrap())
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        d.activate(ALICE).unwrap();
+        d.activate(BOB).unwrap();
+        d.fund_with_slot(ALICE, T0, CLAIM_FUND_SLOT).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_claim_cooldown(ALICE, BOB, 200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.claim_cooldown_slots(),
+            CLAIM_COOLDOWN,
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's cooldown is history, not a
+        // live throttle to retune.
+        let mut e = cooldown_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_claim_cooldown(ALICE, BOB, 200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.claim_cooldown_slots(), CLAIM_COOLDOWN);
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_claim_cooldown(CLAIM_COOLDOWN)
+                .unwrap()
+                .with_vesting(VestingSchedule::new(T0, T0 + 1000).unwrap())
+                .unwrap();
+        paused.fund_with_slot(ALICE, T0, CLAIM_FUND_SLOT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_claim_cooldown(ALICE, BOB, 200),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_claim_cooldown(MALLORY, BOB, 200),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.claim_cooldown_slots(),
+            CLAIM_COOLDOWN,
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_claim_cooldown(ALICE, BOB, 200).unwrap();
+        assert_eq!(paused.claim_cooldown_slots(), 200);
+    }
+
+    #[test]
+    fn amend_claim_cooldown_accepts_zero_as_cooling_off() {
+        // AV-453: zero is the builder's legal "disabled" sentinel,
+        // not a rejection — amending to 0 lets the taker claim again
+        // at the very next slot.
+        let mut e = cooldown_funded_escrow();
+        let first = StaticSlotClock::new(CLAIM_FUND_SLOT);
+        e.claim_cooldown_gated(BOB, CLAIM_T0 + 500, None, BOB, &first)
+            .unwrap();
+        e.amend_claim_cooldown(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.claim_cooldown_slots(), 0);
+        assert_eq!(e.claim_cooldown_eligible_at(), None);
+        assert!(e.is_claim_cooldown_eligible(CLAIM_FUND_SLOT));
+        let again = StaticSlotClock::new(CLAIM_FUND_SLOT);
+        let (payout, _) = e
+            .claim_cooldown_gated(BOB, CLAIM_T0 + 600, None, BOB, &again)
+            .unwrap();
+        assert_eq!(payout, 100_000);
+    }
+
+    #[test]
+    fn amend_claim_cooldown_tightens_live_claim_window() {
+        // AV-453: tightening to 200 pushes the next eligible slot
+        // out — the gate reads the new value live — while
+        // last_claim_slot is untouched.
+        let mut e = cooldown_funded_escrow();
+        let first = StaticSlotClock::new(CLAIM_FUND_SLOT);
+        e.claim_cooldown_gated(BOB, CLAIM_T0 + 500, None, BOB, &first)
+            .unwrap();
+        assert_eq!(e.last_claim_slot(), Some(CLAIM_FUND_SLOT));
+        e.amend_claim_cooldown(ALICE, BOB, 200).unwrap();
+        assert_eq!(e.claim_cooldown_slots(), 200);
+        assert_eq!(e.last_claim_slot(), Some(CLAIM_FUND_SLOT));
+        assert_eq!(
+            e.claim_cooldown_eligible_at(),
+            Some(CLAIM_FUND_SLOT + 200)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        // The old window no longer opens the gate...
+        let early = StaticSlotClock::new(CLAIM_FUND_SLOT + 100);
+        assert_eq!(
+            e.claim_cooldown_gated(BOB, CLAIM_T0 + 600, None, BOB, &early),
+            Err(EscrowError::InvalidClaimCooldown)
+        );
+        assert_eq!(EscrowError::InvalidClaimCooldown.code(), 179);
+        // ...and the new window does (the vesting gate stacks
+        // unchanged: the second claim releases the T0+600 tranche).
+        let at = StaticSlotClock::new(CLAIM_FUND_SLOT + 200);
+        let (payout, _) = e
+            .claim_cooldown_gated(BOB, CLAIM_T0 + 600, None, BOB, &at)
+            .unwrap();
+        assert_eq!(payout, 100_000);
+        assert_eq!(e.last_claim_slot(), Some(CLAIM_FUND_SLOT + 200));
+    }
+
+    #[test]
+    fn amend_claim_cooldown_gives_unconfigured_escrow_a_cooldown() {
+        // AV-453: no configuration precondition — a funded escrow
+        // with no cooldown simply gains one; the first claim stays
+        // eligible until the taker actually claims.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(CLAIM_T0, CLAIM_T0 + 1000).unwrap())
+            .unwrap();
+        e.fund_with_slot(ALICE, CLAIM_T0, CLAIM_FUND_SLOT).unwrap();
+        assert_eq!(e.claim_cooldown_slots(), 0);
+        e.amend_claim_cooldown(ALICE, BOB, 100).unwrap();
+        assert_eq!(e.claim_cooldown_slots(), 100);
+        assert_eq!(e.claim_cooldown_eligible_at(), None);
+        assert!(e.is_claim_cooldown_eligible(CLAIM_FUND_SLOT));
+    }
+
+    #[test]
+    fn amend_claim_cooldown_never_moves_last_claim_slot() {
+        // AV-453: amending the window twice — tightening then
+        // loosening — moves only the window; the last claim slot
+        // never moves and the settled claim keeps its payout.
+        let mut e = cooldown_funded_escrow();
+        let first = StaticSlotClock::new(CLAIM_FUND_SLOT);
+        let (payout, _) = e
+            .claim_cooldown_gated(BOB, CLAIM_T0 + 500, None, BOB, &first)
+            .unwrap();
+        // The first claim releases the vested half (500_000 of
+        // 1_000_000 at the schedule midpoint); the second claim
+        // would release only the newly vested increment.
+        assert_eq!(payout, 500_000);
+        e.amend_claim_cooldown(ALICE, BOB, 200).unwrap();
+        assert_eq!(e.claim_cooldown_slots(), 200);
+        assert_eq!(e.last_claim_slot(), Some(CLAIM_FUND_SLOT));
+        assert_eq!(
+            e.claim_cooldown_eligible_at(),
+            Some(CLAIM_FUND_SLOT + 200)
+        );
+        e.amend_claim_cooldown(ALICE, BOB, 50).unwrap();
+        assert_eq!(e.claim_cooldown_slots(), 50);
+        assert_eq!(e.last_claim_slot(), Some(CLAIM_FUND_SLOT));
+        assert_eq!(
+            e.claim_cooldown_eligible_at(),
+            Some(CLAIM_FUND_SLOT + 50)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_claim_cooldown_noop_on_same_cooldown() {
+        // AV-453: re-affirming the current cooldown is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = cooldown_funded_escrow();
+        e.amend_claim_cooldown(ALICE, BOB, CLAIM_COOLDOWN)
+            .unwrap();
+        assert_eq!(e.claim_cooldown_slots(), CLAIM_COOLDOWN);
+        assert_eq!(e.last_claim_slot(), None);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -59333,6 +59698,21 @@ pub(crate) mod anchor_idl_tests {
             "amend_max_extension_secs",
             "max_extension_secs",
             "max_extension_secs",
+        ),
+        // AV-453: the post-funding per-taker claim-cooldown
+        // revision rewrites the same tail field in place — a second
+        // param source for `claim_cooldown_slots`, like
+        // `amend_release_cooling`'s window. The field's initial
+        // value comes from the `with_claim_cooldown` builder
+        // param (Uninitialized only); this entry documents the
+        // revision source. Only the cooldown moves —
+        // `last_claim_slot` is untouched, so the next claim's
+        // eligibility is recomputed live from the new value, and
+        // any u64 is legal (0 disables the cooldown).
+        (
+            "amend_claim_cooldown",
+            "slots",
+            "claim_cooldown_slots",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -89216,6 +89596,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_max_extension_secs"),
             [27, 236, 127, 250, 215, 64, 248, 225]
+        );
+    }
+
+    #[test]
+    fn amend_claim_cooldown_instruction_discriminator_is_pinned() {
+        // AV-453. IDL:
+        // sha256("global:amend_claim_cooldown")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_claim_cooldown"),
+            [163, 244, 230, 199, 238, 166, 210, 25]
         );
     }
 
