@@ -42659,6 +42659,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "window_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial window set); no delay path covers this method — GovernanceAction has no AmendAppealWindow variant, so the direct call is the only entry point and no delayed handler is staged; a zero window is InvalidAppealWindow (code 146, the same rejection as the builder — a zero-second window makes an appeal expire on arrival); re-affirming the current window is a no-op (succeeds, writes nothing, emits no event); only appeal_window_secs changes — appeal_deadline is untouched, so only slashes executed after the amendment stamp their appeal deadline from the new value (slash reads the live field at slash time) while an already-stamped deadline — a filed appeal under review, or a slash awaiting filing — keeps its original window, so the amendment never shortens or extends a live appeal; emits the AppealWindowAmended indexer event only on an actual change (from == to == the current state); the appeal_window_secs tail field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-456: revise the slash-appeal bond after
+            // funding — the program-level entry point for the
+            // AV-238 pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_appeal_bond")[..8]
+            // = [208, 152, 149, 212, 125, 77, 91, 68] — the Anchor
+            // instruction discriminator for the
+            // amend_appeal_bond handler (pinned by the
+            // discriminator test below).
+            name: "amend_appeal_bond",
+            params: &[(
+                "bond",
+                "u64",
+                "instruction param; the new slash-appeal bond in lamports — the amount the taker must lock when filing a future appeal; a zero bond is InvalidAppealBond (code 158, the same rejection as the builder — a zero bond is a no-op, and the no-bond default already covers free filing)",
+            )],
+            method: "Escrow::amend_appeal_bond",
+            input_mapping: "bond <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial bond set); no delay path covers this method — GovernanceAction has no AmendAppealBond variant, so the direct call is the only entry point and no delayed handler is staged; a zero bond is InvalidAppealBond (code 158, the same rejection as the builder — a zero bond is a no-op, and the no-bond default already covers free filing); re-affirming the current bond is a no-op (succeeds, writes nothing, emits no event); only appeal_bond changes — appeal_bond_paid is untouched, so only appeals filed after the amendment lock the new bond (file_appeal copies the live field into appeal_bond_paid at filing time) while an already-locked bond — a filed appeal under review — keeps its original amount, so the amendment never tops up or refunds a live appeal; emits the AppealBondAmended indexer event only on an actual change (from == to == the current state); the appeal_bond tail field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43618,6 +43636,9 @@ pub(crate) mod anchor_idl_tests {
             // AV-455: the program-level slash-appeal window revision
             // (the AV-236 pure-logic revision wired to the chain).
             "Escrow::amend_appeal_window",
+            // AV-456: the program-level slash-appeal bond revision
+            // (the AV-238 pure-logic revision wired to the chain).
+            "Escrow::amend_appeal_bond",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -43750,7 +43771,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-452 adds `amend_max_extension_secs`;
         // AV-453 adds `amend_claim_cooldown`;
         // AV-454 adds `amend_grace_period`;
-        // AV-455 adds `amend_appeal_window`.)
+        // AV-455 adds `amend_appeal_window`;
+        // AV-456 adds `amend_appeal_bond`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -44069,6 +44091,12 @@ pub(crate) mod anchor_idl_tests {
                 // executed after the amendment stamp their deadline
                 // from the new value.
                 &"amend_appeal_window",
+                // AV-456: the bond-revision value (u64) — the
+                // new slash-appeal bond in lamports; a zero bond
+                // is InvalidAppealBond (code 158), and
+                // appeal_bond_paid is untouched, so only appeals
+                // filed after the amendment lock the new bond.
+                &"amend_appeal_bond",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -56883,6 +56911,349 @@ pub(crate) mod anchor_idl_tests {
         );
     }
 
+    // AV-456: the program-level slash-appeal bond revision —
+    // the AV-238 pure-logic revision wired to the chain.
+    const APPEAL_BOND: u64 = 50_000; // the AV-238 test bond
+
+    fn appeal_bond_funded_escrow() -> Escrow {
+        // AV-456 helper: a funded escrow with slash terms, a
+        // 7-day appeal window, a 50_000 appeal bond and a 2-of-3
+        // arbiter panel — the same shape the AV-238 pure-logic
+        // tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(APPEAL_PENALTY, APPEAL_SLASH_DEADLINE)
+            .unwrap()
+            .with_appeal_window(APPEAL_WINDOW)
+            .unwrap()
+            .with_appeal_bond(APPEAL_BOND)
+            .unwrap()
+            .with_arbiter_panel(&[APPEAL_M1, APPEAL_M2, APPEAL_M3], 2)
+            .unwrap();
+        e.fund(ALICE, APPEAL_T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_appeal_bond_maps_param_to_bond_field() {
+        // IDL: amend_appeal_bond(bond: u64) —
+        // bond <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `appeal_bond` tail field
+        // in place (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // one u64 bond and the AV-238 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_appeal_bond")
+            .expect("INSTRUCTIONS carries amend_appeal_bond");
+        assert_eq!(spec.method, "Escrow::amend_appeal_bond");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "bond");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("AppealBondAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the one arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_appeal_bond\""),
+            "checked-in IDL carries amend_appeal_bond"
+        );
+        assert!(
+            idl.contains("[208, 152, 149, 212, 125, 77, 91, 68]"),
+            "checked-in IDL pins the AV-456 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"bond\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the bond arg"
+        );
+        // Only the bond moves: the locked bond, the state and the
+        // layout are untouched.
+        let mut e = appeal_bond_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.appeal_bond(), APPEAL_BOND);
+        e.amend_appeal_bond(ALICE, BOB, 80_000).unwrap();
+        assert_eq!(e.appeal_bond(), 80_000, "bond revised");
+        assert_eq!(e.appeal_bond_paid(), 0, "nothing locked before filing");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "bond field rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_appeal_bond_rejects_single_party_and_strangers() {
+        // AV-456: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // raise or lower the other's appeal stake.
+        let mut e = appeal_bond_funded_escrow();
+        assert_eq!(
+            e.amend_appeal_bond(ALICE, ALICE, 80_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_appeal_bond(MALLORY, BOB, 80_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_appeal_bond(MALLORY, MALLORY, 80_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.appeal_bond(),
+            APPEAL_BOND,
+            "failed revisions write nothing"
+        );
+        e.amend_appeal_bond(ALICE, BOB, 80_000).unwrap();
+        assert_eq!(e.appeal_bond(), 80_000);
+    }
+
+    #[test]
+    fn amend_appeal_bond_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-456: Funded-only — the Uninitialized builder owns the
+        // initial bond set, and a live dispute or a terminal
+        // escrow settles under the bond it started under. The
+        // pause guard fires before the authority and state gates.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        // Uninitialized: the bond is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(APPEAL_PENALTY, APPEAL_SLASH_DEADLINE)
+            .unwrap()
+            .with_appeal_window(APPEAL_WINDOW)
+            .unwrap()
+            .with_appeal_bond(APPEAL_BOND)
+            .unwrap();
+        assert_eq!(
+            bare.amend_appeal_bond(ALICE, BOB, 80_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.appeal_bond(), APPEAL_BOND);
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_slash_terms(APPEAL_PENALTY, APPEAL_SLASH_DEADLINE)
+                .unwrap()
+                .with_appeal_window(APPEAL_WINDOW)
+                .unwrap()
+                .with_appeal_bond(APPEAL_BOND)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_appeal_bond(ALICE, BOB, 80_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.appeal_bond(), APPEAL_BOND);
+        // Disputed: the bond stays while the dispute is in
+        // flight — the dispute settles under the bond it started
+        // under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_slash_terms(APPEAL_PENALTY, APPEAL_SLASH_DEADLINE)
+            .unwrap()
+            .with_appeal_window(APPEAL_WINDOW)
+            .unwrap()
+            .with_appeal_bond(APPEAL_BOND)
+            .unwrap();
+        d.activate(ALICE).unwrap();
+        d.activate(BOB).unwrap();
+        d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_appeal_bond(ALICE, BOB, 80_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.appeal_bond(),
+            APPEAL_BOND,
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's bond is history, not a
+        // live stake to retune.
+        let mut e = appeal_bond_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_appeal_bond(ALICE, BOB, 80_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.appeal_bond(), APPEAL_BOND);
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_slash_terms(APPEAL_PENALTY, APPEAL_SLASH_DEADLINE)
+                .unwrap()
+                .with_appeal_window(APPEAL_WINDOW)
+                .unwrap()
+                .with_appeal_bond(APPEAL_BOND)
+                .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_appeal_bond(ALICE, BOB, 80_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_appeal_bond(MALLORY, BOB, 80_000),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.appeal_bond(),
+            APPEAL_BOND,
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_appeal_bond(ALICE, BOB, 80_000).unwrap();
+        assert_eq!(paused.appeal_bond(), 80_000);
+    }
+
+    #[test]
+    fn amend_appeal_bond_rejects_zero_bond() {
+        // AV-456: a zero bond is the builder's rejection — a zero
+        // bond is a no-op, and the no-bond default already covers
+        // free filing — and a failed amendment leaves the bond
+        // untouched. The smallest legal bond is one lamport.
+        let mut e = appeal_bond_funded_escrow();
+        assert_eq!(
+            e.amend_appeal_bond(ALICE, BOB, 0),
+            Err(EscrowError::InvalidAppealBond)
+        );
+        assert_eq!(EscrowError::InvalidAppealBond.code(), 158);
+        assert_eq!(
+            e.appeal_bond(),
+            APPEAL_BOND,
+            "failed amendment writes nothing"
+        );
+        e.amend_appeal_bond(ALICE, BOB, 1).unwrap();
+        assert_eq!(e.appeal_bond(), 1);
+    }
+
+    #[test]
+    fn amend_appeal_bond_program_retunes_future_filings_only() {
+        // AV-456: raising the bond to 80_000 retunes the appeal
+        // that follows — the filing locks the NEW bond — while the
+        // state and the locked amount are untouched.
+        let mut e = appeal_bond_funded_escrow();
+        e.amend_appeal_bond(ALICE, BOB, 80_000).unwrap();
+        assert_eq!(e.appeal_bond(), 80_000);
+        assert_eq!(e.appeal_bond_paid(), 0, "nothing locked before filing");
+        assert_eq!(e.state(), EscrowState::Funded);
+        e.slash(ALICE, 200_000, None, APPEAL_SLASH_DEADLINE)
+            .unwrap();
+        let locked = e.file_appeal(BOB, APPEAL_SLASH_DEADLINE + 1).unwrap();
+        assert_eq!(locked, 80_000, "filing locks the amended bond");
+        assert_eq!(e.appeal_bond_paid(), 80_000);
+        assert_eq!(e.appeal_state(), AppealState::Filed);
+    }
+
+    #[test]
+    fn amend_appeal_bond_program_leaves_locked_bond_untouched() {
+        // AV-456: the appeal is already filed under the 50_000
+        // bond — the amendment moves the configured bond but the
+        // locked bond, the live appeal's stake, does not move, so
+        // overturn still refunds exactly the ORIGINAL bond.
+        let mut e = appeal_bond_funded_escrow();
+        e.slash(ALICE, 200_000, None, APPEAL_SLASH_DEADLINE)
+            .unwrap();
+        let locked = e.file_appeal(BOB, APPEAL_SLASH_DEADLINE + 1).unwrap();
+        assert_eq!(locked, APPEAL_BOND);
+        e.amend_appeal_bond(ALICE, BOB, 80_000).unwrap();
+        assert_eq!(e.appeal_bond(), 80_000);
+        assert_eq!(e.appeal_bond_paid(), APPEAL_BOND, "live bond untouched");
+        assert_eq!(e.appeal_state(), AppealState::Filed);
+        e.review_appeal(APPEAL_M1, false).unwrap();
+        let (outcome, penalty_refunded, bond_moved) =
+            e.review_appeal(APPEAL_M2, false).unwrap().unwrap();
+        assert_eq!(outcome, AppealOutcome::Overturned);
+        assert_eq!(penalty_refunded, 200_000);
+        assert_eq!(bond_moved, APPEAL_BOND, "refund is the original bond");
+        assert_eq!(e.appeal_bond_paid(), 0, "counter zeroes on refund");
+    }
+
+    #[test]
+    fn amend_appeal_bond_noop_on_same_bond() {
+        // AV-456: re-affirming the current bond is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = appeal_bond_funded_escrow();
+        e.amend_appeal_bond(ALICE, BOB, APPEAL_BOND).unwrap();
+        assert_eq!(e.appeal_bond(), APPEAL_BOND);
+        assert_eq!(e.appeal_bond_paid(), 0, "no appeal filed, nothing locked");
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+        assert_eq!(e.appeal_deadline(), 0, "no slash yet, no deadline");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn amend_appeal_bond_emits_only_on_change() {
+        // AV-456: the program handler emits AppealBondAmended
+        // only when the bond actually changes — the before/after
+        // comparison in the handler skips the event on a
+        // same-bond re-affirmation (mirrors `rotate_taker`). At
+        // the state-machine level the same-bond call writes
+        // nothing — the encoded escrow is byte-identical before
+        // and after, so there is nothing to emit about — while a
+        // real change moves the field, which is what the handler's
+        // emission keys on. The INSTRUCTIONS entry pins the
+        // change-only event in the spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_appeal_bond")
+            .expect("INSTRUCTIONS carries amend_appeal_bond");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = appeal_bond_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_appeal_bond(ALICE, BOB, APPEAL_BOND).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-bond re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_appeal_bond(ALICE, BOB, 80_000).unwrap();
+        assert_eq!(e.appeal_bond(), 80_000);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -60458,6 +60829,22 @@ pub(crate) mod anchor_idl_tests {
             "amend_appeal_window",
             "window_secs",
             "appeal_window_secs",
+        ),
+        // AV-456: the post-funding slash-appeal bond
+        // revision rewrites the same tail field in place — a second
+        // param source for `appeal_bond`, like
+        // `amend_appeal_window`'s window. The field's initial
+        // value comes from the `with_appeal_bond` builder
+        // param (Uninitialized only); this entry documents the
+        // revision source. Only the bond moves —
+        // `appeal_bond_paid` is untouched, so only appeals
+        // filed after the amendment lock the new bond, and a zero
+        // bond is InvalidAppealBond (code 158, the same rejection
+        // as the builder).
+        (
+            "amend_appeal_bond",
+            "bond",
+            "appeal_bond",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -90377,6 +90764,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_appeal_window"),
             [66, 143, 213, 98, 178, 78, 141, 140]
+        );
+    }
+
+    #[test]
+    fn amend_appeal_bond_instruction_discriminator_is_pinned() {
+        // AV-456. IDL:
+        // sha256("global:amend_appeal_bond")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_appeal_bond"),
+            [208, 152, 149, 212, 125, 77, 91, 68]
         );
     }
 
