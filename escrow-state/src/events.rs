@@ -10663,7 +10663,11 @@ impl IndexedEscrow {
     /// after the amendment follow the new grace). The amended
     /// grace period is read from the vault, so the event needs no
     /// extra field. A failed amendment emits nothing: the core
-    /// call returns before any event is pushed.
+    /// call returns before any event is pushed. A same-grace
+    /// re-affirmation is a no-op that emits nothing (the
+    /// before/after comparison, paralleling
+    /// `amend_claim_cooldown` — the program handler does the same
+    /// check at the Anchor layer).
     pub fn amend_grace_period(
         &mut self,
         initializer: [u8; 32],
@@ -10672,20 +10676,23 @@ impl IndexedEscrow {
         at: u64,
     ) -> Result<(), EscrowError> {
         let from = self.inner.state();
+        let before = self.inner.grace_period();
         self.inner
             .amend_grace_period(initializer, taker, grace_secs)?;
-        self.push_event(
-            EscrowEventKind::GracePeriodAmended,
-            from,
-            self.inner.state(),
-            EventAmounts::none(),
-            at,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        if self.inner.grace_period() != before {
+            self.push_event(
+                EscrowEventKind::GracePeriodAmended,
+                from,
+                self.inner.state(),
+                EventAmounts::none(),
+                at,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
         Ok(())
     }
 
@@ -17812,6 +17819,39 @@ mod event_tests {
         assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
         // Disabling the cooldown with 0 is a change: it emits again.
         e.amend_claim_cooldown(ALICE, BOB, 0, T0 + 4)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 2);
+    }
+
+    #[test]
+    fn amend_grace_period_emits_only_on_change() {
+        // AV-454: the IndexedEscrow wrapper emits
+        // GracePeriodAmended only when the grace actually
+        // changes — a failed amendment emits nothing and a
+        // same-grace re-affirmation is a silent no-op (the
+        // program handler's before/after comparison does the same
+        // at the Anchor layer).
+        let mut e = funded(1_000_000);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_grace_period(ALICE, ALICE, 100, T0 + 2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_grace_period(ALICE, BOB, 100, T0 + 2)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::GracePeriodAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same grace is a no-op: no new event.
+        e.amend_grace_period(ALICE, BOB, 100, T0 + 3)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        // Removing the grace with 0 is a change: it emits again.
+        e.amend_grace_period(ALICE, BOB, 0, T0 + 4)
             .unwrap();
         assert_eq!(e.event_count(), before + 2);
     }

@@ -7272,6 +7272,64 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the expiry grace period after funding (AV-454;
+    /// mirrors `Escrow::amend_grace_period`). Unconditional
+    /// dual-signature governance: both initializer and taker sign — one
+    /// party alone cannot lengthen or shorten the other's expiry
+    /// buffer, paralleling `amend_appeal_bond`. `Funded` only — the builder owns the
+    /// initial grace set. A paused escrow fails fast (`Paused`, before
+    /// the authority gate). `expires_at + grace_secs` overflowing
+    /// `u64` is `InvalidGracePeriod` (code 115, the same rejection as
+    /// the builder, which is why a grace period can never be combined
+    /// with the no-timeout convention), and `0` is a legal value that
+    /// removes the grace (the builder's valid default). No delay path covers this method — `GovernanceAction`
+    /// has no `AmendGracePeriod` variant, so the direct call
+    /// is the only entry point. Emits `GracePeriodAmended`
+    /// (from == to == the current state) only on an actual change; a
+    /// same-grace no-op stays silent (mirrors `rotate_taker`). Only
+    /// `grace_period` changes — `expires_at` is untouched, so the expiry gate is
+    /// recomputed live from the new value (`is_expiry_eligible` and
+    /// `cancel_expired` both evaluate `expires_at + grace_period` at call time),
+    /// while determinations already executed are history and are never rewritten.
+    pub fn amend_grace_period(
+        ctx: Context<AmendGracePeriod>,
+        grace_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.grace_period();
+        escrow
+            .amend_grace_period(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                grace_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `grace_period` tail field in place — no realloc.
+        // Only the grace moves; the state is untouched.
+        // Emits only on an actual change; a same-grace no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.grace_period() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::GracePeriodAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -14437,6 +14495,21 @@ pub struct AmendMaxExtensionSecs<'info> {
 /// state machine enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendClaimCooldown<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-454: accounts for `amend_grace_period` — the
+/// expiry grace-period revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendGracePeriod<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

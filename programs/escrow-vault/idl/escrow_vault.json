@@ -1365,6 +1365,14 @@
       ]
     },
     {
+      "name": "amend_grace_period",
+      "discriminator": [71, 135, 148, 168, 124, 53, 83, 225],
+      "accounts": [],
+      "args": [
+        {"name": "grace_secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
