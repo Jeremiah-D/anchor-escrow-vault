@@ -7503,6 +7503,67 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the pre-agreed arbitration default judgment's deadline after
+    /// funding (AV-458; mirrors `Escrow::amend_arbitration_deadline`).
+    /// Unconditional dual-signature governance: both initializer and taker
+    /// sign — one party alone cannot lengthen or shorten the other's
+    /// fallback window, paralleling `amend_evidence_deadline`. `Funded`
+    /// only — the builder owns the initial deadline set. A paused escrow
+    /// fails fast (`Paused`, before the authority gate). No default
+    /// judgment configured is `DefaultJudgmentNotDue` (code 129, the same
+    /// pre-check as the builder — there is nothing to revise). A zero
+    /// deadline is the same `DefaultJudgmentNotDue` (code 129, the
+    /// builder's rejection — a judgment due immediately would fire on
+    /// the very first trigger call, before the arbiter had any chance to
+    /// rule). No delay path covers this method — `GovernanceAction` has
+    /// no `AmendArbitrationDeadline` variant, so the direct call is the
+    /// only entry point. Emits `ArbitrationDeadlineAmended` (from == to
+    /// == the current state) only on an actual change; a same-deadline
+    /// no-op stays silent (mirrors `rotate_taker`). Only `deadline_secs`
+    /// changes — `default_taker_amount` and `default_confirmed` are
+    /// untouched, so only disputes escalated after the amendment measure
+    /// their window from the new value (`trigger_default_judgment` reads
+    /// `default_judgment.deadline_secs` live), while a live dispute's
+    /// trigger window is untouched.
+    pub fn amend_arbitration_deadline(
+        ctx: Context<AmendArbitrationDeadline>,
+        deadline_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.default_judgment().map(|j| j.deadline_secs);
+        escrow
+            .amend_arbitration_deadline(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                deadline_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `default_judgment.deadline_secs` field in place — no realloc.
+        // Only the deadline moves; the state is untouched.
+        // Emits only on an actual change; a same-deadline no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.default_judgment().map(|j| j.deadline_secs) != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ArbitrationDeadlineAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -14728,6 +14789,22 @@ pub struct AmendAppealBond<'info> {
 /// state machine enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendEvidenceDeadline<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-458: accounts for `amend_arbitration_deadline` — the
+/// pre-agreed arbitration default judgment's deadline revision is
+/// unconditional dual-signature governance: both initializer and taker
+/// sign (the state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendArbitrationDeadline<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

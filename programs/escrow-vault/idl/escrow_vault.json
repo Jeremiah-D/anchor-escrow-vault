@@ -1397,6 +1397,14 @@
       ]
     },
     {
+      "name": "amend_arbitration_deadline",
+      "discriminator": [222, 208, 43, 237, 77, 140, 70, 234],
+      "accounts": [],
+      "args": [
+        {"name": "deadline_secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
