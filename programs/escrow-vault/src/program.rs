@@ -7330,6 +7330,63 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the slash-appeal window after funding (AV-455;
+    /// mirrors `Escrow::amend_appeal_window`). Unconditional
+    /// dual-signature governance: both initializer and taker sign — one
+    /// party alone cannot shorten or lengthen the other's appeal time,
+    /// paralleling `amend_appeal_bond`. `Funded` only — the builder owns the
+    /// initial window set. A paused escrow fails fast (`Paused`, before
+    /// the authority gate). A zero window is `InvalidAppealWindow` (code 146,
+    /// the same rejection as the builder — a zero-second window makes an
+    /// appeal expire on arrival). No delay path covers this method —
+    /// `GovernanceAction` has no `AmendAppealWindow` variant, so the direct call
+    /// is the only entry point. Emits `AppealWindowAmended`
+    /// (from == to == the current state) only on an actual change; a
+    /// same-window no-op stays silent (mirrors `rotate_taker`). Only
+    /// `appeal_window_secs` changes — `appeal_deadline` is untouched, so only
+    /// slashes executed after the amendment stamp their appeal deadline from
+    /// the new value (`slash` reads the live field at slash time), while an
+    /// already-stamped deadline — a filed appeal under review, or a slash
+    /// awaiting filing — keeps its original window.
+    pub fn amend_appeal_window(
+        ctx: Context<AmendAppealWindow>,
+        window_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.appeal_window_secs();
+        escrow
+            .amend_appeal_window(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                window_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `appeal_window_secs` tail field in place — no realloc.
+        // Only the window moves; the state is untouched.
+        // Emits only on an actual change; a same-window no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.appeal_window_secs() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::AppealWindowAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -14510,6 +14567,21 @@ pub struct AmendClaimCooldown<'info> {
 /// state machine enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendGracePeriod<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-455: accounts for `amend_appeal_window` — the
+/// slash-appeal window revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendAppealWindow<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

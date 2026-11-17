@@ -42641,6 +42641,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "grace_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial grace set); no delay path covers this method — GovernanceAction has no AmendGracePeriod variant, so the direct call is the only entry point and no delayed handler is staged; expires_at + grace_secs overflowing u64 is InvalidGracePeriod (code 115, the same rejection as the builder, which is why a grace period can never be combined with the no-timeout convention); 0 is a legal value that removes the grace (the builder's valid default); re-affirming the current grace is a no-op (succeeds, writes nothing, emits no event); only grace_period changes — expires_at is untouched, so the expiry gate is recomputed live from the new value (is_expiry_eligible and cancel_expired both evaluate expires_at + grace_period at call time) — tightening pushes expiry-eligibility out, loosening pulls it in, and clearing to 0 falls back to expires_at itself, while determinations already executed are history and are never rewritten; emits the GracePeriodAmended indexer event only on an actual change (from == to == the current state); the grace_period tail field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-455: revise the slash-appeal window after
+            // funding — the program-level entry point for the
+            // AV-236 pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_appeal_window")[..8]
+            // = [66, 143, 213, 98, 178, 78, 141, 140] — the Anchor
+            // instruction discriminator for the
+            // amend_appeal_window handler (pinned by the
+            // discriminator test below).
+            name: "amend_appeal_window",
+            params: &[(
+                "window_secs",
+                "u64",
+                "instruction param; the new slash-appeal window in seconds — a slash executed after the amendment stamps its appeal deadline as slash time + window_secs; a zero window is InvalidAppealWindow (code 146, the same rejection as the builder — a zero-second window makes an appeal expire on arrival)",
+            )],
+            method: "Escrow::amend_appeal_window",
+            input_mapping: "window_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial window set); no delay path covers this method — GovernanceAction has no AmendAppealWindow variant, so the direct call is the only entry point and no delayed handler is staged; a zero window is InvalidAppealWindow (code 146, the same rejection as the builder — a zero-second window makes an appeal expire on arrival); re-affirming the current window is a no-op (succeeds, writes nothing, emits no event); only appeal_window_secs changes — appeal_deadline is untouched, so only slashes executed after the amendment stamp their appeal deadline from the new value (slash reads the live field at slash time) while an already-stamped deadline — a filed appeal under review, or a slash awaiting filing — keeps its original window, so the amendment never shortens or extends a live appeal; emits the AppealWindowAmended indexer event only on an actual change (from == to == the current state); the appeal_window_secs tail field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43597,6 +43615,9 @@ pub(crate) mod anchor_idl_tests {
             // AV-454: the program-level expiry grace-period revision
             // (the AV-240 pure-logic revision wired to the chain).
             "Escrow::amend_grace_period",
+            // AV-455: the program-level slash-appeal window revision
+            // (the AV-236 pure-logic revision wired to the chain).
+            "Escrow::amend_appeal_window",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -43728,7 +43749,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-451 adds `amend_milestone_claim_deadline`;
         // AV-452 adds `amend_max_extension_secs`;
         // AV-453 adds `amend_claim_cooldown`;
-        // AV-454 adds `amend_grace_period`.)
+        // AV-454 adds `amend_grace_period`;
+        // AV-455 adds `amend_appeal_window`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -44040,6 +44062,13 @@ pub(crate) mod anchor_idl_tests {
                 // and expires_at is untouched, so the expiry gate is
                 // recomputed live from the new value.
                 &"amend_grace_period",
+                // AV-455: the window-revision value (u64) — the
+                // new slash-appeal window in seconds; a zero window
+                // is InvalidAppealWindow (code 146), and
+                // appeal_deadline is untouched, so only slashes
+                // executed after the amendment stamp their deadline
+                // from the new value.
+                &"amend_appeal_window",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -56216,6 +56245,32 @@ pub(crate) mod anchor_idl_tests {
         e
     }
 
+    // AV-455: the program-level slash-appeal window revision —
+    // the AV-236 pure-logic revision wired to the chain.
+    const APPEAL_WINDOW: u64 = 7 * 86_400; // 7 days, the AV-236 test window
+    const APPEAL_T0: u64 = 1_700_000_000; // fund time, before the slash deadline
+    const APPEAL_SLASH_DEADLINE: u64 = APPEAL_T0 + 86_400;
+    const APPEAL_PENALTY: [u8; 32] = [0xDD; 32];
+    const APPEAL_M1: [u8; 32] = [0x11; 32];
+    const APPEAL_M2: [u8; 32] = [0x22; 32];
+    const APPEAL_M3: [u8; 32] = [0x33; 32];
+
+    fn appeal_window_funded_escrow() -> Escrow {
+        // AV-455 helper: a funded escrow with slash terms, a
+        // 7-day appeal window and a 2-of-3 arbiter panel — the same
+        // shape the AV-236 pure-logic tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(APPEAL_PENALTY, APPEAL_SLASH_DEADLINE)
+            .unwrap()
+            .with_appeal_window(APPEAL_WINDOW)
+            .unwrap()
+            .with_arbiter_panel(&[APPEAL_M1, APPEAL_M2, APPEAL_M3], 2)
+            .unwrap();
+        e.fund(ALICE, APPEAL_T0).unwrap();
+        e
+    }
+
     #[test]
     fn amend_grace_period_maps_param_to_grace_field() {
         // IDL: amend_grace_period(grace_secs: u64) —
@@ -56521,6 +56576,311 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(e.state(), EscrowState::Funded);
         assert_eq!(e.remaining_amount(), 1_000_000);
         assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn amend_appeal_window_maps_param_to_window_field() {
+        // IDL: amend_appeal_window(window_secs: u64) —
+        // window_secs <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `appeal_window_secs` tail field
+        // in place (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // one u64 window and the AV-236 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_appeal_window")
+            .expect("INSTRUCTIONS carries amend_appeal_window");
+        assert_eq!(spec.method, "Escrow::amend_appeal_window");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "window_secs");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("AppealWindowAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the one arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_appeal_window\""),
+            "checked-in IDL carries amend_appeal_window"
+        );
+        assert!(
+            idl.contains("[66, 143, 213, 98, 178, 78, 141, 140]"),
+            "checked-in IDL pins the AV-455 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"window_secs\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the window_secs arg"
+        );
+        // Only the window moves: expires_at, the stamped
+        // deadline, the state and the layout are untouched.
+        let mut e = appeal_window_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.appeal_window_secs(), APPEAL_WINDOW);
+        e.amend_appeal_window(ALICE, BOB, 3600).unwrap();
+        assert_eq!(e.appeal_window_secs(), 3600, "window revised");
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+        assert_eq!(e.appeal_deadline(), 0, "no slash yet, no deadline");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "window field rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_appeal_window_rejects_single_party_and_strangers() {
+        // AV-455: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // shorten or lengthen the other's appeal time.
+        let mut e = appeal_window_funded_escrow();
+        assert_eq!(
+            e.amend_appeal_window(ALICE, ALICE, 3600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_appeal_window(MALLORY, BOB, 3600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_appeal_window(MALLORY, MALLORY, 3600),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.appeal_window_secs(),
+            APPEAL_WINDOW,
+            "failed revisions write nothing"
+        );
+        e.amend_appeal_window(ALICE, BOB, 3600).unwrap();
+        assert_eq!(e.appeal_window_secs(), 3600);
+    }
+
+    #[test]
+    fn amend_appeal_window_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-455: Funded-only — the Uninitialized builder owns the
+        // initial window set, and a live dispute or a terminal
+        // escrow settles under the window it started under. The
+        // pause guard fires before the authority and state gates.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        // Uninitialized: the window is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_appeal_window(APPEAL_WINDOW)
+            .unwrap();
+        assert_eq!(
+            bare.amend_appeal_window(ALICE, BOB, 3600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.appeal_window_secs(), APPEAL_WINDOW);
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_appeal_window(APPEAL_WINDOW)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_appeal_window(ALICE, BOB, 3600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.appeal_window_secs(), APPEAL_WINDOW);
+        // Disputed: the window stays while the dispute is in
+        // flight — the dispute settles under the window it started
+        // under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_appeal_window(APPEAL_WINDOW)
+            .unwrap();
+        d.activate(ALICE).unwrap();
+        d.activate(BOB).unwrap();
+        d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        d.escalate(ALICE, EXPIRES_AT - 1, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_appeal_window(ALICE, BOB, 3600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.appeal_window_secs(),
+            APPEAL_WINDOW,
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's window is history, not a
+        // live buffer to retune.
+        let mut e = appeal_window_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_appeal_window(ALICE, BOB, 3600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.appeal_window_secs(), APPEAL_WINDOW);
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_appeal_window(APPEAL_WINDOW)
+                .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_appeal_window(ALICE, BOB, 3600),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_appeal_window(MALLORY, BOB, 3600),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.appeal_window_secs(),
+            APPEAL_WINDOW,
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_appeal_window(ALICE, BOB, 3600).unwrap();
+        assert_eq!(paused.appeal_window_secs(), 3600);
+    }
+
+    #[test]
+    fn amend_appeal_window_rejects_zero_window() {
+        // AV-455: a zero window makes an appeal expire on arrival
+        // — the same rejection as the builder — and a failed
+        // amendment leaves the window untouched. The smallest
+        // legal window is one second.
+        let mut e = appeal_window_funded_escrow();
+        assert_eq!(
+            e.amend_appeal_window(ALICE, BOB, 0),
+            Err(EscrowError::InvalidAppealWindow)
+        );
+        assert_eq!(EscrowError::InvalidAppealWindow.code(), 146);
+        assert_eq!(
+            e.appeal_window_secs(),
+            APPEAL_WINDOW,
+            "failed amendment writes nothing"
+        );
+        e.amend_appeal_window(ALICE, BOB, 1).unwrap();
+        assert_eq!(e.appeal_window_secs(), 1);
+    }
+
+    #[test]
+    fn amend_appeal_window_program_retunes_future_slashes_only() {
+        // AV-455: tightening to one hour retunes the slash that
+        // follows — the slash stamps its deadline from the NEW
+        // window — while the state and the locked amount are
+        // untouched.
+        let mut e = appeal_window_funded_escrow();
+        e.amend_appeal_window(ALICE, BOB, 3600).unwrap();
+        assert_eq!(e.appeal_window_secs(), 3600);
+        assert_eq!(e.state(), EscrowState::Funded);
+        e.slash(ALICE, 200_000, None, APPEAL_SLASH_DEADLINE)
+            .unwrap();
+        assert_eq!(e.appeal_deadline(), APPEAL_SLASH_DEADLINE + 3600);
+        assert!(
+            e.is_appeal_eligible(APPEAL_SLASH_DEADLINE + 3600),
+            "new window is inclusive"
+        );
+        assert!(!e.is_appeal_eligible(APPEAL_SLASH_DEADLINE + 3600 + 1));
+        assert_eq!(e.appeal_window_secs(), 3600);
+    }
+
+    #[test]
+    fn amend_appeal_window_program_leaves_stamped_deadline_untouched() {
+        // AV-455: the slash already happened under the 7-day
+        // window — the amendment moves the configured window but
+        // the stamped deadline, the live appeal's clock, does not
+        // move, so the taker can still file at the very end of the
+        // OLD window even though the new window is only one hour.
+        let mut e = appeal_window_funded_escrow();
+        e.slash(ALICE, 200_000, None, APPEAL_SLASH_DEADLINE)
+            .unwrap();
+        assert_eq!(e.appeal_deadline(), APPEAL_SLASH_DEADLINE + APPEAL_WINDOW);
+        e.amend_appeal_window(ALICE, BOB, 3600).unwrap();
+        assert_eq!(e.appeal_window_secs(), 3600);
+        assert_eq!(e.appeal_deadline(), APPEAL_SLASH_DEADLINE + APPEAL_WINDOW);
+        assert_eq!(
+            e.file_appeal(BOB, APPEAL_SLASH_DEADLINE + APPEAL_WINDOW)
+                .unwrap(),
+            0
+        );
+        assert_eq!(e.appeal_state(), AppealState::Filed);
+    }
+
+    #[test]
+    fn amend_appeal_window_noop_on_same_window() {
+        // AV-455: re-affirming the current window is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = appeal_window_funded_escrow();
+        e.amend_appeal_window(ALICE, BOB, APPEAL_WINDOW).unwrap();
+        assert_eq!(e.appeal_window_secs(), APPEAL_WINDOW);
+        assert_eq!(e.expires_at(), EXPIRES_AT);
+        assert_eq!(e.appeal_deadline(), 0, "no slash yet, no deadline");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn amend_appeal_window_emits_only_on_change() {
+        // AV-455: the program handler emits AppealWindowAmended
+        // only when the window actually changes — the before/after
+        // comparison in the handler skips the event on a
+        // same-window re-affirmation (mirrors `rotate_taker`). At
+        // the state-machine level the same-window call writes
+        // nothing — the encoded escrow is byte-identical before
+        // and after, so there is nothing to emit about — while a
+        // real change moves the field, which is what the handler's
+        // emission keys on. The INSTRUCTIONS entry pins the
+        // change-only event in the spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_appeal_window")
+            .expect("INSTRUCTIONS carries amend_appeal_window");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = appeal_window_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_appeal_window(ALICE, BOB, APPEAL_WINDOW).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-window re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_appeal_window(ALICE, BOB, 3600).unwrap();
+        assert_eq!(e.appeal_window_secs(), 3600);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
     }
 
     #[test]
@@ -60082,6 +60442,22 @@ pub(crate) mod anchor_idl_tests {
             "amend_grace_period",
             "grace_secs",
             "grace_period",
+        ),
+        // AV-455: the post-funding slash-appeal window
+        // revision rewrites the same tail field in place — a second
+        // param source for `appeal_window_secs`, like
+        // `amend_grace_period`'s grace. The field's initial
+        // value comes from the `with_appeal_window` builder
+        // param (Uninitialized only); this entry documents the
+        // revision source. Only the window moves —
+        // `appeal_deadline` is untouched, so only slashes
+        // executed after the amendment stamp their deadline from
+        // the new value, and a zero window is InvalidAppealWindow
+        // (code 146, the same rejection as the builder).
+        (
+            "amend_appeal_window",
+            "window_secs",
+            "appeal_window_secs",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -89989,6 +90365,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_grace_period"),
             [71, 135, 148, 168, 124, 53, 83, 225]
+        );
+    }
+
+    #[test]
+    fn amend_appeal_window_instruction_discriminator_is_pinned() {
+        // AV-455. IDL:
+        // sha256("global:amend_appeal_window")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_appeal_window"),
+            [66, 143, 213, 98, 178, 78, 141, 140]
         );
     }
 

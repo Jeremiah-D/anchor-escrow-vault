@@ -1373,6 +1373,14 @@
       ]
     },
     {
+      "name": "amend_appeal_window",
+      "discriminator": [66, 143, 213, 98, 178, 78, 141, 140],
+      "accounts": [],
+      "args": [
+        {"name": "window_secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
