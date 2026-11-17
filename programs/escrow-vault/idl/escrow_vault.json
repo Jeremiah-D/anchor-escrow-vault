@@ -1389,6 +1389,14 @@
       ]
     },
     {
+      "name": "amend_evidence_deadline",
+      "discriminator": [67, 224, 156, 117, 2, 116, 197, 92],
+      "accounts": [],
+      "args": [
+        {"name": "deadline_secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

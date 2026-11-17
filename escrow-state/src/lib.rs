@@ -42677,6 +42677,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "bond <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial bond set); no delay path covers this method — GovernanceAction has no AmendAppealBond variant, so the direct call is the only entry point and no delayed handler is staged; a zero bond is InvalidAppealBond (code 158, the same rejection as the builder — a zero bond is a no-op, and the no-bond default already covers free filing); re-affirming the current bond is a no-op (succeeds, writes nothing, emits no event); only appeal_bond changes — appeal_bond_paid is untouched, so only appeals filed after the amendment lock the new bond (file_appeal copies the live field into appeal_bond_paid at filing time) while an already-locked bond — a filed appeal under review — keeps its original amount, so the amendment never tops up or refunds a live appeal; emits the AppealBondAmended indexer event only on an actual change (from == to == the current state); the appeal_bond tail field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-457: revise the dispute-evidence disclosure
+            // deadline after funding — the program-level entry
+            // point for the AV-241 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_evidence_deadline")[..8]
+            // = [67, 224, 156, 117, 2, 116, 197, 92] — the Anchor
+            // instruction discriminator for the
+            // amend_evidence_deadline handler (pinned by the
+            // discriminator test below).
+            name: "amend_evidence_deadline",
+            params: &[(
+                "deadline_secs",
+                "u64",
+                "instruction param; the new dispute-evidence disclosure deadline in seconds — measured from disputed_at, the window the escalating party gets to disclose the evidence; a zero deadline is InvalidEvidenceDeadline (code 138, the same rejection as the builder — a zero-second deadline would lapse the moment the dispute starts)",
+            )],
+            method: "Escrow::amend_evidence_deadline",
+            input_mapping: "deadline_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial deadline set); no delay path covers this method — GovernanceAction has no AmendEvidenceDeadline variant, so the direct call is the only entry point and no delayed handler is staged; no arbitration mechanism configured is InvalidArbiter (code 108, the same pre-check as the builder — the deadline disciplines arbitration evidence, so a plain escrow has nothing to discipline); a zero deadline is InvalidEvidenceDeadline (code 138, the same rejection as the builder — a zero-second deadline would lapse the moment the dispute starts); re-affirming the current deadline is a no-op (succeeds, writes nothing, emits no event); only evidence_deadline_secs changes — disputed_at / escalated_by are untouched, so only disputes escalated after the amendment measure their window from the new value (evidence_due_at computes disputed_at + evidence_deadline_secs live) while a live dispute's due date is untouched, so the amendment never moves a live dispute; emits the EvidenceDeadlineAmended indexer event only on an actual change (from == to == the current state); the evidence_deadline_secs tail field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43639,6 +43658,10 @@ pub(crate) mod anchor_idl_tests {
             // AV-456: the program-level slash-appeal bond revision
             // (the AV-238 pure-logic revision wired to the chain).
             "Escrow::amend_appeal_bond",
+            // AV-457: the program-level dispute-evidence
+            // disclosure-deadline revision (the AV-241 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_evidence_deadline",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -43772,7 +43795,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-453 adds `amend_claim_cooldown`;
         // AV-454 adds `amend_grace_period`;
         // AV-455 adds `amend_appeal_window`;
-        // AV-456 adds `amend_appeal_bond`.)
+        // AV-456 adds `amend_appeal_bond`;
+        // AV-457 adds `amend_evidence_deadline`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -44097,6 +44121,14 @@ pub(crate) mod anchor_idl_tests {
                 // appeal_bond_paid is untouched, so only appeals
                 // filed after the amendment lock the new bond.
                 &"amend_appeal_bond",
+                // AV-457: the deadline-revision value (u64) — the
+                // new dispute-evidence disclosure deadline in
+                // seconds; a zero deadline is
+                // InvalidEvidenceDeadline (code 138), and
+                // disputed_at / escalated_by are untouched, so only
+                // disputes escalated after the amendment measure
+                // their window from the new value.
+                &"amend_evidence_deadline",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -57254,6 +57286,395 @@ pub(crate) mod anchor_idl_tests {
         );
     }
 
+    // AV-457: the program-level dispute-evidence disclosure
+    // deadline revision — the AV-241 pure-logic revision wired
+    // to the chain.
+    const EVIDENCE_DEADLINE: u64 = 3_600; // the AV-241 test deadline
+    const EVIDENCE_T0: u64 = 1_700_000_000; // fund time
+    const EVIDENCE_ARBITER: [u8; 32] = [0xA8; 32];
+
+    fn evidence_deadline_funded_escrow() -> Escrow {
+        // AV-457 helper: a funded escrow with a single arbiter
+        // and a 3_600-second evidence deadline — the same shape
+        // the AV-241 pure-logic tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(EVIDENCE_ARBITER)
+            .unwrap()
+            .with_evidence_deadline(EVIDENCE_DEADLINE)
+            .unwrap();
+        e.fund(ALICE, EVIDENCE_T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_evidence_deadline_maps_param_to_deadline_field() {
+        // IDL: amend_evidence_deadline(deadline_secs: u64) —
+        // deadline_secs <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `evidence_deadline_secs` tail
+        // field in place (see PARAM_FIELD_MAP) — no layout change.
+        // The INSTRUCTIONS spec entry pins the program-level
+        // wiring: one u64 deadline and the AV-241 pure-logic
+        // method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_evidence_deadline")
+            .expect("INSTRUCTIONS carries amend_evidence_deadline");
+        assert_eq!(spec.method, "Escrow::amend_evidence_deadline");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "deadline_secs");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("EvidenceDeadlineAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the one arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_evidence_deadline\""),
+            "checked-in IDL carries amend_evidence_deadline"
+        );
+        assert!(
+            idl.contains("[67, 224, 156, 117, 2, 116, 197, 92]"),
+            "checked-in IDL pins the AV-457 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"deadline_secs\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the deadline_secs arg"
+        );
+        // Only the deadline moves: the dispute stamps, the state
+        // and the layout are untouched.
+        let mut e = evidence_deadline_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.evidence_deadline_secs(), EVIDENCE_DEADLINE);
+        e.amend_evidence_deadline(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(e.evidence_deadline_secs(), 7_200, "deadline revised");
+        assert_eq!(e.disputed_at(), 0, "no dispute yet, no stamp");
+        assert_eq!(e.escalated_by(), None, "no dispute yet, no party");
+        assert_eq!(e.evidence_due_at(), None, "no dispute yet, no due date");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "deadline field rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_evidence_deadline_rejects_single_party_and_strangers() {
+        // AV-457: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // lengthen or shorten the other's disclosure bar.
+        let mut e = evidence_deadline_funded_escrow();
+        assert_eq!(
+            e.amend_evidence_deadline(ALICE, ALICE, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_evidence_deadline(MALLORY, BOB, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_evidence_deadline(MALLORY, MALLORY, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.evidence_deadline_secs(),
+            EVIDENCE_DEADLINE,
+            "failed revisions write nothing"
+        );
+        e.amend_evidence_deadline(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(e.evidence_deadline_secs(), 7_200);
+    }
+
+    #[test]
+    fn amend_evidence_deadline_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-457: Funded-only — the Uninitialized builder owns the
+        // initial deadline set, and a live dispute or a terminal
+        // escrow settles under the deadline it started under. The
+        // pause guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        // Uninitialized: the deadline is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(EVIDENCE_ARBITER)
+            .unwrap()
+            .with_evidence_deadline(EVIDENCE_DEADLINE)
+            .unwrap();
+        assert_eq!(
+            bare.amend_evidence_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.evidence_deadline_secs(), EVIDENCE_DEADLINE);
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_arbiter(EVIDENCE_ARBITER)
+                .unwrap()
+                .with_evidence_deadline(EVIDENCE_DEADLINE)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_evidence_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.evidence_deadline_secs(), EVIDENCE_DEADLINE);
+        // Disputed: the due date stays while the dispute is in
+        // flight — the dispute measures its window from the
+        // deadline it started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_arbiter(EVIDENCE_ARBITER)
+            .unwrap()
+            .with_evidence_deadline(EVIDENCE_DEADLINE)
+            .unwrap();
+        d.activate(ALICE).unwrap();
+        d.activate(BOB).unwrap();
+        d.fund(ALICE, EVIDENCE_T0).unwrap();
+        let disputed_at = EVIDENCE_T0 + 100;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_evidence_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.evidence_deadline_secs(),
+            EVIDENCE_DEADLINE,
+            "disputed revision writes nothing"
+        );
+        assert_eq!(
+            d.evidence_due_at(),
+            Some(disputed_at + EVIDENCE_DEADLINE),
+            "live dispute's due date is untouched"
+        );
+        // Terminal: a cancelled escrow's deadline is history, not
+        // a live bar to retune.
+        let mut e = evidence_deadline_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_evidence_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.evidence_deadline_secs(), EVIDENCE_DEADLINE);
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_arbiter(EVIDENCE_ARBITER)
+                .unwrap()
+                .with_evidence_deadline(EVIDENCE_DEADLINE)
+                .unwrap();
+        paused.fund(ALICE, EVIDENCE_T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_evidence_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_evidence_deadline(MALLORY, BOB, 7_200),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.evidence_deadline_secs(),
+            EVIDENCE_DEADLINE,
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_evidence_deadline(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(paused.evidence_deadline_secs(), 7_200);
+    }
+
+    #[test]
+    fn amend_evidence_deadline_refuses_arbiterless_escrow() {
+        // AV-457: the deadline disciplines arbitration evidence,
+        // so a plain escrow with no arbitration mechanism has
+        // nothing to discipline — the same pre-check as the
+        // builder, before any write.
+        let mut plain =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, EVIDENCE_T0).unwrap();
+        assert_eq!(
+            plain.amend_evidence_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidArbiter)
+        );
+        assert_eq!(EscrowError::InvalidArbiter.code(), 108);
+        assert_eq!(
+            plain.evidence_deadline_secs(),
+            0,
+            "failed amendment writes nothing"
+        );
+        // Panel mode counts as a configured arbitration mechanism
+        // — the deadline disciplines the panel's evidence too.
+        let mut panel =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter_panel(&[EVIDENCE_ARBITER], 1)
+                .unwrap()
+                .with_evidence_deadline(EVIDENCE_DEADLINE)
+                .unwrap();
+        panel.fund(ALICE, EVIDENCE_T0).unwrap();
+        panel.amend_evidence_deadline(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(panel.evidence_deadline_secs(), 7_200);
+    }
+
+    #[test]
+    fn amend_evidence_deadline_rejects_zero_deadline() {
+        // AV-457: a zero deadline is the builder's rejection — a
+        // zero-second deadline would lapse the moment the dispute
+        // starts — and a failed amendment leaves the deadline
+        // untouched. The smallest legal deadline is one second.
+        let mut e = evidence_deadline_funded_escrow();
+        assert_eq!(
+            e.amend_evidence_deadline(ALICE, BOB, 0),
+            Err(EscrowError::InvalidEvidenceDeadline)
+        );
+        assert_eq!(EscrowError::InvalidEvidenceDeadline.code(), 138);
+        assert_eq!(
+            e.evidence_deadline_secs(),
+            EVIDENCE_DEADLINE,
+            "failed amendment writes nothing"
+        );
+        e.amend_evidence_deadline(ALICE, BOB, 1).unwrap();
+        assert_eq!(e.evidence_deadline_secs(), 1);
+    }
+
+    #[test]
+    fn amend_evidence_deadline_program_retunes_future_disputes_only() {
+        // AV-457: raising the deadline to 7_200 retunes the
+        // dispute that follows — the escalation stamps its due
+        // date from the NEW deadline — while the state and the
+        // dispute stamps are untouched until then.
+        let mut e = evidence_deadline_funded_escrow();
+        e.amend_evidence_deadline(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(e.evidence_deadline_secs(), 7_200);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.evidence_due_at(), None, "no dispute yet, no due date");
+        let disputed_at = EVIDENCE_T0 + 100;
+        e.escalate(BOB, disputed_at, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(e.disputed_at(), disputed_at);
+        assert_eq!(e.escalated_by(), Some(BOB));
+        assert_eq!(
+            e.evidence_due_at(),
+            Some(disputed_at + 7_200),
+            "later dispute measures from the amended deadline"
+        );
+    }
+
+    #[test]
+    fn amend_evidence_deadline_program_leaves_live_dispute_untouched() {
+        // AV-457: the dispute is already in flight under the
+        // 3_600-second deadline — the amendment is refused
+        // (Disputed, not Funded) and the live dispute's computed
+        // due date, stamp and escalating party do not move.
+        let mut e = evidence_deadline_funded_escrow();
+        let disputed_at = EVIDENCE_T0 + 100;
+        e.escalate(BOB, disputed_at, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(
+            e.evidence_due_at(),
+            Some(disputed_at + EVIDENCE_DEADLINE)
+        );
+        assert_eq!(
+            e.amend_evidence_deadline(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.evidence_deadline_secs(),
+            EVIDENCE_DEADLINE,
+            "live dispute's deadline is untouched"
+        );
+        assert_eq!(e.disputed_at(), disputed_at);
+        assert_eq!(e.escalated_by(), Some(BOB));
+        assert_eq!(
+            e.evidence_due_at(),
+            Some(disputed_at + EVIDENCE_DEADLINE),
+            "live dispute's due date is untouched"
+        );
+    }
+
+    #[test]
+    fn amend_evidence_deadline_noop_on_same_deadline() {
+        // AV-457: re-affirming the current deadline is a no-op —
+        // it succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = evidence_deadline_funded_escrow();
+        e.amend_evidence_deadline(ALICE, BOB, EVIDENCE_DEADLINE)
+            .unwrap();
+        assert_eq!(e.evidence_deadline_secs(), EVIDENCE_DEADLINE);
+        assert_eq!(e.disputed_at(), 0, "no dispute yet, no stamp");
+        assert_eq!(e.escalated_by(), None, "no dispute yet, no party");
+        assert_eq!(e.evidence_due_at(), None, "no dispute yet, no due date");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn amend_evidence_deadline_emits_only_on_change() {
+        // AV-457: the program handler emits EvidenceDeadlineAmended
+        // only when the deadline actually changes — the before/after
+        // comparison in the handler skips the event on a
+        // same-deadline re-affirmation (mirrors `rotate_taker`). At
+        // the state-machine level the same-deadline call writes
+        // nothing — the encoded escrow is byte-identical before
+        // and after, so there is nothing to emit about — while a
+        // real change moves the field, which is what the handler's
+        // emission keys on. The INSTRUCTIONS entry pins the
+        // change-only event in the spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_evidence_deadline")
+            .expect("INSTRUCTIONS carries amend_evidence_deadline");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = evidence_deadline_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_evidence_deadline(ALICE, BOB, EVIDENCE_DEADLINE)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-deadline re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_evidence_deadline(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(e.evidence_deadline_secs(), 7_200);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -60845,6 +61266,23 @@ pub(crate) mod anchor_idl_tests {
             "amend_appeal_bond",
             "bond",
             "appeal_bond",
+        ),
+        // AV-457: the post-funding dispute-evidence disclosure
+        // deadline revision rewrites the same tail field in place
+        // — a second param source for `evidence_deadline_secs`,
+        // like `amend_appeal_bond`'s bond. The field's initial
+        // value comes from the `with_evidence_deadline` builder
+        // param (Uninitialized only); this entry documents the
+        // revision source. Only the deadline moves —
+        // `disputed_at` / `escalated_by` are untouched, so only
+        // disputes escalated after the amendment measure their
+        // window from the new value, and a zero deadline is
+        // InvalidEvidenceDeadline (code 138, the same rejection
+        // as the builder).
+        (
+            "amend_evidence_deadline",
+            "deadline_secs",
+            "evidence_deadline_secs",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -90776,6 +91214,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_appeal_bond"),
             [208, 152, 149, 212, 125, 77, 91, 68]
+        );
+    }
+
+    #[test]
+    fn amend_evidence_deadline_instruction_discriminator_is_pinned() {
+        // AV-457. IDL:
+        // sha256("global:amend_evidence_deadline")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_evidence_deadline"),
+            [67, 224, 156, 117, 2, 116, 197, 92]
         );
     }
 

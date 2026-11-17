@@ -7443,6 +7443,66 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the dispute-evidence disclosure deadline after funding (AV-457;
+    /// mirrors `Escrow::amend_evidence_deadline`). Unconditional
+    /// dual-signature governance: both initializer and taker sign — one
+    /// party alone cannot lengthen or shorten the other's disclosure bar,
+    /// paralleling `amend_grace_period`. `Funded` only — the builder owns the
+    /// initial deadline set. A paused escrow fails fast (`Paused`, before
+    /// the authority gate). No arbitration mechanism configured is
+    /// `InvalidArbiter` (code 108, the same pre-check as the builder — the
+    /// deadline disciplines arbitration evidence, so a plain escrow has
+    /// nothing to discipline). A zero deadline is `InvalidEvidenceDeadline`
+    /// (code 138, the same rejection as the builder — a zero-second deadline
+    /// would lapse the moment the dispute starts). No delay path covers
+    /// this method — `GovernanceAction` has no `AmendEvidenceDeadline` variant, so
+    /// the direct call is the only entry point. Emits `EvidenceDeadlineAmended`
+    /// (from == to == the current state) only on an actual change; a
+    /// same-deadline no-op stays silent (mirrors `rotate_taker`). Only
+    /// `evidence_deadline_secs` changes — `disputed_at` / `escalated_by` are
+    /// untouched, so only disputes escalated after the amendment measure
+    /// their window from the new value (`evidence_due_at` computes
+    /// `disputed_at + evidence_deadline_secs` live), while a live dispute's
+    /// due date is untouched.
+    pub fn amend_evidence_deadline(
+        ctx: Context<AmendEvidenceDeadline>,
+        deadline_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.evidence_deadline_secs();
+        escrow
+            .amend_evidence_deadline(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                deadline_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `evidence_deadline_secs` tail field in place — no realloc.
+        // Only the deadline moves; the state is untouched.
+        // Emits only on an actual change; a same-deadline no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.evidence_deadline_secs() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::EvidenceDeadlineAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -14653,6 +14713,21 @@ pub struct AmendAppealWindow<'info> {
 /// state machine enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendAppealBond<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-457: accounts for `amend_evidence_deadline` — the
+/// dispute-evidence disclosure deadline revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendEvidenceDeadline<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
