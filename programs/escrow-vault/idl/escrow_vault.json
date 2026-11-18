@@ -1421,6 +1421,14 @@
       ]
     },
     {
+      "name": "amend_relative_timelock",
+      "discriminator": [149, 218, 215, 129, 44, 251, 92, 135],
+      "accounts": [],
+      "args": [
+        {"name": "secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

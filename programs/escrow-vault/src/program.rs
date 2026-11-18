@@ -7691,6 +7691,67 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the relative timelock after funding (AV-461;
+    /// mirrors `Escrow::amend_relative_timelock`). Unconditional
+    /// dual-signature governance: both initializer and taker sign —
+    /// one party alone cannot push out or pull in the other's unlock
+    /// moment, paralleling `amend_timelock`. `Funded` only — the
+    /// builder owns the initial window set. A paused escrow fails fast
+    /// (`Paused`, before the authority gate). A nonzero `secs` beside
+    /// a configured absolute or slot lock is `InvalidTimelock` (the
+    /// builder's one-clock rule, code 135); `0` is legal and cancels
+    /// the relative lock (the builder's "no lock" sentinel, a no-op
+    /// beside an absolute or slot lock). No delay path covers this
+    /// method — `GovernanceAction` has no `AmendRelativeTimelock`
+    /// variant, so the direct call is the only entry point. Emits
+    /// `RelativeTimelockAmended` (from == to == the current state)
+    /// only on an actual change; a same-window no-op stays silent
+    /// (mirrors `rotate_taker`). Only `relative_timelock_secs`
+    /// changes — `timelock` and `slot_timelock_slots` are untouched,
+    /// `fund_at` (the lock's anchor) never moves, and amounts already
+    /// released are never restated, so the payout gates re-read the
+    /// live window at the next release (`is_unlock_eligible` consults
+    /// the field at call time against the unchanged anchor) while the
+    /// unilateral exits and the arbiter's `resolve` stay ungated.
+    pub fn amend_relative_timelock(
+        ctx: Context<AmendRelativeTimelock>,
+        secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.relative_timelock_secs();
+        escrow
+            .amend_relative_timelock(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `relative_timelock_secs` field in place — no realloc.
+        // Only the window moves; the state is untouched.
+        // Emits only on an actual change; a same-window no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.relative_timelock_secs() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::RelativeTimelockAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -14964,6 +15025,21 @@ pub struct AmendTimelock<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendRentSweepGrace<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-461: accounts for `amend_relative_timelock` — the
+/// relative-timelock revision is unconditional dual-signature
+/// governance: both initializer and taker sign (the state machine
+/// enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendRelativeTimelock<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
