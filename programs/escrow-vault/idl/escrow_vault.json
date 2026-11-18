@@ -1429,6 +1429,14 @@
       ]
     },
     {
+      "name": "amend_slot_timelock",
+      "discriminator": [232, 45, 41, 23, 206, 210, 52, 242],
+      "accounts": [],
+      "args": [
+        {"name": "slots", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
