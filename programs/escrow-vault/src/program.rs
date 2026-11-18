@@ -7880,6 +7880,64 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the streaming fee rate after funding (AV-464;
+    /// mirrors `Escrow::amend_streaming_fee`). Unconditional
+    /// dual-signature governance: both initializer and taker sign —
+    /// one party alone cannot reprice the other's streaming fee.
+    /// `Funded` only — the builder owns the initial rate set. A
+    /// paused escrow fails fast (`Paused`, before the authority gate).
+    /// Any `u64` is legal and `0` is legal (it disables further
+    /// accrual, the builder's `0` semantics, not a refund). No delay
+    /// path covers this method — `GovernanceAction` has no
+    /// `AmendStreamingFee` variant, so the direct call is the only
+    /// entry point. Emits `StreamingFeeRateAmended` (from == to ==
+    /// the current state) only on an actual change; a same-rate
+    /// no-op stays silent (mirrors `rotate_taker`). Only
+    /// `streaming_fee_rate` changes — `fund_at` is never restated
+    /// and `streaming_fees_accrued` / `fees_paid` are never
+    /// rewritten, so a rate cut can never claw back fees already
+    /// charged, while the charge gate reads the live rate at the
+    /// next settlement (raising the rate bills the difference,
+    /// lowering it bills nothing new).
+    pub fn amend_streaming_fee(
+        ctx: Context<AmendStreamingFee>,
+        rate: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.streaming_fee_rate();
+        escrow
+            .amend_streaming_fee(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                rate,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `streaming_fee_rate` u64 field in place — no
+        // realloc. Only the rate moves; the state is untouched.
+        // Emits only on an actual change; a same-rate no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.streaming_fee_rate() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::StreamingFeeRateAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -15199,6 +15257,21 @@ pub struct AmendSlotTimelock<'info> {
 /// enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendFeeSchedule<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-464: accounts for `amend_streaming_fee` — the
+/// streaming-fee-rate revision is unconditional dual-signature
+/// governance: both initializer and taker sign (the state machine
+/// enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendStreamingFee<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

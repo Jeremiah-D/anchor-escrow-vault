@@ -1445,6 +1445,14 @@
       ]
     },
     {
+      "name": "amend_streaming_fee",
+      "discriminator": [4, 76, 137, 237, 34, 5, 174, 37],
+      "accounts": [],
+      "args": [
+        {"name": "rate", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
