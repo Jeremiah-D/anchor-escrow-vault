@@ -7815,6 +7815,71 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the tiered protocol-fee schedule after funding (AV-463;
+    /// mirrors `Escrow::amend_fee_schedule`). Unconditional
+    /// dual-signature governance: both initializer and taker sign —
+    /// one party alone cannot reprice the other's fee tiers.
+    /// `Funded` only — the builder owns the initial schedule set. A
+    /// paused escrow fails fast (`Paused`, before the authority gate).
+    /// A nonzero flat `fee_bps` refuses the schedule
+    /// (`InvalidProtocolFee`, code 114 — the flat rate and the
+    /// schedule are mutually exclusive, fail-fast not last-wins: a
+    /// schedule here would be silently discarded by
+    /// `protocol_fee_for`). The builder's tier validation applies
+    /// unchanged: a non-empty table of at most 8 tiers, every `bps <=
+    /// 10_000`, `min_amount` floors strictly ascending (same code
+    /// 114). An escrow with no schedule and a zero flat rate gains
+    /// its first schedule on amendment. No delay path covers this
+    /// method — `GovernanceAction` has no `AmendFeeSchedule`
+    /// variant, so the direct call is the only entry point. Emits
+    /// `FeeScheduleAmended` (from == to == the current state) only
+    /// on an actual change; a same-schedule no-op stays silent
+    /// (mirrors `rotate_taker`). Only `fee_schedule` changes —
+    /// `fee_bps` and `fee_cap` are untouched (the cap still floors
+    /// the new schedule's bps fee at computation time) and
+    /// `fees_paid` / `fees_withdrawn` are untouched (fees already
+    /// charged are never restated), so later taker payouts price
+    /// live through `protocol_fee_for` at the new tier the moment
+    /// the amendment lands.
+    pub fn amend_fee_schedule(
+        ctx: Context<AmendFeeSchedule>,
+        tiers: Vec<(u64, u16)>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.fee_schedule();
+        escrow
+            .amend_fee_schedule(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &tiers,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 81-byte schedule region in place — no realloc.
+        // Only the tier table moves; the state is untouched.
+        // Emits only on an actual change; a same-schedule no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.fee_schedule() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::FeeScheduleAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -15119,6 +15184,21 @@ pub struct AmendRelativeTimelock<'info> {
 /// enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendSlotTimelock<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-463: accounts for `amend_fee_schedule` — the
+/// tiered-fee-schedule revision is unconditional dual-signature
+/// governance: both initializer and taker sign (the state machine
+/// enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendFeeSchedule<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

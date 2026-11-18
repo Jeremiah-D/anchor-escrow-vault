@@ -42791,6 +42791,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "slots <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial window set); no delay path covers this method — GovernanceAction has no AmendSlotTimelock variant, so the direct call is the only entry point and no delayed handler is staged; a nonzero slots beside a configured absolute or relative lock is InvalidTimelock (code 135, the builder's one-clock rule — one clock per escrow, in either order); 0 is legal and cancels the slot lock (the builder's \"no lock\" sentinel, a no-op beside an absolute or relative lock); re-affirming the current window is a no-op (succeeds, writes nothing, emits no event); only slot_timelock_slots changes — timelock and relative_timelock_secs are untouched, fund_slot (the lock's anchor) never moves, and amounts already released are never restated, so the slot gates re-read the live window at the next release (slot_unlock_slot is fund_slot + slots, saturating, so a near-u64::MAX anchor plus a long lock never wraps into an early unlock) while the unilateral exits and the arbiter's resolve stay ungated, so lengthening pushes a payout out, shortening pulls one in, and clearing unlocks immediately; emits the SlotTimelockAmended indexer event only on an actual change (from == to == the current state); the slot_timelock_slots tail field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-463: revise the tiered protocol-fee schedule after
+            // funding — the program-level entry point for the AV-253
+            // pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_fee_schedule")[..8]
+            // = [214, 15, 194, 70, 255, 30, 65, 194] — the Anchor
+            // instruction discriminator for the
+            // amend_fee_schedule handler (pinned by the
+            // discriminator test below).
+            name: "amend_fee_schedule",
+            params: &[(
+                "tiers",
+                "Vec<FeeTier>",
+                "instruction param; the amount-to-rate ladder as (min_amount, bps) pairs — the fee for a gross payout uses the rate of the highest tier with min_amount <= amount (FeeSchedule::bps_for), then still floored by the AV-63 fee_cap when one is configured; the handler takes Vec<(u64, u16)> (Anchor-serializable tuple vector, wire-identical to Vec<FeeTier>), so the IDL spells the ladder as the named FeeTier type, paralleling initialize_fee_schedule",
+            )],
+            method: "Escrow::amend_fee_schedule",
+            input_mapping: "tiers <- param (Vec<(u64, u16)> tuple ladder, wire-identical to Vec<FeeTier> — the IDL spells it as the named FeeTier ladder, paralleling initialize_fee_schedule); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial schedule set); no delay path covers this method — GovernanceAction has no AmendFeeSchedule variant, so the direct call is the only entry point and no delayed handler is staged; a nonzero flat fee_bps refuses the schedule outright (InvalidProtocolFee, code 114 — the flat rate and the schedule are mutually exclusive, fail-fast not last-wins, since protocol_fee_for would silently discard a schedule beside a flat rate); an empty or over-8 tier list, a tier bps > 10_000, or non-strictly-ascending min_amount floors is InvalidProtocolFee (code 114, the builder's validation, unchanged); an escrow with no schedule and a zero flat rate gains its first schedule on amendment; re-affirming the current schedule is a no-op (succeeds, writes nothing, emits no event); only fee_schedule changes — fee_bps and fee_cap are untouched (the cap still floors the new schedule's bps fee at computation time) and fees_paid / fees_withdrawn are untouched (fees already charged are never restated), so the new schedule governs from the next taker payout (protocol_fee_for reads the live schedule at every pricing: the highest tier whose min_amount <= amount prices the next claim / release / release_milestone / resolve taker share / release_period at the new tier while a payout already settled keeps the fee it settled under); emits the FeeScheduleAmended indexer event only on an actual change (from == to == the current state); the 81-byte schedule region is rewritten in place with the tail slots zeroed - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43777,6 +43796,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-251 pure-logic revision wired to
             // the chain).
             "Escrow::amend_slot_timelock",
+            // AV-463: the program-level tiered-fee-schedule
+            // revision (the AV-253 pure-logic revision wired to
+            // the chain).
+            "Escrow::amend_fee_schedule",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44298,6 +44321,17 @@ pub(crate) mod anchor_idl_tests {
                 // against the unchanged fund_slot anchor (saturating)
                 // while amounts already released are never restated.
                 &"amend_slot_timelock",
+                // AV-463: the schedule-revision value (Vec<FeeTier>)
+                // — the new amount-to-rate ladder; a nonzero flat
+                // fee_bps refuses the schedule (InvalidProtocolFee,
+                // code 114, the mutual-exclusion fail-fast), an empty
+                // or over-8 table, a tier bps > 10_000, or
+                // non-strictly-ascending floors is InvalidProtocolFee
+                // (code 114), and fee_bps / fee_cap /
+                // fees_paid / fees_withdrawn are untouched, so the
+                // next taker payout prices live from the new ladder
+                // while fees already charged are never restated.
+                &"amend_fee_schedule",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -59966,6 +60000,424 @@ pub(crate) mod anchor_idl_tests {
         assert!(e.is_slot_unlock_eligible(u64::MAX));
     }
 
+    // AV-463: the program-level tiered-fee-schedule revision — the
+    // AV-253 pure-logic revision wired to the chain.
+    const FEE_SCHEDULE_T0: u64 = 1_700_000_000; // fund time
+
+    fn fee_schedule_funded_escrow() -> Escrow {
+        // AV-463 helper: a funded escrow with the one-tier schedule
+        // [(0, 1000)] — the same shape the AV-253 pure-logic tests
+        // build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_schedule(&[(0, 1000)])
+            .unwrap();
+        e.fund(ALICE, FEE_SCHEDULE_T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_fee_schedule_program_maps_tiers_to_schedule_field() {
+        // IDL: amend_fee_schedule(tiers: Vec<FeeTier>) —
+        // tiers <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `fee_schedule` field in place (see
+        // PARAM_FIELD_MAP) — no layout change. The INSTRUCTIONS
+        // spec entry pins the program-level wiring: one tier ladder
+        // and the AV-253 pure-logic method. The handler takes
+        // Vec<(u64, u16)> (wire-identical to Vec<FeeTier>), so the
+        // IDL spells the ladder as the named FeeTier type,
+        // paralleling initialize_fee_schedule.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_fee_schedule")
+            .expect("INSTRUCTIONS carries amend_fee_schedule");
+        assert_eq!(spec.method, "Escrow::amend_fee_schedule");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "tiers");
+        assert_eq!(spec.params[0].1, "Vec<FeeTier>");
+        assert!(
+            spec.input_mapping.contains("FeeScheduleAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the one arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_fee_schedule\""),
+            "checked-in IDL carries amend_fee_schedule"
+        );
+        assert!(
+            idl.contains("[214, 15, 194, 70, 255, 30, 65, 194]"),
+            "checked-in IDL pins the AV-463 discriminator"
+        );
+        assert!(
+            idl.contains(
+                "{\"name\": \"tiers\", \"type\": {\"vec\": {\"defined\": \"FeeTier\"}}}"
+            ),
+            "checked-in IDL carries the tiers arg"
+        );
+        // Only the schedule moves: the flat rate, the cap, the
+        // accrued fees and the layout are untouched.
+        let mut e = fee_schedule_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.fee_schedule().tier_count, 1);
+        assert_eq!(
+            e.fee_schedule().tiers[0],
+            FeeTier { min_amount: 0, bps: 1000 }
+        );
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 200), (100_000, 100)])
+            .unwrap();
+        assert_eq!(e.fee_schedule().tier_count, 2);
+        assert_eq!(
+            e.fee_schedule().tiers[0],
+            FeeTier { min_amount: 0, bps: 200 }
+        );
+        assert_eq!(
+            e.fee_schedule().tiers[1],
+            FeeTier { min_amount: 100_000, bps: 100 }
+        );
+        assert_eq!(
+            e.fee_schedule().tiers[2],
+            FeeTier { min_amount: 0, bps: 0 },
+            "the tail slot is zeroed on replacement"
+        );
+        assert_eq!(e.protocol_fee_for(50_000), 1_000);
+        assert_eq!(e.protocol_fee_for(200_000), 2_000);
+        assert_eq!(e.fee_bps(), 0, "the flat rate stays zero");
+        assert_eq!(e.fee_cap(), 0, "no cap is installed");
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(e.fees_withdrawn(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "schedule region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_fee_schedule_program_rejects_single_party_and_strangers() {
+        // AV-463: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // reprice the other's fee tiers.
+        let mut e = fee_schedule_funded_escrow();
+        assert_eq!(
+            e.amend_fee_schedule(ALICE, ALICE, &[(0, 200)]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_fee_schedule(MALLORY, BOB, &[(0, 200)]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_fee_schedule(MALLORY, MALLORY, &[(0, 200)]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.fee_schedule().tier_count,
+            1,
+            "failed revisions write nothing"
+        );
+        assert_eq!(e.fee_schedule().tiers[0].bps, 1000);
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 200)]).unwrap();
+        assert_eq!(e.fee_schedule().tiers[0].bps, 200);
+    }
+
+    #[test]
+    fn amend_fee_schedule_program_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-463: Funded-only — the Uninitialized builder owns the
+        // initial schedule set, and a live dispute or a terminal
+        // escrow settles under the schedule it started under. The
+        // pause guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Uninitialized: the schedule is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_schedule(&[(0, 1000)])
+            .unwrap();
+        assert_eq!(
+            bare.amend_fee_schedule(ALICE, BOB, &[(0, 500)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.fee_schedule().tiers[0].bps, 1000);
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_fee_schedule(&[(0, 1000)])
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_fee_schedule(ALICE, BOB, &[(0, 500)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.fee_schedule().tiers[0].bps, 1000);
+        // Disputed: the schedule stays while the dispute is in flight —
+        // the dispute settles under the schedule it started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_fee_schedule(&[(0, 1000)])
+            .unwrap();
+        d.fund(ALICE, FEE_SCHEDULE_T0).unwrap();
+        let disputed_at = FEE_SCHEDULE_T0 + 100;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_fee_schedule(ALICE, BOB, &[(0, 500)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.fee_schedule().tiers[0].bps,
+            1000,
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's schedule is history, not
+        // a live table to retune.
+        let mut e = fee_schedule_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_fee_schedule(ALICE, BOB, &[(0, 500)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.fee_schedule().tiers[0].bps, 1000);
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_fee_schedule(&[(0, 1000)])
+                .unwrap();
+        paused.fund(ALICE, FEE_SCHEDULE_T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_fee_schedule(ALICE, BOB, &[(0, 500)]),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_fee_schedule(MALLORY, BOB, &[(0, 500)]),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.fee_schedule().tiers[0].bps,
+            1000,
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_fee_schedule(ALICE, BOB, &[(0, 500)]).unwrap();
+        assert_eq!(paused.fee_schedule().tiers[0].bps, 500);
+    }
+
+    #[test]
+    fn amend_fee_schedule_program_rejects_empty_oversize_and_bad_tiers() {
+        // AV-463: every builder rejection is fail-closed — the old
+        // schedule survives each failed amendment verbatim.
+        let mut e = fee_schedule_funded_escrow();
+        let bad: Vec<Vec<(u64, u16)>> = vec![
+            vec![],
+            (0..9).map(|i| (i * 1000, 100)).collect(),
+            vec![(0, 10_001)],
+            vec![(0, 1000), (0, 500)],
+            vec![(500_000, 500), (0, 1000)],
+        ];
+        for tiers in &bad {
+            assert_eq!(
+                e.amend_fee_schedule(ALICE, BOB, tiers),
+                Err(EscrowError::InvalidProtocolFee),
+                "tiers {tiers:?} must fail"
+            );
+            assert_eq!(EscrowError::InvalidProtocolFee.code(), 114);
+            assert_eq!(e.fee_schedule().tier_count, 1);
+            assert_eq!(
+                e.fee_schedule().tiers[0],
+                FeeTier { min_amount: 0, bps: 1000 }
+            );
+            assert_eq!(e.protocol_fee_for(200_000), 20_000);
+        }
+    }
+
+    #[test]
+    fn amend_fee_schedule_program_refuses_flat_rate_escrow() {
+        // AV-463: mutual exclusion, fail-fast not last-wins — a
+        // nonzero flat rate refuses the schedule, and flat pricing
+        // survives.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_protocol_fee(500)
+            .unwrap();
+        e.fund(ALICE, FEE_SCHEDULE_T0).unwrap();
+        assert_eq!(
+            e.amend_fee_schedule(ALICE, BOB, &[(0, 1000)]),
+            Err(EscrowError::InvalidProtocolFee)
+        );
+        assert_eq!(e.fee_bps(), 500);
+        assert_eq!(e.fee_schedule().tier_count, 0);
+        assert_eq!(e.protocol_fee_for(100_000), 5_000);
+    }
+
+    #[test]
+    fn amend_fee_schedule_program_installs_first_schedule_live() {
+        // AV-463: an escrow with no schedule and a zero flat rate
+        // gains its first schedule on amendment, and later payouts
+        // price live from it: the highest tier whose floor the
+        // amount reaches.
+        let mut e =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, FEE_SCHEDULE_T0).unwrap();
+        assert_eq!(e.fee_schedule().tier_count, 0);
+        assert_eq!(e.protocol_fee_for(600_000), 0);
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 1000), (500_000, 500)])
+            .unwrap();
+        assert_eq!(e.fee_schedule().tier_count, 2);
+        assert_eq!(
+            e.fee_schedule().tiers[0],
+            FeeTier { min_amount: 0, bps: 1000 }
+        );
+        assert_eq!(
+            e.fee_schedule().tiers[1],
+            FeeTier { min_amount: 500_000, bps: 500 }
+        );
+        assert_eq!(e.protocol_fee_for(400_000), 40_000);
+        assert_eq!(e.protocol_fee_for(600_000), 30_000);
+        assert_eq!(e.fee_bps(), 0, "the flat rate stays zero");
+    }
+
+    #[test]
+    fn amend_fee_schedule_program_reprices_next_payout_live() {
+        // AV-463: fees already charged are never restated — a
+        // pre-amendment payout keeps its (zero) fee, and the
+        // post-amendment payout charges the new schedule.
+        let mut e =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, FEE_SCHEDULE_T0).unwrap();
+        let (payout, fee) =
+            e.release(ALICE, FEE_SCHEDULE_T0, 400_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (400_000, 0));
+        assert_eq!(e.fees_paid(), 0);
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 1000), (500_000, 500)])
+            .unwrap();
+        let (payout, fee) =
+            e.release(ALICE, FEE_SCHEDULE_T0, 600_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (570_000, 30_000));
+        assert_eq!(e.fees_paid(), 30_000);
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_fee_schedule_program_keeps_cap_and_accrued_fees() {
+        // AV-463: the cap is untouched by the revision and still
+        // floors the new schedule's bps fee at computation time, and
+        // fees already charged stay charged.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_fee_cap(5000)
+            .unwrap()
+            .with_fee_schedule(&[(0, 1000)])
+            .unwrap();
+        e.fund(ALICE, FEE_SCHEDULE_T0).unwrap();
+        let (payout, fee) =
+            e.release(ALICE, FEE_SCHEDULE_T0, 200_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (195_000, 5_000));
+        assert_eq!(e.fees_paid(), 5_000);
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 200), (100_000, 100)])
+            .unwrap();
+        assert_eq!(e.fee_cap(), 5000);
+        assert_eq!(e.fees_paid(), 5_000, "charged fees are never restated");
+        assert_eq!(e.fees_withdrawn(), 0);
+        assert_eq!(e.fee_bps(), 0, "the flat rate stays zero");
+        assert_eq!(e.protocol_fee_for(200_000), 2_000);
+        assert_eq!(
+            e.protocol_fee_for(600_000),
+            5_000,
+            "the cap still floors the new schedule"
+        );
+    }
+
+    #[test]
+    fn amend_fee_schedule_program_noop_on_same_schedule() {
+        // AV-463: re-affirming the current schedule is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = fee_schedule_funded_escrow();
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 1000)]).unwrap();
+        assert_eq!(e.fee_schedule().tier_count, 1);
+        assert_eq!(
+            e.fee_schedule().tiers[0],
+            FeeTier { min_amount: 0, bps: 1000 }
+        );
+        assert_eq!(e.protocol_fee_for(200_000), 20_000);
+        assert_eq!(e.fee_bps(), 0);
+        assert_eq!(e.fee_cap(), 0);
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        // A second identical re-affirmation is likewise a no-op.
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 1000)]).unwrap();
+        assert_eq!(e.fee_schedule().tier_count, 1);
+        assert_eq!(e.fee_schedule().tiers[0].bps, 1000);
+    }
+
+    #[test]
+    fn amend_fee_schedule_program_emits_only_on_change() {
+        // AV-463: the program handler emits FeeScheduleAmended
+        // only when the schedule actually changes — the before/after
+        // comparison in the handler skips the event on a same-schedule
+        // re-affirmation (mirrors `rotate_taker`). At the
+        // state-machine level the same-schedule call writes nothing —
+        // the encoded escrow is byte-identical before and after, so
+        // there is nothing to emit about — while a real change moves
+        // the field, which is what the handler's emission keys on.
+        // The INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_fee_schedule")
+            .expect("INSTRUCTIONS carries amend_fee_schedule");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = fee_schedule_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 1000)]).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-schedule re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_fee_schedule(ALICE, BOB, &[(0, 200), (100_000, 100)])
+            .unwrap();
+        assert_eq!(e.fee_schedule().tier_count, 2);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -63669,6 +64121,24 @@ pub(crate) mod anchor_idl_tests {
             "amend_slot_timelock",
             "slots",
             "slot_timelock_slots",
+        ),
+        // AV-463: the post-funding tiered-fee-schedule revision
+        // rewrites the 81-byte schedule region in place — a second
+        // param source for `fee_schedule`, like
+        // `initialize_fee_schedule`'s tiers. The field's initial
+        // value comes from the `with_fee_schedule` builder param
+        // (Uninitialized only); this entry documents the revision
+        // source. Only fee_schedule moves — `fee_bps` / `fee_cap`
+        // and `fees_paid` / `fees_withdrawn` are untouched, and a
+        // nonzero flat fee_bps refuses the schedule (InvalidProtocolFee,
+        // code 114, the mutual-exclusion fail-fast), so the new
+        // ladder prices the next taker payout live through
+        // `protocol_fee_for` while fees already charged are never
+        // restated.
+        (
+            "amend_fee_schedule",
+            "tiers",
+            "fee_schedule",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -93683,6 +94153,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_slot_timelock"),
             [232, 45, 41, 23, 206, 210, 52, 242]
+        );
+    }
+
+    #[test]
+    fn amend_fee_schedule_instruction_discriminator_is_pinned() {
+        // AV-463. IDL:
+        // sha256("global:amend_fee_schedule")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_fee_schedule"),
+            [214, 15, 194, 70, 255, 30, 65, 194]
         );
     }
 

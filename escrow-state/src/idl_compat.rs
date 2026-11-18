@@ -1536,12 +1536,13 @@ mod idl_compat_tests {
         // AV-460 adds `amend_rent_sweep_grace`;
         // AV-461 adds `amend_relative_timelock`;
         // AV-462 adds `amend_slot_timelock`;
+        // AV-463 adds `amend_fee_schedule`;
         // the checked-in file diffed against itself has no changes
         // (exercises the parser on the production artifact).
         let idl = std::fs::read_to_string("../programs/escrow-vault/idl/escrow_vault.json")
             .expect("read checked-in IDL");
         let spec = parse_idl(&idl).expect("parse checked-in IDL");
-        assert_eq!(spec.instructions.len(), 220);
+        assert_eq!(spec.instructions.len(), 221);
         // AV-179 adds 4 upgrade-authority errors; AV-180 adds 4
         // freeze-authority errors; AV-184 adds UnsafeMint; AV-186 adds
         // 5 HTLC errors; AV-187 adds 2 NFT-escrow errors; AV-188 adds
