@@ -42734,6 +42734,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "unlock_at <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial lock set); no delay path covers this method — GovernanceAction has no AmendTimelock variant, so the direct call is the only entry point and no delayed handler is staged; a nonzero unlock_at beside a configured relative or slot lock is InvalidTimelock (code 135, the builder's one-clock rule — one clock per escrow, in either order); 0 is legal and cancels the absolute lock (the builder's \"no lock\" sentinel, a no-op beside a relative or slot lock); re-affirming the current lock is a no-op (succeeds, writes nothing, emits no event); only timelock changes — relative_timelock_secs and slot_timelock_slots are untouched, and amounts already released are never restated, so the payout gates re-read the live lock at the next release (is_unlock_eligible consults the field at call time) while the unilateral exits and the arbiter's resolve stay ungated, so lengthening pushes a payout out, shortening pulls one in, and clearing unlocks immediately; emits the TimelockAmended indexer event only on an actual change (from == to == the current state); the timelock tail field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-460: revise the unclaimed-rent sweep grace after
+            // funding — the program-level entry point for the AV-252
+            // pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_rent_sweep_grace")[..8]
+            // = [78, 137, 163, 215, 14, 181, 252, 36] — the Anchor
+            // instruction discriminator for the
+            // amend_rent_sweep_grace handler (pinned by the
+            // discriminator test below).
+            name: "amend_rent_sweep_grace",
+            params: &[(
+                "grace_secs",
+                "u64",
+                "instruction param; the new unclaimed-rent sweep grace in seconds — how long a terminal vault's rent may sit unclaimed before the sweep becomes callable; any u64 is legal and 0 is legal (it restores the 30-day default, the builder's 0 semantics, not \"sweep immediately\")",
+            )],
+            method: "Escrow::amend_rent_sweep_grace",
+            input_mapping: "grace_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial grace set); no delay path covers this method — GovernanceAction has no AmendRentSweepGrace variant, so the direct call is the only entry point and no delayed handler is staged; any u64 is legal and 0 is legal (it restores the 30-day default, the builder's 0 semantics, not \"sweep immediately\"); re-affirming the current grace is a no-op (succeeds, writes nothing, emits no event); only rent_sweep_grace_secs changes — terminal_at is never restated, and a terminal or Closed vault cannot be amended, so a sweep already performed is never undone; the sweep gate reads the grace live (is_rent_sweep_eligible consults effective_rent_sweep_grace_secs at sweep time against the unchanged terminal stamp), so lengthening pushes a sweep out, shortening pulls one in, and clearing to 0 restores the 30-day horizon; emits the RentSweepGraceAmended indexer event only on an actual change (from == to == the current state); the rent_sweep_grace_secs tail field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43708,6 +43727,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-249 pure-logic revision wired to
             // the chain).
             "Escrow::amend_timelock",
+            // AV-460: the program-level unclaimed-rent sweep grace
+            // revision (the AV-252 pure-logic revision wired to
+            // the chain).
+            "Escrow::amend_rent_sweep_grace",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -43844,7 +43867,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-456 adds `amend_appeal_bond`;
         // AV-457 adds `amend_evidence_deadline`;
         // AV-458 adds `amend_arbitration_deadline`;
-        // AV-459 adds `amend_timelock`.)
+        // AV-459 adds `amend_timelock`;
+        // AV-460 adds `amend_rent_sweep_grace`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -44195,6 +44219,15 @@ pub(crate) mod anchor_idl_tests {
                 // gates re-read the live lock at the next release
                 // while amounts already released are never restated.
                 &"amend_timelock",
+                // AV-460: the grace-revision value (u64) — the
+                // new unclaimed-rent sweep grace in seconds; any
+                // u64 is legal and 0 is legal (it restores the
+                // 30-day default, the builder's 0 semantics, not
+                // "sweep immediately"), and terminal_at is never
+                // restated, so the sweep gate re-reads the live
+                // grace at sweep time against the unchanged
+                // terminal stamp.
+                &"amend_rent_sweep_grace",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -58574,6 +58607,428 @@ pub(crate) mod anchor_idl_tests {
             "a real change moves the field, so the handler emits"
         );
     }
+    // AV-460: the program-level unclaimed-rent sweep grace revision —
+    // the AV-252 pure-logic revision wired to the chain.
+    const RENT_SWEEP_GRACE: u64 = 3_600; // the AV-252 test grace
+    const RENT_SWEEP_T0: u64 = 1_700_000_000; // fund time
+    const RENT_SWEEP_DEFAULT: u64 = 30 * 24 * 3600; // 2_592_000
+
+    fn rent_sweep_grace_funded_escrow() -> Escrow {
+        // AV-460 helper: a funded escrow with the sweep grace set to
+        // RENT_SWEEP_GRACE — the same shape the AV-252 pure-logic
+        // tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_rent_sweep_grace_secs(RENT_SWEEP_GRACE)
+            .unwrap();
+        e.fund(ALICE, RENT_SWEEP_T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_maps_param_to_grace_field() {
+        // IDL: amend_rent_sweep_grace(grace_secs: u64) —
+        // grace_secs <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `rent_sweep_grace_secs` field in
+        // place (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring: one
+        // u64 grace and the AV-252 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_rent_sweep_grace")
+            .expect("INSTRUCTIONS carries amend_rent_sweep_grace");
+        assert_eq!(spec.method, "Escrow::amend_rent_sweep_grace");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "grace_secs");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("RentSweepGraceAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the one arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_rent_sweep_grace\""),
+            "checked-in IDL carries amend_rent_sweep_grace"
+        );
+        assert!(
+            idl.contains("[78, 137, 163, 215, 14, 181, 252, 36]"),
+            "checked-in IDL pins the AV-460 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"grace_secs\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the grace_secs arg"
+        );
+        // Only the grace moves: the terminal stamp, the state and
+        // the layout are untouched.
+        let mut e = rent_sweep_grace_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.rent_sweep_grace_secs(), RENT_SWEEP_GRACE);
+        assert_eq!(e.effective_rent_sweep_grace_secs(), RENT_SWEEP_GRACE);
+        assert_eq!(e.terminal_at(), 0, "amending stamps nothing");
+        e.amend_rent_sweep_grace(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(e.rent_sweep_grace_secs(), 7_200);
+        assert_eq!(e.effective_rent_sweep_grace_secs(), 7_200);
+        assert_eq!(e.terminal_at(), 0, "terminal stamp untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "grace field rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_rejects_single_party_and_strangers() {
+        // AV-460: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // push out or pull in the other's sweep horizon.
+        let mut e = rent_sweep_grace_funded_escrow();
+        assert_eq!(
+            e.amend_rent_sweep_grace(ALICE, ALICE, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_rent_sweep_grace(MALLORY, BOB, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_rent_sweep_grace(MALLORY, MALLORY, 7_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.rent_sweep_grace_secs(),
+            RENT_SWEEP_GRACE,
+            "failed revisions write nothing"
+        );
+        e.amend_rent_sweep_grace(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(e.rent_sweep_grace_secs(), 7_200);
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-460: Funded-only — the Uninitialized builder owns the
+        // initial grace set, and a live dispute or a terminal
+        // escrow settles under the grace it started under. The
+        // pause guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Uninitialized: the grace is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_rent_sweep_grace_secs(RENT_SWEEP_GRACE)
+            .unwrap();
+        assert_eq!(
+            bare.amend_rent_sweep_grace(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.rent_sweep_grace_secs(), RENT_SWEEP_GRACE);
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_rent_sweep_grace_secs(RENT_SWEEP_GRACE)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_rent_sweep_grace(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.rent_sweep_grace_secs(), RENT_SWEEP_GRACE);
+        // Disputed: the grace stays while the dispute is in flight —
+        // the dispute settles under the grace it started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_rent_sweep_grace_secs(RENT_SWEEP_GRACE)
+            .unwrap();
+        d.fund(ALICE, RENT_SWEEP_T0).unwrap();
+        let disputed_at = RENT_SWEEP_T0 + 100;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_rent_sweep_grace(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.rent_sweep_grace_secs(),
+            RENT_SWEEP_GRACE,
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's grace is history, not
+        // a live horizon to retune.
+        let mut e = rent_sweep_grace_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_rent_sweep_grace(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.rent_sweep_grace_secs(), RENT_SWEEP_GRACE);
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_rent_sweep_grace_secs(RENT_SWEEP_GRACE)
+                .unwrap();
+        paused.fund(ALICE, RENT_SWEEP_T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_rent_sweep_grace(ALICE, BOB, 7_200),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_rent_sweep_grace(MALLORY, BOB, 7_200),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.rent_sweep_grace_secs(),
+            RENT_SWEEP_GRACE,
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_rent_sweep_grace(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(paused.rent_sweep_grace_secs(), 7_200);
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_accepts_zero_as_default_restored() {
+        // AV-460: zero restores the 30-day default (the builder's
+        // "no grace" sentinel, not "sweep immediately"): a sweep at
+        // the old horizon is refused once the grace is cleared, and
+        // succeeds only at the default horizon, with the terminal
+        // timestamp untouched.
+        let mut e = rent_sweep_grace_funded_escrow();
+        e.amend_rent_sweep_grace(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.rent_sweep_grace_secs(), 0);
+        assert_eq!(
+            e.effective_rent_sweep_grace_secs(),
+            RENT_SWEEP_DEFAULT
+        );
+        assert_eq!(
+            e.effective_rent_sweep_grace_secs(),
+            DEFAULT_RENT_SWEEP_GRACE_SECS
+        );
+        assert_eq!(e.terminal_at(), 0, "clearing stamps nothing");
+        e.cancel(ALICE, None, ALICE, RENT_SWEEP_T0).unwrap();
+        assert_eq!(e.terminal_at(), RENT_SWEEP_T0);
+        assert!(!e.is_rent_sweep_eligible(RENT_SWEEP_T0 + RENT_SWEEP_GRACE));
+        assert_eq!(
+            e.sweep_unclaimed_rent([0x09; 32], RENT_SWEEP_T0 + RENT_SWEEP_GRACE),
+            Err(EscrowError::SweepGraceNotElapsed)
+        );
+        assert!(e.is_rent_sweep_eligible(RENT_SWEEP_T0 + RENT_SWEEP_DEFAULT));
+        assert_eq!(
+            e.sweep_unclaimed_rent([0x09; 32], RENT_SWEEP_T0 + RENT_SWEEP_DEFAULT)
+                .unwrap(),
+            vault_close_rent_reclaimed()
+        );
+        assert_eq!(e.state(), EscrowState::Closed);
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_lengthens_live_sweep_horizon() {
+        // AV-460: lengthening the grace pushes a sweep out — a
+        // sweep at the old horizon is refused once the grace moves,
+        // and settles only at the new horizon, with the terminal
+        // timestamp untouched.
+        let mut e = rent_sweep_grace_funded_escrow();
+        e.amend_rent_sweep_grace(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(e.rent_sweep_grace_secs(), 7_200);
+        assert_eq!(e.effective_rent_sweep_grace_secs(), 7_200);
+        assert_eq!(e.terminal_at(), 0, "amending stamps nothing");
+        e.cancel(ALICE, None, ALICE, RENT_SWEEP_T0).unwrap();
+        assert_eq!(e.terminal_at(), RENT_SWEEP_T0);
+        assert!(!e.is_rent_sweep_eligible(RENT_SWEEP_T0 + RENT_SWEEP_GRACE));
+        assert_eq!(
+            e.sweep_unclaimed_rent([0x09; 32], RENT_SWEEP_T0 + RENT_SWEEP_GRACE),
+            Err(EscrowError::SweepGraceNotElapsed)
+        );
+        assert!(e.is_rent_sweep_eligible(RENT_SWEEP_T0 + 7_200));
+        assert_eq!(
+            e.sweep_unclaimed_rent([0x09; 32], RENT_SWEEP_T0 + 7_200).unwrap(),
+            vault_close_rent_reclaimed()
+        );
+        assert_eq!(e.state(), EscrowState::Closed);
+        assert_eq!(e.terminal_at(), RENT_SWEEP_T0, "sweep moves no stamp");
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_shortens_live_sweep_horizon() {
+        // AV-460: shortening the grace pulls a sweep in — a sweep
+        // at the new horizon settles even though the 30-day default
+        // would still bind.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_rent_sweep_grace_secs(0)
+            .unwrap();
+        e.fund(ALICE, RENT_SWEEP_T0).unwrap();
+        assert_eq!(
+            e.effective_rent_sweep_grace_secs(),
+            RENT_SWEEP_DEFAULT
+        );
+        e.amend_rent_sweep_grace(ALICE, BOB, RENT_SWEEP_GRACE)
+            .unwrap();
+        assert_eq!(e.rent_sweep_grace_secs(), RENT_SWEEP_GRACE);
+        e.cancel(ALICE, None, ALICE, RENT_SWEEP_T0).unwrap();
+        assert_eq!(
+            e.sweep_unclaimed_rent([0x09; 32], RENT_SWEEP_T0 + RENT_SWEEP_GRACE)
+                .unwrap(),
+            vault_close_rent_reclaimed()
+        );
+        assert_eq!(e.state(), EscrowState::Closed);
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_never_undoes_performed_sweep() {
+        // AV-460: a sweep already performed is never undone — a
+        // Closed vault cannot be amended, the grace stays as it
+        // was, and the terminal stamp stays put.
+        let mut e = rent_sweep_grace_funded_escrow();
+        e.cancel(ALICE, None, ALICE, RENT_SWEEP_T0).unwrap();
+        assert_eq!(e.terminal_at(), RENT_SWEEP_T0);
+        e.sweep_unclaimed_rent([0x09; 32], RENT_SWEEP_T0 + RENT_SWEEP_GRACE)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Closed);
+        assert_eq!(
+            e.amend_rent_sweep_grace(ALICE, BOB, 7_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.rent_sweep_grace_secs(), RENT_SWEEP_GRACE);
+        assert_eq!(e.terminal_at(), RENT_SWEEP_T0);
+        assert_eq!(e.state(), EscrowState::Closed);
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_noop_on_same_grace() {
+        // AV-460: re-affirming the current grace is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = rent_sweep_grace_funded_escrow();
+        e.amend_rent_sweep_grace(ALICE, BOB, RENT_SWEEP_GRACE)
+            .unwrap();
+        assert_eq!(e.rent_sweep_grace_secs(), RENT_SWEEP_GRACE);
+        assert_eq!(e.effective_rent_sweep_grace_secs(), RENT_SWEEP_GRACE);
+        assert_eq!(e.terminal_at(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        // Re-stating 0 over a stored 0 is likewise a no-op.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_rent_sweep_grace_secs(0)
+            .unwrap();
+        e.fund(ALICE, RENT_SWEEP_T0).unwrap();
+        assert_eq!(e.rent_sweep_grace_secs(), 0);
+        e.amend_rent_sweep_grace(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.rent_sweep_grace_secs(), 0);
+        assert_eq!(
+            e.effective_rent_sweep_grace_secs(),
+            RENT_SWEEP_DEFAULT
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_emits_only_on_change() {
+        // AV-460: the program handler emits RentSweepGraceAmended
+        // only when the grace actually changes — the before/after
+        // comparison in the handler skips the event on a same-grace
+        // re-affirmation (mirrors `rotate_taker`). At the
+        // state-machine level the same-grace call writes nothing —
+        // the encoded escrow is byte-identical before and after, so
+        // there is nothing to emit about — while a real change moves
+        // the field, which is what the handler's emission keys on.
+        // The comparison is on the RAW stored value: writing
+        // 2,592,000 over a stored 0 is a real change (it emits)
+        // even though the effective grace is the same, while
+        // re-stating 0 over a stored 0 writes nothing. The
+        // INSTRUCTIONS entry pins the change-only event in the spec
+        // table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_rent_sweep_grace")
+            .expect("INSTRUCTIONS carries amend_rent_sweep_grace");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = rent_sweep_grace_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_rent_sweep_grace(ALICE, BOB, RENT_SWEEP_GRACE)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-grace re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_rent_sweep_grace(ALICE, BOB, 7_200).unwrap();
+        assert_eq!(e.rent_sweep_grace_secs(), 7_200);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+        // Raw-vs-effective: 2,592,000 over a stored 0 moves the
+        // field (the handler emits) even though the effective grace
+        // is the same 30 days before and after.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_rent_sweep_grace_secs(0)
+            .unwrap();
+        e.fund(ALICE, RENT_SWEEP_T0).unwrap();
+        let before = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(
+            e.effective_rent_sweep_grace_secs(),
+            RENT_SWEEP_DEFAULT
+        );
+        e.amend_rent_sweep_grace(ALICE, BOB, RENT_SWEEP_DEFAULT)
+            .unwrap();
+        assert_eq!(e.rent_sweep_grace_secs(), RENT_SWEEP_DEFAULT);
+        assert_eq!(
+            e.effective_rent_sweep_grace_secs(),
+            RENT_SWEEP_DEFAULT
+        );
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "2,592,000 over a stored 0 is a real change, so the handler emits"
+        );
+        // And re-stating 0 over a stored 0 writes nothing.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_rent_sweep_grace_secs(0)
+            .unwrap();
+        e.fund(ALICE, RENT_SWEEP_T0).unwrap();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_rent_sweep_grace(ALICE, BOB, 0).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "re-stating 0 over a stored 0 writes nothing, so the handler emits nothing"
+        );
+    }
 
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
@@ -62219,6 +62674,25 @@ pub(crate) mod anchor_idl_tests {
             "amend_timelock",
             "unlock_at",
             "timelock",
+        ),
+        // AV-460: the post-funding unclaimed-rent sweep grace
+        // revision rewrites the grace in place — a second param
+        // source for `rent_sweep_grace_secs`, like
+        // `amend_timelock`'s unlock_at. The field's initial value
+        // comes from the `with_rent_sweep_grace_secs` builder param
+        // (Uninitialized only); this entry documents the revision
+        // source. Only rent_sweep_grace_secs moves — `terminal_at`
+        // is never restated, and a terminal or `Closed` vault cannot
+        // be amended, so a sweep already performed is never undone;
+        // the sweep gate re-reads the live grace at sweep time
+        // (`is_rent_sweep_eligible` consults
+        // `effective_rent_sweep_grace_secs`), so lengthening pushes
+        // a sweep out, shortening pulls one in, and clearing to 0
+        // restores the 30-day default.
+        (
+            "amend_rent_sweep_grace",
+            "grace_secs",
+            "rent_sweep_grace_secs",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -92197,6 +92671,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_timelock"),
             [231, 145, 111, 83, 193, 111, 220, 102]
+        );
+    }
+
+    #[test]
+    fn amend_rent_sweep_grace_instruction_discriminator_is_pinned() {
+        // AV-460. IDL:
+        // sha256("global:amend_rent_sweep_grace")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_rent_sweep_grace"),
+            [78, 137, 163, 215, 14, 181, 252, 36]
         );
     }
 

@@ -7625,6 +7625,72 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the unclaimed-rent sweep grace after funding (AV-460;
+    /// mirrors `Escrow::amend_rent_sweep_grace`). Unconditional
+    /// dual-signature governance: both initializer and taker sign —
+    /// one party alone cannot push out or pull in the other's sweep
+    /// horizon, paralleling `amend_timelock`. `Funded` only — the
+    /// builder owns the initial grace set. A paused escrow fails fast
+    /// (`Paused`, before the authority gate). Any `u64` is legal and
+    /// `0` is legal: it restores the 30-day default
+    /// (`DEFAULT_RENT_SWEEP_GRACE_SECS` = 2,592,000), the builder's
+    /// `0` semantics — not "sweep immediately". No delay path covers
+    /// this method — `GovernanceAction` has no
+    /// `AmendRentSweepGrace` variant, so the direct call is the only
+    /// entry point. Emits `RentSweepGraceAmended` (from == to == the
+    /// current state) only on an actual change; a same-grace no-op
+    /// stays silent (mirrors `rotate_taker`). The before-value is
+    /// the RAW stored grace: writing 2,592,000 over a stored `0` is
+    /// a real change (it emits) even though the effective grace is
+    /// the same, while re-stating `0` over a stored `0` is a no-op.
+    /// Only `rent_sweep_grace_secs` changes — `terminal_at` is never
+    /// restated, and a terminal or `Closed` vault cannot be amended,
+    /// so a sweep already performed is never undone; the sweep gate
+    /// re-reads the live grace at sweep time
+    /// (`is_rent_sweep_eligible` consults
+    /// `effective_rent_sweep_grace_secs` against the unchanged
+    /// terminal stamp).
+    pub fn amend_rent_sweep_grace(
+        ctx: Context<AmendRentSweepGrace>,
+        grace_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.rent_sweep_grace_secs();
+        escrow
+            .amend_rent_sweep_grace(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                grace_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `rent_sweep_grace_secs` field in place — no realloc.
+        // Only the grace moves; the state is untouched.
+        // Emits only on an actual change; a same-grace no-op stays
+        // silent (mirrors `rotate_taker`). The comparison is on the
+        // RAW stored value: 2,592,000 over a stored 0 is a real
+        // change even though the effective grace is the same.
+        if escrow.rent_sweep_grace_secs() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::RentSweepGraceAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -14881,6 +14947,23 @@ pub struct AmendArbitrationDeadline<'info> {
 /// enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendTimelock<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+
+/// AV-460: accounts for `amend_rent_sweep_grace` — the
+/// unclaimed-rent sweep grace revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendRentSweepGrace<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
