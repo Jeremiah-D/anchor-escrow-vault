@@ -42715,6 +42715,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "deadline_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial deadline set); no delay path covers this method — GovernanceAction has no AmendArbitrationDeadline variant, so the direct call is the only entry point and no delayed handler is staged; no default judgment configured is DefaultJudgmentNotDue (code 129, the same rejection as the builder — there is nothing to revise); a zero deadline is the same DefaultJudgmentNotDue (code 129, the builder's rejection — a judgment due immediately would fire on the very first trigger call, before the arbiter had any chance to rule); re-affirming the current deadline is a no-op (succeeds, writes nothing, emits no event); only deadline_secs changes — default_taker_amount and default_confirmed are untouched, so only disputes escalated after the amendment measure their window from the new value (trigger_default_judgment reads default_judgment.deadline_secs live) while a live dispute's trigger window is untouched, so the amendment never moves a live dispute; emits the ArbitrationDeadlineAmended indexer event only on an actual change (from == to == the current state); the default_judgment.deadline_secs field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-459: revise the absolute timelock after funding —
+            // the program-level entry point for the AV-249
+            // pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_timelock")[..8]
+            // = [231, 145, 111, 83, 193, 111, 220, 102] — the Anchor
+            // instruction discriminator for the
+            // amend_timelock handler (pinned by the
+            // discriminator test below).
+            name: "amend_timelock",
+            params: &[(
+                "unlock_at",
+                "u64",
+                "instruction param; the new absolute unlock timestamp — the moment before which taker payouts stay locked; 0 is legal and cancels the absolute lock (the builder's \"no lock\" sentinel, a no-op beside a relative or slot lock), while a nonzero unlock beside a configured relative or slot lock is InvalidTimelock (code 135, the builder's one-clock rule)",
+            )],
+            method: "Escrow::amend_timelock",
+            input_mapping: "unlock_at <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial lock set); no delay path covers this method — GovernanceAction has no AmendTimelock variant, so the direct call is the only entry point and no delayed handler is staged; a nonzero unlock_at beside a configured relative or slot lock is InvalidTimelock (code 135, the builder's one-clock rule — one clock per escrow, in either order); 0 is legal and cancels the absolute lock (the builder's \"no lock\" sentinel, a no-op beside a relative or slot lock); re-affirming the current lock is a no-op (succeeds, writes nothing, emits no event); only timelock changes — relative_timelock_secs and slot_timelock_slots are untouched, and amounts already released are never restated, so the payout gates re-read the live lock at the next release (is_unlock_eligible consults the field at call time) while the unilateral exits and the arbiter's resolve stay ungated, so lengthening pushes a payout out, shortening pulls one in, and clearing unlocks immediately; emits the TimelockAmended indexer event only on an actual change (from == to == the current state); the timelock tail field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43685,6 +43704,10 @@ pub(crate) mod anchor_idl_tests {
             // deadline revision (the AV-242 pure-logic revision
             // wired to the chain).
             "Escrow::amend_arbitration_deadline",
+            // AV-459: the program-level absolute-timelock
+            // revision (the AV-249 pure-logic revision wired to
+            // the chain).
+            "Escrow::amend_timelock",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -43820,7 +43843,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-455 adds `amend_appeal_window`;
         // AV-456 adds `amend_appeal_bond`;
         // AV-457 adds `amend_evidence_deadline`;
-        // AV-458 adds `amend_arbitration_deadline`.)
+        // AV-458 adds `amend_arbitration_deadline`;
+        // AV-459 adds `amend_timelock`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -44161,6 +44185,16 @@ pub(crate) mod anchor_idl_tests {
                 // untouched, so only disputes escalated after the
                 // amendment measure their window from the new value.
                 &"amend_arbitration_deadline",
+                // AV-459: the lock-revision value (u64) — the
+                // new absolute unlock timestamp; a nonzero unlock
+                // beside a configured relative or slot lock is
+                // InvalidTimelock (code 135, the builder's
+                // one-clock rule), 0 is legal (it cancels the
+                // absolute lock), and relative_timelock_secs /
+                // slot_timelock_slots are untouched, so the payout
+                // gates re-read the live lock at the next release
+                // while amounts already released are never restated.
+                &"amend_timelock",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -58174,6 +58208,373 @@ pub(crate) mod anchor_idl_tests {
         );
     }
 
+    // AV-459: the program-level absolute-timelock revision — the
+    // AV-249 pure-logic revision wired to the chain.
+    const TIMELOCK_T0: u64 = 1_700_000_000; // fund time
+    const TIMELOCK_UNLOCK_AT: u64 = 1_900_000_000; // the AV-249 test lock
+
+    fn timelock_funded_escrow() -> Escrow {
+        // AV-459 helper: a funded escrow with the absolute lock set
+        // to TIMELOCK_UNLOCK_AT — the same shape the AV-249
+        // pure-logic tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(TIMELOCK_UNLOCK_AT)
+            .unwrap();
+        e.fund(ALICE, TIMELOCK_T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_timelock_maps_param_to_lock_field() {
+        // IDL: amend_timelock(unlock_at: u64) —
+        // unlock_at <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `timelock` field in place (see
+        // PARAM_FIELD_MAP) — no layout change. The INSTRUCTIONS
+        // spec entry pins the program-level wiring: one u64 unlock
+        // timestamp and the AV-249 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_timelock")
+            .expect("INSTRUCTIONS carries amend_timelock");
+        assert_eq!(spec.method, "Escrow::amend_timelock");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "unlock_at");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("TimelockAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the one arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_timelock\""),
+            "checked-in IDL carries amend_timelock"
+        );
+        assert!(
+            idl.contains("[231, 145, 111, 83, 193, 111, 220, 102]"),
+            "checked-in IDL pins the AV-459 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"unlock_at\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the unlock_at arg"
+        );
+        // Only the lock moves: the relative and slot locks, the
+        // funding anchor, the state and the layout are untouched.
+        let mut e = timelock_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.unlock_at(), TIMELOCK_UNLOCK_AT);
+        assert_eq!(e.relative_timelock_secs(), 0);
+        assert_eq!(e.slot_timelock_slots(), 0);
+        e.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT + 1000).unwrap();
+        assert_eq!(e.unlock_at(), TIMELOCK_UNLOCK_AT + 1000);
+        assert_eq!(e.relative_timelock_secs(), 0, "relative lock untouched");
+        assert_eq!(e.slot_timelock_slots(), 0, "slot lock untouched");
+        assert_eq!(e.fund_at(), TIMELOCK_T0, "funding anchor untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "lock field rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_timelock_rejects_single_party_and_strangers() {
+        // AV-459: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // push out or pull in the other's unlock moment.
+        let mut e = timelock_funded_escrow();
+        assert_eq!(
+            e.amend_timelock(ALICE, ALICE, TIMELOCK_UNLOCK_AT + 1000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_timelock(MALLORY, BOB, TIMELOCK_UNLOCK_AT + 1000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_timelock(MALLORY, MALLORY, TIMELOCK_UNLOCK_AT + 1000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.unlock_at(),
+            TIMELOCK_UNLOCK_AT,
+            "failed revisions write nothing"
+        );
+        e.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT + 1000).unwrap();
+        assert_eq!(e.unlock_at(), TIMELOCK_UNLOCK_AT + 1000);
+    }
+
+    #[test]
+    fn amend_timelock_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-459: Funded-only — the Uninitialized builder owns the
+        // initial lock set, and a live dispute or a terminal
+        // escrow settles under the lock it started under. The
+        // pause guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Uninitialized: the lock is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_timelock(TIMELOCK_UNLOCK_AT)
+            .unwrap();
+        assert_eq!(
+            bare.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT + 1000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.unlock_at(), TIMELOCK_UNLOCK_AT);
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_timelock(TIMELOCK_UNLOCK_AT)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT + 1000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.unlock_at(), TIMELOCK_UNLOCK_AT);
+        // Disputed: the lock stays while the dispute is in flight —
+        // the dispute settles under the lock it started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_timelock(TIMELOCK_UNLOCK_AT)
+            .unwrap();
+        d.fund(ALICE, TIMELOCK_T0).unwrap();
+        let disputed_at = TIMELOCK_T0 + 100;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT + 1000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.unlock_at(),
+            TIMELOCK_UNLOCK_AT,
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's lock is history, not
+        // a live bar to retune.
+        let mut e = timelock_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT + 1000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.unlock_at(), TIMELOCK_UNLOCK_AT);
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_timelock(TIMELOCK_UNLOCK_AT)
+                .unwrap();
+        paused.fund(ALICE, TIMELOCK_T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT + 1000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_timelock(MALLORY, BOB, TIMELOCK_UNLOCK_AT + 1000),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.unlock_at(),
+            TIMELOCK_UNLOCK_AT,
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT + 1000).unwrap();
+        assert_eq!(paused.unlock_at(), TIMELOCK_UNLOCK_AT + 1000);
+    }
+
+    #[test]
+    fn amend_timelock_accepts_zero_as_lock_cancelled() {
+        // AV-459: zero cancels the lock (the builder's "no lock"
+        // sentinel): a release at funding time settles at once,
+        // and the relative and slot locks stay untouched.
+        let mut e = timelock_funded_escrow();
+        e.amend_timelock(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.unlock_at(), 0);
+        assert!(e.is_unlock_eligible(TIMELOCK_T0));
+        assert_eq!(e.relative_timelock_secs(), 0);
+        assert_eq!(e.slot_timelock_slots(), 0);
+        e.release(ALICE, TIMELOCK_T0, 1_000_000, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_timelock_pushes_live_release_out() {
+        // AV-459: lengthening the lock pushes a payout out — a
+        // release at the old unlock moment is refused once the
+        // lock moves, and settles only at the new unlock moment.
+        let mut e = timelock_funded_escrow();
+        assert_eq!(
+            e.release(ALICE, TIMELOCK_UNLOCK_AT - 1, 1_000_000, None, BOB),
+            Err(EscrowError::TimelockNotReached)
+        );
+        e.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT + 1000).unwrap();
+        assert_eq!(e.unlock_at(), TIMELOCK_UNLOCK_AT + 1000);
+        assert_eq!(
+            e.release(ALICE, TIMELOCK_UNLOCK_AT, 1_000_000, None, BOB),
+            Err(EscrowError::TimelockNotReached)
+        );
+        e.release(ALICE, TIMELOCK_UNLOCK_AT + 1000, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_timelock_pulls_live_release_in() {
+        // AV-459: shortening the lock pulls a payout in — a
+        // release at the new unlock moment settles even though the
+        // old lock would still bind.
+        let mut e = timelock_funded_escrow();
+        e.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT - 1000).unwrap();
+        assert_eq!(e.unlock_at(), TIMELOCK_UNLOCK_AT - 1000);
+        e.release(ALICE, TIMELOCK_UNLOCK_AT - 1000, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_timelock_gives_unconfigured_escrow_a_lock() {
+        // AV-459: an escrow with no lock gains one on first
+        // amendment — the revision installs, it does not only
+        // retune.
+        let mut e =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, TIMELOCK_T0).unwrap();
+        assert_eq!(e.unlock_at(), 0);
+        e.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT).unwrap();
+        assert_eq!(e.unlock_at(), TIMELOCK_UNLOCK_AT);
+        assert_eq!(
+            e.release(ALICE, TIMELOCK_UNLOCK_AT - 1, 1_000_000, None, BOB),
+            Err(EscrowError::TimelockNotReached)
+        );
+        e.release(ALICE, TIMELOCK_UNLOCK_AT, 1_000_000, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_timelock_refuses_second_clock() {
+        // AV-459: one clock per escrow, the builder's rule — a
+        // nonzero absolute lock beside a relative lock is
+        // InvalidTimelock, and the relative lock keeps binding
+        // afterwards; the zero sentinel stays a no-op beside it.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_relative_timelock(3_600)
+            .unwrap();
+        e.fund(ALICE, TIMELOCK_T0).unwrap();
+        assert_eq!(
+            e.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT),
+            Err(EscrowError::InvalidTimelock)
+        );
+        assert_eq!(EscrowError::InvalidTimelock.code(), 135);
+        assert_eq!(e.unlock_at(), 0);
+        assert_eq!(e.relative_timelock_secs(), 3_600);
+        assert_eq!(e.fund_at(), TIMELOCK_T0, "funding anchor untouched");
+        // The zero sentinel stays a no-op beside a relative lock.
+        e.amend_timelock(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.relative_timelock_secs(), 3_600);
+        assert_eq!(
+            e.release(ALICE, TIMELOCK_T0 + 3_599, 1_000_000, None, BOB),
+            Err(EscrowError::TimelockNotReached)
+        );
+        e.release(ALICE, TIMELOCK_T0 + 3_600, 1_000_000, None, BOB)
+            .unwrap();
+        // A slot lock likewise refuses a second clock.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slot_timelock(100)
+            .unwrap();
+        e.fund(ALICE, TIMELOCK_T0).unwrap();
+        assert_eq!(
+            e.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT),
+            Err(EscrowError::InvalidTimelock)
+        );
+        assert_eq!(e.unlock_at(), 0);
+        assert_eq!(e.slot_timelock_slots(), 100);
+    }
+
+    #[test]
+    fn amend_timelock_noop_on_same_lock() {
+        // AV-459: re-affirming the current lock is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = timelock_funded_escrow();
+        e.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT).unwrap();
+        assert_eq!(e.unlock_at(), TIMELOCK_UNLOCK_AT);
+        assert_eq!(e.relative_timelock_secs(), 0);
+        assert_eq!(e.slot_timelock_slots(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn amend_timelock_emits_only_on_change() {
+        // AV-459: the program handler emits TimelockAmended only
+        // when the lock actually changes — the before/after
+        // comparison in the handler skips the event on a same-lock
+        // re-affirmation (mirrors `rotate_taker`). At the
+        // state-machine level the same-lock call writes nothing —
+        // the encoded escrow is byte-identical before and after, so
+        // there is nothing to emit about — while a real change moves
+        // the field, which is what the handler's emission keys on.
+        // The INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_timelock")
+            .expect("INSTRUCTIONS carries amend_timelock");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = timelock_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-lock re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_timelock(ALICE, BOB, TIMELOCK_UNLOCK_AT + 1000).unwrap();
+        assert_eq!(e.unlock_at(), TIMELOCK_UNLOCK_AT + 1000);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -61800,6 +62201,24 @@ pub(crate) mod anchor_idl_tests {
             "amend_arbitration_deadline",
             "deadline_secs",
             "default_judgment.deadline_secs",
+        ),
+        // AV-459: the post-funding absolute-timelock revision
+        // rewrites the lock in place — a second param source for
+        // `timelock`, like `amend_arbitration_deadline`'s
+        // deadline_secs. The field's initial value comes from the
+        // `with_timelock` builder param (Uninitialized only); this
+        // entry documents the revision source. Only timelock moves
+        // — `relative_timelock_secs` / `slot_timelock_slots` are
+        // untouched, and amounts already released are never
+        // restated, so the payout gates re-read the live lock at
+        // the next release, and a nonzero unlock beside a
+        // configured relative or slot lock is InvalidTimelock
+        // (code 135, the builder's one-clock rule) while 0 is
+        // legal (it cancels the absolute lock).
+        (
+            "amend_timelock",
+            "unlock_at",
+            "timelock",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -91766,6 +92185,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_arbitration_deadline"),
             [222, 208, 43, 237, 77, 140, 70, 234]
+        );
+    }
+
+    #[test]
+    fn amend_timelock_instruction_discriminator_is_pinned() {
+        // AV-459. IDL:
+        // sha256("global:amend_timelock")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_timelock"),
+            [231, 145, 111, 83, 193, 111, 220, 102]
         );
     }
 

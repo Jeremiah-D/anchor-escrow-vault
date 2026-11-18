@@ -1405,6 +1405,14 @@
       ]
     },
     {
+      "name": "amend_timelock",
+      "discriminator": [231, 145, 111, 83, 193, 111, 220, 102],
+      "accounts": [],
+      "args": [
+        {"name": "unlock_at", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
