@@ -42829,6 +42829,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "rate <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial rate set); no delay path covers this method — GovernanceAction has no AmendStreamingFee variant, so the direct call is the only entry point and no delayed handler is staged; any u64 is legal and 0 is legal (it disables further accrual, the builder's 0 semantics, not a refund); re-affirming the current rate is a no-op (succeeds, writes nothing, emits no event); only streaming_fee_rate changes — fund_at is never restated and streaming_fees_accrued / fees_paid are never rewritten, so a rate cut can never claw back fees already charged, while the charge gate reads the live rate at the next settlement (charge_streaming_fee recomputes theoretical = rate × (accrue_upto − fund_at) at every payout and bills only the saturating excess over accrued, so raising the rate bills the difference on the next settlement and lowering it bills nothing new); emits the StreamingFeeRateAmended indexer event only on an actual change (from == to == the current state); the streaming_fee_rate u64 field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-465: revise the dead-man's switch inactivity
+            // threshold after funding — the program-level entry
+            // point for the AV-265 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_deadman_inactivity")[..8]
+            // = [169, 60, 134, 249, 28, 193, 149, 93] — the Anchor
+            // instruction discriminator for the
+            // amend_deadman_inactivity handler (pinned by the
+            // discriminator test below).
+            name: "amend_deadman_inactivity",
+            params: &[(
+                "inactivity_secs",
+                "u64",
+                "instruction param; the new inactivity threshold in seconds — the idle time after which the heir may claim; a zero threshold is InvalidDeadmanConfig (code 168, the builder's gate, unchanged)",
+            )],
+            method: "Escrow::amend_deadman_inactivity",
+            input_mapping: "inactivity_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); the heir itself does not sign, so a lost heir key cannot block its own threshold's revision (the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial threshold set); no delay path covers this method — GovernanceAction has no AmendDeadmanInactivity variant, so the direct call is the only entry point and no delayed handler is staged; only an escrow whose switch is already configured (non-zero threshold and a set heir) may revise — an unconfigured escrow is InvalidDeadmanConfig (code 168, fail-closed: post-funding installation would add a recovery path the taker never funded under); a zero inactivity_secs is InvalidDeadmanConfig (code 168, the builder's gate, unchanged); re-affirming the current threshold is a no-op (succeeds, writes nothing, emits no event); only deadman_inactivity_secs changes — deadman_heir and deadman_last_activity are untouched (the revision takes no clock parameter and never resets the inactivity timer), so the eligibility gate reads the live threshold at the next claim_deadman — tightening can make an already-idle escrow eligible at once (the elapsed time is re-judged, not restated) while loosening can revoke an already-satisfied but unexecuted eligibility, and a claim already settled keeps the threshold it settled under; emits the DeadmanInactivityAmended indexer event only on an actual change (from == to == the current state); the deadman_inactivity_secs u64 field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43823,6 +43842,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-254 pure-logic revision wired to
             // the chain).
             "Escrow::amend_streaming_fee",
+            // AV-465: the program-level dead-man's-switch
+            // threshold revision (the AV-265 pure-logic revision
+            // wired to the chain).
+            "Escrow::amend_deadman_inactivity",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44364,6 +44387,15 @@ pub(crate) mod anchor_idl_tests {
                 // bills live from the new rate while fees already
                 // charged are never clawed back.
                 &"amend_streaming_fee",
+                // AV-465: the threshold-revision value (u64) — the
+                // new inactivity threshold in seconds; an
+                // unconfigured escrow or a zero threshold is
+                // InvalidDeadmanConfig (code 168), and
+                // deadman_heir / deadman_last_activity are
+                // untouched, so the eligibility gate re-judges the
+                // unchanged elapsed time against the live threshold
+                // at the next claim_deadman.
+                &"amend_deadman_inactivity",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -60828,6 +60860,427 @@ pub(crate) mod anchor_idl_tests {
         );
     }
 
+    // AV-465: the program-level dead-man's-switch threshold
+    // revision — the AV-265 pure-logic revision wired to the chain.
+    const DEADMAN_HEIR: [u8; 32] = [0xEE; 32];
+    const DEADMAN_FUND_AT: u64 = 1_700_000_000; // fund time
+
+    fn deadman_funded_escrow(threshold: u64) -> Escrow {
+        // AV-465 helper: a funded escrow with the dead-man's switch
+        // configured — the same shape the AV-265 pure-logic tests
+        // build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_deadman_switch(threshold, DEADMAN_HEIR)
+            .unwrap();
+        e.fund(ALICE, DEADMAN_FUND_AT).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_deadman_inactivity_program_maps_param_to_threshold_field() {
+        // IDL: amend_deadman_inactivity(inactivity_secs: u64) —
+        // inactivity_secs <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `deadman_inactivity_secs` field in
+        // place (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // one u64 threshold and the AV-265 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_deadman_inactivity")
+            .expect("INSTRUCTIONS carries amend_deadman_inactivity");
+        assert_eq!(spec.method, "Escrow::amend_deadman_inactivity");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "inactivity_secs");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("DeadmanInactivityAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the one arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_deadman_inactivity\""),
+            "checked-in IDL carries amend_deadman_inactivity"
+        );
+        assert!(
+            idl.contains("[169, 60, 134, 249, 28, 193, 149, 93]"),
+            "checked-in IDL pins the AV-465 discriminator"
+        );
+        assert!(
+            idl.contains(
+                "{\"name\": \"inactivity_secs\", \"type\": \"u64\"}"
+            ),
+            "checked-in IDL carries the inactivity_secs arg"
+        );
+        // Only the threshold moves: the heir, the activity clock
+        // and the layout are untouched.
+        let mut e = deadman_funded_escrow(3_600);
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.deadman_inactivity_secs(), 3_600);
+        assert_eq!(e.deadman_heir(), Some(DEADMAN_HEIR));
+        assert_eq!(e.deadman_last_activity(), DEADMAN_FUND_AT);
+        e.amend_deadman_inactivity(ALICE, BOB, 1_800).unwrap();
+        assert_eq!(e.deadman_inactivity_secs(), 1_800);
+        assert_eq!(e.deadman_heir(), Some(DEADMAN_HEIR));
+        assert_eq!(
+            e.deadman_last_activity(),
+            DEADMAN_FUND_AT,
+            "the anchor never moves"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "threshold field rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_deadman_inactivity_program_rejects_single_party_and_strangers() {
+        // AV-465: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // move the recovery clock on the other's funds. The heir
+        // itself does not sign: a lost heir key must not block its
+        // own threshold's revision.
+        let mut e = deadman_funded_escrow(3_600);
+        assert_eq!(
+            e.amend_deadman_inactivity(ALICE, ALICE, 1_800),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_deadman_inactivity(MALLORY, BOB, 1_800),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_deadman_inactivity(MALLORY, MALLORY, 1_800),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_deadman_inactivity(DEADMAN_HEIR, BOB, 1_800),
+            Err(EscrowError::Unauthorized),
+            "the heir is not a party — the heir never signs"
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.deadman_inactivity_secs(),
+            3_600,
+            "failed revisions write nothing"
+        );
+        e.amend_deadman_inactivity(ALICE, BOB, 1_800).unwrap();
+        assert_eq!(e.deadman_inactivity_secs(), 1_800);
+    }
+
+    #[test]
+    fn amend_deadman_inactivity_program_refuses_unconfigured_zero_and_unfunded() {
+        // AV-465: fail-closed — an unconfigured escrow never gains
+        // a switch through this path, and a zero threshold is never
+        // a deliberate policy. The builder owns the initial set.
+        // A funded escrow with no switch: any threshold, zero or
+        // not, is InvalidDeadmanConfig.
+        let mut bare =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        bare.fund(ALICE, DEADMAN_FUND_AT).unwrap();
+        assert_eq!(
+            bare.amend_deadman_inactivity(ALICE, BOB, 3_600),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert_eq!(
+            bare.amend_deadman_inactivity(ALICE, BOB, 0),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert_eq!(bare.deadman_inactivity_secs(), 0);
+        assert_eq!(bare.deadman_heir(), None);
+        assert_eq!(EscrowError::InvalidDeadmanConfig.code(), 168);
+        // A configured escrow: zero is the builder's gate, not a
+        // disable — disabling is AV-417's job.
+        let mut e = deadman_funded_escrow(3_600);
+        assert_eq!(
+            e.amend_deadman_inactivity(ALICE, BOB, 0),
+            Err(EscrowError::InvalidDeadmanConfig)
+        );
+        assert_eq!(
+            e.deadman_inactivity_secs(),
+            3_600,
+            "failed revisions write nothing"
+        );
+        // Uninitialized: the threshold is still a builder decision.
+        let mut uninit =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_deadman_switch(3_600, DEADMAN_HEIR)
+                .unwrap();
+        assert_eq!(
+            uninit.amend_deadman_inactivity(ALICE, BOB, 1_800),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(uninit.deadman_inactivity_secs(), 3_600);
+        // ... and the revision lands once funded.
+        uninit.fund(ALICE, DEADMAN_FUND_AT).unwrap();
+        uninit.amend_deadman_inactivity(ALICE, BOB, 1_800).unwrap();
+        assert_eq!(uninit.deadman_inactivity_secs(), 1_800);
+    }
+
+    #[test]
+    fn amend_deadman_inactivity_program_noop_on_same_threshold() {
+        // AV-465: re-affirming the current threshold is a no-op —
+        // it succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = deadman_funded_escrow(3_600);
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_deadman_inactivity(ALICE, BOB, 3_600).unwrap();
+        assert_eq!(e.deadman_inactivity_secs(), 3_600);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-threshold re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.deadman_heir(), Some(DEADMAN_HEIR));
+        assert_eq!(e.deadman_last_activity(), DEADMAN_FUND_AT);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        // A second identical re-affirmation is likewise a no-op.
+        e.amend_deadman_inactivity(ALICE, BOB, 3_600).unwrap();
+        assert_eq!(e.deadman_inactivity_secs(), 3_600);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a second same-threshold re-affirmation still writes nothing"
+        );
+    }
+
+    #[test]
+    fn amend_deadman_inactivity_program_emits_only_on_change() {
+        // AV-465: the program handler emits DeadmanInactivityAmended
+        // only when the threshold actually changes — the before/after
+        // comparison in the handler skips the event on a
+        // same-threshold re-affirmation (mirrors `rotate_taker`). At
+        // the state-machine level the same-threshold call writes
+        // nothing — the encoded escrow is byte-identical before and
+        // after, so there is nothing to emit about — while a real
+        // change moves the field, which is what the handler's
+        // emission keys on. The INSTRUCTIONS entry pins the
+        // change-only event in the spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_deadman_inactivity")
+            .expect("INSTRUCTIONS carries amend_deadman_inactivity");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = deadman_funded_escrow(3_600);
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_deadman_inactivity(ALICE, BOB, 3_600).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-threshold re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_deadman_inactivity(ALICE, BOB, 1_800).unwrap();
+        assert_eq!(e.deadman_inactivity_secs(), 1_800);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_deadman_inactivity_program_rejudges_eligibility_live() {
+        // AV-465: the eligibility gate reads the live threshold —
+        // tightening re-judges the unchanged elapsed time at once,
+        // loosening revokes an already-satisfied but unexecuted
+        // eligibility, and the activity clock is never restated.
+        // Threshold 3_600, idle for 1_800: not yet eligible.
+        let mut e = deadman_funded_escrow(3_600);
+        let idle_at = DEADMAN_FUND_AT + 1_800;
+        assert!(!e.is_deadman_eligible(idle_at));
+        assert_eq!(
+            e.claim_deadman(DEADMAN_HEIR, idle_at),
+            Err(EscrowError::DeadmanNotElapsed)
+        );
+        assert_eq!(EscrowError::DeadmanNotElapsed.code(), 169);
+        // Tighten to 900: the same 1_800 of idleness now clears
+        // the bar — eligibility arrives at once.
+        e.amend_deadman_inactivity(ALICE, BOB, 900).unwrap();
+        assert!(e.is_deadman_eligible(idle_at));
+        assert_eq!(e.deadman_last_activity(), DEADMAN_FUND_AT);
+        let payout = e.claim_deadman(DEADMAN_HEIR, idle_at).unwrap();
+        assert_eq!(payout, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        // Loosening revokes a satisfied-but-unexecuted eligibility.
+        let mut e2 = deadman_funded_escrow(900);
+        let idle_at2 = DEADMAN_FUND_AT + 1_000;
+        assert!(e2.is_deadman_eligible(idle_at2));
+        e2.amend_deadman_inactivity(ALICE, BOB, 3_600).unwrap();
+        assert!(!e2.is_deadman_eligible(idle_at2));
+        assert_eq!(
+            e2.claim_deadman(DEADMAN_HEIR, idle_at2),
+            Err(EscrowError::DeadmanNotElapsed)
+        );
+        // And the clock was never reset: at the original anchor +
+        // 3_600 the escrow is eligible again.
+        assert!(e2.is_deadman_eligible(DEADMAN_FUND_AT + 3_600));
+        assert_eq!(e2.deadman_last_activity(), DEADMAN_FUND_AT);
+    }
+
+    #[test]
+    fn amend_deadman_inactivity_program_keeps_heir_and_activity_clock() {
+        // AV-465: only the threshold moves — the heir and the
+        // activity clock are untouched, since the revision takes no
+        // clock parameter and never resets the timer.
+        let mut e = deadman_funded_escrow(3_600);
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.deadman_last_activity(), DEADMAN_FUND_AT);
+        e.amend_deadman_inactivity(ALICE, BOB, 1_800).unwrap();
+        assert_eq!(e.deadman_inactivity_secs(), 1_800);
+        assert_eq!(e.deadman_heir(), Some(DEADMAN_HEIR));
+        assert_eq!(
+            e.deadman_last_activity(),
+            DEADMAN_FUND_AT,
+            "the revision takes no clock and never resets the timer"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "threshold region rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_deadman_inactivity_program_refuses_disputed_terminal_and_paused() {
+        // AV-465: Funded-only — the Uninitialized builder owns the
+        // initial threshold set, and a live dispute or a terminal
+        // escrow settles under the threshold it started under. The
+        // pause guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Uninitialized: the threshold is still a builder decision.
+        let mut bare =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_deadman_switch(3_600, DEADMAN_HEIR)
+                .unwrap();
+        assert_eq!(
+            bare.amend_deadman_inactivity(ALICE, BOB, 1_800),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.deadman_inactivity_secs(), 3_600);
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_deadman_switch(3_600, DEADMAN_HEIR)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_deadman_inactivity(ALICE, BOB, 1_800),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.deadman_inactivity_secs(), 3_600);
+        // Disputed: the threshold stays while the dispute is in
+        // flight — the dispute settles under the threshold it
+        // started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_deadman_switch(3_600, DEADMAN_HEIR)
+            .unwrap();
+        d.fund(ALICE, DEADMAN_FUND_AT).unwrap();
+        let disputed_at = DEADMAN_FUND_AT + 100;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_deadman_inactivity(ALICE, BOB, 1_800),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.deadman_inactivity_secs(),
+            3_600,
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's threshold is history, not
+        // a live table to retune.
+        let mut e = deadman_funded_escrow(3_600);
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_deadman_inactivity(ALICE, BOB, 1_800),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.deadman_inactivity_secs(), 3_600);
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_deadman_switch(3_600, DEADMAN_HEIR)
+                .unwrap();
+        paused.fund(ALICE, DEADMAN_FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_deadman_inactivity(ALICE, BOB, 1_800),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_deadman_inactivity(MALLORY, BOB, 1_800),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.deadman_inactivity_secs(),
+            3_600,
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_deadman_inactivity(ALICE, BOB, 1_800).unwrap();
+        assert_eq!(paused.deadman_inactivity_secs(), 1_800);
+    }
+
+    #[test]
+    fn amend_deadman_inactivity_program_settled_claim_keeps_threshold() {
+        // AV-465: a claim already settled keeps the threshold it
+        // settled under — the settled escrow is terminal history,
+        // not a live table to retune.
+        let mut e = deadman_funded_escrow(3_600);
+        let claim_at = DEADMAN_FUND_AT + 3_600;
+        assert!(e.is_deadman_eligible(claim_at));
+        let payout = e.claim_deadman(DEADMAN_HEIR, claim_at).unwrap();
+        assert_eq!(payout, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_deadman_inactivity(ALICE, BOB, 1_800),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.deadman_inactivity_secs(),
+            3_600,
+            "a settled claim keeps the threshold it settled under"
+        );
+        assert_eq!(e.deadman_heir(), Some(DEADMAN_HEIR));
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -64565,6 +65018,23 @@ pub(crate) mod anchor_idl_tests {
             "amend_streaming_fee",
             "rate",
             "streaming_fee_rate",
+        ),
+        // AV-465: the post-funding dead-man's-switch threshold
+        // revision rewrites the deadman_inactivity_secs u64 field
+        // in place — a second param source for
+        // `deadman_inactivity_secs`, like
+        // `initialize_deadman_switch`'s inactivity_secs. The
+        // field's initial value comes from the
+        // `with_deadman_switch` builder param (Uninitialized only);
+        // this entry documents the revision source. Only the
+        // threshold moves — `deadman_heir` and
+        // `deadman_last_activity` are never rewritten, so the
+        // eligibility gate reads the live threshold at the next
+        // claim_deadman while the elapsed time is never restated.
+        (
+            "amend_deadman_inactivity",
+            "inactivity_secs",
+            "deadman_inactivity_secs",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source

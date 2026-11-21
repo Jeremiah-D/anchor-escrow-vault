@@ -7938,6 +7938,72 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the dead-man's switch inactivity threshold after
+    /// funding (AV-465; mirrors `Escrow::amend_deadman_inactivity`).
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign — one party alone cannot move the recovery clock
+    /// on the other's funds; the heir itself does not sign, so a
+    /// lost heir key cannot block its own threshold's revision
+    /// (the `rotate_arbiter` reasoning). `Funded` only — the
+    /// builder owns the initial threshold set. A paused escrow fails
+    /// fast (`Paused`, before the authority gate). Only an escrow
+    /// whose switch is already configured may revise
+    /// (`InvalidDeadmanConfig` otherwise — post-funding
+    /// installation would add a recovery path the taker never
+    /// funded under); a zero threshold is `InvalidDeadmanConfig`
+    /// (the builder's gate, unchanged). No delay path covers this
+    /// method — `GovernanceAction` has no `AmendDeadmanInactivity`
+    /// variant, so the direct call is the only entry point. Emits
+    /// `DeadmanInactivityAmended` (from == to == the current
+    /// state) only on an actual change; a same-threshold no-op
+    /// stays silent (mirrors `rotate_taker`). Only
+    /// `deadman_inactivity_secs` changes — `deadman_heir` and
+    /// `deadman_last_activity` are untouched, since the revision
+    /// takes no clock parameter and never resets the inactivity
+    /// timer, while the eligibility gate reads the live threshold
+    /// at the next `claim_deadman` (tightening can make an
+    /// already-idle escrow eligible at once, loosening can revoke
+    /// an already-satisfied but unexecuted eligibility).
+    pub fn amend_deadman_inactivity(
+        ctx: Context<AmendDeadmanInactivity>,
+        inactivity_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.deadman_inactivity_secs();
+        escrow
+            .amend_deadman_inactivity(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                inactivity_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `deadman_inactivity_secs` u64 field in
+        // place — no realloc. Only the threshold moves; the heir
+        // and the activity clock are untouched.
+        // Emits only on an actual change; a same-threshold no-op
+        // stays silent (mirrors `rotate_taker`).
+        if escrow.deadman_inactivity_secs() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::DeadmanInactivityAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -15272,6 +15338,23 @@ pub struct AmendFeeSchedule<'info> {
 /// enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendStreamingFee<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-465: accounts for `amend_deadman_inactivity` — the
+/// dead-man's-switch threshold revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`); the heir itself does not sign, so a lost heir
+/// key cannot block its own threshold's revision.
+#[derive(Accounts)]
+pub struct AmendDeadmanInactivity<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
