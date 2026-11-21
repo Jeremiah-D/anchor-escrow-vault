@@ -42848,6 +42848,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "inactivity_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); the heir itself does not sign, so a lost heir key cannot block its own threshold's revision (the rotate_arbiter reasoning); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial threshold set); no delay path covers this method — GovernanceAction has no AmendDeadmanInactivity variant, so the direct call is the only entry point and no delayed handler is staged; only an escrow whose switch is already configured (non-zero threshold and a set heir) may revise — an unconfigured escrow is InvalidDeadmanConfig (code 168, fail-closed: post-funding installation would add a recovery path the taker never funded under); a zero inactivity_secs is InvalidDeadmanConfig (code 168, the builder's gate, unchanged); re-affirming the current threshold is a no-op (succeeds, writes nothing, emits no event); only deadman_inactivity_secs changes — deadman_heir and deadman_last_activity are untouched (the revision takes no clock parameter and never resets the inactivity timer), so the eligibility gate reads the live threshold at the next claim_deadman — tightening can make an already-idle escrow eligible at once (the elapsed time is re-judged, not restated) while loosening can revoke an already-satisfied but unexecuted eligibility, and a claim already settled keeps the threshold it settled under; emits the DeadmanInactivityAmended indexer event only on an actual change (from == to == the current state); the deadman_inactivity_secs u64 field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-466: retune the tiered slash ladder after funding —
+            // the program-level entry point for the AV-237
+            // pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_slash_ladder")[..8]
+            // = [213, 24, 223, 138, 106, 229, 255, 200] — the Anchor
+            // instruction discriminator for the
+            // amend_slash_ladder handler (pinned by the
+            // discriminator test below).
+            name: "amend_slash_ladder",
+            params: &[(
+                "new_rungs",
+                "Vec<SlashRung>",
+                "instruction param; the new (deadline, bps) rung ladder — the handler takes Vec<(u64, u16)> (Anchor-serializable tuple vector, wire-identical to Vec<SlashRung>), so the IDL spells the ladder as the named SlashRung type, paralleling initialize_slash_ladder",
+            )],
+            method: "Escrow::amend_slash_ladder",
+            input_mapping: "new_rungs <- param (Vec<(u64, u16)> tuple ladder, wire-identical to Vec<SlashRung> — the IDL spells it as the named SlashRung ladder, paralleling initialize_slash_ladder); `now` <- clock sysvar on the Anchor layer (never an instruction param); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial ladder set); no delay path covers this method — GovernanceAction has no AmendSlashLadder variant, so the direct call is the only entry point and no delayed handler is staged; only an escrow already carrying a ladder may revise — an escrow with no ladder (plain, or flat-terms) is InvalidSlashLadder (code 184, fail-closed: post-funding installation would add a penalty clause the taker never funded under, so a ladder can never be installed after funding); the consumed prefix is immutable rung-by-rung (the cursor is the next rung's index), the new table must hold at least the consumed count and at most 8 rungs, stay strictly ascending in deadline and bps with each bps <= 10_000, and no future rung may be backdated before `now` — every violation is InvalidSlashLadder (code 184, the builder's validation, unchanged) and leaves the escrow untouched; re-affirming the current table is a no-op (succeeds, writes nothing, emits no event); only the future rungs change — penalty_account, penalty_paid already banked and the consumption cursor are untouched (the cursor is deliberately not reset), so the next slash prices from the new rung at the same cursor while a slash already settled keeps the rung it settled under, and the slash path reads the live rung at the next eligibility check (now >= rung deadline), so tightening can make an unexecuted default slashable at once while loosening can defer an already-satisfied but unexecuted eligibility; emits the SlashLadderAmended indexer event only on an actual change (from == to == the current state); the 113-byte ladder region (32 + 8×(8+2) + 1) is rewritten in place with the tail slots zeroed - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43846,6 +43865,10 @@ pub(crate) mod anchor_idl_tests {
             // threshold revision (the AV-265 pure-logic revision
             // wired to the chain).
             "Escrow::amend_deadman_inactivity",
+            // AV-466: the program-level tiered-slash-ladder
+            // revision (the AV-237 pure-logic revision wired to
+            // the chain).
+            "Escrow::amend_slash_ladder",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44396,6 +44419,16 @@ pub(crate) mod anchor_idl_tests {
                 // unchanged elapsed time against the live threshold
                 // at the next claim_deadman.
                 &"amend_deadman_inactivity",
+                // AV-466: the ladder-revision value (Vec<SlashRung>)
+                // — the new (deadline, bps) rung ladder; a
+                // ladder-less escrow, an empty or over-8 table, a
+                // mutated consumed prefix, non-strictly-ascending
+                // deadlines or bps, a bps > 10_000, or a future rung
+                // backdated before `now` is InvalidSlashLadder
+                // (code 184), and penalty_account / penalty_paid /
+                // the consumption cursor are untouched, so the next
+                // slash prices from the new rung at the same cursor.
+                &"amend_slash_ladder",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -61281,6 +61314,671 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(e.deadman_heir(), Some(DEADMAN_HEIR));
     }
 
+    // AV-466: the program-level slash-ladder revision — the AV-237
+    // pure-logic revision wired to the chain.
+    const SLASH_LADDER_T0: u64 = 1_700_000_000; // fund time
+    const SLASH_LADDER_DAY: u64 = 86_400;
+    const SLASH_LADDER_PENALTY: [u8; 32] = [0xDD; 32];
+
+    fn slash_ladder_funded_escrow() -> Escrow {
+        // AV-466 helper: a funded ladder escrow with three rungs —
+        // (T0, 100) → (T0+1d, 500) → (T0+2d, 1000) — the same shape
+        // the AV-237 pure-logic tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_ladder(
+                SLASH_LADDER_PENALTY,
+                &[
+                    (SLASH_LADDER_T0, 100),
+                    (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+                    (SLASH_LADDER_T0 + 2 * SLASH_LADDER_DAY, 1_000),
+                ],
+            )
+            .unwrap();
+        e.fund(ALICE, SLASH_LADDER_T0 - 1).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_slash_ladder_program_maps_param_to_future_rungs() {
+        // IDL: amend_slash_ladder(new_rungs: Vec<SlashRung>) —
+        // new_rungs <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `slash_ladder` region in place (see
+        // PARAM_FIELD_MAP) — no layout change. The INSTRUCTIONS
+        // spec entry pins the program-level wiring: one rung ladder
+        // and the AV-237 pure-logic method. The handler takes
+        // Vec<(u64, u16)> (wire-identical to Vec<SlashRung>), so the
+        // IDL spells the ladder as the named SlashRung type,
+        // paralleling initialize_slash_ladder. `now` comes from the
+        // clock sysvar, never an instruction param.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_slash_ladder")
+            .expect("INSTRUCTIONS carries amend_slash_ladder");
+        assert_eq!(spec.method, "Escrow::amend_slash_ladder");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "new_rungs");
+        assert_eq!(spec.params[0].1, "Vec<SlashRung>");
+        assert!(
+            spec.input_mapping.contains("SlashLadderAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the one arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_slash_ladder\""),
+            "checked-in IDL carries amend_slash_ladder"
+        );
+        assert!(
+            idl.contains("[213, 24, 223, 138, 106, 229, 255, 200]"),
+            "checked-in IDL pins the AV-466 discriminator"
+        );
+        assert!(
+            idl.contains(
+                "{\"name\": \"new_rungs\", \"type\": {\"vec\": {\"defined\": \"SlashRung\"}}}"
+            ),
+            "checked-in IDL carries the new_rungs arg"
+        );
+        // Only the future rungs move: the penalty account, the
+        // cursor and the layout are untouched.
+        let mut e = slash_ladder_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let ladder = e.slash_ladder().unwrap();
+        assert_eq!(ladder.penalty_account, SLASH_LADDER_PENALTY);
+        assert_eq!(ladder.rung_count, 3);
+        assert_eq!(
+            ladder.rungs[0],
+            SlashRung {
+                deadline: SLASH_LADDER_T0,
+                bps: 100
+            }
+        );
+        e.amend_slash_ladder(
+            ALICE,
+            BOB,
+            &[
+                (SLASH_LADDER_T0, 200),
+                (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 600),
+                (SLASH_LADDER_T0 + 2 * SLASH_LADDER_DAY, 1_200),
+            ],
+            SLASH_LADDER_T0 - 1,
+        )
+        .unwrap();
+        let ladder = e.slash_ladder().unwrap();
+        assert_eq!(ladder.penalty_account, SLASH_LADDER_PENALTY);
+        assert_eq!(ladder.rung_count, 3);
+        assert_eq!(
+            ladder.rungs[0],
+            SlashRung {
+                deadline: SLASH_LADDER_T0,
+                bps: 200
+            }
+        );
+        assert_eq!(
+            ladder.rungs[1],
+            SlashRung {
+                deadline: SLASH_LADDER_T0 + SLASH_LADDER_DAY,
+                bps: 600
+            }
+        );
+        assert_eq!(
+            ladder.rungs[2],
+            SlashRung {
+                deadline: SLASH_LADDER_T0 + 2 * SLASH_LADDER_DAY,
+                bps: 1_200
+            }
+        );
+        assert_eq!(e.slash_ladder_index(), 0);
+        assert_eq!(e.penalty_paid(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "ladder region rewritten in place, no layout change"
+        );
+        // New rung 0 caps at 2% of 1_000_000 = 20_000.
+        let s = e.slash(ALICE, 20_000, None, SLASH_LADDER_T0).unwrap();
+        assert_eq!(s, 20_000);
+        assert_eq!(e.slash_ladder_index(), 1);
+    }
+
+    #[test]
+    fn amend_slash_ladder_program_rejects_single_party_and_strangers() {
+        // AV-466: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // reprice the other's default penalty.
+        let mut e = slash_ladder_funded_escrow();
+        let rungs = &[
+            (SLASH_LADDER_T0, 200),
+            (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 600),
+        ];
+        assert_eq!(
+            e.amend_slash_ladder(ALICE, ALICE, rungs, SLASH_LADDER_T0 - 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_slash_ladder(MALLORY, BOB, rungs, SLASH_LADDER_T0 - 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_slash_ladder(MALLORY, MALLORY, rungs, SLASH_LADDER_T0 - 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.slash_ladder().unwrap().rungs[0].bps,
+            100,
+            "failed revisions write nothing"
+        );
+        e.amend_slash_ladder(ALICE, BOB, rungs, SLASH_LADDER_T0 - 1)
+            .unwrap();
+        assert_eq!(e.slash_ladder().unwrap().rungs[0].bps, 200);
+    }
+
+    #[test]
+    fn amend_slash_ladder_program_refuses_no_ladder_and_consumed_prefix_mutation() {
+        // AV-466: fail-closed — a ladder is never installed after
+        // funding, and history is never rewritten. A flat-terms
+        // escrow and a plain escrow both refuse InvalidSlashLadder.
+        assert_eq!(EscrowError::InvalidSlashLadder.code(), 184);
+        let mut plain =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, SLASH_LADDER_T0 - 1).unwrap();
+        assert_eq!(
+            plain.amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[(SLASH_LADDER_T0, 100)],
+                SLASH_LADDER_T0 - 1
+            ),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        assert_eq!(plain.slash_ladder(), None);
+        let mut flat = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(SLASH_LADDER_PENALTY, SLASH_LADDER_T0)
+            .unwrap();
+        flat.fund(ALICE, SLASH_LADDER_T0 - 1).unwrap();
+        assert_eq!(
+            flat.amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[(SLASH_LADDER_T0, 100)],
+                SLASH_LADDER_T0 - 1
+            ),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        assert_eq!(flat.slash_ladder(), None);
+        // Consumed-prefix immutability: rung 0 is history once
+        // slashed — mutating its bps or its deadline is refused
+        // and leaves the ladder, cursor and penalty untouched.
+        let mut e = slash_ladder_funded_escrow();
+        e.slash(ALICE, 10_000, None, SLASH_LADDER_T0).unwrap();
+        assert_eq!(e.slash_ladder_index(), 1);
+        let before = e.slash_ladder().unwrap();
+        assert_eq!(
+            e.amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[
+                    (SLASH_LADDER_T0, 101),
+                    (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+                    (SLASH_LADDER_T0 + 2 * SLASH_LADDER_DAY, 1_000),
+                ],
+                SLASH_LADDER_T0 + SLASH_LADDER_DAY,
+            ),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        assert_eq!(
+            e.amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[
+                    (SLASH_LADDER_T0 + 1, 100),
+                    (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+                    (SLASH_LADDER_T0 + 2 * SLASH_LADDER_DAY, 1_000),
+                ],
+                SLASH_LADDER_T0 + SLASH_LADDER_DAY,
+            ),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        assert_eq!(e.slash_ladder().unwrap(), before);
+        assert_eq!(e.slash_ladder_index(), 1);
+        assert_eq!(e.penalty_paid(), 10_000);
+    }
+
+    #[test]
+    fn amend_slash_ladder_program_rejects_malformed_tables_and_backdating() {
+        // AV-466: the builder's table validation applies unchanged
+        // — an empty table, an over-8 table, a table shorter than
+        // the consumed prefix, non-strictly-ascending deadlines or
+        // bps, a bps above 10_000, and a future rung backdated
+        // before `now` are all InvalidSlashLadder, and a failed
+        // revision leaves the table untouched. A deadline exactly
+        // at `now` is not earlier than now.
+        let mut e = slash_ladder_funded_escrow();
+        e.slash(ALICE, 10_000, None, SLASH_LADDER_T0).unwrap();
+        e.slash(
+            ALICE,
+            49_500,
+            None,
+            SLASH_LADDER_T0 + SLASH_LADDER_DAY,
+        )
+        .unwrap();
+        assert_eq!(e.slash_ladder_index(), 2);
+        let before = e.slash_ladder().unwrap();
+        // Two rungs consumed: a one-rung table would drop history.
+        assert_eq!(
+            e.amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[(SLASH_LADDER_T0, 100)],
+                SLASH_LADDER_T0 + SLASH_LADDER_DAY
+            ),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        // An empty table is not a ladder at all.
+        assert_eq!(
+            e.amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[],
+                SLASH_LADDER_T0 + SLASH_LADDER_DAY
+            ),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        // More rungs than the fixed slots hold.
+        assert_eq!(
+            e.amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[
+                    (SLASH_LADDER_T0, 100),
+                    (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+                    (SLASH_LADDER_T0 + 2 * SLASH_LADDER_DAY, 1_000),
+                    (SLASH_LADDER_T0 + 3 * SLASH_LADDER_DAY, 1_500),
+                    (SLASH_LADDER_T0 + 4 * SLASH_LADDER_DAY, 2_000),
+                    (SLASH_LADDER_T0 + 5 * SLASH_LADDER_DAY, 2_500),
+                    (SLASH_LADDER_T0 + 6 * SLASH_LADDER_DAY, 3_000),
+                    (SLASH_LADDER_T0 + 7 * SLASH_LADDER_DAY, 3_500),
+                    (SLASH_LADDER_T0 + 8 * SLASH_LADDER_DAY, 4_000),
+                ],
+                SLASH_LADDER_T0 + SLASH_LADDER_DAY,
+            ),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        assert_eq!(e.slash_ladder().unwrap(), before);
+        assert_eq!(e.slash_ladder_index(), 2);
+        // Equal deadlines, equal bps, and an over-100% rung in the
+        // future table.
+        let mut fresh = slash_ladder_funded_escrow();
+        assert_eq!(
+            fresh.amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[
+                    (SLASH_LADDER_T0, 100),
+                    (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+                    (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 600),
+                ],
+                SLASH_LADDER_T0 - 1,
+            ),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        assert_eq!(
+            fresh.amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[
+                    (SLASH_LADDER_T0, 100),
+                    (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+                    (SLASH_LADDER_T0 + 2 * SLASH_LADDER_DAY, 500),
+                ],
+                SLASH_LADDER_T0 - 1,
+            ),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        assert_eq!(
+            fresh.amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[
+                    (SLASH_LADDER_T0, 100),
+                    (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 10_001),
+                ],
+                SLASH_LADDER_T0 - 1,
+            ),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        // A future rung dated before `now` would make the next slash
+        // fire immediately — backdating is refused, while a deadline
+        // exactly at `now` is legal.
+        assert_eq!(
+            fresh.amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[
+                    (SLASH_LADDER_T0 - 1, 100),
+                    (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+                ],
+                SLASH_LADDER_T0,
+            ),
+            Err(EscrowError::InvalidSlashLadder)
+        );
+        fresh
+            .amend_slash_ladder(
+                ALICE,
+                BOB,
+                &[
+                    (SLASH_LADDER_T0, 100),
+                    (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+                ],
+                SLASH_LADDER_T0,
+            )
+            .unwrap();
+        assert_eq!(fresh.slash_ladder().unwrap().rung_count, 2);
+        assert_eq!(fresh.slash_ladder().unwrap().rungs[0].bps, 100);
+    }
+
+    #[test]
+    fn amend_slash_ladder_program_noop_on_same_table() {
+        // AV-466: re-affirming the current table is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = slash_ladder_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        let same = &[
+            (SLASH_LADDER_T0, 100),
+            (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+            (SLASH_LADDER_T0 + 2 * SLASH_LADDER_DAY, 1_000),
+        ];
+        e.amend_slash_ladder(ALICE, BOB, same, SLASH_LADDER_T0 - 1)
+            .unwrap();
+        assert_eq!(e.slash_ladder().unwrap().rung_count, 3);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-table re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.slash_ladder().unwrap().rungs[1].bps, 500);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        // A second identical re-affirmation is likewise a no-op.
+        e.amend_slash_ladder(ALICE, BOB, same, SLASH_LADDER_T0 - 1)
+            .unwrap();
+        assert_eq!(e.slash_ladder().unwrap().rung_count, 3);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a second same-table re-affirmation still writes nothing"
+        );
+    }
+
+    #[test]
+    fn amend_slash_ladder_program_emits_only_on_change() {
+        // AV-466: the program handler emits SlashLadderAmended
+        // only when the ladder actually changes — the before/after
+        // comparison in the handler skips the event on a same-table
+        // re-affirmation (mirrors `rotate_taker`). At the
+        // state-machine level the same-table call writes nothing —
+        // the encoded escrow is byte-identical before and after, so
+        // there is nothing to emit about — while a real change moves
+        // the field, which is what the handler's emission keys on.
+        // The INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_slash_ladder")
+            .expect("INSTRUCTIONS carries amend_slash_ladder");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = slash_ladder_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_slash_ladder(
+            ALICE,
+            BOB,
+            &[
+                (SLASH_LADDER_T0, 100),
+                (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+                (SLASH_LADDER_T0 + 2 * SLASH_LADDER_DAY, 1_000),
+            ],
+            SLASH_LADDER_T0 - 1,
+        )
+        .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-table re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_slash_ladder(
+            ALICE,
+            BOB,
+            &[
+                (SLASH_LADDER_T0, 200),
+                (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 600),
+                (SLASH_LADDER_T0 + 2 * SLASH_LADDER_DAY, 1_200),
+            ],
+            SLASH_LADDER_T0 - 1,
+        )
+        .unwrap();
+        assert_eq!(e.slash_ladder().unwrap().rungs[0].bps, 200);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_slash_ladder_program_keeps_penalty_account_cursor_and_paid() {
+        // AV-466: only the future rungs move — the penalty account,
+        // the consumption cursor and the penalty already paid are
+        // untouched, so the next slash prices from the new rung at
+        // the same cursor.
+        let mut e = slash_ladder_funded_escrow();
+        e.slash(ALICE, 10_000, None, SLASH_LADDER_T0).unwrap();
+        assert_eq!(e.slash_ladder_index(), 1);
+        e.amend_slash_ladder(
+            ALICE,
+            BOB,
+            &[
+                (SLASH_LADDER_T0, 100),
+                (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 600),
+                (SLASH_LADDER_T0 + 2 * SLASH_LADDER_DAY, 1_500),
+            ],
+            SLASH_LADDER_T0 + SLASH_LADDER_DAY,
+        )
+        .unwrap();
+        let ladder = e.slash_ladder().unwrap();
+        assert_eq!(ladder.penalty_account, SLASH_LADDER_PENALTY);
+        assert_eq!(
+            ladder.rungs[0],
+            SlashRung {
+                deadline: SLASH_LADDER_T0,
+                bps: 100
+            }
+        );
+        assert_eq!(
+            ladder.rungs[1],
+            SlashRung {
+                deadline: SLASH_LADDER_T0 + SLASH_LADDER_DAY,
+                bps: 600
+            }
+        );
+        assert_eq!(
+            ladder.rungs[2],
+            SlashRung {
+                deadline: SLASH_LADDER_T0 + 2 * SLASH_LADDER_DAY,
+                bps: 1_500
+            }
+        );
+        assert_eq!(e.slash_ladder_index(), 1);
+        assert_eq!(e.penalty_paid(), 10_000);
+        // New rung 1 caps at 6% of the 990_000 remainder = 59_400.
+        let s = e
+            .slash(
+                ALICE,
+                59_400,
+                None,
+                SLASH_LADDER_T0 + SLASH_LADDER_DAY,
+            )
+            .unwrap();
+        assert_eq!(s, 59_400);
+        assert_eq!(e.slash_ladder_index(), 2);
+        assert_eq!(e.penalty_paid(), 10_000 + 59_400);
+        // The amended ladder can also shrink the tail: dropping
+        // the top rung is fine while the consumed prefix survives.
+        e.amend_slash_ladder(
+            ALICE,
+            BOB,
+            &[(SLASH_LADDER_T0, 100), (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 600)],
+            SLASH_LADDER_T0 + SLASH_LADDER_DAY,
+        )
+        .unwrap();
+        assert_eq!(e.slash_ladder().unwrap().rung_count, 2);
+        assert_eq!(e.slash_ladder_index(), 2);
+        assert_eq!(e.slash_ladder().unwrap().penalty_account, SLASH_LADDER_PENALTY);
+        assert_eq!(e.penalty_paid(), 10_000 + 59_400);
+    }
+
+    #[test]
+    fn amend_slash_ladder_program_refuses_disputed_terminal_and_paused() {
+        // AV-466: Funded-only — the Uninitialized builder owns the
+        // initial ladder set, and a live dispute or a terminal
+        // escrow settles under the ladder it started under. The
+        // pause guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        let rungs = &[
+            (SLASH_LADDER_T0, 200),
+            (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 600),
+        ];
+        // Uninitialized: the ladder is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_ladder(
+                SLASH_LADDER_PENALTY,
+                &[
+                    (SLASH_LADDER_T0, 100),
+                    (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            bare.amend_slash_ladder(ALICE, BOB, rungs, SLASH_LADDER_T0 - 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.slash_ladder().unwrap().rungs[0].bps, 100);
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_slash_ladder(
+                    SLASH_LADDER_PENALTY,
+                    &[
+                        (SLASH_LADDER_T0, 100),
+                        (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+                    ],
+                )
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_slash_ladder(ALICE, BOB, rungs, SLASH_LADDER_T0 - 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.slash_ladder().unwrap().rungs[0].bps, 100);
+        // Disputed: the ladder stays while the dispute is in
+        // flight — the dispute settles under the ladder it
+        // started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_slash_ladder(
+                SLASH_LADDER_PENALTY,
+                &[
+                    (SLASH_LADDER_T0, 100),
+                    (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+                ],
+            )
+            .unwrap();
+        d.fund(ALICE, SLASH_LADDER_T0 - 1).unwrap();
+        let disputed_at = SLASH_LADDER_T0 + 100;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_slash_ladder(ALICE, BOB, rungs, SLASH_LADDER_T0 - 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.slash_ladder().unwrap().rungs[0].bps,
+            100,
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's ladder is history, not
+        // a live table to retune.
+        let mut e = slash_ladder_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_slash_ladder(ALICE, BOB, rungs, SLASH_LADDER_T0 - 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.slash_ladder().unwrap().rungs[0].bps, 100);
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_slash_ladder(
+                    SLASH_LADDER_PENALTY,
+                    &[
+                        (SLASH_LADDER_T0, 100),
+                        (SLASH_LADDER_T0 + SLASH_LADDER_DAY, 500),
+                    ],
+                )
+                .unwrap();
+        paused.fund(ALICE, SLASH_LADDER_T0 - 1).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_slash_ladder(ALICE, BOB, rungs, SLASH_LADDER_T0 - 1),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_slash_ladder(MALLORY, BOB, rungs, SLASH_LADDER_T0 - 1),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.slash_ladder().unwrap().rungs[0].bps,
+            100,
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_slash_ladder(ALICE, BOB, rungs, SLASH_LADDER_T0 - 1).unwrap();
+        assert_eq!(paused.slash_ladder().unwrap().rungs[0].bps, 200);
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -65035,6 +65733,22 @@ pub(crate) mod anchor_idl_tests {
             "amend_deadman_inactivity",
             "inactivity_secs",
             "deadman_inactivity_secs",
+        ),
+        // AV-466: the post-funding slash-ladder revision rewrites
+        // the slash_ladder region in place — a second param source
+        // for `slash_ladder`, like `initialize_slash_ladder`'s
+        // rungs. The field's initial value comes from the
+        // `with_slash_ladder` builder param (Uninitialized only);
+        // this entry documents the revision source. Only the future
+        // rungs move — `penalty_account`, `penalty_paid` already
+        // banked and the consumption cursor are never rewritten, so
+        // the next slash prices from the new rung at the same cursor
+        // while a slash already settled keeps the rung it settled
+        // under.
+        (
+            "amend_slash_ladder",
+            "new_rungs",
+            "slash_ladder",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source

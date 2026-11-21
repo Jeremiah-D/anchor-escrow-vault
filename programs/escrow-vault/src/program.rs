@@ -8004,6 +8004,74 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Retune the tiered default-penalty (slash) ladder after
+    /// funding (AV-466; mirrors `Escrow::amend_slash_ladder`).
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign — one party alone cannot reprice the other's
+    /// default penalty. `Funded` only — the builder owns the
+    /// initial ladder set. A paused escrow fails fast (`Paused`,
+    /// before the authority gate). Only an escrow already carrying
+    /// a ladder may revise (`InvalidSlashLadder`, code 184,
+    /// otherwise — post-funding installation would add a penalty
+    /// clause the taker never funded under); the consumed prefix
+    /// is immutable rung-by-rung, the new table must hold at least
+    /// the consumed count and at most 8 rungs, stay strictly
+    /// ascending in deadline and bps with each bps at most 10_000,
+    /// and no future rung may be backdated before `now` (all
+    /// `InvalidSlashLadder`, code 184). `now` comes from the clock
+    /// sysvar (never an instruction param — a rung cannot be
+    /// backdated into eligibility). No delay path covers this
+    /// method — `GovernanceAction` has no `AmendSlashLadder`
+    /// variant, so the direct call is the only entry point. Emits
+    /// `SlashLadderAmended` (from == to == the current state)
+    /// only on an actual change; a same-table no-op stays silent
+    /// (mirrors `rotate_taker`). Only the future rungs change —
+    /// `penalty_account`, `penalty_paid` already banked and the
+    /// consumption cursor are untouched, so the next slash prices
+    /// from the new rung at the same cursor, while the slash path
+    /// reads the live rung at the next eligibility check.
+    pub fn amend_slash_ladder(
+        ctx: Context<AmendSlashLadder>,
+        new_rungs: Vec<(u64, u16)>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.slash_ladder();
+        escrow
+            .amend_slash_ladder(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &new_rungs,
+                Clock::get()?.unix_timestamp as u64,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 113-byte ladder region in place — no realloc.
+        // Only the future rungs move; the penalty account, the
+        // penalty already paid and the consumption cursor are
+        // untouched.
+        // Emits only on an actual change; a same-table no-op stays
+        // silent (mirrors `rotate_taker`).
+        if escrow.slash_ladder() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::SlashLadderAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -15355,6 +15423,21 @@ pub struct AmendStreamingFee<'info> {
 /// key cannot block its own threshold's revision.
 #[derive(Accounts)]
 pub struct AmendDeadmanInactivity<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-466: accounts for `amend_slash_ladder` — the
+/// tiered-slash-ladder revision is unconditional dual-signature
+/// governance: both initializer and taker sign (the state machine
+/// enforces this — one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendSlashLadder<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

@@ -1461,6 +1461,14 @@
       ]
     },
     {
+      "name": "amend_slash_ladder",
+      "discriminator": [213, 24, 223, 138, 106, 229, 255, 200],
+      "accounts": [],
+      "args": [
+        {"name": "new_rungs", "type": {"vec": {"defined": "SlashRung"}}}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
