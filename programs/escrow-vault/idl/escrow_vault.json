@@ -1494,6 +1494,16 @@
       ]
     },
     {
+      "name": "amend_price_gate",
+      "discriminator": [140, 17, 64, 167, 230, 89, 62, 195],
+      "accounts": [],
+      "args": [
+        {"name": "direction", "type": "u8"},
+        {"name": "target", "type": "u64"},
+        {"name": "max_staleness_secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

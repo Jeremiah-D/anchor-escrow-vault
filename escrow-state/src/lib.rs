@@ -29857,7 +29857,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// post-funding revision), to AV-113 (that is the gate
     /// mechanism itself, this item is its parameters) and to
     /// AV-128 (that is the TWAP gate — a separate gate struct
-    /// and region, untouched by this revision). Emits
+    /// and region, untouched by this revision). AV-470 wires
+    /// this revision to the chain as the program-level
+    /// `amend_price_gate` Anchor instruction. Emits
     /// `PriceGateAmended` on the event layer, except for the
     /// no-op re-affirmation.
     pub fn amend_price_gate(
@@ -42932,6 +42934,37 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "reference <- param (Pubkey -> [u8; 32] conversion); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial memo set); no delay path covers this method — GovernanceAction has no AmendReference variant, so the direct call is the only entry point and no delayed handler is staged; any 32 bytes are accepted — the memo is read-only pass-through with nothing to validate, so no new error variant is needed and a failed amendment leaves the memo untouched; re-affirming the current memo is a no-op (succeeds, writes nothing, emits no event); only reference changes — amount, released, fees_paid and state are untouched, and the new memo enters indexer events, keeper reports and the AV-26 snapshot export from the revision onward (each reads the live field at emit time) while memos already exported in past reports or snapshots are history and are never rewritten; emits the ReferenceAmended indexer event only on an actual change (from == to == the current state); the 33-byte reference region is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-470: revise the oracle price gate after
+            // funding — the program-level entry point for the AV-261
+            // pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_price_gate")[..8]
+            // = [140, 17, 64, 167, 230, 89, 62, 195] — the Anchor
+            // instruction discriminator for the
+            // amend_price_gate handler (pinned by the
+            // discriminator test below).
+            name: "amend_price_gate",
+            params: &[
+                (
+                    "direction",
+                    "u8",
+                    "instruction param; 0 = price must sit at or above target (AtOrAbove), 1 = at or below (AtOrBelow); any other byte is InvalidPriceGate on decode, rejected at the gate",
+                ),
+                (
+                    "target",
+                    "u64",
+                    "instruction param; the replacement threshold price in the oracle's quote units — must be > 0 (InvalidPriceGate, code 176, otherwise)",
+                ),
+                (
+                    "max_staleness_secs",
+                    "u64",
+                    "instruction param; the replacement maximum quote age in seconds — a quote with now - observed_at beyond this is stale and fails the gate (PriceGateNotSatisfied, code 175)",
+                ),
+            ],
+            method: "Escrow::amend_price_gate",
+            input_mapping: "direction/target/max_staleness_secs <- params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial gate set); only a gate already configured may be revised — an ungated escrow is InvalidPriceGate (code 176, fail-closed: post-funding installation would add a release restriction the taker never funded under); no delay path covers this method — GovernanceAction has no AmendPriceGate variant, so the direct call is the only entry point and no delayed handler is staged; there is deliberately no clearing path (the gate rides as three scalar args, never an Option, so a configured gate cannot be removed to None); target == 0 is InvalidPriceGate (code 176, the builder's gate, unchanged — a zero threshold can never be a deliberate policy) and leaves the escrow untouched; re-affirming the current gate is a no-op (succeeds, writes nothing, emits no event, paralleling amend_interest_rate); the revision replaces the gate wholesale — direction, target and max_staleness_secs together, never partially; only price_gate changes — amount, released, fees_paid, state and the TWAP gate are untouched, and the gated payout paths read the gate live through require_price_gate, so a new gate governs the next release_price_gated / claim_price_gated the moment the amendment lands — tightening can make an in-flight escrow immediately fail the gate, loosening can satisfy it — while a payout already settled keeps the gate it settled under, and the gated routing itself never changes; emits the PriceGateAmended indexer event only on an actual change (from == to == the current state); the 18-byte gate region is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43946,6 +43979,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-377 pure-logic revision wired to
             // the chain).
             "Escrow::amend_reference",
+            // AV-470: the program-level oracle-price-gate
+            // revision (the AV-261 pure-logic revision wired to
+            // the chain).
+            "Escrow::amend_price_gate",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44087,7 +44124,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-461 adds `amend_relative_timelock`;
         // AV-462 adds `amend_slot_timelock`;
         // AV-468 adds `amend_refund_address`;
-        // AV-469 adds `amend_reference`.)
+        // AV-469 adds `amend_reference`;
+        // AV-470 adds `amend_price_gate`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -44530,6 +44568,17 @@ pub(crate) mod anchor_idl_tests {
                 // report and snapshot export read live;
                 // re-affirming the current memo is a no-op.
                 &"amend_reference",
+                // AV-470: the price-gate revision carries the
+                // direction (u8), the target price (u64) and the
+                // staleness bound (u64) — the replacement gate,
+                // wholesale; the gated payout paths re-read the
+                // live gate at the next release_price_gated /
+                // claim_price_gated, so tightening can fail an
+                // in-flight escrow and loosening can satisfy it,
+                // while a payout already settled keeps the gate
+                // it settled under; re-affirming the current gate
+                // is a no-op.
+                &"amend_price_gate",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -63177,6 +63226,396 @@ pub(crate) mod anchor_idl_tests {
         );
     }
 
+    // AV-470: the program-level oracle-price-gate revision — the
+    // AV-261 pure-logic revision wired to the chain.
+    fn ceiling_gate() -> PriceGate {
+        PriceGate {
+            direction: PriceDirection::AtOrBelow,
+            target: 50_000,
+            max_staleness_secs: 60,
+        }
+    }
+
+    #[test]
+    fn amend_price_gate_maps_params_to_price_gate_field() {
+        // IDL: amend_price_gate(direction: u8, target: u64,
+        // max_staleness_secs: u64) — direction/target/
+        // max_staleness_secs <- params; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The params rewrite the `price_gate` region in place
+        // (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the three scalar params and the AV-261 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_price_gate")
+            .expect("INSTRUCTIONS carries amend_price_gate");
+        assert_eq!(spec.method, "Escrow::amend_price_gate");
+        assert_eq!(spec.params.len(), 3);
+        assert_eq!(spec.params[0].0, "direction");
+        assert_eq!(spec.params[0].1, "u8");
+        assert_eq!(spec.params[1].0, "target");
+        assert_eq!(spec.params[1].1, "u64");
+        assert_eq!(spec.params[2].0, "max_staleness_secs");
+        assert_eq!(spec.params[2].1, "u64");
+        assert!(
+            spec.input_mapping.contains("PriceGateAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the three args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_price_gate\""),
+            "checked-in IDL carries amend_price_gate"
+        );
+        assert!(
+            idl.contains("[140, 17, 64, 167, 230, 89, 62, 195]"),
+            "checked-in IDL pins the AV-470 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"direction\", \"type\": \"u8\"}"),
+            "checked-in IDL carries the direction arg"
+        );
+        assert!(
+            idl.contains("{\"name\": \"target\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the target arg"
+        );
+        assert!(
+            idl.contains("{\"name\": \"max_staleness_secs\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the max_staleness_secs arg"
+        );
+        // Only the gate moves: the amounts, the state and the
+        // layout are untouched.
+        let mut e = gated_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.price_gate(), Some(floor_gate()));
+        e.amend_price_gate(ALICE, BOB, ceiling_gate()).unwrap();
+        assert_eq!(e.price_gate(), Some(ceiling_gate()));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "gate rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_price_gate_rejects_single_party_and_strangers() {
+        // AV-470: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // retune the market condition the other's payout waits on.
+        let mut e = gated_escrow();
+        assert_eq!(
+            e.amend_price_gate(ALICE, ALICE, ceiling_gate()),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_price_gate(MALLORY, BOB, ceiling_gate()),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_price_gate(MALLORY, MALLORY, ceiling_gate()),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.price_gate(),
+            Some(floor_gate()),
+            "failed revisions write nothing"
+        );
+        e.amend_price_gate(ALICE, BOB, ceiling_gate()).unwrap();
+        assert_eq!(e.price_gate(), Some(ceiling_gate()));
+    }
+
+    #[test]
+    fn amend_price_gate_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-470: Funded-only — the Uninitialized builder owns the
+        // initial gate, and a live dispute or a terminal escrow
+        // settles under the gate it started under. The pause
+        // guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Uninitialized: the gate is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_price_gate(floor_gate())
+            .unwrap();
+        assert_eq!(
+            bare.amend_price_gate(ALICE, BOB, ceiling_gate()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.price_gate(), Some(floor_gate()));
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_price_gate(floor_gate())
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_price_gate(ALICE, BOB, ceiling_gate()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.price_gate(), Some(floor_gate()));
+        // Disputed: the gate stays while the dispute is in
+        // flight — the dispute settles under the gate it
+        // started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_price_gate(floor_gate())
+            .unwrap();
+        d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let disputed_at = EXPIRES_AT - 3_500;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_price_gate(ALICE, BOB, ceiling_gate()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.price_gate(),
+            Some(floor_gate()),
+            "disputed revision writes nothing"
+        );
+        // Terminal: a released escrow's gate is history, not a
+        // live condition to retune.
+        let mut e = gated_escrow();
+        e.release(ALICE, 1_000_000, 1_000_000, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.amend_price_gate(ALICE, BOB, ceiling_gate()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.price_gate(), Some(floor_gate()));
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_price_gate(floor_gate())
+            .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_price_gate(ALICE, BOB, ceiling_gate()),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_price_gate(MALLORY, BOB, ceiling_gate()),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.price_gate(),
+            Some(floor_gate()),
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_price_gate(ALICE, BOB, ceiling_gate()).unwrap();
+        assert_eq!(paused.price_gate(), Some(ceiling_gate()));
+    }
+
+    #[test]
+    fn amend_price_gate_refuses_ungated() {
+        // AV-470: fail-closed — an ungated escrow can never acquire
+        // a gate after funding, and a failed amendment leaves it
+        // ungated.
+        let mut ungated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        ungated.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(ungated.price_gate(), None);
+        assert_eq!(
+            ungated.amend_price_gate(ALICE, BOB, floor_gate()),
+            Err(EscrowError::InvalidPriceGate)
+        );
+        assert_eq!(EscrowError::InvalidPriceGate.code(), 176);
+        assert_eq!(ungated.price_gate(), None, "no gate installed by the refusal");
+        // Even a zero target cannot smuggle a gate in — the
+        // gate-presence gate fires first.
+        assert_eq!(
+            ungated.amend_price_gate(
+                ALICE,
+                BOB,
+                PriceGate {
+                    direction: PriceDirection::AtOrAbove,
+                    target: 0,
+                    max_staleness_secs: 300,
+                }
+            ),
+            Err(EscrowError::InvalidPriceGate)
+        );
+        assert_eq!(ungated.price_gate(), None);
+    }
+
+    #[test]
+    fn amend_price_gate_refuses_zero_target() {
+        // AV-470: the builder's gate, unchanged — a zero threshold
+        // can never be a deliberate policy.
+        let mut e = gated_escrow();
+        assert_eq!(
+            e.amend_price_gate(
+                ALICE,
+                BOB,
+                PriceGate {
+                    direction: PriceDirection::AtOrAbove,
+                    target: 0,
+                    max_staleness_secs: 300,
+                }
+            ),
+            Err(EscrowError::InvalidPriceGate)
+        );
+        assert_eq!(EscrowError::InvalidPriceGate.code(), 176);
+        assert_eq!(
+            e.price_gate(),
+            Some(floor_gate()),
+            "failed revision writes nothing"
+        );
+    }
+
+    #[test]
+    fn amend_price_gate_noop_on_same_gate() {
+        // AV-470: re-affirming the current gate is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = gated_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_price_gate(ALICE, BOB, floor_gate()).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-gate re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.price_gate(), Some(floor_gate()));
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_price_gate(ALICE, BOB, ceiling_gate()).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_price_gate(ALICE, BOB, ceiling_gate()).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised gate writes nothing either"
+        );
+        assert_eq!(e.price_gate(), Some(ceiling_gate()));
+    }
+
+    #[test]
+    fn amend_price_gate_emits_only_on_change() {
+        // AV-470: the program handler emits PriceGateAmended
+        // only when the gate actually changes — the before/after
+        // comparison in the handler skips the event on a no-op
+        // re-affirmation (mirrors `amend_interest_rate`). At the
+        // state-machine level the same-gate call writes nothing
+        // — the encoded escrow is byte-identical before and after,
+        // so there is nothing to emit about — while a real change
+        // moves the field, which is what the handler's emission keys
+        // on. The INSTRUCTIONS entry pins the change-only event in
+        // the spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_price_gate")
+            .expect("INSTRUCTIONS carries amend_price_gate");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = gated_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_price_gate(ALICE, BOB, floor_gate()).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-gate re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_price_gate(ALICE, BOB, ceiling_gate()).unwrap();
+        assert_eq!(e.price_gate(), Some(ceiling_gate()));
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_price_gate_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-470: the program handler emits `PriceGateAmended`
+        // only when the gate actually changes — the indexed wrapper
+        // is the event-layer mirror of the handler's before/after
+        // comparison. A failed revision emits nothing, a no-op
+        // re-affirmation emits nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const NOW: u64 = 1_700_000_000;
+        let mut e = IndexedEscrow::wrap([0x1D; 32], gated_escrow());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_price_gate(ALICE, MALLORY, ceiling_gate(), NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_price_gate(ALICE, BOB, ceiling_gate(), NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::PriceGateAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same gate is a no-op: no new event.
+        e.amend_price_gate(ALICE, BOB, ceiling_gate(), NOW + 1)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_price_gate_retunes_gate_and_next_release_reads_live_gate() {
+        // AV-470: floor 100_000 / 300s replaced wholesale by ceiling
+        // 50_000 / 60s: direction, target and staleness all move at
+        // once — there is no partial revision that could mix an old
+        // threshold with a new staleness bound. The gated payout
+        // paths read the gate live, so the new gate governs the next
+        // gated payout the moment the amendment lands.
+        const T0: u64 = 1_700_000_000;
+        let mut e = gated_escrow();
+        e.amend_price_gate(ALICE, BOB, ceiling_gate()).unwrap();
+        assert_eq!(e.price_gate(), Some(ceiling_gate()));
+        // Under the old floor, 40_000 would have failed; under the
+        // new ceiling it passes — the live gate governs.
+        let cheap = StaticPriceFeed::new(40_000, T0);
+        e.require_price_gate(&cheap, T0).unwrap();
+        // Above the new ceiling fails, and a quote older than the
+        // new 60s bound fails even at a passing price.
+        let expensive = StaticPriceFeed::new(60_000, T0);
+        assert_eq!(
+            e.require_price_gate(&expensive, T0),
+            Err(EscrowError::PriceGateNotSatisfied)
+        );
+        let stale = StaticPriceFeed::new(40_000, T0 - 61);
+        assert_eq!(
+            e.require_price_gate(&stale, T0),
+            Err(EscrowError::PriceGateNotSatisfied)
+        );
+        // The gated payout path itself follows the new gate.
+        let (payout, fee) = e
+            .release_price_gated(ALICE, T0, 1_000_000, None, BOB, &cheap)
+            .unwrap();
+        assert_eq!((payout, fee), (1_000_000, 0));
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -66992,6 +67431,30 @@ pub(crate) mod anchor_idl_tests {
             "amend_reference",
             "reference",
             "reference",
+        ),
+        // AV-470: the post-funding price-gate revision rewrites
+        // the 18-byte `price_gate` region in place — a second
+        // param source for `price_gate`, like
+        // `initialize_price_gate`'s direction / target /
+        // max_staleness_secs params. Only the gate moves — the
+        // amount, the released total, the fees, the state and the
+        // TWAP gate are untouched, so the next gated payout reads
+        // the new gate live while a payout already settled keeps
+        // the gate it settled under.
+        (
+            "amend_price_gate",
+            "direction",
+            "price_gate",
+        ),
+        (
+            "amend_price_gate",
+            "target",
+            "price_gate",
+        ),
+        (
+            "amend_price_gate",
+            "max_staleness_secs",
+            "price_gate",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -97066,6 +97529,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_reference"),
             [112, 27, 40, 125, 229, 151, 24, 230]
+        );
+    }
+
+    #[test]
+    fn amend_price_gate_instruction_discriminator_is_pinned() {
+        // AV-470. IDL:
+        // sha256("global:amend_price_gate")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_price_gate"),
+            [140, 17, 64, 167, 230, 89, 62, 195]
         );
     }
 

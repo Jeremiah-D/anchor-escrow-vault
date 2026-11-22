@@ -8258,6 +8258,96 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the oracle price gate after funding (AV-470;
+    /// mirrors `Escrow::amend_price_gate`, the AV-261 pure-logic
+    /// revision). Unconditional dual-signature governance: both
+    /// initializer and taker sign — one party alone cannot retune
+    /// the other's market condition. `Funded` only — the builder
+    /// owns the initial gate set. A paused escrow fails fast
+    /// (`Paused`, before the authority gate). Only a gate already
+    /// configured may be revised — an ungated escrow is
+    /// `InvalidPriceGate` (code 176, fail-closed: post-funding
+    /// installation would add a release restriction the taker never
+    /// funded under). There is deliberately no clearing path: the
+    /// gate rides as three scalar args (`direction`, `target`,
+    /// `max_staleness_secs`), never an `Option`, so a configured
+    /// gate cannot be removed to `None`. A `target == 0` is
+    /// `InvalidPriceGate` (the builder's gate, unchanged — a zero
+    /// threshold can never be a deliberate policy). Re-affirming
+    /// the current gate is a no-op: it succeeds, writes nothing
+    /// and emits nothing. No delay path covers this method —
+    /// `GovernanceAction` has no `AmendPriceGate` variant, so the
+    /// direct call is the only entry point. Emits `PriceGateAmended`
+    /// (from == to == the current state) only on an actual change;
+    /// a no-op re-affirmation stays silent (mirrors
+    /// `amend_interest_rate`). The revision replaces the gate
+    /// wholesale — `direction`, `target` and `max_staleness_secs`
+    /// together, never partially. Only the 18-byte gate region is
+    /// rewritten in place — no layout change. The gated payout
+    /// paths read the gate live through `require_price_gate` (the
+    /// release/claim handlers route to the gated entry points only
+    /// while `price_gate` is `Some`), so a new gate governs the
+    /// next `release_price_gated` / `claim_price_gated` the moment
+    /// the amendment lands — tightening can make an in-flight
+    /// escrow immediately fail the gate, loosening can satisfy it —
+    /// while a payout already settled keeps the gate it settled
+    /// under, and the gated routing itself never changes; the TWAP
+    /// gate is untouched.
+    pub fn amend_price_gate(
+        ctx: Context<AmendPriceGate>,
+        direction: u8,
+        target: u64,
+        max_staleness_secs: u64,
+    ) -> Result<()> {
+        let direction = match direction {
+            0 => escrow_state::PriceDirection::AtOrAbove,
+            1 => escrow_state::PriceDirection::AtOrBelow,
+            _ => {
+                return Err(escrow_error(
+                    escrow_state::EscrowError::InvalidPriceGate,
+                ))
+            }
+        };
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.price_gate();
+        escrow
+            .amend_price_gate(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                escrow_state::PriceGate {
+                    direction,
+                    target,
+                    max_staleness_secs,
+                },
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 18-byte `price_gate` region in place — no
+        // realloc. Only the gate moves; the amounts, the state and
+        // the initializer/taker identities are untouched.
+        // Emits only on an actual change; a no-op re-affirmation
+        // stays silent (mirrors `amend_interest_rate`).
+        if escrow.price_gate() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::PriceGateAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -15672,6 +15762,22 @@ pub struct AmendRefundAddress<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendReference<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-470: accounts for `amend_price_gate` — the
+/// oracle-price-gate revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendPriceGate<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
