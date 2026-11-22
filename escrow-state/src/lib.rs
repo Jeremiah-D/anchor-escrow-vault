@@ -42893,6 +42893,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "rate_bps_per_day/cap_bps <- params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial schedule set); no delay path covers this method — GovernanceAction has no AmendPenaltyEscalation variant, so the direct call is the only entry point and no delayed handler is staged; rate_bps_per_day > 10_000 or cap_bps > 10_000 is InvalidPenalty (code 117, the builder's gate, unchanged) and leaves the escrow untouched; 0 is legal for either field (a 0 rate means no further escalation from here on, a 0 cap means the escalation is capped at 0 — the builder's 0 semantics, and a cap below the base rate degrades to the fixed base rate, never shrinking the penalty already agreed); re-affirming the current (rate, cap) pair is a no-op (succeeds, writes nothing, emits no event); only penalty_escalation_rate_bps/penalty_escalation_cap_bps change — penalty_bps and the meter origin (expires_at + grace) are untouched, so the escalation headroom is recomputed live as cap minus the unchanged base while a cancel already settled keeps the penalty it charged, and the cancel gate reads the live schedule at the next expiry cancel (effective_penalty_bps / expiry_cancel_penalty_at recompute from the live pair at every cancel_expired), so tightening can raise an already-late cancel's penalty at once while loosening can lower it; emits the PenaltyEscalationAmended indexer event only on an actual change (from == to == the current state); the two u16 tail fields are rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-468: revise the whitelisted refund address after
+            // funding — the program-level entry point for the AV-258
+            // pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_refund_address")[..8]
+            // = [23, 174, 219, 129, 213, 248, 239, 53] — the Anchor
+            // instruction discriminator for the
+            // amend_refund_address handler (pinned by the
+            // discriminator test below).
+            name: "amend_refund_address",
+            params: &[(
+                "new_refund_to",
+                "Pubkey",
+                "instruction param; the replacement refund address — the key a unilateral refund pays to from the next cancel on",
+            )],
+            method: "Escrow::amend_refund_address",
+            input_mapping: "new_refund_to <- param (Pubkey -> [u8; 32] conversion); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial binding); no delay path covers this method — GovernanceAction has no AmendRefundAddress variant, so the direct call is the only entry point and no delayed handler is staged; a zero address is RefundAddressMismatch (code 116, the builder's gate, unchanged) and leaves the escrow untouched; re-affirming the current effective recipient (the whitelist when set, else the initializer) is a no-op (succeeds, writes nothing, emits no event); there is deliberately no unbind-to-None path — callers that want the default route pass the initializer's key; only refund_to changes — the initializer/taker identities are never restated and no settled refund is ever rewritten, and the cancel paths read the address live through refund_recipient (refund_to.unwrap_or(initializer)) with require_refund_recipient checking the live address, so a cancel after the amendment routes to the new address while a cancel before it routed to the old one; emits the RefundAddressAmended indexer event only on an actual change (from == to == the current state); the 32-byte refund_to region is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43899,6 +43918,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-257 pure-logic revision wired to
             // the chain).
             "Escrow::amend_penalty_escalation",
+            // AV-468: the program-level whitelisted-refund-address
+            // revision (the AV-258 pure-logic revision wired to
+            // the chain).
+            "Escrow::amend_refund_address",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44038,7 +44061,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-459 adds `amend_timelock`;
         // AV-460 adds `amend_rent_sweep_grace`;
         // AV-461 adds `amend_relative_timelock`;
-        // AV-462 adds `amend_slot_timelock`.)
+        // AV-462 adds `amend_slot_timelock`;
+        // AV-468 adds `amend_refund_address`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -44469,6 +44493,12 @@ pub(crate) mod anchor_idl_tests {
                 // prices live from the new schedule while a cancel
                 // already settled keeps the penalty it charged.
                 &"amend_penalty_escalation",
+                // AV-468: the refund-address revision carries the
+                // replacement address (Pubkey) — the key the next
+                // cancel refunds to; re-affirming the current
+                // effective recipient is a no-op, and there is no
+                // unbind-to-None path.
+                &"amend_refund_address",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -62461,6 +62491,341 @@ pub(crate) mod anchor_idl_tests {
         );
     }
 
+    // AV-468: the program-level refund-address revision — the AV-258
+    // pure-logic revision wired to the chain.
+    const REFUND_CAROL: [u8; 32] = [0xC4; 32];
+    const REFUND_DAVE: [u8; 32] = [0xD4; 32];
+
+    fn refund_address_funded_escrow() -> Escrow {
+        // AV-468 helper: a funded escrow with REFUND_CAROL bound as
+        // the whitelisted refund address — the same shape the AV-258
+        // pure-logic tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_refund_address(REFUND_CAROL)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_refund_address_maps_param_to_refund_field() {
+        // IDL: amend_refund_address(new_refund_to: Pubkey) —
+        // new_refund_to <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `refund_to` tail field in place
+        // (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the one Pubkey param and the AV-258 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_refund_address")
+            .expect("INSTRUCTIONS carries amend_refund_address");
+        assert_eq!(spec.method, "Escrow::amend_refund_address");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "new_refund_to");
+        assert_eq!(spec.params[0].1, "Pubkey");
+        assert!(
+            spec.input_mapping.contains("RefundAddressAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the one arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_refund_address\""),
+            "checked-in IDL carries amend_refund_address"
+        );
+        assert!(
+            idl.contains("[23, 174, 219, 129, 213, 248, 239, 53]"),
+            "checked-in IDL pins the AV-468 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"new_refund_to\", \"type\": \"publicKey\"}"),
+            "checked-in IDL carries the new_refund_to arg"
+        );
+        // Only the address moves: the identities, the state and the
+        // layout are untouched.
+        let mut e = refund_address_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.refund_to(), Some(REFUND_CAROL));
+        assert_eq!(e.refund_recipient(), REFUND_CAROL);
+        e.amend_refund_address(ALICE, BOB, REFUND_DAVE).unwrap();
+        assert_eq!(e.refund_to(), Some(REFUND_DAVE));
+        assert_eq!(e.refund_recipient(), REFUND_DAVE);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "refund address rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_refund_address_rejects_single_party_and_strangers() {
+        // AV-468: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // re-point the other's refund.
+        let mut e = refund_address_funded_escrow();
+        assert_eq!(
+            e.amend_refund_address(ALICE, ALICE, REFUND_DAVE),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_refund_address(MALLORY, BOB, REFUND_DAVE),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_refund_address(MALLORY, MALLORY, REFUND_DAVE),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.refund_to(),
+            Some(REFUND_CAROL),
+            "failed revisions write nothing"
+        );
+        e.amend_refund_address(ALICE, BOB, REFUND_DAVE).unwrap();
+        assert_eq!(e.refund_to(), Some(REFUND_DAVE));
+    }
+
+    #[test]
+    fn amend_refund_address_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-468: Funded-only — the Uninitialized builder owns the
+        // initial binding, and a live dispute or a terminal escrow
+        // settles under the address it started under. The pause
+        // guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Uninitialized: the address is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_refund_address(REFUND_CAROL)
+            .unwrap();
+        assert_eq!(
+            bare.amend_refund_address(ALICE, BOB, REFUND_DAVE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.refund_to(), Some(REFUND_CAROL));
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_refund_address(REFUND_CAROL)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_refund_address(ALICE, BOB, REFUND_DAVE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.refund_to(), Some(REFUND_CAROL));
+        // Disputed: the address stays while the dispute is in
+        // flight — the dispute settles under the address it
+        // started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_refund_address(REFUND_CAROL)
+            .unwrap();
+        d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let disputed_at = EXPIRES_AT - 3_500;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_refund_address(ALICE, BOB, REFUND_DAVE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.refund_to(),
+            Some(REFUND_CAROL),
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's address is history, not a
+        // live route to re-point.
+        let mut e = refund_address_funded_escrow();
+        e.cancel(ALICE, None, REFUND_CAROL, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_refund_address(ALICE, BOB, REFUND_DAVE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.refund_to(), Some(REFUND_CAROL));
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_refund_address(REFUND_CAROL)
+            .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_refund_address(ALICE, BOB, REFUND_DAVE),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_refund_address(MALLORY, BOB, REFUND_DAVE),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.refund_to(),
+            Some(REFUND_CAROL),
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_refund_address(ALICE, BOB, REFUND_DAVE).unwrap();
+        assert_eq!(paused.refund_to(), Some(REFUND_DAVE));
+    }
+
+    #[test]
+    fn amend_refund_address_rejects_zero_address() {
+        // AV-468: the builder's gate, unchanged — a zero key can
+        // never be a legitimate refund destination, and a failed
+        // amendment leaves the address untouched.
+        assert_eq!(EscrowError::RefundAddressMismatch.code(), 116);
+        let mut e = refund_address_funded_escrow();
+        assert_eq!(
+            e.amend_refund_address(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::RefundAddressMismatch)
+        );
+        assert_eq!(
+            e.refund_to(),
+            Some(REFUND_CAROL),
+            "failed revision writes nothing"
+        );
+        // The builder gate agrees: binding a zero address is refused
+        // before funding too.
+        let err = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_refund_address([0u8; 32])
+            .unwrap_err();
+        assert_eq!(err, EscrowError::RefundAddressMismatch);
+    }
+
+    #[test]
+    fn amend_refund_address_noop_on_same_recipient() {
+        // AV-468: re-affirming the current effective recipient is a
+        // no-op — it succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = refund_address_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_refund_address(ALICE, BOB, REFUND_CAROL).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-recipient re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.refund_to(), Some(REFUND_CAROL));
+        // With no whitelist bound, the effective recipient is the
+        // initializer — re-affirming the initializer's key is the
+        // same no-op (and the only way to ask for the default route).
+        let mut plain =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(plain.refund_to(), None);
+        assert_eq!(plain.refund_recipient(), ALICE);
+        let plain_before = super::account_space_tests::encode_escrow(&plain);
+        plain.amend_refund_address(ALICE, BOB, ALICE).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&plain),
+            plain_before,
+            "re-affirming the initializer on an unbound escrow writes nothing"
+        );
+        assert_eq!(
+            plain.refund_to(),
+            None,
+            "the no-op creates no unbind-to-None path"
+        );
+    }
+
+    #[test]
+    fn amend_refund_address_emits_only_on_change() {
+        // AV-468: the program handler emits RefundAddressAmended
+        // only when the address actually changes — the before/after
+        // comparison in the handler skips the event on a no-op
+        // re-affirmation (mirrors `amend_referrer`). At the
+        // state-machine level the same-recipient call writes nothing
+        // — the encoded escrow is byte-identical before and after,
+        // so there is nothing to emit about — while a real change
+        // moves the field, which is what the handler's emission keys
+        // on. The INSTRUCTIONS entry pins the change-only event in
+        // the spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_refund_address")
+            .expect("INSTRUCTIONS carries amend_refund_address");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = refund_address_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_refund_address(ALICE, BOB, REFUND_CAROL).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-recipient re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_refund_address(ALICE, BOB, REFUND_DAVE).unwrap();
+        assert_eq!(e.refund_to(), Some(REFUND_DAVE));
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_refund_address_routes_next_cancel_only() {
+        // AV-468: the cancel paths read the address live through
+        // refund_recipient, so a cancel after the amendment routes
+        // to the new address while a cancel before it routed to the
+        // old one. A cancel settled before the amendment keeps the
+        // destination it paid: the pre-amendment cancel requires the
+        // old address, the post-amendment cancel requires the new
+        // one.
+        let mut settled = refund_address_funded_escrow();
+        assert_eq!(
+            settled.cancel(ALICE, None, REFUND_DAVE, EXPIRES_AT - 3_600),
+            Err(EscrowError::RefundAddressMismatch),
+            "before the amendment the new address is not the recipient"
+        );
+        let (refund, _) = settled
+            .cancel(ALICE, None, REFUND_CAROL, EXPIRES_AT - 3_600)
+            .unwrap();
+        assert_eq!(refund, 1_000_000);
+        assert_eq!(settled.state(), EscrowState::Cancelled);
+        let mut e = refund_address_funded_escrow();
+        assert_eq!(e.refund_recipient(), REFUND_CAROL);
+        e.amend_refund_address(ALICE, BOB, REFUND_DAVE).unwrap();
+        assert_eq!(e.refund_recipient(), REFUND_DAVE);
+        assert_eq!(
+            e.cancel(ALICE, None, REFUND_CAROL, EXPIRES_AT - 3_600),
+            Err(EscrowError::RefundAddressMismatch),
+            "after the amendment the old address is no longer the recipient"
+        );
+        let (refund, _) = e
+            .cancel(ALICE, None, REFUND_DAVE, EXPIRES_AT - 3_600)
+            .unwrap();
+        assert_eq!(refund, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Cancelled);
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -66250,6 +66615,19 @@ pub(crate) mod anchor_idl_tests {
             "amend_penalty_escalation",
             "cap_bps",
             "penalty_escalation_cap_bps",
+        ),
+        // AV-468: the post-funding refund-address revision rewrites
+        // the 32-byte `refund_to` tail field in place — a second
+        // param source for `refund_to`, like
+        // `initialize_refund_address`'s refund_to param. Only the
+        // address moves — the initializer/taker identities and any
+        // settled refund are untouched, so the next cancel routes to
+        // the new address while a cancel already settled keeps the
+        // destination it paid.
+        (
+            "amend_refund_address",
+            "new_refund_to",
+            "refund_to",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -96300,6 +96678,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_penalty_escalation"),
             [127, 220, 220, 118, 206, 235, 195, 117]
+        );
+    }
+
+    #[test]
+    fn amend_refund_address_instruction_discriminator_is_pinned() {
+        // AV-468. IDL:
+        // sha256("global:amend_refund_address")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_refund_address"),
+            [23, 174, 219, 129, 213, 248, 239, 53]
         );
     }
 

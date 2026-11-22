@@ -1478,6 +1478,14 @@
       ]
     },
     {
+      "name": "amend_refund_address",
+      "discriminator": [23, 174, 219, 129, 213, 248, 239, 53],
+      "accounts": [],
+      "args": [
+        {"name": "new_refund_to", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

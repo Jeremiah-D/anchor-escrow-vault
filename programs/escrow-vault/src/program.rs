@@ -8140,6 +8140,67 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the whitelisted refund address after funding (AV-468;
+    /// mirrors `Escrow::amend_refund_address`). Unconditional
+    /// dual-signature governance: both initializer and taker sign —
+    /// one party alone cannot re-point the other's refund. `Funded`
+    /// only — the builder owns the initial binding. A paused escrow
+    /// fails fast (`Paused`, before the authority gate). A zero
+    /// address is `RefundAddressMismatch` (code 116, the builder's
+    /// gate, unchanged). Re-affirming the current effective
+    /// recipient (the whitelist when set, else the initializer) is a
+    /// no-op: it succeeds, writes nothing and emits nothing. There
+    /// is no unbind-to-`None` path — callers that want the default
+    /// route pass the initializer's key. No delay path covers this
+    /// method — `GovernanceAction` has no `AmendRefundAddress`
+    /// variant, so the direct call is the only entry point. Emits
+    /// `RefundAddressAmended` (from == to == the current state)
+    /// only on an actual change; a no-op re-affirmation stays
+    /// silent (mirrors `amend_referrer`). Only `refund_to` changes
+    /// — the initializer/taker identities and any settled refund
+    /// are untouched, so the cancel paths read the live address at
+    /// the next cancel while a refund already settled keeps the
+    /// destination it paid.
+    pub fn amend_refund_address(
+        ctx: Context<AmendRefundAddress>,
+        new_refund_to: Pubkey,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.refund_to();
+        escrow
+            .amend_refund_address(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_refund_to.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 32-byte `refund_to` region in place — no
+        // realloc. Only the address moves; the state and the
+        // initializer/taker identities are untouched.
+        // Emits only on an actual change; a no-op re-affirmation
+        // stays silent (mirrors `amend_referrer`).
+        if escrow.refund_to() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::RefundAddressAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -15522,6 +15583,22 @@ pub struct AmendSlashLadder<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendPenaltyEscalation<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-468: accounts for `amend_refund_address` — the
+/// whitelisted-refund-address revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendRefundAddress<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
