@@ -8443,6 +8443,114 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the vesting unlock curve's shape after funding (AV-472;
+    /// mirrors `Escrow::amend_vesting_curve`, the AV-290 pure-logic
+    /// revision). Unconditional dual-signature governance: both
+    /// initializer and taker sign — one party alone cannot rewrite
+    /// the unlock timeline on the other's share, paralleling
+    /// `amend_vesting_schedule`. `Funded` only — the builder owns
+    /// the initial shape. A paused escrow fails fast (`Paused`,
+    /// before the authority gate). Only a curve already configured
+    /// may be revised — a curve-less escrow is `InvalidVesting`
+    /// (code 107, fail-closed: post-funding installation would
+    /// price the unlock under a shape the taker never funded
+    /// under). The mirror curve carries tiers only — the window it
+    /// must fit comes from the live vesting schedule and is checked
+    /// by the state machine, so the conversion validates the shape
+    /// here against the widest possible window (mirroring the
+    /// `GovernanceAction::AmendVestingCurve` execute path): an
+    /// empty or oversized tier table, non-monotone timestamps or
+    /// unlock fractions, a bps above 10_000, or a final tier below
+    /// full unlock is `InvalidVestingCurve` (code 147). The new
+    /// curve's tier window must fall inside the live schedule's
+    /// `[start, end]` (the `with_vesting_curve` attach gate, judged
+    /// against the live schedule, via `InvalidVestingCurve`, code
+    /// 147), and the anti-clawback floor mirrors
+    /// `amend_vesting_schedule`: the new curve priced at `now`
+    /// over the live schedule must vest at least what the taker
+    /// already claimed (`InvalidVesting`, with the AV-51 cliff
+    /// gating inside the pricing). There is deliberately no clearing
+    /// path: the signature takes a `VestingCurve` by value, never
+    /// an `Option`, so a configured curve cannot be removed to
+    /// `None`. On a delay-opted-in escrow the direct call is refused
+    /// (`GovernanceActionNotProposed`, code 219) — the curve moves
+    /// only through the AV-158 propose/execute protocol
+    /// (`GovernanceAction` kind 8, no new variant, no new program
+    /// instruction for propose/execute — both already exist).
+    /// Re-affirming the current curve is a no-op: it succeeds,
+    /// writes nothing and emits nothing. Only `vesting_curve`
+    /// changes — the linear schedule table, the cliff, the locked
+    /// amount and the state are untouched — and the 82-byte curve
+    /// region is already resident, so the revision rewrites it in
+    /// place with no layout change. The claim paths read the curve
+    /// live through `VestingCurve::vested_amount`, so a new shape
+    /// governs the next `claim` the moment the amendment lands,
+    /// while an amount already claimed keeps the shape it settled
+    /// under. Emits `VestingCurveAmended` (from == to == the
+    /// current state) only on an actual change; a no-op
+    /// re-affirmation stays silent (mirrors
+    /// `amend_payout_split_shares`). `now` comes from the clock
+    /// sysvar, never an instruction param (mirrors
+    /// `amend_payout_split_shares`).
+    pub fn amend_vesting_curve(
+        ctx: Context<AmendVestingCurve>,
+        curve: VestingCurve,
+    ) -> Result<()> {
+        // The mirror curve carries tiers only — the window it must
+        // fit comes from the live vesting schedule and is checked by
+        // the state machine, so the conversion validates the shape
+        // here against the widest possible window (mirrors the
+        // `GovernanceAction::AmendVestingCurve` execute path).
+        if curve.count == 0 || curve.count as usize > 8 {
+            return Err(escrow_error(
+                escrow_state::EscrowError::InvalidVestingCurve,
+            ));
+        }
+        let mut tuples = [(0u64, 0u16); 8];
+        for (i, t) in curve.tiers[..curve.count as usize].iter().enumerate() {
+            tuples[i] = (t.at, t.unlocked_bps);
+        }
+        let state_curve =
+            escrow_state::VestingCurve::stepped(&tuples[..curve.count as usize], 0, u64::MAX)
+                .map_err(|e| escrow_error(e))?;
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.vesting_curve();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_vesting_curve(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                state_curve,
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 82-byte `vesting_curve` region in place — no
+        // realloc. Only the curve moves; the linear schedule table,
+        // the cliff, the locked amount and the state are untouched.
+        // Emits only on an actual change; a same-curve no-op stays
+        // silent (mirrors `amend_payout_split_shares`).
+        if escrow.vesting_curve() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::VestingCurveAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -15889,6 +15997,22 @@ pub struct AmendPriceGate<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendTwapGate<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-472: accounts for `amend_vesting_curve` — the
+/// vesting-curve revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendVestingCurve<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

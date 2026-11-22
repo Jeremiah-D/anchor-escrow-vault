@@ -1515,6 +1515,14 @@
       ]
     },
     {
+      "name": "amend_vesting_curve",
+      "discriminator": [97, 245, 3, 155, 89, 88, 44, 48],
+      "accounts": [],
+      "args": [
+        {"name": "curve", "type": {"defined": "VestingCurve"}}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

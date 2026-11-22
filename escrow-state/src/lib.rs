@@ -22243,7 +22243,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// revises it `Funded`-only and never installs one. Orthogonal
     /// to [`Escrow::amend_vesting_schedule`]: that changes the
     /// linear table (start / end / cliff) the shape prices over;
-    /// this changes the non-linear shape itself. Emits
+    /// this changes the non-linear shape itself. AV-472 wires
+    /// this revision to the chain as the program-level
+    /// `amend_vesting_curve` Anchor instruction. Emits
     /// `VestingCurveAmended` on the event layer, except for the
     /// no-op re-affirmation.
     pub fn amend_vesting_curve(
@@ -43003,6 +43005,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "window_slots/target/direction/max_staleness_secs <- params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial gate set); only a gate already configured may be revised — a TWAP-ungated escrow is InvalidTwapGate (code 187, fail-closed: post-funding installation would add a release restriction the taker never funded under); no delay path covers this method — GovernanceAction has no AmendTwapGate variant, so the direct call is the only entry point and no delayed handler is staged; there is deliberately no clearing path (the gate rides as four scalar args, never an Option, so a configured gate cannot be removed to None); window_slots == 0 or target == 0 is InvalidTwapGate (code 187, the builders' gate, unchanged — a zero window is a single-point gate in disguise and a zero threshold can never be a deliberate policy) and leaves the escrow untouched; re-affirming the current gate is a no-op (succeeds, writes nothing, emits no event, paralleling amend_price_gate); the revision replaces the gate wholesale — window_slots, target, direction and max_staleness_secs together, never partially; only twap_gate changes — amount, released, fees_paid, state and the single-point price gate are untouched, and the gated payout paths read the gate live through require_twap_gate, so a new gate governs the next release_twap_gated / claim_twap_gated the moment the amendment lands — including the full-window history coverage requirement, so a shorter window can pass on history the old window could not cover — while a payout already settled keeps the gate it settled under, and the gated routing itself never changes; emits the TwapGateAmended indexer event only on an actual change (from == to == the current state); the 26-byte gate region is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-472: revise the vesting unlock curve's shape
+            // after funding — the program-level entry point for
+            // the AV-290 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_vesting_curve")[..8]
+            // = [97, 245, 3, 155, 89, 88, 44, 48] — the Anchor
+            // instruction discriminator for the
+            // amend_vesting_curve handler (pinned by the
+            // discriminator test below).
+            name: "amend_vesting_curve",
+            params: &[(
+                "curve",
+                "VestingCurve",
+                "instruction param; the replacement unlock curve as a whole — up to 8 tiers of (at, unlocked_bps), validated by VestingCurve::stepped against the widest window at the program layer (an empty or oversized table, non-monotone timestamps or unlock fractions, a bps above 10_000, or a final tier below full unlock is InvalidVestingCurve, code 147) and re-checked against the live schedule by the state machine",
+            )],
+            method: "Escrow::amend_vesting_curve",
+            input_mapping: "curve <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial shape); only a curve already configured may be revised — a curve-less escrow is InvalidVesting (code 107, fail-closed: post-funding installation would price the unlock under a shape the taker never funded under); the new curve's tier window must fall inside the live schedule's [start, end] (InvalidVestingCurve, code 147, judged against the live schedule — a schedule amend_vesting_schedule moved since creation is judged as it stands) and the anti-clawback floor mirrors amend_vesting_schedule (the new curve priced at now over the live schedule must vest at least what the taker already claimed, InvalidVesting, with the AV-51 cliff gating inside the pricing); on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219 — the curve moves only through the propose/execute protocol, GovernanceAction kind 8, with no new proposal variant); there is deliberately no clearing path (the curve rides as a VestingCurve by value, never an Option, so a configured curve cannot be removed to None); re-affirming the current curve is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); the revision replaces the curve wholesale — all tiers together, never partially; only vesting_curve changes — the linear schedule table, the cliff, the locked amount and the state are untouched, and the claim paths read the curve live through VestingCurve::vested_amount, so a new shape governs the next claim the moment the amendment lands — a claim after the amendment unlocks under the new shape while an amount already claimed keeps the shape it settled under; emits the VestingCurveAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param); the 82-byte curve region is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -44025,6 +44046,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-262 pure-logic revision wired to
             // the chain).
             "Escrow::amend_twap_gate",
+            // AV-472: the program-level vesting-curve
+            // revision (the AV-290 pure-logic revision wired to
+            // the chain).
+            "Escrow::amend_vesting_curve",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44168,7 +44193,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-468 adds `amend_refund_address`;
         // AV-469 adds `amend_reference`;
         // AV-470 adds `amend_price_gate`;
-        // AV-471 adds `amend_twap_gate`.)
+        // AV-471 adds `amend_twap_gate`;
+        // AV-472 adds `amend_vesting_curve`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -44635,6 +44661,13 @@ pub(crate) mod anchor_idl_tests {
                 // settled under; re-affirming the current gate
                 // is a no-op.
                 &"amend_twap_gate",
+                // AV-472: the vesting-curve revision carries the
+                // replacement curve (VestingCurve) — the whole
+                // unlock shape, wholesale; the claim paths re-read
+                // the live curve at the next claim, while an amount
+                // already claimed keeps the shape it settled under;
+                // re-affirming the current curve is a no-op.
+                &"amend_vesting_curve",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -64109,6 +64142,473 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!((payout, fee), (1_000_000, 0));
     }
 
+    // AV-472: the program-level vesting-curve revision — the
+    // AV-290 pure-logic revision wired to the chain.
+    const VEST_START: u64 = 1_700_000_000;
+    const VEST_MID: u64 = 1_750_000_000;
+    const VEST_END: u64 = 1_800_000_000;
+
+    fn floor_curve() -> VestingCurve {
+        VestingCurve::stepped(
+            &[(VEST_MID, 2_500), (VEST_END, 10_000)],
+            VEST_START,
+            VEST_END,
+        )
+        .unwrap()
+    }
+
+    fn ceiling_curve() -> VestingCurve {
+        VestingCurve::stepped(
+            &[(VEST_MID, 5_000), (VEST_END, 10_000)],
+            VEST_START,
+            VEST_END,
+        )
+        .unwrap()
+    }
+
+    fn funded_curved_vesting_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting_curve(
+                VestingSchedule::new(VEST_START, VEST_END).unwrap(),
+                floor_curve(),
+            )
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_vesting_curve_maps_param_to_vesting_curve_field() {
+        // IDL: amend_vesting_curve(curve: VestingCurve) —
+        // curve <- param; initializer <- accounts.initializer
+        // (signer) AND taker <- accounts.taker (signer), enforced
+        // by the Anchor account constraints and the state machine's
+        // dual-signature gate. The param rewrites the
+        // `vesting_curve` region in place (see PARAM_FIELD_MAP) —
+        // no layout change. The INSTRUCTIONS spec entry pins the
+        // program-level wiring: the single curve param and the
+        // AV-290 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_vesting_curve")
+            .expect("INSTRUCTIONS carries amend_vesting_curve");
+        assert_eq!(spec.method, "Escrow::amend_vesting_curve");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "curve");
+        assert_eq!(spec.params[0].1, "VestingCurve");
+        assert!(
+            spec.input_mapping.contains("VestingCurveAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the curve arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_vesting_curve\""),
+            "checked-in IDL carries amend_vesting_curve"
+        );
+        assert!(
+            idl.contains("[97, 245, 3, 155, 89, 88, 44, 48]"),
+            "checked-in IDL pins the AV-472 discriminator"
+        );
+        assert!(
+            idl.contains(
+                "{\"name\": \"curve\", \"type\": {\"defined\": \"VestingCurve\"}}"
+            ),
+            "checked-in IDL carries the curve arg"
+        );
+        // Only the curve moves: the amounts, the state and the
+        // layout are untouched.
+        let mut e = funded_curved_vesting_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.vesting_curve(), Some(floor_curve()));
+        e.amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_START)
+            .unwrap();
+        assert_eq!(e.vesting_curve(), Some(ceiling_curve()));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(
+            e.vesting_schedule(),
+            Some(VestingSchedule::new(VEST_START, VEST_END).unwrap()),
+            "the linear table is untouched"
+        );
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "curve rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_vesting_curve_rejects_single_party_and_strangers() {
+        // AV-472: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // rewrite the unlock timeline on the other's share.
+        let mut e = funded_curved_vesting_escrow();
+        assert_eq!(
+            e.amend_vesting_curve(ALICE, ALICE, ceiling_curve(), VEST_START),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_vesting_curve(MALLORY, BOB, ceiling_curve(), VEST_START),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_vesting_curve(MALLORY, MALLORY, ceiling_curve(), VEST_START),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.vesting_curve(),
+            Some(floor_curve()),
+            "failed revisions write nothing"
+        );
+        e.amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_START)
+            .unwrap();
+        assert_eq!(e.vesting_curve(), Some(ceiling_curve()));
+    }
+
+    #[test]
+    fn amend_vesting_curve_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-472: Funded-only — the Uninitialized builder owns the
+        // initial shape, and a live dispute or a terminal escrow
+        // settles under the shape it started under. The pause
+        // guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Uninitialized: the shape is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting_curve(
+                VestingSchedule::new(VEST_START, VEST_END).unwrap(),
+                floor_curve(),
+            )
+            .unwrap();
+        assert_eq!(
+            bare.amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_START),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.vesting_curve(), Some(floor_curve()));
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_vesting_curve(
+                    VestingSchedule::new(VEST_START, VEST_END).unwrap(),
+                    floor_curve(),
+                )
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_START),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.vesting_curve(), Some(floor_curve()));
+        // Disputed: the shape stays while the dispute is in
+        // flight — the dispute settles under the shape it
+        // started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_vesting_curve(
+                VestingSchedule::new(VEST_START, VEST_END).unwrap(),
+                floor_curve(),
+            )
+            .unwrap();
+        d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let disputed_at = EXPIRES_AT - 3_500;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_START),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.vesting_curve(),
+            Some(floor_curve()),
+            "disputed revision writes nothing"
+        );
+        // Terminal: a fully claimed escrow's shape is history, not
+        // a live condition to reshape.
+        let mut e = funded_curved_vesting_escrow();
+        let (payout, _) = e.claim(BOB, VEST_END, None, BOB).unwrap();
+        assert_eq!(payout, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_END),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.vesting_curve(), Some(floor_curve()));
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_vesting_curve(
+                VestingSchedule::new(VEST_START, VEST_END).unwrap(),
+                floor_curve(),
+            )
+            .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_START),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_vesting_curve(MALLORY, BOB, ceiling_curve(), VEST_START),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.vesting_curve(),
+            Some(floor_curve()),
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused
+            .amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_START)
+            .unwrap();
+        assert_eq!(paused.vesting_curve(), Some(ceiling_curve()));
+    }
+
+    #[test]
+    fn amend_vesting_curve_refuses_curve_less() {
+        // AV-472: fail-closed — a curve-less escrow can never
+        // acquire a curve after funding, and a failed amendment
+        // leaves it curve-less.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
+            .unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(plain.vesting_curve(), None);
+        assert_eq!(
+            plain.amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_START),
+            Err(EscrowError::InvalidVesting)
+        );
+        assert_eq!(EscrowError::InvalidVesting.code(), 107);
+        assert_eq!(
+            plain.vesting_curve(),
+            None,
+            "no curve installed by the refusal"
+        );
+    }
+
+    #[test]
+    fn amend_vesting_curve_rejects_window_outside_schedule() {
+        // AV-472: a curve whose tier window escapes the live
+        // schedule is refused — the construction window is wider
+        // than the live one, so the final tier lands past the
+        // live end.
+        let mut e = funded_curved_vesting_escrow();
+        let wide = VestingCurve::stepped(
+            &[(VEST_MID, 5_000), (1_900_000_000, 10_000)],
+            VEST_START,
+            1_900_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            e.amend_vesting_curve(ALICE, BOB, wide, VEST_START),
+            Err(EscrowError::InvalidVestingCurve)
+        );
+        assert_eq!(EscrowError::InvalidVestingCurve.code(), 147);
+        assert_eq!(
+            e.vesting_curve(),
+            Some(floor_curve()),
+            "a failed amendment leaves the curve untouched"
+        );
+    }
+
+    #[test]
+    fn amend_vesting_curve_rejects_clawback_below_claimed() {
+        // AV-472: a quarter claimed at the midpoint; a reshaped
+        // curve that would vest only a tenth at that moment rewrites
+        // the settled quarter backwards — refused, curve untouched.
+        let mut e = funded_curved_vesting_escrow();
+        let (payout, _) = e.claim(BOB, VEST_MID, None, BOB).unwrap();
+        assert_eq!(payout, 250_000);
+        assert_eq!(e.released_amount(), 250_000);
+        let clawback = VestingCurve::stepped(
+            &[(VEST_MID, 1_000), (VEST_END, 10_000)],
+            VEST_START,
+            VEST_END,
+        )
+        .unwrap();
+        assert_eq!(
+            e.amend_vesting_curve(ALICE, BOB, clawback, VEST_MID),
+            Err(EscrowError::InvalidVesting)
+        );
+        assert_eq!(
+            e.vesting_curve(),
+            Some(floor_curve()),
+            "a failed amendment leaves the curve untouched"
+        );
+        assert_eq!(e.released_amount(), 250_000);
+    }
+
+    #[test]
+    fn amend_vesting_curve_noop_on_same_curve() {
+        // AV-472: re-affirming the current curve is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = funded_curved_vesting_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_vesting_curve(ALICE, BOB, floor_curve(), VEST_START)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-curve re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.vesting_curve(), Some(floor_curve()));
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_START)
+            .unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_START)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised curve writes nothing either"
+        );
+        assert_eq!(e.vesting_curve(), Some(ceiling_curve()));
+    }
+
+    #[test]
+    fn amend_vesting_curve_emits_only_on_change() {
+        // AV-472: the program handler emits VestingCurveAmended
+        // only when the curve actually changes — the before/after
+        // comparison in the handler skips the event on a no-op
+        // re-affirmation (mirrors `amend_payout_split_shares`). At
+        // the state-machine level the same-curve call writes nothing
+        // — the encoded escrow is byte-identical before and after,
+        // so there is nothing to emit about — while a real change
+        // moves the field, which is what the handler's emission keys
+        // on. The INSTRUCTIONS entry pins the change-only event in
+        // the spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_vesting_curve")
+            .expect("INSTRUCTIONS carries amend_vesting_curve");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = funded_curved_vesting_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_vesting_curve(ALICE, BOB, floor_curve(), VEST_START)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-curve re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_START)
+            .unwrap();
+        assert_eq!(e.vesting_curve(), Some(ceiling_curve()));
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_vesting_curve_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-472: the program handler emits `VestingCurveAmended`
+        // only when the curve actually changes — the indexed wrapper
+        // is the event-layer mirror of the handler's before/after
+        // comparison. A failed revision emits nothing, a no-op
+        // re-affirmation emits nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const NOW: u64 = 1_700_000_000;
+        let mut e = IndexedEscrow::wrap([0x1D; 32], funded_curved_vesting_escrow());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_vesting_curve(ALICE, MALLORY, ceiling_curve(), NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_vesting_curve(ALICE, BOB, ceiling_curve(), NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::VestingCurveAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same curve is a no-op: no new event.
+        e.amend_vesting_curve(ALICE, BOB, ceiling_curve(), NOW + 1)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_vesting_curve_retunes_curve_and_next_claim_reads_live_curve() {
+        // AV-472: floor 2_500 bps at the midpoint replaced wholesale
+        // by ceiling 5_000 bps — the tiers move together, never
+        // partially. The claim paths read the curve live, so the new
+        // shape governs the next claim the moment the amendment
+        // lands — while an amount already claimed keeps the shape it
+        // settled under.
+        let mut e = funded_curved_vesting_escrow();
+        assert_eq!(e.claimable_amount(VEST_MID), 250_000);
+        e.amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_START)
+            .unwrap();
+        assert_eq!(e.vesting_curve(), Some(ceiling_curve()));
+        assert_eq!(
+            e.claimable_amount(VEST_MID),
+            500_000,
+            "the live curve prices the next claim"
+        );
+        let (payout, fee) = e.claim(BOB, VEST_MID, None, BOB).unwrap();
+        assert_eq!((payout, fee), (500_000, 0));
+        // At the end the new shape has vested everything, so the
+        // next pull is everything minus the half already claimed.
+        let (payout, _) = e.claim(BOB, VEST_END, None, BOB).unwrap();
+        assert_eq!(payout, 500_000);
+        assert_eq!(e.released_amount(), 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_vesting_curve_refuses_direct_on_delay_opted_in() {
+        // AV-472: on a delay-opted-in escrow the curve moves only
+        // through the propose/execute protocol (GovernanceAction
+        // kind 8) — the direct call is refused, whatever the shape.
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_vesting_curve(
+                VestingSchedule::new(VEST_START, VEST_END).unwrap(),
+                floor_curve(),
+            )
+            .unwrap();
+        delayed.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(
+            delayed.amend_vesting_curve(ALICE, BOB, ceiling_curve(), VEST_START),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(EscrowError::GovernanceActionNotProposed.code(), 219);
+        assert_eq!(delayed.vesting_curve(), Some(floor_curve()));
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -67978,6 +68478,19 @@ pub(crate) mod anchor_idl_tests {
             "amend_twap_gate",
             "max_staleness_secs",
             "twap_gate",
+        ),
+        // AV-472: the post-funding vesting-curve revision
+        // rewrites the 82-byte `vesting_curve` region in place —
+        // a second param source for `vesting_curve`, like
+        // `initialize_vesting_curve`'s tiers param. Only the
+        // curve moves — the linear schedule table, the cliff, the
+        // locked amount and the state are untouched, so the next
+        // claim prices through the new shape live, while an amount
+        // already claimed keeps the shape it settled under.
+        (
+            "amend_vesting_curve",
+            "curve",
+            "vesting_curve",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -98076,6 +98589,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_twap_gate"),
             [42, 9, 58, 138, 7, 188, 13, 251]
+        );
+    }
+
+    #[test]
+    fn amend_vesting_curve_instruction_discriminator_is_pinned() {
+        // AV-472. IDL:
+        // sha256("global:amend_vesting_curve")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_vesting_curve"),
+            [97, 245, 3, 155, 89, 88, 44, 48]
         );
     }
 

@@ -336,6 +336,10 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         "Vec<String>" => IdlType::Vec(Box::new(IdlType::Str)),
         // AV-158: the propose_governance instruction's staged action.
         "GovernanceAction" => IdlType::Named("GovernanceAction"),
+        // AV-472: the amend_vesting_curve instruction's replacement
+        // curve — a whole VestingCurve by value (tiers only; the
+        // window is judged against the live schedule).
+        "VestingCurve" => IdlType::Named("VestingCurve"),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         // AV-130: the initiate_release instruction's optional SPL mint
         // binding (a real pubkey, not raw bytes).
