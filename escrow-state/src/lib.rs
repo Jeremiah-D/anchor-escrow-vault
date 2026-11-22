@@ -42867,6 +42867,32 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_rungs <- param (Vec<(u64, u16)> tuple ladder, wire-identical to Vec<SlashRung> — the IDL spells it as the named SlashRung ladder, paralleling initialize_slash_ladder); `now` <- clock sysvar on the Anchor layer (never an instruction param); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial ladder set); no delay path covers this method — GovernanceAction has no AmendSlashLadder variant, so the direct call is the only entry point and no delayed handler is staged; only an escrow already carrying a ladder may revise — an escrow with no ladder (plain, or flat-terms) is InvalidSlashLadder (code 184, fail-closed: post-funding installation would add a penalty clause the taker never funded under, so a ladder can never be installed after funding); the consumed prefix is immutable rung-by-rung (the cursor is the next rung's index), the new table must hold at least the consumed count and at most 8 rungs, stay strictly ascending in deadline and bps with each bps <= 10_000, and no future rung may be backdated before `now` — every violation is InvalidSlashLadder (code 184, the builder's validation, unchanged) and leaves the escrow untouched; re-affirming the current table is a no-op (succeeds, writes nothing, emits no event); only the future rungs change — penalty_account, penalty_paid already banked and the consumption cursor are untouched (the cursor is deliberately not reset), so the next slash prices from the new rung at the same cursor while a slash already settled keeps the rung it settled under, and the slash path reads the live rung at the next eligibility check (now >= rung deadline), so tightening can make an unexecuted default slashable at once while loosening can defer an already-satisfied but unexecuted eligibility; emits the SlashLadderAmended indexer event only on an actual change (from == to == the current state); the 113-byte ladder region (32 + 8×(8+2) + 1) is rewritten in place with the tail slots zeroed - no layout / rent change",
         },
         InstructionSpec {
+            // AV-467: retune the penalty-escalation schedule after
+            // funding — the program-level entry point for the AV-257
+            // pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_penalty_escalation")[..8]
+            // = [127, 220, 220, 118, 206, 235, 195, 117] — the Anchor
+            // instruction discriminator for the
+            // amend_penalty_escalation handler (pinned by the
+            // discriminator test below).
+            name: "amend_penalty_escalation",
+            params: &[
+                (
+                    "rate_bps_per_day",
+                    "u16",
+                    "instruction param; the new daily escalation rate in basis points — how fast the expiry-cancel penalty grows per whole day past the expiry gate",
+                ),
+                (
+                    "cap_bps",
+                    "u16",
+                    "instruction param; the new escalation cap in basis points — the ceiling the effective penalty rate can never exceed",
+                ),
+            ],
+            method: "Escrow::amend_penalty_escalation",
+            input_mapping: "rate_bps_per_day/cap_bps <- params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial schedule set); no delay path covers this method — GovernanceAction has no AmendPenaltyEscalation variant, so the direct call is the only entry point and no delayed handler is staged; rate_bps_per_day > 10_000 or cap_bps > 10_000 is InvalidPenalty (code 117, the builder's gate, unchanged) and leaves the escrow untouched; 0 is legal for either field (a 0 rate means no further escalation from here on, a 0 cap means the escalation is capped at 0 — the builder's 0 semantics, and a cap below the base rate degrades to the fixed base rate, never shrinking the penalty already agreed); re-affirming the current (rate, cap) pair is a no-op (succeeds, writes nothing, emits no event); only penalty_escalation_rate_bps/penalty_escalation_cap_bps change — penalty_bps and the meter origin (expires_at + grace) are untouched, so the escalation headroom is recomputed live as cap minus the unchanged base while a cancel already settled keeps the penalty it charged, and the cancel gate reads the live schedule at the next expiry cancel (effective_penalty_bps / expiry_cancel_penalty_at recompute from the live pair at every cancel_expired), so tightening can raise an already-late cancel's penalty at once while loosening can lower it; emits the PenaltyEscalationAmended indexer event only on an actual change (from == to == the current state); the two u16 tail fields are rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43869,6 +43895,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-237 pure-logic revision wired to
             // the chain).
             "Escrow::amend_slash_ladder",
+            // AV-467: the program-level penalty-escalation
+            // revision (the AV-257 pure-logic revision wired to
+            // the chain).
+            "Escrow::amend_penalty_escalation",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44429,6 +44459,16 @@ pub(crate) mod anchor_idl_tests {
                 // the consumption cursor are untouched, so the next
                 // slash prices from the new rung at the same cursor.
                 &"amend_slash_ladder",
+                // AV-467: the schedule-revision pair (u16, u16) — the
+                // new daily escalation rate and cap in basis points;
+                // either above 10_000 is InvalidPenalty (code 117),
+                // 0 is legal (a 0 rate means no further escalation, a
+                // 0 cap means the escalation is capped at 0 — the
+                // builder's 0 semantics), and penalty_bps / the meter
+                // origin are untouched, so the next expiry cancel
+                // prices live from the new schedule while a cancel
+                // already settled keeps the penalty it charged.
+                &"amend_penalty_escalation",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -61979,6 +62019,448 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(paused.slash_ladder().unwrap().rungs[0].bps, 200);
     }
 
+    // AV-467: the program-level penalty-escalation revision — the
+    // AV-257 pure-logic revision wired to the chain.
+    fn penalty_escalation_funded_escrow() -> Escrow {
+        // AV-467 helper: a funded escrow with base 250 bps and an
+        // escalation schedule of 100 bps/day capped at 1_000 bps — the
+        // same shape the AV-257 pure-logic tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap()
+            .with_penalty_escalation(100, 1_000)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_penalty_escalation_maps_params_to_schedule_fields() {
+        // IDL: amend_penalty_escalation(rate_bps_per_day: u16,
+        // cap_bps: u16) — rate_bps_per_day/cap_bps <- params;
+        // initializer <- accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The pair rewrites the `penalty_escalation_rate_bps` /
+        // `penalty_escalation_cap_bps` tail fields in place (see
+        // PARAM_FIELD_MAP) — no layout change. The INSTRUCTIONS
+        // spec entry pins the program-level wiring: the two u16
+        // params and the AV-257 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_penalty_escalation")
+            .expect("INSTRUCTIONS carries amend_penalty_escalation");
+        assert_eq!(spec.method, "Escrow::amend_penalty_escalation");
+        assert_eq!(spec.params.len(), 2);
+        assert_eq!(spec.params[0].0, "rate_bps_per_day");
+        assert_eq!(spec.params[0].1, "u16");
+        assert_eq!(spec.params[1].0, "cap_bps");
+        assert_eq!(spec.params[1].1, "u16");
+        assert!(
+            spec.input_mapping.contains("PenaltyEscalationAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the two args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_penalty_escalation\""),
+            "checked-in IDL carries amend_penalty_escalation"
+        );
+        assert!(
+            idl.contains("[127, 220, 220, 118, 206, 235, 195, 117]"),
+            "checked-in IDL pins the AV-467 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"rate_bps_per_day\", \"type\": \"u16\"}"),
+            "checked-in IDL carries the rate_bps_per_day arg"
+        );
+        assert!(
+            idl.contains("{\"name\": \"cap_bps\", \"type\": \"u16\"}"),
+            "checked-in IDL carries the cap_bps arg"
+        );
+        // Only the two schedule fields move: the base rate, the
+        // meter origin and the layout are untouched.
+        let mut e = penalty_escalation_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.penalty_bps(), 250);
+        assert_eq!(e.penalty_escalation_base(), EXPIRES_AT);
+        e.amend_penalty_escalation(ALICE, BOB, 200, 2_000).unwrap();
+        assert_eq!(e.penalty_escalation_rate_bps(), 200);
+        assert_eq!(e.penalty_escalation_cap_bps(), 2_000);
+        assert_eq!(e.penalty_bps(), 250, "the base rate is untouched");
+        assert_eq!(
+            e.penalty_escalation_base(),
+            EXPIRES_AT,
+            "the meter origin never moves"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "schedule fields rewritten in place, no layout change"
+        );
+        // New schedule: base 250 + 200/day, capped at 2_000 — 10
+        // days late the meter is at the cap.
+        assert_eq!(
+            e.effective_penalty_bps(EXPIRES_AT + 10 * SLASH_LADDER_DAY),
+            2_000
+        );
+        assert_eq!(
+            e.expiry_cancel_penalty_at(
+                1_000_000,
+                EXPIRES_AT + 10 * SLASH_LADDER_DAY
+            ),
+            200_000
+        );
+    }
+
+    #[test]
+    fn amend_penalty_escalation_rejects_single_party_and_strangers() {
+        // AV-467: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // retune the other's delay meter.
+        let mut e = penalty_escalation_funded_escrow();
+        assert_eq!(
+            e.amend_penalty_escalation(ALICE, ALICE, 200, 2_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_penalty_escalation(MALLORY, BOB, 200, 2_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_penalty_escalation(MALLORY, MALLORY, 200, 2_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            (
+                e.penalty_escalation_rate_bps(),
+                e.penalty_escalation_cap_bps()
+            ),
+            (100, 1_000),
+            "failed revisions write nothing"
+        );
+        e.amend_penalty_escalation(ALICE, BOB, 200, 2_000).unwrap();
+        assert_eq!(
+            (
+                e.penalty_escalation_rate_bps(),
+                e.penalty_escalation_cap_bps()
+            ),
+            (200, 2_000)
+        );
+    }
+
+    #[test]
+    fn amend_penalty_escalation_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-467: Funded-only — the Uninitialized builder owns the
+        // initial schedule set, and a live dispute or a terminal
+        // escrow settles under the schedule it started under. The
+        // pause guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Uninitialized: the schedule is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap()
+            .with_penalty_escalation(100, 1_000)
+            .unwrap();
+        assert_eq!(
+            bare.amend_penalty_escalation(ALICE, BOB, 200, 2_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            (
+                bare.penalty_escalation_rate_bps(),
+                bare.penalty_escalation_cap_bps()
+            ),
+            (100, 1_000)
+        );
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_penalty_bps(250)
+                .unwrap()
+                .with_penalty_escalation(100, 1_000)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_penalty_escalation(ALICE, BOB, 200, 2_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            (
+                activated.penalty_escalation_rate_bps(),
+                activated.penalty_escalation_cap_bps()
+            ),
+            (100, 1_000)
+        );
+        // Disputed: the schedule stays while the dispute is in
+        // flight — the dispute settles under the schedule it
+        // started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap()
+            .with_penalty_escalation(100, 1_000)
+            .unwrap();
+        d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let disputed_at = EXPIRES_AT - 3_500;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_penalty_escalation(ALICE, BOB, 200, 2_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            (
+                d.penalty_escalation_rate_bps(),
+                d.penalty_escalation_cap_bps()
+            ),
+            (100, 1_000),
+            "disputed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow's schedule is history, not
+        // a live table to retune.
+        let mut e = penalty_escalation_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_penalty_escalation(ALICE, BOB, 200, 2_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            (
+                e.penalty_escalation_rate_bps(),
+                e.penalty_escalation_cap_bps()
+            ),
+            (100, 1_000)
+        );
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_penalty_bps(250)
+            .unwrap()
+            .with_penalty_escalation(100, 1_000)
+            .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_penalty_escalation(ALICE, BOB, 200, 2_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_penalty_escalation(MALLORY, BOB, 200, 2_000),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            (
+                paused.penalty_escalation_rate_bps(),
+                paused.penalty_escalation_cap_bps()
+            ),
+            (100, 1_000),
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_penalty_escalation(ALICE, BOB, 200, 2_000).unwrap();
+        assert_eq!(
+            (
+                paused.penalty_escalation_rate_bps(),
+                paused.penalty_escalation_cap_bps()
+            ),
+            (200, 2_000)
+        );
+    }
+
+    #[test]
+    fn amend_penalty_escalation_rejects_rate_or_cap_above_10000() {
+        // AV-467: the builder's gate, unchanged — neither the rate
+        // nor the cap may exceed 100%, and a failed amendment leaves
+        // the schedule untouched. The 10_000 boundary is legal for
+        // both fields, and 0 is legal (a 0 rate means no further
+        // escalation, a 0 cap means the escalation is capped at 0 —
+        // the builder's 0 semantics).
+        assert_eq!(EscrowError::InvalidPenalty.code(), 117);
+        let mut e = penalty_escalation_funded_escrow();
+        assert_eq!(
+            e.amend_penalty_escalation(ALICE, BOB, 10_001, 1_000),
+            Err(EscrowError::InvalidPenalty)
+        );
+        assert_eq!(
+            e.amend_penalty_escalation(ALICE, BOB, 100, 10_001),
+            Err(EscrowError::InvalidPenalty)
+        );
+        assert_eq!(
+            e.amend_penalty_escalation(ALICE, BOB, 10_001, 10_001),
+            Err(EscrowError::InvalidPenalty)
+        );
+        assert_eq!(
+            (
+                e.penalty_escalation_rate_bps(),
+                e.penalty_escalation_cap_bps()
+            ),
+            (100, 1_000),
+            "failed revisions write nothing"
+        );
+        e.amend_penalty_escalation(ALICE, BOB, 10_000, 10_000).unwrap();
+        assert_eq!(
+            (
+                e.penalty_escalation_rate_bps(),
+                e.penalty_escalation_cap_bps()
+            ),
+            (10_000, 10_000)
+        );
+        e.amend_penalty_escalation(ALICE, BOB, 0, 0).unwrap();
+        assert_eq!(
+            (
+                e.penalty_escalation_rate_bps(),
+                e.penalty_escalation_cap_bps()
+            ),
+            (0, 0)
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        // A zeroed schedule prices the next expiry cancel at the
+        // fixed base rate only.
+        assert_eq!(
+            e.effective_penalty_bps(EXPIRES_AT + 30 * SLASH_LADDER_DAY),
+            250
+        );
+    }
+
+    #[test]
+    fn amend_penalty_escalation_noop_on_same_pair() {
+        // AV-467: re-affirming the current (rate, cap) pair is a
+        // no-op — it succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = penalty_escalation_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_penalty_escalation(ALICE, BOB, 100, 1_000).unwrap();
+        assert_eq!(
+            (
+                e.penalty_escalation_rate_bps(),
+                e.penalty_escalation_cap_bps()
+            ),
+            (100, 1_000)
+        );
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-pair re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        // A second identical re-affirmation is likewise a no-op.
+        e.amend_penalty_escalation(ALICE, BOB, 100, 1_000).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a second same-pair re-affirmation still writes nothing"
+        );
+    }
+
+    #[test]
+    fn amend_penalty_escalation_emits_only_on_change() {
+        // AV-467: the program handler emits PenaltyEscalationAmended
+        // only when the schedule actually changes — the before/after
+        // comparison in the handler skips the event on a same-pair
+        // re-affirmation (mirrors `rotate_taker`). At the
+        // state-machine level the same-pair call writes nothing — the
+        // encoded escrow is byte-identical before and after, so there
+        // is nothing to emit about — while a real change moves the
+        // fields, which is what the handler's emission keys on. The
+        // INSTRUCTIONS entry pins the change-only event in the spec
+        // table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_penalty_escalation")
+            .expect("INSTRUCTIONS carries amend_penalty_escalation");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = penalty_escalation_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_penalty_escalation(ALICE, BOB, 100, 1_000).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-pair re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_penalty_escalation(ALICE, BOB, 200, 2_000).unwrap();
+        assert_eq!(
+            (
+                e.penalty_escalation_rate_bps(),
+                e.penalty_escalation_cap_bps()
+            ),
+            (200, 2_000)
+        );
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the fields, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_penalty_escalation_reprices_next_expiry_cancel_only() {
+        // AV-467: 250 base + 100/day, capped at 1_000: 30 days late
+        // the meter is at the cap (1_000 bps). Retuning to 10/day
+        // capped at 500 drops the next cancel to 500 bps — and the
+        // base rate and expiry gate never move. A cancel settled
+        // before the amendment keeps the penalty it charged: the
+        // pre-amendment schedule prices a parallel settlement at
+        // 100_000 while the post-amendment cancel prices at 50_000.
+        const DAY: u64 = 86_400;
+        let mut settled = penalty_escalation_funded_escrow();
+        let (settled_refund, _, settled_penalty) = settled
+            .cancel_expired(BOB, EXPIRES_AT + 30 * DAY, None, ALICE)
+            .unwrap();
+        assert_eq!((settled_refund, settled_penalty), (900_000, 100_000));
+        let mut e = penalty_escalation_funded_escrow();
+        assert_eq!(e.effective_penalty_bps(EXPIRES_AT + 30 * DAY), 1_000);
+        e.amend_penalty_escalation(ALICE, BOB, 10, 500).unwrap();
+        assert_eq!(e.penalty_escalation_rate_bps(), 10);
+        assert_eq!(e.penalty_escalation_cap_bps(), 500);
+        assert_eq!(e.penalty_bps(), 250, "the base rate is untouched");
+        assert_eq!(
+            e.penalty_escalation_base(),
+            EXPIRES_AT,
+            "the meter origin never moves"
+        );
+        assert_eq!(e.effective_penalty_bps(EXPIRES_AT + 30 * DAY), 500);
+        assert_eq!(e.state(), EscrowState::Funded, "amending moves no state");
+        let (refund, _, penalty) = e
+            .cancel_expired(BOB, EXPIRES_AT + 30 * DAY, None, ALICE)
+            .unwrap();
+        assert_eq!((refund, penalty), (950_000, 50_000));
+        assert_ne!(
+            penalty, settled_penalty,
+            "the settled cancel keeps the penalty it charged"
+        );
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -65749,6 +66231,25 @@ pub(crate) mod anchor_idl_tests {
             "amend_slash_ladder",
             "new_rungs",
             "slash_ladder",
+        ),
+        // AV-467: the post-funding escalation-schedule revision
+        // rewrites the two u16 tail fields in place — a second param
+        // source for `penalty_escalation_rate_bps` /
+        // `penalty_escalation_cap_bps`, like
+        // `initialize_penalty_escalation`'s rate/cap params. Only
+        // the schedule moves — `penalty_bps` and the meter origin
+        // (expires_at + grace) are never rewritten, so the next
+        // expiry cancel prices from the new schedule while a cancel
+        // already settled keeps the penalty it charged.
+        (
+            "amend_penalty_escalation",
+            "rate_bps_per_day",
+            "penalty_escalation_rate_bps",
+        ),
+        (
+            "amend_penalty_escalation",
+            "cap_bps",
+            "penalty_escalation_cap_bps",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -95787,6 +96288,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_streaming_fee"),
             [4, 76, 137, 237, 34, 5, 174, 37]
+        );
+    }
+
+    #[test]
+    fn amend_penalty_escalation_instruction_discriminator_is_pinned() {
+        // AV-467. IDL:
+        // sha256("global:amend_penalty_escalation")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_penalty_escalation"),
+            [127, 220, 220, 118, 206, 235, 195, 117]
         );
     }
 

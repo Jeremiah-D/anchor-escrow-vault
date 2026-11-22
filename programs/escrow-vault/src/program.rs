@@ -8072,6 +8072,74 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Retune the penalty-escalation schedule after funding (AV-467;
+    /// mirrors `Escrow::amend_penalty_escalation`). Unconditional
+    /// dual-signature governance: both initializer and taker sign —
+    /// one party alone cannot retune the other's delay meter.
+    /// `Funded` only — the builder owns the initial schedule set. A
+    /// paused escrow fails fast (`Paused`, before the authority
+    /// gate). `rate_bps_per_day > 10_000` or `cap_bps > 10_000` is
+    /// `InvalidPenalty` (code 117, the builder's gate, unchanged);
+    /// `0` is legal for either field (a `0` rate means no further
+    /// escalation from here on, a `0` cap means the escalation is
+    /// capped at `0` — the builder's `0` semantics). No delay path
+    /// covers this method — `GovernanceAction` has no
+    /// `AmendPenaltyEscalation` variant, so the direct call is the
+    /// only entry point. Emits `PenaltyEscalationAmended` (from ==
+    /// to == the current state) only on an actual change; a
+    /// same-pair no-op stays silent (mirrors `rotate_taker`). Only
+    /// the two `u16` schedule fields change — `penalty_bps` and the
+    /// meter origin (`expires_at` + grace) are untouched, so the
+    /// cancel gate reads the live schedule at the next expiry
+    /// cancel while a cancel already settled keeps the penalty it
+    /// charged.
+    pub fn amend_penalty_escalation(
+        ctx: Context<AmendPenaltyEscalation>,
+        rate_bps_per_day: u16,
+        cap_bps: u16,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = (
+            escrow.penalty_escalation_rate_bps(),
+            escrow.penalty_escalation_cap_bps(),
+        );
+        escrow
+            .amend_penalty_escalation(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                rate_bps_per_day,
+                cap_bps,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the two `u16` schedule fields in place — no
+        // realloc. Only the rate and cap move; the base rate and
+        // the meter origin are untouched.
+        // Emits only on an actual change; a same-pair no-op stays
+        // silent (mirrors `rotate_taker`).
+        if (escrow.penalty_escalation_rate_bps(), escrow.penalty_escalation_cap_bps())
+            != before
+        {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::PenaltyEscalationAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -15438,6 +15506,22 @@ pub struct AmendDeadmanInactivity<'info> {
 /// enforces this — one party alone is `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendSlashLadder<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-467: accounts for `amend_penalty_escalation` — the
+/// penalty-escalation-schedule revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendPenaltyEscalation<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

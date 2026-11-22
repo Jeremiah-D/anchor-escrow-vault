@@ -1469,6 +1469,15 @@
       ]
     },
     {
+      "name": "amend_penalty_escalation",
+      "discriminator": [127, 220, 220, 118, 206, 235, 195, 117],
+      "accounts": [],
+      "args": [
+        {"name": "rate_bps_per_day", "type": "u16"},
+        {"name": "cap_bps", "type": "u16"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
