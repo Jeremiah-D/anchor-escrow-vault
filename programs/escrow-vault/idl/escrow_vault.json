@@ -1531,6 +1531,15 @@
       ]
     },
     {
+      "name": "amend_dutch_auction_window",
+      "discriminator": [188, 166, 232, 233, 57, 199, 108, 79],
+      "accounts": [],
+      "args": [
+        {"name": "new_start_at", "type": "u64"},
+        {"name": "new_end_at", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
