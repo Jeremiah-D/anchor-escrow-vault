@@ -8551,6 +8551,77 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the Dutch auction's reserve floor after funding (AV-473;
+    /// mirrors `Escrow::amend_dutch_auction_reserve_bps`, the AV-277
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot move
+    /// the floor on the other's share, paralleling `amend_fee_cap`.
+    /// `Funded` only — the builder owns the initial auction set. A
+    /// paused escrow fails fast (`Paused`, before the authority
+    /// gate). Only an escrow already carrying an auction may revise —
+    /// an auction-less escrow is `InvalidAuctionParams` (code 155,
+    /// fail-closed: post-funding installation would add a pricing
+    /// curve the taker never funded under). Only before the window
+    /// opens (`now < start_at`) may the floor move — at the open,
+    /// live, or after the close the revision is `AuctionNotActive`
+    /// (code 156). The new floor reuses the `DutchAuction::new` gate
+    /// (`> 10_000` is `InvalidAuctionParams`). Re-affirming the
+    /// current floor is a no-op: it succeeds, writes nothing and
+    /// emits nothing. No delay path covers this method —
+    /// `GovernanceAction` has no `AmendDutchAuctionReserveBps`
+    /// variant, so the direct call is the only entry point. Emits
+    /// `DutchAuctionReserveBpsAmended` (from == to == the current
+    /// state) only on an actual change; a no-op re-affirmation stays
+    /// silent (mirrors `amend_price_gate`). Only `reserve_bps`
+    /// changes — `start_at` and `end_at` are untouched, so the window
+    /// does not move. The claim paths read the floor live through
+    /// `DutchAuction::payout_cap`, so a new floor governs the next
+    /// `claim` the moment the amendment lands — while a claim already
+    /// settled keeps the cap it settled under. `now` comes from the
+    /// clock sysvar, never an instruction param (mirrors
+    /// `amend_vesting_curve`).
+    pub fn amend_dutch_auction_reserve_bps(
+        ctx: Context<AmendDutchAuctionReserveBps>,
+        new_reserve_bps: u16,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.auction().map(|a| a.reserve_bps());
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_dutch_auction_reserve_bps(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_reserve_bps,
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 2-byte `reserve_bps` field in place — no
+        // realloc. Only the floor moves; the window, the amounts,
+        // the state and the initializer/taker identities are untouched.
+        // Emits only on an actual change; a no-op re-affirmation
+        // stays silent (mirrors `amend_price_gate`).
+        if escrow.auction().map(|a| a.reserve_bps()) != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::DutchAuctionReserveBpsAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -16013,6 +16084,22 @@ pub struct AmendTwapGate<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendVestingCurve<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-473: accounts for `amend_dutch_auction_reserve_bps` — the
+/// Dutch-auction reserve-floor revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendDutchAuctionReserveBps<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

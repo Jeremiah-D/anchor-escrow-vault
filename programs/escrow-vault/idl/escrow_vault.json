@@ -1523,6 +1523,14 @@
       ]
     },
     {
+      "name": "amend_dutch_auction_reserve_bps",
+      "discriminator": [220, 34, 206, 90, 191, 37, 59, 83],
+      "accounts": [],
+      "args": [
+        {"name": "new_reserve_bps", "type": "u16"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
