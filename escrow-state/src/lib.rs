@@ -30032,7 +30032,9 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// item is the post-funding revision), to AV-128 (that is the
     /// TWAP gate mechanism itself, this item is its parameters)
     /// and to AV-261 (that is the single-point gate — a separate
-    /// gate struct and region, untouched by this revision). Emits
+    /// gate struct and region, untouched by this revision). AV-471
+    /// wires this revision to the chain as the program-level
+    /// `amend_twap_gate` Anchor instruction. Emits
     /// `TwapGateAmended` on the event layer, except for the
     /// no-op re-affirmation.
     pub fn amend_twap_gate(
@@ -42965,6 +42967,42 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "direction/target/max_staleness_secs <- params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial gate set); only a gate already configured may be revised — an ungated escrow is InvalidPriceGate (code 176, fail-closed: post-funding installation would add a release restriction the taker never funded under); no delay path covers this method — GovernanceAction has no AmendPriceGate variant, so the direct call is the only entry point and no delayed handler is staged; there is deliberately no clearing path (the gate rides as three scalar args, never an Option, so a configured gate cannot be removed to None); target == 0 is InvalidPriceGate (code 176, the builder's gate, unchanged — a zero threshold can never be a deliberate policy) and leaves the escrow untouched; re-affirming the current gate is a no-op (succeeds, writes nothing, emits no event, paralleling amend_interest_rate); the revision replaces the gate wholesale — direction, target and max_staleness_secs together, never partially; only price_gate changes — amount, released, fees_paid, state and the TWAP gate are untouched, and the gated payout paths read the gate live through require_price_gate, so a new gate governs the next release_price_gated / claim_price_gated the moment the amendment lands — tightening can make an in-flight escrow immediately fail the gate, loosening can satisfy it — while a payout already settled keeps the gate it settled under, and the gated routing itself never changes; emits the PriceGateAmended indexer event only on an actual change (from == to == the current state); the 18-byte gate region is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-471: revise the TWAP price gate after
+            // funding — the program-level entry point for the AV-262
+            // pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_twap_gate")[..8]
+            // = [42, 9, 58, 138, 7, 188, 13, 251] — the Anchor
+            // instruction discriminator for the
+            // amend_twap_gate handler (pinned by the
+            // discriminator test below).
+            name: "amend_twap_gate",
+            params: &[
+                (
+                    "window_slots",
+                    "u64",
+                    "instruction param; the replacement TWAP window in Solana slots, ending at the evaluation slot — must be > 0 (InvalidTwapGate, code 187, otherwise; a zero window is a single-point gate in disguise)",
+                ),
+                (
+                    "target",
+                    "u64",
+                    "instruction param; the replacement threshold TWAP in the oracle's quote units — must be > 0 (InvalidTwapGate, code 187, otherwise)",
+                ),
+                (
+                    "direction",
+                    "u8",
+                    "instruction param; 0 = TWAP must sit at or above target (AtOrAbove), 1 = at or below (AtOrBelow); any other byte is InvalidTwapGate on decode, rejected at the gate",
+                ),
+                (
+                    "max_staleness_secs",
+                    "u64",
+                    "instruction param; the replacement maximum latest-quote age in seconds — a quote with now - observed_at beyond this is stale and fails the gate (TwapGateNotSatisfied, code 186)",
+                ),
+            ],
+            method: "Escrow::amend_twap_gate",
+            input_mapping: "window_slots/target/direction/max_staleness_secs <- params; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial gate set); only a gate already configured may be revised — a TWAP-ungated escrow is InvalidTwapGate (code 187, fail-closed: post-funding installation would add a release restriction the taker never funded under); no delay path covers this method — GovernanceAction has no AmendTwapGate variant, so the direct call is the only entry point and no delayed handler is staged; there is deliberately no clearing path (the gate rides as four scalar args, never an Option, so a configured gate cannot be removed to None); window_slots == 0 or target == 0 is InvalidTwapGate (code 187, the builders' gate, unchanged — a zero window is a single-point gate in disguise and a zero threshold can never be a deliberate policy) and leaves the escrow untouched; re-affirming the current gate is a no-op (succeeds, writes nothing, emits no event, paralleling amend_price_gate); the revision replaces the gate wholesale — window_slots, target, direction and max_staleness_secs together, never partially; only twap_gate changes — amount, released, fees_paid, state and the single-point price gate are untouched, and the gated payout paths read the gate live through require_twap_gate, so a new gate governs the next release_twap_gated / claim_twap_gated the moment the amendment lands — including the full-window history coverage requirement, so a shorter window can pass on history the old window could not cover — while a payout already settled keeps the gate it settled under, and the gated routing itself never changes; emits the TwapGateAmended indexer event only on an actual change (from == to == the current state); the 26-byte gate region is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43983,6 +44021,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-261 pure-logic revision wired to
             // the chain).
             "Escrow::amend_price_gate",
+            // AV-471: the program-level TWAP-price-gate
+            // revision (the AV-262 pure-logic revision wired to
+            // the chain).
+            "Escrow::amend_twap_gate",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44125,7 +44167,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-462 adds `amend_slot_timelock`;
         // AV-468 adds `amend_refund_address`;
         // AV-469 adds `amend_reference`;
-        // AV-470 adds `amend_price_gate`.)
+        // AV-470 adds `amend_price_gate`;
+        // AV-471 adds `amend_twap_gate`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -44579,6 +44622,19 @@ pub(crate) mod anchor_idl_tests {
                 // it settled under; re-affirming the current gate
                 // is a no-op.
                 &"amend_price_gate",
+                // AV-471: the TWAP-gate revision carries the
+                // window (u64), the target TWAP (u64), the
+                // direction (u8) and the staleness bound (u64) —
+                // the replacement gate, wholesale; the gated
+                // payout paths re-read the live gate at the next
+                // release_twap_gated / claim_twap_gated —
+                // including the full-window history coverage
+                // requirement, so a shorter window can pass on
+                // history the old window could not cover — while
+                // a payout already settled keeps the gate it
+                // settled under; re-affirming the current gate
+                // is a no-op.
+                &"amend_twap_gate",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -63616,6 +63672,443 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!((payout, fee), (1_000_000, 0));
     }
 
+    // AV-471: the program-level TWAP-price-gate revision — the
+    // AV-262 pure-logic revision wired to the chain.
+    fn ceiling_twap_gate() -> TwapGate {
+        TwapGate {
+            direction: PriceDirection::AtOrBelow,
+            target: 50_000,
+            window_slots: 50,
+            max_staleness_secs: 60,
+        }
+    }
+
+    /// A feed whose history holds `price` for the whole window:
+    /// one sample at the window's left edge (a sample at or before
+    /// the window start covers the window — see `compute_twap`).
+    fn constant_twap_feed(
+        price: u64,
+        window_start: u64,
+        observed_at: u64,
+    ) -> ScriptedPriceFeed {
+        ScriptedPriceFeed::new(
+            PriceQuote { price, observed_at },
+            vec![PriceSample {
+                slot: window_start,
+                price,
+            }],
+        )
+    }
+
+    #[test]
+    fn amend_twap_gate_maps_params_to_twap_gate_field() {
+        // IDL: amend_twap_gate(window_slots: u64, target: u64,
+        // direction: u8, max_staleness_secs: u64) —
+        // window_slots/target/direction/max_staleness_secs <-
+        // params; initializer <- accounts.initializer (signer) AND
+        // taker <- accounts.taker (signer), enforced by the Anchor
+        // account constraints and the state machine's dual-signature
+        // gate. The params rewrite the `twap_gate` region in place
+        // (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the four scalar params and the AV-262 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_twap_gate")
+            .expect("INSTRUCTIONS carries amend_twap_gate");
+        assert_eq!(spec.method, "Escrow::amend_twap_gate");
+        assert_eq!(spec.params.len(), 4);
+        assert_eq!(spec.params[0].0, "window_slots");
+        assert_eq!(spec.params[0].1, "u64");
+        assert_eq!(spec.params[1].0, "target");
+        assert_eq!(spec.params[1].1, "u64");
+        assert_eq!(spec.params[2].0, "direction");
+        assert_eq!(spec.params[2].1, "u8");
+        assert_eq!(spec.params[3].0, "max_staleness_secs");
+        assert_eq!(spec.params[3].1, "u64");
+        assert!(
+            spec.input_mapping.contains("TwapGateAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the four args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_twap_gate\""),
+            "checked-in IDL carries amend_twap_gate"
+        );
+        assert!(
+            idl.contains("[42, 9, 58, 138, 7, 188, 13, 251]"),
+            "checked-in IDL pins the AV-471 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"window_slots\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the window_slots arg"
+        );
+        assert!(
+            idl.contains("{\"name\": \"target\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the target arg"
+        );
+        assert!(
+            idl.contains("{\"name\": \"direction\", \"type\": \"u8\"}"),
+            "checked-in IDL carries the direction arg"
+        );
+        assert!(
+            idl.contains("{\"name\": \"max_staleness_secs\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the max_staleness_secs arg"
+        );
+        // Only the gate moves: the amounts, the state and the
+        // layout are untouched.
+        let mut e = twap_gated_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.twap_gate(), Some(floor_twap_gate()));
+        e.amend_twap_gate(ALICE, BOB, ceiling_twap_gate()).unwrap();
+        assert_eq!(e.twap_gate(), Some(ceiling_twap_gate()));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "gate rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_twap_gate_rejects_single_party_and_strangers() {
+        // AV-471: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // retune the averaged market condition the other's payout
+        // waits on.
+        let mut e = twap_gated_escrow();
+        assert_eq!(
+            e.amend_twap_gate(ALICE, ALICE, ceiling_twap_gate()),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_twap_gate(MALLORY, BOB, ceiling_twap_gate()),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_twap_gate(MALLORY, MALLORY, ceiling_twap_gate()),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.twap_gate(),
+            Some(floor_twap_gate()),
+            "failed revisions write nothing"
+        );
+        e.amend_twap_gate(ALICE, BOB, ceiling_twap_gate()).unwrap();
+        assert_eq!(e.twap_gate(), Some(ceiling_twap_gate()));
+    }
+
+    #[test]
+    fn amend_twap_gate_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-471: Funded-only — the Uninitialized builder owns the
+        // initial gate, and a live dispute or a terminal escrow
+        // settles under the gate it started under. The pause
+        // guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Uninitialized: the gate is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_twap_gate(100, 100_000, PriceDirection::AtOrAbove)
+            .unwrap();
+        assert_eq!(
+            bare.amend_twap_gate(ALICE, BOB, ceiling_twap_gate()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.twap_gate(), Some(floor_twap_gate()));
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_twap_gate(100, 100_000, PriceDirection::AtOrAbove)
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_twap_gate(ALICE, BOB, ceiling_twap_gate()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.twap_gate(), Some(floor_twap_gate()));
+        // Disputed: the gate stays while the dispute is in
+        // flight — the dispute settles under the gate it
+        // started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_twap_gate(100, 100_000, PriceDirection::AtOrAbove)
+            .unwrap();
+        d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let disputed_at = EXPIRES_AT - 3_500;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_twap_gate(ALICE, BOB, ceiling_twap_gate()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.twap_gate(),
+            Some(floor_twap_gate()),
+            "disputed revision writes nothing"
+        );
+        // Terminal: a released escrow's gate is history, not a
+        // live condition to retune.
+        let mut e = twap_gated_escrow();
+        e.release(ALICE, 1_000_000, 1_000_000, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.amend_twap_gate(ALICE, BOB, ceiling_twap_gate()),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.twap_gate(), Some(floor_twap_gate()));
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_twap_gate(100, 100_000, PriceDirection::AtOrAbove)
+            .unwrap();
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_twap_gate(ALICE, BOB, ceiling_twap_gate()),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_twap_gate(MALLORY, BOB, ceiling_twap_gate()),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.twap_gate(),
+            Some(floor_twap_gate()),
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_twap_gate(ALICE, BOB, ceiling_twap_gate()).unwrap();
+        assert_eq!(paused.twap_gate(), Some(ceiling_twap_gate()));
+    }
+
+    #[test]
+    fn amend_twap_gate_refuses_ungated() {
+        // AV-471: fail-closed — a TWAP-ungated escrow can never
+        // acquire a gate after funding, and a failed amendment
+        // leaves it ungated.
+        let mut ungated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        ungated.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(ungated.twap_gate(), None);
+        assert_eq!(
+            ungated.amend_twap_gate(ALICE, BOB, floor_twap_gate()),
+            Err(EscrowError::InvalidTwapGate)
+        );
+        assert_eq!(EscrowError::InvalidTwapGate.code(), 187);
+        assert_eq!(ungated.twap_gate(), None, "no gate installed by the refusal");
+        // Even a zero window cannot smuggle a gate in — the
+        // gate-presence gate fires first.
+        assert_eq!(
+            ungated.amend_twap_gate(
+                ALICE,
+                BOB,
+                TwapGate {
+                    direction: PriceDirection::AtOrAbove,
+                    target: 100_000,
+                    window_slots: 0,
+                    max_staleness_secs: 300,
+                }
+            ),
+            Err(EscrowError::InvalidTwapGate)
+        );
+        assert_eq!(ungated.twap_gate(), None);
+    }
+
+    #[test]
+    fn amend_twap_gate_rejects_zero_window_or_target() {
+        // AV-471: the builders' gate, unchanged — a zero window is
+        // a single-point gate in disguise and a zero threshold can
+        // never be a deliberate policy.
+        let mut e = twap_gated_escrow();
+        assert_eq!(
+            e.amend_twap_gate(
+                ALICE,
+                BOB,
+                TwapGate {
+                    direction: PriceDirection::AtOrAbove,
+                    target: 100_000,
+                    window_slots: 0,
+                    max_staleness_secs: 300,
+                }
+            ),
+            Err(EscrowError::InvalidTwapGate)
+        );
+        assert_eq!(
+            e.amend_twap_gate(
+                ALICE,
+                BOB,
+                TwapGate {
+                    direction: PriceDirection::AtOrAbove,
+                    target: 0,
+                    window_slots: 100,
+                    max_staleness_secs: 300,
+                }
+            ),
+            Err(EscrowError::InvalidTwapGate)
+        );
+        assert_eq!(EscrowError::InvalidTwapGate.code(), 187);
+        assert_eq!(
+            e.twap_gate(),
+            Some(floor_twap_gate()),
+            "failed revisions write nothing"
+        );
+    }
+
+    #[test]
+    fn amend_twap_gate_noop_on_same_gate() {
+        // AV-471: re-affirming the current gate is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = twap_gated_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_twap_gate(ALICE, BOB, floor_twap_gate()).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-gate re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.twap_gate(), Some(floor_twap_gate()));
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_twap_gate(ALICE, BOB, ceiling_twap_gate()).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_twap_gate(ALICE, BOB, ceiling_twap_gate()).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised gate writes nothing either"
+        );
+        assert_eq!(e.twap_gate(), Some(ceiling_twap_gate()));
+    }
+
+    #[test]
+    fn amend_twap_gate_emits_only_on_change() {
+        // AV-471: the program handler emits TwapGateAmended
+        // only when the gate actually changes — the before/after
+        // comparison in the handler skips the event on a no-op
+        // re-affirmation (mirrors `amend_price_gate`). At the
+        // state-machine level the same-gate call writes nothing
+        // — the encoded escrow is byte-identical before and after,
+        // so there is nothing to emit about — while a real change
+        // moves the field, which is what the handler's emission keys
+        // on. The INSTRUCTIONS entry pins the change-only event in
+        // the spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_twap_gate")
+            .expect("INSTRUCTIONS carries amend_twap_gate");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = twap_gated_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_twap_gate(ALICE, BOB, floor_twap_gate()).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-gate re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_twap_gate(ALICE, BOB, ceiling_twap_gate()).unwrap();
+        assert_eq!(e.twap_gate(), Some(ceiling_twap_gate()));
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_twap_gate_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-471: the program handler emits `TwapGateAmended`
+        // only when the gate actually changes — the indexed wrapper
+        // is the event-layer mirror of the handler's before/after
+        // comparison. A failed revision emits nothing, a no-op
+        // re-affirmation emits nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const NOW: u64 = 1_700_000_000;
+        let mut e = IndexedEscrow::wrap([0x1D; 32], twap_gated_escrow());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_twap_gate(ALICE, MALLORY, ceiling_twap_gate(), NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_twap_gate(ALICE, BOB, ceiling_twap_gate(), NOW).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::TwapGateAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same gate is a no-op: no new event.
+        e.amend_twap_gate(ALICE, BOB, ceiling_twap_gate(), NOW + 1)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_twap_gate_retunes_gate_and_next_release_reads_live_gate() {
+        // AV-471: floor 100_000 / 100 slots / 300s replaced
+        // wholesale by ceiling 50_000 / 50 slots / 60s: window,
+        // direction, target and staleness all move at once — there
+        // is no partial revision that could mix an old window with
+        // a new threshold. The gated payout paths read the gate
+        // live, so the new gate governs the next gated payout the
+        // moment the amendment lands — including the full-window
+        // history coverage requirement.
+        const T0: u64 = 1_700_000_000;
+        const S0: u64 = 10_000;
+        let mut e = twap_gated_escrow();
+        e.amend_twap_gate(ALICE, BOB, ceiling_twap_gate()).unwrap();
+        assert_eq!(e.twap_gate(), Some(ceiling_twap_gate()));
+        // Under the old floor, 40_000 would have failed; under the
+        // new ceiling it passes — the live gate governs. The single
+        // sample at slot 9_900 covers both the old 100-slot window
+        // and the new 50-slot window (a sample at or before the
+        // window start covers the window).
+        let cheap = constant_twap_feed(40_000, S0 - 100, T0);
+        e.require_twap_gate(&cheap, T0, S0).unwrap();
+        // Above the new ceiling fails, and a quote older than the
+        // new 60s bound fails even at a passing price.
+        let expensive = constant_twap_feed(60_000, S0 - 100, T0);
+        assert_eq!(
+            e.require_twap_gate(&expensive, T0, S0),
+            Err(EscrowError::TwapGateNotSatisfied)
+        );
+        let stale = constant_twap_feed(40_000, S0 - 100, T0 - 61);
+        assert_eq!(
+            e.require_twap_gate(&stale, T0, S0),
+            Err(EscrowError::TwapGateNotSatisfied)
+        );
+        // The gated payout path itself follows the new gate.
+        let (payout, fee) = e
+            .release_twap_gated(ALICE, T0, S0, 1_000_000, None, BOB, &cheap)
+            .unwrap();
+        assert_eq!((payout, fee), (1_000_000, 0));
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -67455,6 +67948,36 @@ pub(crate) mod anchor_idl_tests {
             "amend_price_gate",
             "max_staleness_secs",
             "price_gate",
+        ),
+        // AV-471: the post-funding TWAP-gate revision rewrites
+        // the 26-byte `twap_gate` region in place — a second
+        // param source for `twap_gate`, like
+        // `initialize_twap_gate`'s window_slots / target /
+        // direction / max_staleness_secs params. Only the gate
+        // moves — the amount, the released total, the fees, the
+        // state and the single-point gate are untouched, so the
+        // next gated payout reads the new gate live — including
+        // the full-window history coverage requirement — while a
+        // payout already settled keeps the gate it settled under.
+        (
+            "amend_twap_gate",
+            "window_slots",
+            "twap_gate",
+        ),
+        (
+            "amend_twap_gate",
+            "target",
+            "twap_gate",
+        ),
+        (
+            "amend_twap_gate",
+            "direction",
+            "twap_gate",
+        ),
+        (
+            "amend_twap_gate",
+            "max_staleness_secs",
+            "twap_gate",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -97541,6 +98064,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_price_gate"),
             [140, 17, 64, 167, 230, 89, 62, 195]
+        );
+    }
+
+    #[test]
+    fn amend_twap_gate_instruction_discriminator_is_pinned() {
+        // AV-471. IDL:
+        // sha256("global:amend_twap_gate")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_twap_gate"),
+            [42, 9, 58, 138, 7, 188, 13, 251]
         );
     }
 

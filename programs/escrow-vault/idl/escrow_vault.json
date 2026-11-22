@@ -1504,6 +1504,17 @@
       ]
     },
     {
+      "name": "amend_twap_gate",
+      "discriminator": [42, 9, 58, 138, 7, 188, 13, 251],
+      "accounts": [],
+      "args": [
+        {"name": "window_slots", "type": "u64"},
+        {"name": "target", "type": "u64"},
+        {"name": "direction", "type": "u8"},
+        {"name": "max_staleness_secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

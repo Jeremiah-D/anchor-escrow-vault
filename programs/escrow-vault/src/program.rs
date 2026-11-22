@@ -8348,6 +8348,101 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the TWAP price gate after funding (AV-471;
+    /// mirrors `Escrow::amend_twap_gate`, the AV-262 pure-logic
+    /// revision). Unconditional dual-signature governance: both
+    /// initializer and taker sign — one party alone cannot retune
+    /// the other's averaged market condition. `Funded` only — the
+    /// builder owns the initial gate set. A paused escrow fails fast
+    /// (`Paused`, before the authority gate). Only a gate already
+    /// configured may be revised — a TWAP-ungated escrow is
+    /// `InvalidTwapGate` (code 187, fail-closed: post-funding
+    /// installation would add a release restriction the taker never
+    /// funded under). There is deliberately no clearing path: the
+    /// gate rides as four scalar args (`window_slots`, `target`,
+    /// `direction`, `max_staleness_secs`), never an `Option`, so a
+    /// configured gate cannot be removed to `None`. A
+    /// `window_slots == 0` or `target == 0` is `InvalidTwapGate`
+    /// (the builders' gate, unchanged — a zero window is a
+    /// single-point gate in disguise and a zero threshold can never
+    /// be a deliberate policy). Re-affirming the current gate is a
+    /// no-op: it succeeds, writes nothing and emits nothing. No
+    /// delay path covers this method — `GovernanceAction` has no
+    /// `AmendTwapGate` variant, so the direct call is the only
+    /// entry point. Emits `TwapGateAmended`
+    /// (from == to == the current state) only on an actual change;
+    /// a no-op re-affirmation stays silent (mirrors
+    /// `amend_price_gate`). The revision replaces the gate
+    /// wholesale — `window_slots`, `target`, `direction` and
+    /// `max_staleness_secs` together, never partially. Only the
+    /// 26-byte gate region is rewritten in place — no layout
+    /// change. The gated payout paths read the gate live through
+    /// `require_twap_gate` (the release/claim handlers route to the
+    /// gated entry points only while `twap_gate` is `Some`), so a
+    /// new gate governs the next `release_twap_gated` /
+    /// `claim_twap_gated` the moment the amendment lands —
+    /// including the full-window history coverage requirement, so a
+    /// shorter window can pass on history the old window could not
+    /// cover — while a payout already settled keeps the gate it
+    /// settled under, and the gated routing itself never changes;
+    /// the single-point gate is untouched.
+    pub fn amend_twap_gate(
+        ctx: Context<AmendTwapGate>,
+        window_slots: u64,
+        target: u64,
+        direction: u8,
+        max_staleness_secs: u64,
+    ) -> Result<()> {
+        let direction = match direction {
+            0 => escrow_state::PriceDirection::AtOrAbove,
+            1 => escrow_state::PriceDirection::AtOrBelow,
+            _ => {
+                return Err(escrow_error(
+                    escrow_state::EscrowError::InvalidTwapGate,
+                ))
+            }
+        };
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.twap_gate();
+        escrow
+            .amend_twap_gate(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                escrow_state::TwapGate {
+                    direction,
+                    target,
+                    window_slots,
+                    max_staleness_secs,
+                },
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 26-byte `twap_gate` region in place — no
+        // realloc. Only the gate moves; the amounts, the state and
+        // the initializer/taker identities are untouched.
+        // Emits only on an actual change; a no-op re-affirmation
+        // stays silent (mirrors `amend_price_gate`).
+        if escrow.twap_gate() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::TwapGateAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -15778,6 +15873,22 @@ pub struct AmendReference<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendPriceGate<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-471: accounts for `amend_twap_gate` — the
+/// TWAP-price-gate revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendTwapGate<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
