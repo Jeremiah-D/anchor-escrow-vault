@@ -27465,10 +27465,11 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// rewritten. Orthogonal to [`Escrow::with_reference`] (AV-53,
     /// the `Uninitialized`-only initial set — this is the
     /// `Funded`-only revision path) and to [`Escrow::amend_decimals`]
-    /// (AV-376, same amend shape, different field). No new Anchor
-    /// instruction: pure logic layer, like the other `amend_*`
-    /// revisions. Emits `ReferenceAmended` on the event layer,
-    /// except for the no-op re-affirmation.
+    /// (AV-376, same amend shape, different field). AV-469 wires
+    /// this revision to the chain as the program-level
+    /// `amend_reference` Anchor instruction. Emits
+    /// `ReferenceAmended` on the event layer, except for the
+    /// no-op re-affirmation.
     pub fn amend_reference(
         &mut self,
         initializer: [u8; 32],
@@ -42912,6 +42913,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_refund_to <- param (Pubkey -> [u8; 32] conversion); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial binding); no delay path covers this method — GovernanceAction has no AmendRefundAddress variant, so the direct call is the only entry point and no delayed handler is staged; a zero address is RefundAddressMismatch (code 116, the builder's gate, unchanged) and leaves the escrow untouched; re-affirming the current effective recipient (the whitelist when set, else the initializer) is a no-op (succeeds, writes nothing, emits no event); there is deliberately no unbind-to-None path — callers that want the default route pass the initializer's key; only refund_to changes — the initializer/taker identities are never restated and no settled refund is ever rewritten, and the cancel paths read the address live through refund_recipient (refund_to.unwrap_or(initializer)) with require_refund_recipient checking the live address, so a cancel after the amendment routes to the new address while a cancel before it routed to the old one; emits the RefundAddressAmended indexer event only on an actual change (from == to == the current state); the 32-byte refund_to region is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-469: revise the off-chain reference memo after
+            // funding — the program-level entry point for the AV-377
+            // pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_reference")[..8]
+            // = [112, 27, 40, 125, 229, 151, 24, 230] — the Anchor
+            // instruction discriminator for the
+            // amend_reference handler (pinned by the
+            // discriminator test below).
+            name: "amend_reference",
+            params: &[(
+                "reference",
+                "Pubkey",
+                "instruction param; the replacement off-chain reference memo — the 32-byte correlation id the next indexer event, keeper report and snapshot export read live",
+            )],
+            method: "Escrow::amend_reference",
+            input_mapping: "reference <- param (Pubkey -> [u8; 32] conversion); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial memo set); no delay path covers this method — GovernanceAction has no AmendReference variant, so the direct call is the only entry point and no delayed handler is staged; any 32 bytes are accepted — the memo is read-only pass-through with nothing to validate, so no new error variant is needed and a failed amendment leaves the memo untouched; re-affirming the current memo is a no-op (succeeds, writes nothing, emits no event); only reference changes — amount, released, fees_paid and state are untouched, and the new memo enters indexer events, keeper reports and the AV-26 snapshot export from the revision onward (each reads the live field at emit time) while memos already exported in past reports or snapshots are history and are never rewritten; emits the ReferenceAmended indexer event only on an actual change (from == to == the current state); the 33-byte reference region is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -43922,6 +43942,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-258 pure-logic revision wired to
             // the chain).
             "Escrow::amend_refund_address",
+            // AV-469: the program-level off-chain-reference-memo
+            // revision (the AV-377 pure-logic revision wired to
+            // the chain).
+            "Escrow::amend_reference",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44062,7 +44086,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-460 adds `amend_rent_sweep_grace`;
         // AV-461 adds `amend_relative_timelock`;
         // AV-462 adds `amend_slot_timelock`;
-        // AV-468 adds `amend_refund_address`.)
+        // AV-468 adds `amend_refund_address`;
+        // AV-469 adds `amend_reference`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -44499,6 +44524,12 @@ pub(crate) mod anchor_idl_tests {
                 // effective recipient is a no-op, and there is no
                 // unbind-to-None path.
                 &"amend_refund_address",
+                // AV-469: the reference-memo revision carries the
+                // replacement memo (Pubkey) — the 32-byte
+                // correlation id the next indexer event, keeper
+                // report and snapshot export read live;
+                // re-affirming the current memo is a no-op.
+                &"amend_reference",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -62826,6 +62857,326 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(e.state(), EscrowState::Cancelled);
     }
 
+    // AV-469: the program-level off-chain-reference-memo revision —
+    // the AV-377 pure-logic revision wired to the chain.
+    const MEMO_ORDER: [u8; 32] = [0x0D; 32];
+    const MEMO_CORRECTED: [u8; 32] = [0x0E; 32];
+
+    fn reference_funded_escrow() -> Escrow {
+        // AV-469 helper: a funded escrow with MEMO_ORDER bound as
+        // the off-chain reference memo — the same shape the AV-377
+        // pure-logic tests build.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_reference(MEMO_ORDER);
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_reference_maps_param_to_reference_field() {
+        // IDL: amend_reference(reference: Pubkey) —
+        // reference <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `reference` region in place
+        // (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the one Pubkey param and the AV-377 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_reference")
+            .expect("INSTRUCTIONS carries amend_reference");
+        assert_eq!(spec.method, "Escrow::amend_reference");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "reference");
+        assert_eq!(spec.params[0].1, "Pubkey");
+        assert!(
+            spec.input_mapping.contains("ReferenceAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the one arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_reference\""),
+            "checked-in IDL carries amend_reference"
+        );
+        assert!(
+            idl.contains("[112, 27, 40, 125, 229, 151, 24, 230]"),
+            "checked-in IDL pins the AV-469 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"reference\", \"type\": \"publicKey\"}"),
+            "checked-in IDL carries the reference arg"
+        );
+        // Only the memo moves: the amounts, the state and the
+        // layout are untouched.
+        let mut e = reference_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.reference(), Some(MEMO_ORDER));
+        e.amend_reference(ALICE, BOB, MEMO_CORRECTED).unwrap();
+        assert_eq!(e.reference(), Some(MEMO_CORRECTED));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "reference rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_reference_rejects_single_party_and_strangers() {
+        // AV-469: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // re-point the off-chain record the other's settlement
+        // reconciles against.
+        let mut e = reference_funded_escrow();
+        assert_eq!(
+            e.amend_reference(ALICE, ALICE, MEMO_CORRECTED),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_reference(MALLORY, BOB, MEMO_CORRECTED),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_reference(MALLORY, MALLORY, MEMO_CORRECTED),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.reference(),
+            Some(MEMO_ORDER),
+            "failed revisions write nothing"
+        );
+        e.amend_reference(ALICE, BOB, MEMO_CORRECTED).unwrap();
+        assert_eq!(e.reference(), Some(MEMO_CORRECTED));
+    }
+
+    #[test]
+    fn amend_reference_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-469: Funded-only — the Uninitialized builder owns the
+        // initial memo, and a live dispute or a terminal escrow
+        // settles under the memo it started under. The pause
+        // guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Uninitialized: the memo is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_reference(MEMO_ORDER);
+        assert_eq!(
+            bare.amend_reference(ALICE, BOB, MEMO_CORRECTED),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.reference(), Some(MEMO_ORDER));
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_reference(MEMO_ORDER);
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_reference(ALICE, BOB, MEMO_CORRECTED),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(activated.reference(), Some(MEMO_ORDER));
+        // Disputed: the memo stays while the dispute is in
+        // flight — the dispute settles under the memo it
+        // started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_reference(MEMO_ORDER);
+        d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let disputed_at = EXPIRES_AT - 3_500;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_reference(ALICE, BOB, MEMO_CORRECTED),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.reference(),
+            Some(MEMO_ORDER),
+            "disputed revision writes nothing"
+        );
+        // Terminal: a released escrow's memo is history, not a
+        // live record to re-point.
+        let mut e = reference_funded_escrow();
+        e.release(ALICE, 1_000_000, 1_000_000, None, BOB).unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.amend_reference(ALICE, BOB, MEMO_CORRECTED),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(e.reference(), Some(MEMO_ORDER));
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_reference(MEMO_ORDER);
+        paused.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_reference(ALICE, BOB, MEMO_CORRECTED),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_reference(MALLORY, BOB, MEMO_CORRECTED),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.reference(),
+            Some(MEMO_ORDER),
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused.amend_reference(ALICE, BOB, MEMO_CORRECTED).unwrap();
+        assert_eq!(paused.reference(), Some(MEMO_CORRECTED));
+    }
+
+    #[test]
+    fn amend_reference_noop_on_same_reference() {
+        // AV-469: re-affirming the current memo is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = reference_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_reference(ALICE, BOB, MEMO_ORDER).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-memo re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.reference(), Some(MEMO_ORDER));
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_reference(ALICE, BOB, MEMO_CORRECTED).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_reference(ALICE, BOB, MEMO_CORRECTED).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised memo writes nothing either"
+        );
+        assert_eq!(e.reference(), Some(MEMO_CORRECTED));
+    }
+
+    #[test]
+    fn amend_reference_emits_only_on_change() {
+        // AV-469: the program handler emits ReferenceAmended
+        // only when the memo actually changes — the before/after
+        // comparison in the handler skips the event on a no-op
+        // re-affirmation (mirrors `amend_referrer`). At the
+        // state-machine level the same-memo call writes nothing
+        // — the encoded escrow is byte-identical before and after,
+        // so there is nothing to emit about — while a real change
+        // moves the field, which is what the handler's emission keys
+        // on. The INSTRUCTIONS entry pins the change-only event in
+        // the spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_reference")
+            .expect("INSTRUCTIONS carries amend_reference");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = reference_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_reference(ALICE, BOB, MEMO_ORDER).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-memo re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_reference(ALICE, BOB, MEMO_CORRECTED).unwrap();
+        assert_eq!(e.reference(), Some(MEMO_CORRECTED));
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_reference_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-469: the program handler emits `ReferenceAmended`
+        // only when the memo actually changes — the indexed wrapper
+        // is the event-layer mirror of the handler's before/after
+        // comparison. A failed revision emits nothing, a no-op
+        // re-affirmation emits nothing, and the event carries the
+        // new memo read live at emit time, so later events carry
+        // the revised memo too.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        let mut e =
+            IndexedEscrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT, [0x1D; 32], 1_000_000)
+                .unwrap()
+                .with_reference(MEMO_ORDER);
+        e.fund(ALICE, 1_000_001).unwrap();
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_reference(ALICE, MALLORY, MEMO_CORRECTED, 1_000_002),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_reference(ALICE, BOB, MEMO_CORRECTED, 1_000_002)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::ReferenceAmended);
+        assert_eq!((ev.from, ev.to), (EscrowState::Funded, EscrowState::Funded));
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // The event carries the new memo, read live at emit time.
+        assert_eq!(ev.reference, Some(MEMO_CORRECTED));
+        // Re-affirming the same memo is a no-op: no new event.
+        e.amend_reference(ALICE, BOB, MEMO_CORRECTED, 1_000_003)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        // A later event carries the revised memo too.
+        e.release(ALICE, 400_000, None, BOB, 1_000_004).unwrap();
+        assert_eq!(
+            e.events().last().copied().expect("event pushed").reference,
+            Some(MEMO_CORRECTED)
+        );
+    }
+
+    #[test]
+    fn amend_reference_enters_snapshot_export_only_after_revision() {
+        // AV-469: the new memo enters the AV-26 snapshot export
+        // from the revision onward — the export reads the live
+        // field, so a snapshot taken before the amendment keeps
+        // the old memo while one taken after carries the new one.
+        let mut e = reference_funded_escrow();
+        let snap_before = e.snapshot(1_000_000);
+        assert_eq!(snap_before.reference, Some(MEMO_ORDER));
+        e.amend_reference(ALICE, BOB, MEMO_CORRECTED).unwrap();
+        assert_eq!(e.snapshot(1_000_000).reference, Some(MEMO_CORRECTED));
+        assert_eq!(
+            snap_before.reference,
+            Some(MEMO_ORDER),
+            "a snapshot already exported keeps the memo it exported under"
+        );
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -66628,6 +66979,19 @@ pub(crate) mod anchor_idl_tests {
             "amend_refund_address",
             "new_refund_to",
             "refund_to",
+        ),
+        // AV-469: the post-funding reference-memo revision rewrites
+        // the 33-byte `reference` region in place — a second param
+        // source for `reference`, like `initialize_reference`'s
+        // reference param. Only the memo moves — the amount, the
+        // released total, the fees and the state are untouched, so
+        // the next indexer event, keeper report and snapshot export
+        // read the new memo live while memos already exported keep
+        // the memo they exported under.
+        (
+            "amend_reference",
+            "reference",
+            "reference",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -96690,6 +97054,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_refund_address"),
             [23, 174, 219, 129, 213, 248, 239, 53]
+        );
+    }
+
+    #[test]
+    fn amend_reference_instruction_discriminator_is_pinned() {
+        // AV-469. IDL:
+        // sha256("global:amend_reference")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_reference"),
+            [112, 27, 40, 125, 229, 151, 24, 230]
         );
     }
 

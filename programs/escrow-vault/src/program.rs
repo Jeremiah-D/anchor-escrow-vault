@@ -8201,6 +8201,63 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the off-chain reference memo after funding (AV-469;
+    /// mirrors `Escrow::amend_reference`). Unconditional
+    /// dual-signature governance: both initializer and taker sign —
+    /// one party alone cannot re-point the other's off-chain
+    /// record. `Funded` only — the builder owns the initial memo
+    /// set. A paused escrow fails fast (`Paused`, before the
+    /// authority gate). Any 32 bytes are accepted — the memo is
+    /// read-only pass-through with nothing to validate, so no new
+    /// error variant is needed. Re-affirming the current memo is a
+    /// no-op: it succeeds, writes nothing and emits nothing. No
+    /// delay path covers this method — `GovernanceAction` has no
+    /// `AmendReference` variant, so the direct call is the only
+    /// entry point. Emits `ReferenceAmended` (from == to == the
+    /// current state) only on an actual change; a no-op
+    /// re-affirmation stays silent (mirrors `amend_referrer`).
+    /// Only `reference` changes — `amount`, `released`,
+    /// `fees_paid` and `state` are untouched, and the new memo
+    /// enters indexer events, keeper reports and the AV-26
+    /// snapshot export from the revision onward (each reads the
+    /// live field), while memos already exported stay as history.
+    pub fn amend_reference(ctx: Context<AmendReference>, reference: Pubkey) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.reference();
+        escrow
+            .amend_reference(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                reference.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 33-byte `reference` region in place — no
+        // realloc. Only the memo moves; the amounts, the state and
+        // the initializer/taker identities are untouched.
+        // Emits only on an actual change; a no-op re-affirmation
+        // stays silent (mirrors `amend_referrer`).
+        if escrow.reference() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ReferenceAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            Clock::get()?.unix_timestamp as u64,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -15599,6 +15656,22 @@ pub struct AmendPenaltyEscalation<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendRefundAddress<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-469: accounts for `amend_reference` — the
+/// off-chain-reference-memo revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendReference<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

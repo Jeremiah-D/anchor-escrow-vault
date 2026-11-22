@@ -1486,6 +1486,14 @@
       ]
     },
     {
+      "name": "amend_reference",
+      "discriminator": [112, 27, 40, 125, 229, 151, 24, 230],
+      "accounts": [],
+      "args": [
+        {"name": "reference", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
