@@ -43088,6 +43088,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_start_at <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Uninitialized or Activated only (InvalidStateTransition otherwise — Funded, terminal states and Disputed; a window already consumed by real funds is never rewritten); funded_total != 0 is a second, independent bar (installments accumulate while still Uninitialized, so the state gate alone is not clean); a funding-plan escrow is InvalidFundingPlan (code 173) and a partial-funding escrow is InvalidPartialFunding (code 351) — the window never gates fund_tranche / fund_partial, so revising it there would rewrite a dead configuration, fail-closed; on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219 — the window moves only through the propose/execute protocol, GovernanceAction kind 4, with no new proposal variant); the new value reuses the with_funding_start gate (none — any u64 is accepted, 0 clears the window, no relation to expires_at is checked, so a window opening after the deadline simply never funds); re-affirming the current window is a no-op (succeeds, writes nothing, emits no event, paralleling amend_price_gate); only funding_start changes — expires_at, funded_total, amount, and state are untouched, so the new window governs from the next fund / fund_with_slot (those read the live value, so an early funding under the new window is refused with FundingNotStarted at once while a funding at or after it succeeds); emits the FundingStartAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 8-byte funding_start field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-476: revise the compound-interest mode after
+            // funding — the program-level entry point for the
+            // AV-333 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_compound_interest")[..8]
+            // = [217, 144, 80, 104, 246, 86, 61, 237] — the Anchor
+            // instruction discriminator for the
+            // amend_compound_interest handler (pinned by the
+            // discriminator test below).
+            name: "amend_compound_interest",
+            params: &[(
+                "enabled",
+                "bool",
+                "instruction param; the replacement compound-interest mode — true folds yield into principal on the next take, false pays it out on the next take / claim; re-affirming the current mode is a no-op",
+            )],
+            method: "Escrow::amend_compound_interest",
+            input_mapping: "enabled <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial opt-in and the dispute window settles under the frozen mode); no delay path covers this method — GovernanceAction has no AmendCompoundInterest variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current mode is a no-op (succeeds, writes nothing, emits no event, paralleling amend_interest_rate); only the compound_interest flag flips — amount, interest_compounded, interest_paid and interest_accrued are never restated, so yield already folded stays principal and yield already paid stays paid, and the next take_accrued_interest / settle_dispute_interest / claim_interest reads the live flag, so a flip governs the very next settlement while a settlement already made keeps the mode it settled under (and claim_interest is refused with CompoundInterestActive, code 178, while compounding is on); emits the CompoundInterestAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 1-byte compound_interest flag is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -44126,6 +44145,10 @@ pub(crate) mod anchor_idl_tests {
             // window revision (the AV-321 pure-logic
             // revision wired to the chain).
             "Escrow::amend_funding_start",
+            // AV-476: the program-level compound-interest
+            // mode revision (the AV-333 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_compound_interest",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44273,7 +44296,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-472 adds `amend_vesting_curve`;
         // AV-473 adds `amend_dutch_auction_reserve_bps`;
         // AV-474 adds `amend_dutch_auction_window`;
-        // AV-475 adds `amend_funding_start`.)
+        // AV-475 adds `amend_funding_start`;
+        // AV-476 adds `amend_compound_interest`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -44774,6 +44798,14 @@ pub(crate) mod anchor_idl_tests {
                 // funding at or after it succeeds; re-affirming
                 // the current window is a no-op.
                 &"amend_funding_start",
+                // AV-476: the compound-interest mode revision
+                // carries the replacement mode (bool) — the flag
+                // alone; the next take / dispute / claim reads
+                // the live flag, so a flip governs the very next
+                // settlement while a settlement already made
+                // keeps the mode it settled under; re-affirming
+                // the current mode is a no-op.
+                &"amend_compound_interest",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -65964,6 +65996,393 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(e.funded_total(), 1_000_000);
     }
 
+    fn funded_interest_escrow() -> Escrow {
+        // A Funded simple-interest escrow (5% APR, compounding
+        // off) — the AV-476 program-surface fixture, paralleling
+        // the AV-333 `interest_escrow(500)` helper in
+        // `interest_tests`.
+        const FUND_AT: u64 = 1_700_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e
+    }
+
+    fn funded_compound_escrow() -> Escrow {
+        // A Funded compound-interest escrow (5% APR, compounding
+        // on) — the AV-476 program-surface fixture, paralleling
+        // the AV-333 `compound_escrow()` helper in `interest_tests`.
+        const FUND_AT: u64 = 1_700_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_interest(500)
+            .unwrap()
+            .with_compound_interest()
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_compound_interest_maps_params_to_compound_interest_field() {
+        // IDL: amend_compound_interest(enabled: bool) —
+        // enabled <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param flips the `compound_interest` flag in place
+        // (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the single bool param and the AV-333 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_compound_interest")
+            .expect("INSTRUCTIONS carries amend_compound_interest");
+        assert_eq!(spec.method, "Escrow::amend_compound_interest");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "enabled");
+        assert_eq!(spec.params[0].1, "bool");
+        assert!(
+            spec.input_mapping.contains("CompoundInterestAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single bool arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_compound_interest\""),
+            "checked-in IDL carries amend_compound_interest"
+        );
+        assert!(
+            idl.contains("[217, 144, 80, 104, 246, 86, 61, 237]"),
+            "checked-in IDL pins the AV-476 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"enabled\", \"type\": \"bool\"}"),
+            "checked-in IDL carries the enabled arg"
+        );
+        // Only the flag flips: the amounts, the state and the layout
+        // are untouched.
+        let mut e = funded_interest_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert!(!e.compound_interest());
+        e.amend_compound_interest(ALICE, BOB, true).unwrap();
+        assert!(e.compound_interest(), "mode revised");
+        assert_eq!(e.amount(), 1_000_000, "amount untouched");
+        assert_eq!(e.interest_compounded(), 0, "nothing folded yet");
+        assert_eq!(e.interest_paid(), 0, "nothing paid yet");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "flag rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the mode is set
+        // there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        assert_eq!(
+            bare.amend_compound_interest(ALICE, BOB, true),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_compound_interest_rejects_single_party_and_strangers() {
+        // AV-476: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // flip the other's yield mode.
+        let mut e = funded_interest_escrow();
+        assert_eq!(
+            e.amend_compound_interest(ALICE, ALICE, true),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_compound_interest(MALLORY, BOB, true),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_compound_interest(MALLORY, MALLORY, true),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert!(
+            !e.compound_interest(),
+            "failed revisions flip nothing"
+        );
+        e.amend_compound_interest(ALICE, BOB, true).unwrap();
+        assert!(e.compound_interest());
+    }
+
+    #[test]
+    fn amend_compound_interest_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-476: the builder owns the initial opt-in and the
+        // dispute window settles under the frozen mode. The pause
+        // guard fires before the authority and state gates — and
+        // unpausing a Funded escrow re-opens the revision (Funded
+        // is the allowed state, the AV-475 contrast where an
+        // unpaused Funded escrow still refuses).
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = 1_700_000_000;
+        // Activated: funded money is the lock-in point, not
+        // activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_compound_interest(ALICE, BOB, true),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: the dispute window settles under the frozen
+        // mode.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let disputed_at = EXPIRES_AT - 3_500;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_compound_interest(ALICE, BOB, true),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(
+            !d.compound_interest(),
+            "disputed revision flips nothing"
+        );
+        // Terminal: a released escrow's mode is history, not
+        // policy.
+        let mut released = funded_interest_escrow();
+        released
+            .release(ALICE, FUND_AT, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_compound_interest(ALICE, BOB, true),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert!(!released.compound_interest());
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_compound_interest(ALICE, BOB, true),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_compound_interest(MALLORY, BOB, true),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert!(!paused.compound_interest(), "paused revision flips nothing");
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — and Funded is the
+        // allowed state, so the revision now lands.
+        paused.amend_compound_interest(ALICE, BOB, true).unwrap();
+        assert!(paused.compound_interest());
+    }
+
+    #[test]
+    fn amend_compound_interest_allows_direct_on_delay_opted_in() {
+        // AV-476: no delay path covers this method —
+        // `GovernanceAction` has no `AmendCompoundInterest`
+        // variant and the pure logic carries no `via_delayed`
+        // gate, so the direct call is the only entry point and
+        // stays open on a delay-opted-in escrow (the AV-471
+        // `amend_twap_gate` precedent — gating it here would
+        // self-lock exactly the escrows that need it, since no
+        // delayed path could take the revision instead).
+        const FUND_AT: u64 = 1_700_000_000;
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_interest(500)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap();
+        delayed.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(delayed.state(), EscrowState::Funded);
+        delayed.amend_compound_interest(ALICE, BOB, true).unwrap();
+        assert!(
+            delayed.compound_interest(),
+            "direct call stays open on a delay-opted-in escrow"
+        );
+        // And back again — the mode stays revisable.
+        delayed.amend_compound_interest(ALICE, BOB, false).unwrap();
+        assert!(!delayed.compound_interest());
+    }
+
+    #[test]
+    fn amend_compound_interest_noop_on_same_mode() {
+        // AV-476: re-affirming the current mode is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = funded_interest_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_compound_interest(ALICE, BOB, false).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-mode re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert!(!e.compound_interest());
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_compound_interest(ALICE, BOB, true).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_compound_interest(ALICE, BOB, true).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised mode writes nothing either"
+        );
+        assert!(e.compound_interest());
+    }
+
+    #[test]
+    fn amend_compound_interest_emits_only_on_change() {
+        // AV-476: the program handler emits
+        // `CompoundInterestAmended` only when the mode
+        // actually changes — the before/after comparison in the
+        // handler skips the event on a no-op re-affirmation
+        // (mirrors `amend_price_gate`). At the state-machine level
+        // the same-mode call writes nothing — the encoded escrow
+        // is byte-identical before and after, so there is nothing
+        // to emit about — while a real change flips the flag,
+        // which is what the handler's emission keys on. The
+        // INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_compound_interest")
+            .expect("INSTRUCTIONS carries amend_compound_interest");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = funded_interest_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_compound_interest(ALICE, BOB, false).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-mode re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_compound_interest(ALICE, BOB, true).unwrap();
+        assert!(e.compound_interest());
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change flips the flag, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_compound_interest_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-476: the program handler emits
+        // `CompoundInterestAmended` only when the mode
+        // actually changes — the indexed wrapper is the event-layer
+        // mirror of the handler's before/after comparison. A failed
+        // revision emits nothing, a no-op re-affirmation emits
+        // nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const FUND_AT: u64 = 1_700_000_000;
+        let funded = funded_interest_escrow();
+        let mut e = IndexedEscrow::wrap([0x1D; 32], funded);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_compound_interest(ALICE, ALICE, true, FUND_AT),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_compound_interest(ALICE, BOB, true, FUND_AT)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::CompoundInterestAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same mode is a no-op: no new event.
+        e.amend_compound_interest(ALICE, BOB, true, FUND_AT)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_compound_interest_retunes_mode_and_next_take_folds_and_blocks_claim() {
+        // AV-476: a simple escrow that opts into compounding
+        // mid-flight — the outstanding claim folds on the next
+        // take, and the standalone harvest is refused from the
+        // flip on. The new mode governs the next settlement the
+        // moment the amendment lands.
+        const FUND_AT: u64 = 1_700_000_000;
+        const YEAR: u64 = 31_536_000;
+        let mut e = funded_interest_escrow();
+        e.settle_interest(FUND_AT + YEAR);
+        assert_eq!(e.interest_accrued(), 50_000);
+        e.amend_compound_interest(ALICE, BOB, true).unwrap();
+        assert!(e.compound_interest());
+        let err = e.claim_interest(BOB, FUND_AT + YEAR).unwrap_err();
+        assert_eq!(err, EscrowError::CompoundInterestActive);
+        assert_eq!(err.code(), 178);
+        assert_eq!(e.interest_accrued(), 50_000, "refused claim settles nothing");
+        // The next take folds instead of paying out: a partial
+        // release (1_050_000, 500_000 paid out, 550_000 locked).
+        let (payout, fee) = e.release(ALICE, FUND_AT + YEAR, 500_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (500_000, 0));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_050_000);
+        assert_eq!(e.interest_compounded(), 50_000);
+        assert_eq!(e.interest_accrued(), 0);
+        assert_eq!(e.interest_paid(), 0, "compound never pays out separately");
+    }
+
+    #[test]
+    fn amend_compound_interest_retunes_mode_and_next_claim_pays_after_opt_out() {
+        // AV-476: a compound escrow that opts out mid-flight —
+        // the outstanding claim pays out on the next take, and the
+        // standalone harvest is open again from the flip on.
+        const FUND_AT: u64 = 1_700_000_000;
+        const YEAR: u64 = 31_536_000;
+        let mut e = funded_compound_escrow();
+        e.settle_interest(FUND_AT + YEAR);
+        assert_eq!(e.interest_accrued(), 50_000);
+        e.amend_compound_interest(ALICE, BOB, false).unwrap();
+        assert!(!e.compound_interest());
+        assert_eq!(e.claim_interest(BOB, FUND_AT + YEAR).unwrap(), 50_000);
+        assert_eq!(e.interest_paid(), 50_000);
+        assert_eq!(e.interest_compounded(), 0);
+        assert_eq!(e.interest_accrued(), 0);
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -69897,6 +70316,21 @@ pub(crate) mod anchor_idl_tests {
             "new_start_at",
             "funding_start",
         ),
+        // AV-476: the post-funding compound-interest mode
+        // revision flips the 1-byte `compound_interest` flag in
+        // place — the mode alone, never the amounts. The flag's
+        // *initial* value comes from the `with_compound_interest`
+        // builder (a state-machine method, not an instruction
+        // param, so it cannot appear in the param table); the
+        // param entry documents the revision source. Only the
+        // flag flips — yield already folded stays principal and
+        // yield already paid stays paid, and the next take /
+        // dispute / claim prices through the new mode.
+        (
+            "amend_compound_interest",
+            "enabled",
+            "compound_interest",
+        ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
         // for `delegation` (the whole grant region, like
@@ -70337,16 +70771,14 @@ pub(crate) mod anchor_idl_tests {
              accumulates here — the new sink in the extended \
              conservation identity, never mixed into released",
         ),
-        // AV-117: no instruction param writes this field —
-        // `initialize_compound_interest` sets the mode flag only; the
-        // counter accumulates transition-side when the accrued yield
-        // folds into the principal at claim/settlement, so it is a
-        // field source, not a param mapping.
-        (
-            "compound_interest",
-            "zeroed by initialize; set once by \\
-             initialize_compound_interest (Uninitialized only)",
-        ),
+        // AV-117: the compound-interest mode flag was a field source
+        // (`false` by `initialize`; set once by
+        // `initialize_compound_interest`, Uninitialized only; read by
+        // the take / dispute / claim paths as the live mode) until
+        // AV-476 added the `amend_compound_interest` instruction
+        // param that flips it — the field is now param-sourced (see
+        // PARAM_FIELD_MAP), so it is not listed here: every field
+        // gets exactly one source kind.
         (
             "interest_compounded",
             "zeroed by initialize; every compounding at claim/settlement \\
@@ -100040,6 +100472,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_funding_start"),
             [42, 29, 17, 243, 217, 250, 120, 14]
+        );
+    }
+
+    #[test]
+    fn amend_compound_interest_instruction_discriminator_is_pinned() {
+        // AV-476. IDL:
+        // sha256("global:amend_compound_interest")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_compound_interest"),
+            [217, 144, 80, 104, 246, 86, 61, 237]
         );
     }
 

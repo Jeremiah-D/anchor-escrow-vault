@@ -8769,6 +8769,73 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the compound-interest mode after funding (AV-476;
+    /// mirrors `Escrow::amend_compound_interest`, the AV-333
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot flip
+    /// the other's yield mode. `Funded` only — the builder owns the
+    /// initial opt-in, and the dispute window settles under the frozen
+    /// mode. A paused escrow fails fast (`Paused`, before the authority
+    /// gate). No delay path covers this method — `GovernanceAction`
+    /// has no `AmendCompoundInterest` variant, so the direct call is
+    /// the only entry point and stays open on a delay-opted-in escrow
+    /// (the AV-471 `amend_twap_gate` precedent: the method carries no
+    /// `via_delayed` gate, so gating it here would self-lock exactly
+    /// the escrows that need it). Re-affirming the current mode is a
+    /// no-op: it succeeds, writes nothing and emits nothing. Emits
+    /// `CompoundInterestAmended` (from == to == the current state) only
+    /// on an actual change. Only the `compound_interest` flag flips —
+    /// `amount`, `interest_compounded`, `interest_paid` and
+    /// `interest_accrued` are untouched, so yield already folded stays
+    /// principal and yield already paid stays paid, and the next
+    /// `take_accrued_interest` / `claim_interest` reads the live flag
+    /// the moment the amendment lands — while a settlement already made
+    /// keeps the mode it settled under, and `claim_interest` is refused
+    /// with `CompoundInterestActive` (code 178) while compounding is on.
+    /// `now` comes from the clock sysvar, never an instruction param
+    /// (mirrors `amend_funding_start`) — here only for the event
+    /// timestamp, since the pure logic takes no `now`.
+    pub fn amend_compound_interest(
+        ctx: Context<AmendCompoundInterest>,
+        enabled: bool,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.compound_interest();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_compound_interest(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                enabled,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 1-byte `compound_interest` flag in place — no
+        // realloc. Only the mode flips; the amounts, the state and the
+        // initializer/taker identities are untouched. Emits only on an
+        // actual change; a no-op re-affirmation stays silent (mirrors
+        // `amend_price_gate`).
+        if escrow.compound_interest() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::CompoundInterestAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -16279,6 +16346,22 @@ pub struct AmendDutchAuctionWindow<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendFundingStart<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-476: accounts for `amend_compound_interest` — the
+/// compound-interest mode revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendCompoundInterest<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

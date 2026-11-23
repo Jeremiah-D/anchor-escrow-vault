@@ -1548,6 +1548,14 @@
       ]
     },
     {
+      "name": "amend_compound_interest",
+      "discriminator": [217, 144, 80, 104, 246, 86, 61, 237],
+      "accounts": [],
+      "args": [
+        {"name": "enabled", "type": "bool"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
