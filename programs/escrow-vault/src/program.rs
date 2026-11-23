@@ -8697,6 +8697,78 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the funding start window before funding (AV-475;
+    /// mirrors `Escrow::amend_funding_start`, the AV-321
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot move
+    /// the window on the other's share, paralleling
+    /// `amend_settlement_mint`. `Uninitialized`/`Activated` only —
+    /// the builder owns the initial window set, and a window already
+    /// consumed by real funds is never rewritten (`funded_total != 0`
+    /// is a second, independent bar). A paused escrow fails fast
+    /// (`Paused`, before the authority gate). A funding-plan or
+    /// partial-funding escrow is refused fail-closed
+    /// (`InvalidFundingPlan`, code 173 / `InvalidPartialFunding`,
+    /// code 351 — the window never gates `fund_tranche` /
+    /// `fund_partial`, so revising it there would rewrite a dead
+    /// configuration). On a delay-opted-in escrow the direct call is
+    /// refused (`GovernanceActionNotProposed`, code 219) — the window
+    /// moves only through the propose/execute protocol, with no new
+    /// proposal variant (the `AmendFundingStart` variant, kind 4, is
+    /// already there). Re-affirming the current window is a no-op: it
+    /// succeeds, writes nothing and emits nothing. Emits
+    /// `FundingStartAmended` (from == to == the current state) only
+    /// on an actual change. Only `funding_start` changes —
+    /// `expires_at`, `funded_total`, `amount` and state are untouched,
+    /// so the new window governs the next `fund` / `fund_with_slot`
+    /// the moment the amendment lands — while a funding already made
+    /// keeps the window it funded under. The new value reuses the
+    /// `with_funding_start` gate (none — any `u64` is accepted, `0`
+    /// clears the window). `now` comes from the clock sysvar, never an
+    /// instruction param (mirrors `amend_vesting_curve`) — here only
+    /// for the event timestamp, since the pure logic takes no `now`.
+    pub fn amend_funding_start(
+        ctx: Context<AmendFundingStart>,
+        new_start_at: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.funding_start();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_funding_start(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_start_at,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 8-byte `funding_start` field in place — no
+        // realloc. Only the window moves; the deadline, the funded
+        // total, the amount, the state and the initializer/taker
+        // identities are untouched. Emits only on an actual change;
+        // a no-op re-affirmation stays silent (mirrors
+        // `amend_price_gate`).
+        if escrow.funding_start() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::FundingStartAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -16191,6 +16263,22 @@ pub struct AmendDutchAuctionReserveBps<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendDutchAuctionWindow<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-475: accounts for `amend_funding_start` — the
+/// funding-start window revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendFundingStart<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

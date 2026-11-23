@@ -43069,6 +43069,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_start_at <- param; new_end_at <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial auction set); only an escrow already carrying an auction may revise — an auction-less escrow is InvalidAuctionParams (code 155, fail-closed: post-funding installation would add a pricing curve the taker never funded under); only before the window opens may the window move — both now < the current start_at and now < the new start_at must hold, else AuctionNotActive (code 156, a window that already opened would re-price claims already in flight and a new window that already opened would rewrite the escalate mutual exclusion mid-flight, so the whole window freezes once either side opens); the new window reuses the DutchAuction::new gate (new_start_at >= new_end_at is InvalidAuctionParams, code 155) and leaves the original window untouched, with the current reserve floor carried along for re-validation; on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219 — the window moves only through the propose/execute protocol, GovernanceAction kind 9, with no new proposal variant); there is deliberately no clearing path (the window rides as two u64 scalars, never an Option, so a configured auction cannot be removed to None); re-affirming the current window is a no-op (succeeds, writes nothing, emits no event, paralleling amend_price_gate); only start_at/end_at change — reserve_bps is untouched, so the window and the floor stay orthogonal (the floor moves via AV-277), and the claim paths read the window live through DutchAuction::payout_cap, so a new window governs the next claim the moment the amendment lands — is_live and the linear decay both follow the new window, and the escalate mutual exclusion follows the new window the same way — while a claim already settled keeps the window it settled under; emits the DutchAuctionWindowAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param); the 16-byte start_at/end_at window is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-475: revise the funding start window before
+            // funding — the program-level entry point for the
+            // AV-321 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_funding_start")[..8]
+            // = [42, 29, 17, 243, 217, 250, 120, 14] — the Anchor
+            // instruction discriminator for the
+            // amend_funding_start handler (pinned by the
+            // discriminator test below).
+            name: "amend_funding_start",
+            params: &[(
+                "new_start_at",
+                "u64",
+                "instruction param; the replacement funding window open — any u64 is accepted (the with_funding_start gate: none), 0 clears the window",
+            )],
+            method: "Escrow::amend_funding_start",
+            input_mapping: "new_start_at <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Uninitialized or Activated only (InvalidStateTransition otherwise — Funded, terminal states and Disputed; a window already consumed by real funds is never rewritten); funded_total != 0 is a second, independent bar (installments accumulate while still Uninitialized, so the state gate alone is not clean); a funding-plan escrow is InvalidFundingPlan (code 173) and a partial-funding escrow is InvalidPartialFunding (code 351) — the window never gates fund_tranche / fund_partial, so revising it there would rewrite a dead configuration, fail-closed; on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219 — the window moves only through the propose/execute protocol, GovernanceAction kind 4, with no new proposal variant); the new value reuses the with_funding_start gate (none — any u64 is accepted, 0 clears the window, no relation to expires_at is checked, so a window opening after the deadline simply never funds); re-affirming the current window is a no-op (succeeds, writes nothing, emits no event, paralleling amend_price_gate); only funding_start changes — expires_at, funded_total, amount, and state are untouched, so the new window governs from the next fund / fund_with_slot (those read the live value, so an early funding under the new window is refused with FundingNotStarted at once while a funding at or after it succeeds); emits the FundingStartAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 8-byte funding_start field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -44103,6 +44122,10 @@ pub(crate) mod anchor_idl_tests {
             // window revision (the AV-288 pure-logic
             // revision wired to the chain).
             "Escrow::amend_dutch_auction_window",
+            // AV-475: the program-level funding-start
+            // window revision (the AV-321 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_funding_start",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44249,7 +44272,8 @@ pub(crate) mod anchor_idl_tests {
         // AV-471 adds `amend_twap_gate`;
         // AV-472 adds `amend_vesting_curve`;
         // AV-473 adds `amend_dutch_auction_reserve_bps`;
-        // AV-474 adds `amend_dutch_auction_window`.)
+        // AV-474 adds `amend_dutch_auction_window`;
+        // AV-475 adds `amend_funding_start`.)
         let with_params: Vec<&&str> = INSTRUCTIONS
             .iter()
             .filter(|s| !s.params.is_empty())
@@ -44742,6 +44766,14 @@ pub(crate) mod anchor_idl_tests {
                 // the same way; re-affirming the current window is
                 // a no-op.
                 &"amend_dutch_auction_window",
+                // AV-475: the funding-start revision carries
+                // the replacement window open (u64) — the window
+                // alone; the next fund / fund_with_slot reads
+                // the live window, so an early funding under
+                // the new window is refused at once while a
+                // funding at or after it succeeds; re-affirming
+                // the current window is a no-op.
+                &"amend_funding_start",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -65537,6 +65569,401 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(e.released_amount(), 750_000);
     }
 
+    // AV-475: the program-level funding-start window
+    // revision — the AV-321 pure-logic revision wired to the chain.
+    const WINDOW_OPEN: u64 = 1_700_000_500;
+    const WINDOW_LATER: u64 = 1_700_001_000;
+
+    fn windowed_escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_funding_start(WINDOW_OPEN)
+            .unwrap()
+    }
+
+    fn delay_windowed_escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_funding_start(WINDOW_OPEN)
+            .unwrap()
+    }
+
+    #[test]
+    fn amend_funding_start_maps_params_to_funding_start_field() {
+        // IDL: amend_funding_start(new_start_at: u64) —
+        // new_start_at <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `funding_start` field in place
+        // (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the single u64 param and the AV-321 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_funding_start")
+            .expect("INSTRUCTIONS carries amend_funding_start");
+        assert_eq!(spec.method, "Escrow::amend_funding_start");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "new_start_at");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("FundingStartAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single u64 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_funding_start\""),
+            "checked-in IDL carries amend_funding_start"
+        );
+        assert!(
+            idl.contains("[42, 29, 17, 243, 217, 250, 120, 14]"),
+            "checked-in IDL pins the AV-475 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"new_start_at\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the new_start_at arg"
+        );
+        // Only the window moves: the deadline, the funded total,
+        // the amount, the state and the layout are untouched.
+        let mut e = windowed_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.funding_start(), WINDOW_OPEN);
+        e.amend_funding_start(ALICE, BOB, WINDOW_LATER).unwrap();
+        assert_eq!(e.funding_start(), WINDOW_LATER, "window revised");
+        assert_eq!(e.expires_at(), EXPIRES_AT, "deadline untouched");
+        assert_eq!(e.funded_total(), 0, "nothing funded yet");
+        assert_eq!(e.amount(), 1_000_000, "amount untouched");
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "window rewritten in place, no layout change"
+        );
+        // Activated is the second allowed state: both parties
+        // signed, funds not yet locked, the window still moves.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_funding_start(WINDOW_OPEN)
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        activated
+            .amend_funding_start(ALICE, BOB, WINDOW_LATER)
+            .unwrap();
+        assert_eq!(activated.funding_start(), WINDOW_LATER);
+    }
+
+    #[test]
+    fn amend_funding_start_rejects_single_party_and_strangers() {
+        // AV-475: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // move the window on the other's share.
+        let mut e = windowed_escrow();
+        assert_eq!(
+            e.amend_funding_start(ALICE, ALICE, WINDOW_LATER),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_funding_start(MALLORY, BOB, WINDOW_LATER),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_funding_start(MALLORY, MALLORY, WINDOW_LATER),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.funding_start(),
+            WINDOW_OPEN,
+            "failed revisions write nothing"
+        );
+        e.amend_funding_start(ALICE, BOB, WINDOW_LATER).unwrap();
+        assert_eq!(e.funding_start(), WINDOW_LATER);
+    }
+
+    #[test]
+    fn amend_funding_start_refuses_funded_or_tranche_plan() {
+        // AV-475: a window already consumed by real funds is never
+        // rewritten — Funded refuses, and `funded_total != 0` is a
+        // second, independent bar. A funding-plan or partial-funding
+        // escrow is refused fail-closed: the window never gates
+        // `fund_tranche` / `fund_partial`, so revising it there
+        // would rewrite a dead configuration.
+        let mut funded = windowed_escrow();
+        funded.fund(ALICE, WINDOW_OPEN).unwrap();
+        assert_eq!(funded.state(), EscrowState::Funded);
+        assert_eq!(
+            funded.amend_funding_start(ALICE, BOB, WINDOW_LATER),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(funded.funding_start(), WINDOW_OPEN);
+        // A funding-plan escrow carries the tranche schedule, not
+        // the window — the revision is InvalidFundingPlan.
+        let mut plan = windowed_escrow();
+        plan.with_funding_plan(1_000_000, 3).unwrap();
+        assert_eq!(
+            plan.amend_funding_start(ALICE, BOB, WINDOW_LATER),
+            Err(EscrowError::InvalidFundingPlan)
+        );
+        assert_eq!(EscrowError::InvalidFundingPlan.code(), 173);
+        assert_eq!(plan.funding_start(), WINDOW_OPEN);
+        // A partial-funding escrow takes installments, not the
+        // window — the revision is InvalidPartialFunding.
+        let mut partial = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_partial_funding()
+            .unwrap()
+            .with_funding_start(WINDOW_OPEN)
+            .unwrap();
+        assert_eq!(
+            partial.amend_funding_start(ALICE, BOB, WINDOW_LATER),
+            Err(EscrowError::InvalidPartialFunding)
+        );
+        assert_eq!(EscrowError::InvalidPartialFunding.code(), 351);
+        assert_eq!(partial.funding_start(), WINDOW_OPEN);
+    }
+
+    #[test]
+    fn amend_funding_start_refuses_terminal_disputed_and_paused() {
+        // AV-475: terminal states and Disputed settle under the
+        // window they started under. The pause guard fires before
+        // the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Terminal: a released escrow's window is history, not a
+        // live condition to retune.
+        let mut e = windowed_escrow();
+        e.fund(ALICE, WINDOW_OPEN).unwrap();
+        e.release(ALICE, WINDOW_OPEN, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Released);
+        assert_eq!(
+            e.amend_funding_start(ALICE, BOB, WINDOW_LATER),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(e.funding_start(), WINDOW_OPEN);
+        // Disputed: the window stays while the dispute is in
+        // flight — the dispute settles under the window it
+        // started under.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_funding_start(WINDOW_OPEN)
+            .unwrap();
+        d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let disputed_at = EXPIRES_AT - 3_500;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_funding_start(ALICE, BOB, WINDOW_LATER),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.funding_start(),
+            WINDOW_OPEN,
+            "disputed revision writes nothing"
+        );
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_funding_start(WINDOW_OPEN)
+            .unwrap();
+        paused.fund(ALICE, WINDOW_OPEN).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_funding_start(ALICE, BOB, WINDOW_LATER),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_funding_start(MALLORY, BOB, WINDOW_LATER),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.funding_start(),
+            WINDOW_OPEN,
+            "paused revision writes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — the state gate then
+        // applies: a funded escrow's window is never rewritten.
+        assert_eq!(
+            paused.amend_funding_start(ALICE, BOB, WINDOW_LATER),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(paused.funding_start(), WINDOW_OPEN);
+    }
+
+    #[test]
+    fn amend_funding_start_refuses_direct_on_delay_opted_in() {
+        // AV-475: on a delay-opted-in escrow the window moves only
+        // through the propose/execute protocol (GovernanceAction
+        // kind 4) — the direct call is refused, whatever the window.
+        let mut delayed = delay_windowed_escrow();
+        assert_eq!(
+            delayed.amend_funding_start(ALICE, BOB, WINDOW_LATER),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(EscrowError::GovernanceActionNotProposed.code(), 219);
+        assert_eq!(delayed.funding_start(), WINDOW_OPEN);
+    }
+
+    #[test]
+    fn amend_funding_start_noop_on_same_start() {
+        // AV-475: re-affirming the current window is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = windowed_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_funding_start(ALICE, BOB, WINDOW_OPEN).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-window re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.funding_start(), WINDOW_OPEN);
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_funding_start(ALICE, BOB, WINDOW_LATER).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_funding_start(ALICE, BOB, WINDOW_LATER).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised window writes nothing either"
+        );
+        assert_eq!(e.funding_start(), WINDOW_LATER);
+    }
+
+    #[test]
+    fn amend_funding_start_emits_only_on_change() {
+        // AV-475: the program handler emits
+        // `FundingStartAmended` only when the window
+        // actually changes — the before/after comparison in the
+        // handler skips the event on a no-op re-affirmation
+        // (mirrors `amend_price_gate`). At the state-machine level
+        // the same-window call writes nothing — the encoded escrow
+        // is byte-identical before and after, so there is nothing
+        // to emit about — while a real change moves the field,
+        // which is what the handler's emission keys on. The
+        // INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_funding_start")
+            .expect("INSTRUCTIONS carries amend_funding_start");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = windowed_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_funding_start(ALICE, BOB, WINDOW_OPEN).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-window re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_funding_start(ALICE, BOB, WINDOW_LATER).unwrap();
+        assert_eq!(e.funding_start(), WINDOW_LATER);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_funding_start_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-475: the program handler emits
+        // `FundingStartAmended` only when the window
+        // actually changes — the indexed wrapper is the event-layer
+        // mirror of the handler's before/after comparison. A failed
+        // revision emits nothing, a no-op re-affirmation emits
+        // nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        let mut e = IndexedEscrow::wrap([0x1D; 32], windowed_escrow());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_funding_start(MALLORY, BOB, WINDOW_LATER, WINDOW_OPEN),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_funding_start(ALICE, BOB, WINDOW_LATER, WINDOW_OPEN)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::FundingStartAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Uninitialized, EscrowState::Uninitialized)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same window is a no-op: no new event.
+        e.amend_funding_start(ALICE, BOB, WINDOW_LATER, WINDOW_OPEN + 1)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_funding_start_retunes_window_and_next_fund_reads_live_window() {
+        // AV-475: window 1_700_000_500 replaced by 1_700_001_000
+        // — the deadline, the funded total and the amount never
+        // move, only the window. The funding paths read the window
+        // live through `fund` / `fund_with_slot`, so the new window
+        // governs the next funding the moment the amendment lands
+        // — while a funding already made keeps the window it
+        // funded under.
+        let mut e = windowed_escrow();
+        assert_eq!(
+            e.fund(ALICE, WINDOW_OPEN - 1),
+            Err(EscrowError::FundingNotStarted),
+            "funding before the current window is refused"
+        );
+        assert_eq!(EscrowError::FundingNotStarted.code(), 356);
+        e.amend_funding_start(ALICE, BOB, WINDOW_LATER).unwrap();
+        assert_eq!(e.funding_start(), WINDOW_LATER);
+        assert_eq!(
+            e.fund(ALICE, WINDOW_OPEN),
+            Err(EscrowError::FundingNotStarted),
+            "the old window no longer exists"
+        );
+        e.fund(ALICE, WINDOW_LATER).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.funded_total(), 1_000_000);
+    }
+
+    #[test]
+    fn amend_funding_start_accepts_zero_clears_window() {
+        // AV-475: the `with_funding_start` gate, unchanged — any
+        // u64 is accepted, and 0 clears the window: with no window
+        // attached, funding at any time succeeds.
+        let mut e = windowed_escrow();
+        e.amend_funding_start(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.funding_start(), 0, "zero clears the window");
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        e.fund(ALICE, WINDOW_OPEN - 1_000).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.funded_total(), 1_000_000);
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -69454,6 +69881,22 @@ pub(crate) mod anchor_idl_tests {
             "new_end_at",
             "auction",
         ),
+        // AV-475: the pre-funding funding-start window
+        // revision rewrites the 8-byte `funding_start` field in
+        // place — the window alone, never the deadline, the
+        // funded total or the amount. The field's *initial*
+        // value comes from the `with_funding_start` builder (a
+        // state-machine method, not an instruction param, so it
+        // cannot appear in the param table); the param entry
+        // documents the revision source. Only the window moves —
+        // the next fund / fund_with_slot reads the live value,
+        // so an early funding under the new window is refused
+        // at once while a funding at or after it succeeds.
+        (
+            "amend_funding_start",
+            "new_start_at",
+            "funding_start",
+        ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
         // for `delegation` (the whole grant region, like
@@ -70193,18 +70636,16 @@ pub(crate) mod anchor_idl_tests {
         // claim cutoff) is documented on that map entry. The
         // release_cooling_secs precedent: a builder + revision pair
         // documents the field through the map alone.
-        // AV-228: the funding start window — zeroed by
-        // `initialize` (no window attached); set by
-        // `with_funding_start` (Uninitialized only, zero = no
-        // window); read by fund / fund_with_slot as the funding
-        // gate — funding before the window is refused with
-        // FundingNotStarted (code 356).
-        (
-            "funding_start",
-            "Zeroed by initialize; set by with_funding_start \
-             (Uninitialized only, zero = no window); read by fund \
-             / fund_with_slot as the funding gate",
-        ),
+        // AV-228: the funding start window was a field source
+        // (`0` by `initialize`; set by `with_funding_start`,
+        // Uninitialized only, zero = no window; read by fund /
+        // fund_with_slot as the funding gate — funding before
+        // the window is refused with FundingNotStarted, code
+        // 356) until AV-475 added the `amend_funding_start`
+        // instruction param that rewrites it — the field is now
+        // param-sourced (see PARAM_FIELD_MAP), like
+        // `late_delivery_penalty_bps`, so it is not listed here:
+        // every field gets exactly one source kind.
         // AV-229: per-tranche partial-claim ledger — zeroed by
         // `initialize`; written only by `release_milestone_partial`
         // (and by a full `release_milestone` settling a partially
@@ -99587,6 +100028,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_dutch_auction_window"),
             [188, 166, 232, 233, 57, 199, 108, 79]
+        );
+    }
+
+    #[test]
+    fn amend_funding_start_instruction_discriminator_is_pinned() {
+        // AV-475. IDL:
+        // sha256("global:amend_funding_start")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_funding_start"),
+            [42, 29, 17, 243, 217, 250, 120, 14]
         );
     }
 

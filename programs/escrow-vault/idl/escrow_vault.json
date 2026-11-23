@@ -1540,6 +1540,14 @@
       ]
     },
     {
+      "name": "amend_funding_start",
+      "discriminator": [42, 29, 17, 243, 217, 250, 120, 14],
+      "accounts": [],
+      "args": [
+        {"name": "new_start_at", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
