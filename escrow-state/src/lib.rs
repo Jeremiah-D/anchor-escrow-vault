@@ -43126,6 +43126,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_threshold <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial threshold via update_panel_threshold and the dispute window tallies under the frozen threshold); only an escrow with a configured panel may amend — an unconfigured escrow is InvalidArbiterPanel (code 136, fail-closed: post-funding installation would add a settlement mechanism the taker never funded under); the new threshold reuses the ArbiterPanel::new gate (0 or above N is InvalidArbiterPanel, code 136) leaving the original threshold untouched; on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219 — the threshold moves only through the propose/execute protocol, GovernanceAction kind 17, with no new proposal variant); re-affirming the current threshold is a no-op (succeeds, writes nothing, emits no event, paralleling update_quorum); only the threshold changes — the members, the count, the blind mode and the reveal window are carried over verbatim, and the vote state is necessarily zero on a Funded escrow, so preserving the panel struct is exactly a no-reset; the new M governs from the next dispute (escalate then submit_panel_judgment tallies under the live threshold, so a lowered M lets a smaller roster settle and a raised M demands a wider agreement, and lowering M first unlocks a roster shrink under AV-283); emits the PanelThresholdChanged indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 1-byte threshold field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-478: revise the dispute jury's panel size after
+            // funding — the program-level entry point for the
+            // AV-281 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_jury_panel_size")[..8]
+            // = [112, 8, 17, 155, 181, 32, 0, 32] — the Anchor
+            // instruction discriminator for the
+            // amend_jury_panel_size handler (pinned by the
+            // discriminator test below).
+            name: "amend_jury_panel_size",
+            params: &[(
+                "new_panel_size",
+                "u8",
+                "instruction param; the replacement jury panel size — 1 <= K <= MAX_JURORS (64, the with_jury gate), 0 or above 64 is InvalidJurySize; re-affirming the current size is a no-op",
+            )],
+            method: "Escrow::amend_jury_panel_size",
+            input_mapping: "new_panel_size <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial size via with_jury and the draw has not happened yet, since draw_panel runs only on a Disputed escrow, so there is no in-flight panel to re-draw); only an escrow already carrying a jury may amend — an unconfigured escrow is InvalidJurySize (code 294, fail-closed: post-funding installation would add a settlement mechanism the taker never funded under); an escrow with a bound single arbiter is JuryArbiterConflict (code 298, mirroring draw_panel's mutual-exclusion gate, checked before configuration so an arbiter-settled escrow reports the conflict rather than the missing jury); the new size reuses the with_jury gate (1..=MAX_JURORS, otherwise InvalidJurySize, code 294) leaving the original size untouched, and the registry's size-vs-registration check stays at draw time (k > n is InvalidJurySize there — a size above today's registration count may become drawable as jurors register); on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219 — the size moves only through the propose/execute protocol, GovernanceAction kind 6, with no new proposal variant); re-affirming the current size is a no-op (succeeds, writes nothing, emits no event, paralleling update_quorum); only the size changes — the arbiter slot, the arbiter panel and the juror registry are untouched; the new size governs from the next dispute draw (draw_panel reads the live jury_panel_size at every call, so a panel drawn after the amendment seats the new size while no panel is ever re-drawn in flight); emits the JuryPanelSizeAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 1-byte jury_panel_size field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -44172,6 +44191,10 @@ pub(crate) mod anchor_idl_tests {
             // threshold revision (the AV-378 pure-logic
             // revision wired to the chain).
             "Escrow::amend_panel_threshold",
+            // AV-478: the program-level dispute-jury
+            // panel-size revision (the AV-281 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_jury_panel_size",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44838,6 +44861,14 @@ pub(crate) mod anchor_idl_tests {
                 // under AV-283; re-affirming the current threshold
                 // is a no-op.
                 &"amend_panel_threshold",
+                // AV-478: the jury-size revision carries the
+                // replacement panel size (u8) — the size alone;
+                // the next dispute draw seats the live size, so a
+                // loosened size seats a wider panel and a
+                // tightened size a narrower one, while a panel
+                // already drawn is never re-drawn; re-affirming
+                // the current size is a no-op.
+                &"amend_jury_panel_size",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -66812,6 +66843,409 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn amend_jury_panel_size_maps_params_to_jury_panel_size_field() {
+        // IDL: amend_jury_panel_size(new_panel_size: u8) —
+        // new_panel_size <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `jury_panel_size` tail field in
+        // place (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the single u8 param and the AV-281 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_jury_panel_size")
+            .expect("INSTRUCTIONS carries amend_jury_panel_size");
+        assert_eq!(spec.method, "Escrow::amend_jury_panel_size");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "new_panel_size");
+        assert_eq!(spec.params[0].1, "u8");
+        assert!(
+            spec.input_mapping.contains("JuryPanelSizeAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single u8 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_jury_panel_size\""),
+            "checked-in IDL carries amend_jury_panel_size"
+        );
+        assert!(
+            idl.contains("[112, 8, 17, 155, 181, 32, 0, 32]"),
+            "checked-in IDL pins the AV-478 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"new_panel_size\", \"type\": \"u8\"}"),
+            "checked-in IDL carries the new_panel_size arg"
+        );
+        // Only the size moves: the arbiter slot, the panel and the
+        // state are untouched.
+        let mut e = jury_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.jury_panel_size(), 5);
+        e.amend_jury_panel_size(ALICE, BOB, 3).unwrap();
+        assert_eq!(e.jury_panel_size(), 3, "size revised");
+        assert_eq!(e.arbiter(), None, "arbiter slot untouched");
+        assert_eq!(e.arbiter_panel(), None, "arbiter panel untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "size rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the size is set
+        // there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_jury(5)
+            .unwrap();
+        assert_eq!(
+            bare.amend_jury_panel_size(ALICE, BOB, 3),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_jury_panel_size_rejects_single_party_and_strangers() {
+        // AV-478: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // resize the dispute panel on the other's share.
+        let mut e = jury_funded_escrow();
+        assert_eq!(
+            e.amend_jury_panel_size(ALICE, ALICE, 3),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_jury_panel_size(MALLORY, BOB, 3),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_jury_panel_size(MALLORY, MALLORY, 3),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.jury_panel_size(),
+            5,
+            "failed revisions move nothing"
+        );
+        e.amend_jury_panel_size(ALICE, BOB, 3).unwrap();
+        assert_eq!(e.jury_panel_size(), 3);
+    }
+
+    #[test]
+    fn amend_jury_panel_size_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-478: the builder owns the initial size and the draw
+        // has not happened yet. The pause guard fires before the
+        // authority and state gates — and unpausing a Funded
+        // escrow re-opens the revision (Funded is the allowed
+        // state, the AV-475 contrast where an unpaused Funded
+        // escrow still refuses).
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        // Activated: funding is the lock-in point, not activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_jury(5)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_jury_panel_size(ALICE, BOB, 3),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: the draw has happened, so the size is frozen
+        // for this dispute.
+        let mut d = jury_funded_escrow();
+        d.escalate(ALICE, FUND_AT + 10, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_jury_panel_size(ALICE, BOB, 3),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.jury_panel_size(),
+            5,
+            "disputed revision moves nothing"
+        );
+        // Terminal: a released escrow's size is history, not
+        // policy.
+        let mut released = jury_funded_escrow();
+        released
+            .release(ALICE, FUND_AT + 10, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_jury_panel_size(ALICE, BOB, 3),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(released.jury_panel_size(), 5);
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_jury(5)
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_jury_panel_size(ALICE, BOB, 3),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_jury_panel_size(MALLORY, BOB, 3),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.jury_panel_size(),
+            5,
+            "paused revision moves nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — and Funded is the
+        // allowed state, so the revision now lands.
+        paused.amend_jury_panel_size(ALICE, BOB, 3).unwrap();
+        assert_eq!(paused.jury_panel_size(), 3);
+    }
+
+    #[test]
+    fn amend_jury_panel_size_refuses_unconfigured_jury() {
+        // AV-478: only an escrow already carrying a jury may
+        // revise a size — post-funding installation would add a
+        // settlement mechanism the taker never funded under.
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        bare.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            bare.amend_jury_panel_size(ALICE, BOB, 3),
+            Err(EscrowError::InvalidJurySize)
+        );
+        assert_eq!(EscrowError::InvalidJurySize.code(), 294);
+        assert_eq!(bare.jury_panel_size(), 0);
+    }
+
+    #[test]
+    fn amend_jury_panel_size_refuses_arbiter_set_jury_conflict() {
+        // AV-478: the mutual-exclusion gate fires before the
+        // configuration gate — an arbiter-settled escrow reports
+        // the conflict, not the missing jury (mirrors
+        // draw_panel's gate).
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut single = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        single.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            single.amend_jury_panel_size(ALICE, BOB, 3),
+            Err(EscrowError::JuryArbiterConflict)
+        );
+        assert_eq!(EscrowError::JuryArbiterConflict.code(), 298);
+        assert_eq!(single.jury_panel_size(), 0);
+    }
+
+    #[test]
+    fn amend_jury_panel_size_refuses_zero_or_over_64() {
+        // AV-478: the builder's size validation, reused —
+        // K in 1..=MAX_JURORS (64); a rejected K leaves the live
+        // size untouched.
+        let mut e = jury_funded_escrow();
+        assert_eq!(
+            e.amend_jury_panel_size(ALICE, BOB, 0),
+            Err(EscrowError::InvalidJurySize)
+        );
+        assert_eq!(
+            e.amend_jury_panel_size(ALICE, BOB, 65),
+            Err(EscrowError::InvalidJurySize)
+        );
+        assert_eq!(
+            e.jury_panel_size(),
+            5,
+            "failed call changes nothing"
+        );
+    }
+
+    #[test]
+    fn amend_jury_panel_size_refuses_direct_on_delay_opted_in() {
+        // AV-478: on a delay-opted-in escrow the size moves only
+        // through the propose/execute protocol
+        // (GovernanceAction kind 6) — the direct call is refused,
+        // whatever the size; the delayed path then lands it.
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_jury(5)
+            .unwrap();
+        delayed.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(delayed.state(), EscrowState::Funded);
+        assert_eq!(
+            delayed.amend_jury_panel_size(ALICE, BOB, 3),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(EscrowError::GovernanceActionNotProposed.code(), 219);
+        assert_eq!(delayed.jury_panel_size(), 5);
+        delayed
+            .propose_governance(
+                ALICE,
+                GovernanceAction::AmendJuryPanelSize { new_panel_size: 3 },
+                FUND_AT + 10,
+            )
+            .unwrap();
+        delayed
+            .execute_governance(BOB, FUND_AT + 10 + 3_600)
+            .unwrap();
+        assert_eq!(delayed.jury_panel_size(), 3);
+        assert!(delayed.governance_proposal().is_none());
+    }
+
+    #[test]
+    fn amend_jury_panel_size_noop_on_same_size() {
+        // AV-478: re-affirming the current size is a no-op —
+        // it succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = jury_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_jury_panel_size(ALICE, BOB, 5).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-size re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.jury_panel_size(), 5);
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_jury_panel_size(ALICE, BOB, 3).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_jury_panel_size(ALICE, BOB, 3).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised size writes nothing either"
+        );
+        assert_eq!(e.jury_panel_size(), 3);
+    }
+
+    #[test]
+    fn amend_jury_panel_size_emits_only_on_change() {
+        // AV-478: the program handler emits
+        // `JuryPanelSizeAmended` only when the size actually
+        // changes — the before/after comparison in the handler
+        // skips the event on a no-op re-affirmation (mirrors
+        // `amend_price_gate`). At the state-machine level the
+        // same-size call writes nothing — the encoded escrow is
+        // byte-identical before and after, so there is nothing
+        // to emit about — while a real change moves the field,
+        // which is what the handler's emission keys on. The
+        // INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_jury_panel_size")
+            .expect("INSTRUCTIONS carries amend_jury_panel_size");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = jury_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_jury_panel_size(ALICE, BOB, 5).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-size re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_jury_panel_size(ALICE, BOB, 3).unwrap();
+        assert_eq!(e.jury_panel_size(), 3);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_jury_panel_size_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-478: the program handler emits
+        // `JuryPanelSizeAmended` only when the size actually
+        // changes — the indexed wrapper is the event-layer
+        // mirror of the handler's before/after comparison. A failed
+        // revision emits nothing, a no-op re-affirmation emits
+        // nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const AT: u64 = EXPIRES_AT - 3_500;
+        let mut e = IndexedEscrow::wrap([0x1D; 32], jury_funded_escrow());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_jury_panel_size(MALLORY, BOB, 3, AT),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_jury_panel_size(ALICE, BOB, 3, AT).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::JuryPanelSizeAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same size is a no-op: no new event.
+        e.amend_jury_panel_size(ALICE, BOB, 3, AT + 1).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_jury_panel_size_retunes_size_and_next_draw_reads_live_size() {
+        // AV-478: loosening seats a wider panel at the next draw
+        // and tightening past today's registration count is still
+        // a valid amendment — the registry check stays at draw
+        // time. The new size governs from the next dispute draw,
+        // since `draw_panel` reads the live size at every call.
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut e = jury_funded_escrow();
+        e.amend_jury_panel_size(ALICE, BOB, 3).unwrap();
+        e.escalate(ALICE, FUND_AT + 1, 1_000_000, None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        let r = juror_registry_with(5);
+        let panel = r
+            .draw_panel(&e, [0xE0; 32], [0x51; 32])
+            .expect("3-of-5 draw succeeds");
+        assert_eq!(panel.members().len(), 3, "draw seats the amended size");
+        assert!(panel.verify(&r, &e, [0x51; 32]));
+        // Tightening past today's registration count is still a
+        // valid amendment — the registry check stays at draw time
+        // (k > n is InvalidJurySize there), so a size above
+        // today's count may become drawable as jurors register.
+        let mut f = jury_funded_escrow();
+        f.amend_jury_panel_size(ALICE, BOB, 7).unwrap();
+        assert_eq!(f.jury_panel_size(), 7);
+        f.escalate(ALICE, FUND_AT + 1, 1_000_000, None, None, 0)
+            .unwrap();
+        assert_eq!(
+            juror_registry_with(5).draw_panel(&f, [0xE0; 32], [0x51; 32]),
+            Err(EscrowError::InvalidJurySize),
+            "7-of-5 draw refused at draw time, not at amendment time"
+        );
+    }
+
+    #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
         // new_delegate <- param; caller <-
@@ -67769,6 +68203,24 @@ pub(crate) mod anchor_idl_tests {
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         assert_eq!(e.state(), EscrowState::Funded);
         e
+    }
+
+    fn jury_funded_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_jury(5)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn juror_registry_with(n: u8) -> JurorRegistry {
+        let mut r = JurorRegistry::new();
+        for i in 1..=n {
+            r.register([i; 32], 1_000 * i as u64).unwrap();
+        }
+        r
     }
 
     fn panel_members(e: &Escrow) -> Vec<[u8; 32]> {
@@ -70776,6 +71228,23 @@ pub(crate) mod anchor_idl_tests {
             "amend_panel_threshold",
             "new_threshold",
             "arbiter_panel",
+        ),
+        // AV-478: the post-funding dispute-jury size revision
+        // rewrites the 1-byte `jury_panel_size` tail field in
+        // place — a second param source for the field, like
+        // `configure_jury`'s panel_size param. The size's
+        // *initial* value comes from the `with_jury` builder (a
+        // state-machine method, not an instruction param, so it
+        // cannot appear in the param table); the param entry
+        // documents the revision source. Only the size moves —
+        // the arbiter slot, the arbiter panel and the juror
+        // registry are untouched, so the next dispute draw seats
+        // the live size while a panel already drawn is never
+        // re-drawn.
+        (
+            "amend_jury_panel_size",
+            "new_panel_size",
+            "jury_panel_size",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -100942,6 +101411,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_panel_threshold"),
             [192, 166, 186, 13, 85, 249, 94, 78]
+        );
+    }
+
+    #[test]
+    fn amend_jury_panel_size_instruction_discriminator_is_pinned() {
+        // AV-478. IDL:
+        // sha256("global:amend_jury_panel_size")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_jury_panel_size"),
+            [112, 8, 17, 155, 181, 32, 0, 32]
         );
     }
 

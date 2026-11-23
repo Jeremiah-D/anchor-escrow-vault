@@ -1564,6 +1564,14 @@
       ]
     },
     {
+      "name": "amend_jury_panel_size",
+      "discriminator": [112, 8, 17, 155, 181, 32, 0, 32],
+      "accounts": [],
+      "args": [
+        {"name": "new_panel_size", "type": "u8"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

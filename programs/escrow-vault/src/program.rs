@@ -8910,6 +8910,84 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the dispute jury's panel size after funding (AV-478;
+    /// mirrors `Escrow::amend_jury_panel_size`, the AV-281
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot resize
+    /// the dispute panel on the other's share. `Funded` only — the
+    /// builder owns the initial size via `with_jury`, and the draw
+    /// has not happened yet, since `draw_panel` runs only on a
+    /// `Disputed` escrow, so there is no in-flight panel to re-draw.
+    /// A paused escrow fails fast (`Paused`, before the authority
+    /// gate). On a delay-opted-in escrow the direct call is refused
+    /// (`GovernanceActionNotProposed`, code 219) — the size moves
+    /// only through the propose/execute protocol, with no new proposal
+    /// variant (the `AmendJuryPanelSize` variant, kind 6, is already
+    /// there). Only an escrow already carrying a jury may amend — an
+    /// unconfigured escrow is `InvalidJurySize` fail-closed
+    /// (post-funding installation would add a settlement mechanism the
+    /// taker never funded under); an escrow with a bound single
+    /// arbiter is `JuryArbiterConflict` (code 298, mirroring
+    /// `draw_panel`'s mutual-exclusion gate, checked before
+    /// configuration so an arbiter-settled escrow reports the
+    /// conflict rather than the missing jury); the new size reuses the
+    /// `with_jury` gate (`1..=MAX_JURORS`, otherwise
+    /// `InvalidJurySize`, code 294). Re-affirming the current size
+    /// is a no-op: it succeeds, writes nothing and emits nothing.
+    /// Emits `JuryPanelSizeAmended` (from == to == the current
+    /// state) only on an actual change. Only the size changes — the
+    /// arbiter slot, the arbiter panel and the juror registry are
+    /// untouched, and the registry's size-vs-registration check stays
+    /// at draw time (`k > n` is `InvalidJurySize` there — a size
+    /// above today's registration count may become drawable as jurors
+    /// register); the new size governs from the next dispute draw
+    /// (`draw_panel` reads the live `jury_panel_size` at every call,
+    /// so a panel drawn after the amendment seats the new size while
+    /// no panel is ever re-drawn in flight). `now` comes from the
+    /// clock sysvar, never an instruction param (mirrors
+    /// `amend_funding_start`) — here only for the event timestamp,
+    /// since the pure logic takes no `now`.
+    pub fn amend_jury_panel_size(
+        ctx: Context<AmendJuryPanelSize>,
+        new_panel_size: u8,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.jury_panel_size();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_jury_panel_size(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_panel_size,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 1-byte `jury_panel_size` tail field in
+        // place — no realloc. Only the size moves; the arbiter slot,
+        // the arbiter panel and the juror registry are untouched.
+        // Emits only on an actual change; a no-op re-affirmation
+        // stays silent (mirrors `amend_price_gate`).
+        if escrow.jury_panel_size() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::JuryPanelSizeAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -16452,6 +16530,22 @@ pub struct AmendCompoundInterest<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendPanelThreshold<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-478: accounts for `amend_jury_panel_size` — the
+/// dispute-jury panel-size revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendJuryPanelSize<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
