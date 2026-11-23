@@ -8836,6 +8836,80 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the arbiter panel's judgment threshold after funding (AV-477;
+    /// mirrors `Escrow::amend_panel_threshold`, the AV-378
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot reshape
+    /// the settlement gate on the other's share. `Funded` only — the
+    /// builder owns the initial threshold via `update_panel_threshold`,
+    /// and a live dispute's tally can never move mid-flight. A paused
+    /// escrow fails fast (`Paused`, before the authority gate). On a
+    /// delay-opted-in escrow the direct call is refused
+    /// (`GovernanceActionNotProposed`, code 219) — the threshold moves
+    /// only through the propose/execute protocol, with no new proposal
+    /// variant (the `AmendPanelThreshold` variant, kind 17, is already
+    /// there). Only an escrow with a configured panel may amend — an
+    /// unconfigured escrow is `InvalidArbiterPanel` fail-closed
+    /// (post-funding installation would add a settlement mechanism the
+    /// taker never funded under); the new threshold reuses the
+    /// `ArbiterPanel::new` gate (`1 <= M <= N`, otherwise
+    /// `InvalidArbiterPanel`, code 136). Re-affirming the current
+    /// threshold is a no-op: it succeeds, writes nothing and emits
+    /// nothing. Emits `PanelThresholdChanged` (from == to == the current
+    /// state) only on an actual change. Only the threshold changes —
+    /// the members, the count, the blind mode and the reveal window are
+    /// carried over verbatim, and the vote state is necessarily zero on
+    /// a `Funded` escrow, so preserving the panel struct is exactly a
+    /// no-reset; the new M governs from the next dispute (`escalate`
+    /// then `submit_panel_judgment` tallies under the live threshold,
+    /// so a lowered M lets a smaller roster settle and a raised M
+    /// demands a wider agreement, and lowering M first unlocks a roster
+    /// shrink under AV-283) — while a dispute already settled keeps the
+    /// threshold it settled under. `now` comes from the clock sysvar,
+    /// never an instruction param (mirrors `amend_funding_start`) —
+    /// here only for the event timestamp, since the pure logic takes
+    /// no `now`.
+    pub fn amend_panel_threshold(
+        ctx: Context<AmendPanelThreshold>,
+        new_threshold: u8,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.arbiter_panel().map(|p| p.threshold);
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_panel_threshold(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_threshold,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 1-byte `threshold` field of the panel region in
+        // place — no realloc. Only the threshold moves; the members,
+        // the count, the blind mode, the reveal window and the vote
+        // state are untouched. Emits only on an actual change; a no-op
+        // re-affirmation stays silent (mirrors `amend_price_gate`).
+        if escrow.arbiter_panel().map(|p| p.threshold) != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::PanelThresholdChanged,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -16362,6 +16436,22 @@ pub struct AmendFundingStart<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendCompoundInterest<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-477: accounts for `amend_panel_threshold` — the
+/// arbiter-panel threshold revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendPanelThreshold<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

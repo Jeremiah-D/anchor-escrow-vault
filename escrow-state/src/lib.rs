@@ -43107,6 +43107,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "enabled <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial opt-in and the dispute window settles under the frozen mode); no delay path covers this method — GovernanceAction has no AmendCompoundInterest variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current mode is a no-op (succeeds, writes nothing, emits no event, paralleling amend_interest_rate); only the compound_interest flag flips — amount, interest_compounded, interest_paid and interest_accrued are never restated, so yield already folded stays principal and yield already paid stays paid, and the next take_accrued_interest / settle_dispute_interest / claim_interest reads the live flag, so a flip governs the very next settlement while a settlement already made keeps the mode it settled under (and claim_interest is refused with CompoundInterestActive, code 178, while compounding is on); emits the CompoundInterestAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 1-byte compound_interest flag is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-477: revise the arbiter panel's judgment threshold
+            // after funding — the program-level entry point for the
+            // AV-378 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_panel_threshold")[..8]
+            // = [192, 166, 186, 13, 85, 249, 94, 78] — the Anchor
+            // instruction discriminator for the
+            // amend_panel_threshold handler (pinned by the
+            // discriminator test below).
+            name: "amend_panel_threshold",
+            params: &[(
+                "new_threshold",
+                "u8",
+                "instruction param; the replacement M-of-N judgment threshold — 1 <= M <= N (the ArbiterPanel::new gate), 0 or above N is InvalidArbiterPanel; re-affirming the current threshold is a no-op",
+            )],
+            method: "Escrow::amend_panel_threshold",
+            input_mapping: "new_threshold <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial threshold via update_panel_threshold and the dispute window tallies under the frozen threshold); only an escrow with a configured panel may amend — an unconfigured escrow is InvalidArbiterPanel (code 136, fail-closed: post-funding installation would add a settlement mechanism the taker never funded under); the new threshold reuses the ArbiterPanel::new gate (0 or above N is InvalidArbiterPanel, code 136) leaving the original threshold untouched; on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219 — the threshold moves only through the propose/execute protocol, GovernanceAction kind 17, with no new proposal variant); re-affirming the current threshold is a no-op (succeeds, writes nothing, emits no event, paralleling update_quorum); only the threshold changes — the members, the count, the blind mode and the reveal window are carried over verbatim, and the vote state is necessarily zero on a Funded escrow, so preserving the panel struct is exactly a no-reset; the new M governs from the next dispute (escalate then submit_panel_judgment tallies under the live threshold, so a lowered M lets a smaller roster settle and a raised M demands a wider agreement, and lowering M first unlocks a roster shrink under AV-283); emits the PanelThresholdChanged indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 1-byte threshold field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -44149,6 +44168,10 @@ pub(crate) mod anchor_idl_tests {
             // mode revision (the AV-333 pure-logic
             // revision wired to the chain).
             "Escrow::amend_compound_interest",
+            // AV-477: the program-level arbiter-panel
+            // threshold revision (the AV-378 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_panel_threshold",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44806,6 +44829,15 @@ pub(crate) mod anchor_idl_tests {
                 // keeps the mode it settled under; re-affirming
                 // the current mode is a no-op.
                 &"amend_compound_interest",
+                // AV-477: the panel-threshold revision carries
+                // the replacement threshold (u8) — the threshold
+                // alone; the next dispute tallies under the live
+                // threshold, so a lowered M lets a smaller roster
+                // settle and a raised M demands a wider agreement,
+                // and lowering M first unlocks a roster shrink
+                // under AV-283; re-affirming the current threshold
+                // is a no-op.
+                &"amend_panel_threshold",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -66384,6 +66416,402 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn amend_panel_threshold_maps_params_to_arbiter_panel_field() {
+        // IDL: amend_panel_threshold(new_threshold: u8) —
+        // new_threshold <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `threshold` field of the
+        // `arbiter_panel` region in place (see PARAM_FIELD_MAP) —
+        // no layout change. The INSTRUCTIONS spec entry pins the
+        // program-level wiring: the single u8 param and the AV-378
+        // pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_panel_threshold")
+            .expect("INSTRUCTIONS carries amend_panel_threshold");
+        assert_eq!(spec.method, "Escrow::amend_panel_threshold");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "new_threshold");
+        assert_eq!(spec.params[0].1, "u8");
+        assert!(
+            spec.input_mapping.contains("PanelThresholdChanged"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single u8 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_panel_threshold\""),
+            "checked-in IDL carries amend_panel_threshold"
+        );
+        assert!(
+            idl.contains("[192, 166, 186, 13, 85, 249, 94, 78]"),
+            "checked-in IDL pins the AV-477 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"new_threshold\", \"type\": \"u8\"}"),
+            "checked-in IDL carries the new_threshold arg"
+        );
+        // Only the threshold moves: the roster, the state and the
+        // layout are untouched.
+        let mut e = panel_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.arbiter_panel().unwrap().threshold, 2);
+        e.amend_panel_threshold(ALICE, BOB, 1).unwrap();
+        assert_eq!(e.arbiter_panel().unwrap().threshold, 1, "threshold revised");
+        assert_eq!(e.arbiter_panel().unwrap().n, 3, "roster untouched");
+        assert_eq!(
+            panel_members(&e),
+            vec![ARB_M1, ARB_M2, ARB_M3],
+            "members untouched"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "threshold rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the threshold is
+        // set there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[ARB_M1, ARB_M2, ARB_M3], 2)
+            .unwrap();
+        assert_eq!(
+            bare.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_panel_threshold_rejects_single_party_and_strangers() {
+        // AV-477: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // reshape the settlement gate on the other's share.
+        let mut e = panel_funded_escrow();
+        assert_eq!(
+            e.amend_panel_threshold(ALICE, ALICE, 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_panel_threshold(MALLORY, BOB, 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_panel_threshold(MALLORY, MALLORY, 1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.arbiter_panel().unwrap().threshold,
+            2,
+            "failed revisions move nothing"
+        );
+        e.amend_panel_threshold(ALICE, BOB, 1).unwrap();
+        assert_eq!(e.arbiter_panel().unwrap().threshold, 1);
+    }
+
+    #[test]
+    fn amend_panel_threshold_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-477: the builder owns the initial threshold and the
+        // dispute window tallies under the frozen threshold. The
+        // pause guard fires before the authority and state gates —
+        // and unpausing a Funded escrow re-opens the revision
+        // (Funded is the allowed state, the AV-475 contrast where
+        // an unpaused Funded escrow still refuses).
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        // Activated: funding is the lock-in point, not activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[ARB_M1, ARB_M2, ARB_M3], 2)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: the dispute window tallies under the frozen
+        // threshold.
+        let mut d = panel_funded_escrow();
+        d.escalate(ALICE, FUND_AT + 10, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.arbiter_panel().unwrap().threshold,
+            2,
+            "disputed revision moves nothing"
+        );
+        // Terminal: a released escrow's threshold is history, not
+        // policy.
+        let mut released = panel_funded_escrow();
+        released
+            .release(ALICE, FUND_AT + 10, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(released.arbiter_panel().unwrap().threshold, 2);
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_arbiter_panel(&[ARB_M1, ARB_M2, ARB_M3], 2)
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_panel_threshold(MALLORY, BOB, 1),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.arbiter_panel().unwrap().threshold,
+            2,
+            "paused revision moves nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — and Funded is the
+        // allowed state, so the revision now lands.
+        paused.amend_panel_threshold(ALICE, BOB, 1).unwrap();
+        assert_eq!(paused.arbiter_panel().unwrap().threshold, 1);
+    }
+
+    #[test]
+    fn amend_panel_threshold_refuses_unconfigured_panel() {
+        // AV-477: only an escrow with a configured panel may
+        // revise a threshold — post-funding installation would
+        // add a settlement mechanism the taker never funded
+        // under; single-arbiter mode revises through
+        // `rotate_arbiter`, not here.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut single = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap();
+        single.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            single.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        bare.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            bare.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(EscrowError::InvalidArbiterPanel.code(), 136);
+    }
+
+    #[test]
+    fn amend_panel_threshold_refuses_zero_or_over_n() {
+        // AV-477: the builder's threshold validation, reused —
+        // M in 1..=N; a rejected M leaves the live threshold
+        // untouched.
+        let mut e = panel_funded_escrow();
+        assert_eq!(
+            e.amend_panel_threshold(ALICE, BOB, 0),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(
+            e.amend_panel_threshold(ALICE, BOB, 4),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(
+            e.arbiter_panel().unwrap().threshold,
+            2,
+            "failed call changes nothing"
+        );
+    }
+
+    #[test]
+    fn amend_panel_threshold_refuses_direct_on_delay_opted_in() {
+        // AV-477: on a delay-opted-in escrow the threshold moves
+        // only through the propose/execute protocol
+        // (GovernanceAction kind 17) — the direct call is
+        // refused, whatever the threshold.
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_arbiter_panel(&[ARB_M1, ARB_M2, ARB_M3], 2)
+            .unwrap();
+        delayed.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(delayed.state(), EscrowState::Funded);
+        assert_eq!(
+            delayed.amend_panel_threshold(ALICE, BOB, 1),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(EscrowError::GovernanceActionNotProposed.code(), 219);
+        assert_eq!(delayed.arbiter_panel().unwrap().threshold, 2);
+    }
+
+    #[test]
+    fn amend_panel_threshold_noop_on_same_threshold() {
+        // AV-477: re-affirming the current threshold is a no-op —
+        // it succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = panel_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_panel_threshold(ALICE, BOB, 2).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-threshold re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.arbiter_panel().unwrap().threshold, 2);
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_panel_threshold(ALICE, BOB, 1).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_panel_threshold(ALICE, BOB, 1).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised threshold writes nothing either"
+        );
+        assert_eq!(e.arbiter_panel().unwrap().threshold, 1);
+    }
+
+    #[test]
+    fn amend_panel_threshold_emits_only_on_change() {
+        // AV-477: the program handler emits
+        // `PanelThresholdChanged` only when the threshold
+        // actually changes — the before/after comparison in the
+        // handler skips the event on a no-op re-affirmation
+        // (mirrors `amend_price_gate`). At the state-machine level
+        // the same-threshold call writes nothing — the encoded
+        // escrow is byte-identical before and after, so there is
+        // nothing to emit about — while a real change moves the
+        // field, which is what the handler's emission keys on. The
+        // INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_panel_threshold")
+            .expect("INSTRUCTIONS carries amend_panel_threshold");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = panel_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_panel_threshold(ALICE, BOB, 2).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-threshold re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_panel_threshold(ALICE, BOB, 1).unwrap();
+        assert_eq!(e.arbiter_panel().unwrap().threshold, 1);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_panel_threshold_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-477: the program handler emits
+        // `PanelThresholdChanged` only when the threshold
+        // actually changes — the indexed wrapper is the event-layer
+        // mirror of the handler's before/after comparison. A failed
+        // revision emits nothing, a no-op re-affirmation emits
+        // nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const AT: u64 = EXPIRES_AT - 3_500;
+        let mut e = IndexedEscrow::wrap([0x1D; 32], panel_funded_escrow());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_panel_threshold(MALLORY, BOB, 1, AT),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_panel_threshold(ALICE, BOB, 1, AT).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::PanelThresholdChanged);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same threshold is a no-op: no new event.
+        e.amend_panel_threshold(ALICE, BOB, 1, AT + 1).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_panel_threshold_retunes_threshold_and_panel_resize_reads_live_threshold() {
+        // AV-477: lowering M first is what unlocks the shrink — a
+        // 1-member roster is below the old M=2, so it is refused
+        // until the threshold moves; raising M demands a wider
+        // agreement at the next dispute. The new M governs from
+        // the next dispute, since `submit_panel_judgment` tallies
+        // under the live threshold.
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut e = panel_funded_escrow();
+        assert_eq!(
+            e.update_arbiter_panel_members(ALICE, BOB, &[ARB_M1]),
+            Err(EscrowError::InvalidArbiterPanel),
+            "a 1-member roster is below the live M=2"
+        );
+        e.amend_panel_threshold(ALICE, BOB, 1).unwrap();
+        e.update_arbiter_panel_members(ALICE, BOB, &[ARB_M1])
+            .unwrap();
+        let panel = e.arbiter_panel().unwrap();
+        assert_eq!((panel.n, panel.threshold), (1, 1));
+        assert_eq!(panel_members(&e), vec![ARB_M1]);
+        // Raising M: two matching votes no longer settle; the
+        // third does.
+        let mut raised = panel_funded_escrow();
+        raised.amend_panel_threshold(ALICE, BOB, 3).unwrap();
+        assert_eq!(raised.arbiter_panel().unwrap().threshold, 3);
+        raised
+            .escalate(ALICE, FUND_AT + 10, raised.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert!(raised
+            .submit_panel_judgment(ARB_M1, 600_000, FUND_AT + 10, None, None, BOB)
+            .unwrap()
+            .is_none());
+        assert!(raised
+            .submit_panel_judgment(ARB_M2, 600_000, FUND_AT + 10, None, None, BOB)
+            .unwrap()
+            .is_none());
+        assert_eq!(raised.state(), EscrowState::Disputed);
+        assert!(raised
+            .submit_panel_judgment(ARB_M3, 600_000, FUND_AT + 10, None, None, BOB)
+            .unwrap()
+            .is_some());
+        assert_eq!(raised.state(), EscrowState::Settled);
+    }
+
+    #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
         // new_delegate <- param; caller <-
@@ -70330,6 +70758,24 @@ pub(crate) mod anchor_idl_tests {
             "amend_compound_interest",
             "enabled",
             "compound_interest",
+        ),
+        // AV-477: the post-funding arbiter-panel threshold
+        // revision rewrites the 1-byte `threshold` field of the
+        // `arbiter_panel` region in place — a second param source
+        // for the region, like `update_arbiter_panel_members`'s
+        // members param. The threshold's *initial* value comes
+        // from the `with_arbiter_panel` builder (a state-machine
+        // method, not an instruction param, so it cannot appear
+        // in the param table); the param entry documents the
+        // revision source. Only the threshold moves — the members,
+        // the count, the blind mode and the reveal window are
+        // carried over verbatim, so the next dispute tallies
+        // under the live threshold while a dispute already
+        // settled keeps the threshold it settled under.
+        (
+            "amend_panel_threshold",
+            "new_threshold",
+            "arbiter_panel",
         ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
@@ -100484,6 +100930,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_compound_interest"),
             [217, 144, 80, 104, 246, 86, 61, 237]
+        );
+    }
+
+    #[test]
+    fn amend_panel_threshold_instruction_discriminator_is_pinned() {
+        // AV-477. IDL:
+        // sha256("global:amend_panel_threshold")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_panel_threshold"),
+            [192, 166, 186, 13, 85, 249, 94, 78]
         );
     }
 
