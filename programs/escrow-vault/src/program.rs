@@ -9065,6 +9065,80 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the bound settlement mint after funding (AV-480;
+    /// mirrors `Escrow::amend_settlement_mint`, the AV-317
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot
+    /// redenominate the other's share. `Funded` only — the builder
+    /// owns the initial binding via `with_settlement_mint`, and only
+    /// an escrow with a settlement mint already bound may amend —
+    /// an unbound escrow is `SettlementMintNotBound` (code 346,
+    /// fail-closed: post-funding installation would add a
+    /// denomination the taker never funded under). The new mint
+    /// reuses the `with_settlement_mint` gate (the zero address is
+    /// `InvalidMint`, code 112) leaving the original mint untouched.
+    /// A paused escrow fails fast (`Paused`, before the authority
+    /// gate). On a delay-opted-in escrow the direct call is refused
+    /// (`GovernanceActionNotProposed`, code 219) — the mint moves
+    /// only through the propose/execute protocol, with no new
+    /// proposal variant (the `AmendSettlementMint` variant, kind 5,
+    /// is already there). Re-affirming the current mint is a no-op:
+    /// it succeeds, writes nothing and emits nothing. Emits
+    /// `SettlementMintAmended` (from == to == the current state)
+    /// only on an actual change. Only the settlement mint changes —
+    /// the funded mint, the allowlist, any settled release already
+    /// made, and the funded-unit counters are untouched, and plain
+    /// `release` is unaffected, so the new mint governs from the
+    /// next `release_with_settlement_rate` (that path reads the live
+    /// mint before rate verification, so a quote for the old mint
+    /// fails at once while a quote for the new mint settles). The
+    /// live allowlist is not consulted here (the release-time gate
+    /// stays the single enforcement point, AV-276). `now` comes from
+    /// the clock sysvar, never an instruction param (mirrors
+    /// `amend_funding_start`) — here only for the event timestamp,
+    /// since the pure logic takes no `now`.
+    pub fn amend_settlement_mint(
+        ctx: Context<AmendSettlementMint>,
+        new_settle_mint: Pubkey,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.settlement_mint();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_settlement_mint(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_settle_mint.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 32-byte `settlement_mint` tail field in
+        // place — no realloc. Only the mint moves; the funded
+        // mint, the allowlist, any settled release already made,
+        // and the funded-unit counters are untouched.
+        // Emits only on an actual change; a no-op re-affirmation
+        // stays silent (mirrors `amend_price_gate`).
+        if escrow.settlement_mint() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::SettlementMintAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -16639,6 +16713,22 @@ pub struct AmendJuryPanelSize<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendEventCapacity<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-480: accounts for `amend_settlement_mint` — the
+/// settlement-mint revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendSettlementMint<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

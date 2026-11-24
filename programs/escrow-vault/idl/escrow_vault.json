@@ -1580,6 +1580,14 @@
       ]
     },
     {
+      "name": "amend_settlement_mint",
+      "discriminator": [126, 142, 67, 196, 194, 88, 37, 79],
+      "accounts": [],
+      "args": [
+        {"name": "new_settle_mint", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
