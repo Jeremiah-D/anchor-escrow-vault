@@ -43184,6 +43184,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_settle_mint <- param (Pubkey -> [u8; 32] conversion); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial binding via with_settlement_mint); only an escrow with a settlement mint already bound may amend — an unbound escrow is SettlementMintNotBound (code 346, fail-closed: post-funding installation would add a denomination the taker never funded under); the new mint reuses the with_settlement_mint gate (the zero address is InvalidMint, code 112) leaving the original mint untouched; on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219 — the mint moves only through the propose/execute protocol, GovernanceAction kind 5, with no new proposal variant); re-affirming the current mint is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only the settlement_mint changes — the funded mint, the allowlist, any settled release already made, and the funded-unit counters are untouched, and plain release is unaffected; the new mint governs from the next release_with_settlement_rate (that path reads the live mint before rate verification, so a quote for the old mint fails with SettlementRateInvalid at once while a quote for the new mint settles, and a release already settled keeps the mint it settled under); the live allowlist is not consulted here (the release-time gate stays the single enforcement point, AV-276); emits the SettlementMintAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 32-byte settlement_mint field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-481: revise a subscription's period cadence after
+            // funding — the program-level entry point for the
+            // AV-289 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_subscription_period_secs")[..8]
+            // = [170, 23, 105, 193, 38, 129, 89, 179] — the Anchor
+            // instruction discriminator for the
+            // amend_subscription_period_secs handler (pinned by the
+            // discriminator test below).
+            name: "amend_subscription_period_secs",
+            params: &[(
+                "new_period_secs",
+                "u64",
+                "instruction param; the replacement period cadence in seconds — zero is InvalidSubscription, and a period whose (periods - 1) * new_period_secs would overflow the escrow lifetime is refused with the same error; re-affirming the current period is a no-op",
+            )],
+            method: "Escrow::amend_subscription_period_secs",
+            input_mapping: "new_period_secs <- param (u64); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial schedule via with_subscription); only an escrow with a subscription plan already configured may revise — an unconfigured escrow is InvalidSubscription (code 130, fail-closed: post-funding installation would add a payout schedule the taker never funded under); the new period reuses the with_subscription gates (a zero period is InvalidSubscription, code 130, and if (periods - 1) * new_period_secs > expires_at the plan would overflow the escrow lifetime, so the revision is refused with the same error) leaving the original period untouched; on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219 — the cadence moves only through the propose/execute protocol, GovernanceAction kind 10, with no new proposal variant); re-affirming the current period is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only subscription.period_secs changes — periods, per_period, the amount conservation (periods * per_period == amount), subscription_next and subscription_released are untouched, and the new cadence governs from the next claim (subscription_period_due_at / SubscriptionSchedule::due_at read the live period_secs, so due dates of unreleased periods move with the new cadence when computed backwards from expires_at, with the last period pinned to expires_at, while a period already released keeps the due date it released under); emits the SubscriptionPeriodSecsAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 8-byte subscription.period_secs field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -44243,6 +44262,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-317 pure-logic
             // revision wired to the chain).
             "Escrow::amend_settlement_mint",
+            // AV-481: the program-level subscription-cadence
+            // revision (the AV-289 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_subscription_period_secs",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44937,6 +44960,15 @@ pub(crate) mod anchor_idl_tests {
                 // unaffected; re-affirming the current mint is a
                 // no-op.
                 &"amend_settlement_mint",
+                // AV-481: the subscription-cadence revision carries
+                // the replacement period (u64) — the cadence alone;
+                // the new period governs from the next claim
+                // (subscription_period_due_at reads the live
+                // period_secs, so due dates of unreleased periods
+                // move with the new cadence while a period already
+                // released keeps the due date it released under);
+                // re-affirming the current period is a no-op.
+                &"amend_subscription_period_secs",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -68202,6 +68234,493 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn amend_subscription_period_secs_maps_params_to_subscription_period_secs_field() {
+        // IDL: amend_subscription_period_secs(new_period_secs: u64) —
+        // new_period_secs <- param (u64); initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites `subscription.period_secs` in place
+        // (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the single u64 param and the AV-289 pure-logic method.
+        const PERIOD_SECS: u64 = 86_400;
+        const PERIODS: u8 = 4;
+        const PER_PERIOD: u64 = 250_000;
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_subscription_period_secs")
+            .expect("INSTRUCTIONS carries amend_subscription_period_secs");
+        assert_eq!(spec.method, "Escrow::amend_subscription_period_secs");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "new_period_secs");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("SubscriptionPeriodSecsAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single u64 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_subscription_period_secs\""),
+            "checked-in IDL carries amend_subscription_period_secs"
+        );
+        assert!(
+            idl.contains("[170, 23, 105, 193, 38, 129, 89, 179]"),
+            "checked-in IDL pins the AV-481 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"new_period_secs\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the new_period_secs arg"
+        );
+        // Only the cadence moves: the period count, the per-period
+        // amount, the next-period cursor, the released bitmap, the
+        // state, and the encoded length are untouched.
+        let mut e = subscription_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let schedule_before = e.subscription_schedule().unwrap();
+        assert_eq!(schedule_before.period_secs, PERIOD_SECS);
+        assert_eq!(schedule_before.periods, PERIODS);
+        assert_eq!(schedule_before.per_period, PER_PERIOD);
+        e.amend_subscription_period_secs(ALICE, BOB, 43_200).unwrap();
+        let schedule = e.subscription_schedule().unwrap();
+        assert_eq!(schedule.period_secs, 43_200, "cadence revised");
+        assert_eq!(schedule.periods, PERIODS, "period count untouched");
+        assert_eq!(schedule.per_period, PER_PERIOD, "per-period untouched");
+        assert_eq!(
+            schedule.periods as u64 * schedule.per_period,
+            1_000_000,
+            "amount conservation untouched"
+        );
+        assert_eq!(e.subscription_next_period(), 0);
+        assert_eq!(e.subscription_released_periods(), 0);
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "cadence region rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the schedule is
+        // configured there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_subscription(PERIOD_SECS, PERIODS, PER_PERIOD)
+            .unwrap();
+        assert_eq!(
+            bare.amend_subscription_period_secs(ALICE, BOB, 43_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_subscription_period_secs_rejects_single_party_and_strangers() {
+        // AV-481: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // move the cadence on the other's share.
+        let mut e = subscription_funded_escrow();
+        assert_eq!(
+            e.amend_subscription_period_secs(ALICE, ALICE, 43_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_subscription_period_secs(MALLORY, BOB, 43_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_subscription_period_secs(MALLORY, MALLORY, 43_200),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.subscription_schedule().unwrap().period_secs,
+            86_400,
+            "failed revisions move nothing"
+        );
+        e.amend_subscription_period_secs(ALICE, BOB, 43_200).unwrap();
+        assert_eq!(
+            e.subscription_schedule().unwrap().period_secs,
+            43_200
+        );
+    }
+
+    #[test]
+    fn amend_subscription_period_secs_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-481: the builder owns the initial schedule and a
+        // disputed or cancelled escrow never retunes. The pause
+        // guard fires before the authority and state gates — and
+        // unpausing a Funded escrow re-opens the revision
+        // (Funded is the allowed state).
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        // Activated: funding is the lock-in point, not activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_subscription(86_400, 4, 250_000)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_subscription_period_secs(ALICE, BOB, 43_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: the cadence is frozen for this dispute.
+        // The escrow carries a jury so the dispute can open at all
+        // (escalate needs an adjudication mechanism configured).
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_subscription(86_400, 4, 250_000)
+            .unwrap()
+            .with_jury(5)
+            .unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(d.state(), EscrowState::Funded);
+        d.escalate(ALICE, FUND_AT + 10, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_subscription_period_secs(ALICE, BOB, 43_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.subscription_schedule().unwrap().period_secs,
+            86_400,
+            "disputed revision moves nothing"
+        );
+        // Terminal: a cancelled escrow's cadence is history,
+        // not policy.
+        let mut cancelled = subscription_funded_escrow();
+        cancelled.cancel(ALICE, None, ALICE, FUND_AT + 10).unwrap();
+        assert_eq!(cancelled.state(), EscrowState::Cancelled);
+        assert_eq!(
+            cancelled.amend_subscription_period_secs(ALICE, BOB, 43_200),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            cancelled.subscription_schedule().unwrap().period_secs,
+            86_400
+        );
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_subscription(86_400, 4, 250_000)
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_subscription_period_secs(ALICE, BOB, 43_200),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_subscription_period_secs(MALLORY, BOB, 43_200),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.subscription_schedule().unwrap().period_secs,
+            86_400,
+            "paused revision moves nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — and Funded is the
+        // allowed state, so the revision now lands.
+        paused
+            .amend_subscription_period_secs(ALICE, BOB, 43_200)
+            .unwrap();
+        assert_eq!(
+            paused.subscription_schedule().unwrap().period_secs,
+            43_200
+        );
+    }
+
+    #[test]
+    fn amend_subscription_period_secs_refuses_unconfigured_subscription() {
+        // AV-481: fail-closed — only an escrow with a subscription
+        // plan already configured may revise; post-funding
+        // installation would add a payout schedule the taker never
+        // funded under. The unconfigured gate fires before the
+        // value gate, so even a zero period on an unconfigured
+        // escrow reports InvalidSubscription.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap();
+        plain.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(plain.state(), EscrowState::Funded);
+        assert_eq!(
+            plain.amend_subscription_period_secs(ALICE, BOB, 43_200),
+            Err(EscrowError::InvalidSubscription)
+        );
+        assert_eq!(
+            plain.amend_subscription_period_secs(ALICE, BOB, 0),
+            Err(EscrowError::InvalidSubscription)
+        );
+        assert_eq!(EscrowError::InvalidSubscription.code(), 130);
+        assert_eq!(plain.subscription_schedule(), None);
+    }
+
+    #[test]
+    fn amend_subscription_period_secs_rejects_zero_period() {
+        // AV-481: the builder's value gate, reused — a zero period
+        // is not a cadence; a rejected period leaves the original
+        // cadence untouched.
+        let mut e = subscription_funded_escrow();
+        assert_eq!(
+            e.amend_subscription_period_secs(ALICE, BOB, 0),
+            Err(EscrowError::InvalidSubscription)
+        );
+        assert_eq!(EscrowError::InvalidSubscription.code(), 130);
+        assert_eq!(
+            e.subscription_schedule().unwrap().period_secs,
+            86_400,
+            "failed call changes nothing"
+        );
+    }
+
+    #[test]
+    fn amend_subscription_period_secs_rejects_overflow_period() {
+        // AV-481: the builder's lifetime gate, reused — a plan whose
+        // (periods - 1) * new_period_secs would overflow the escrow
+        // lifetime is refused, leaving the original cadence
+        // untouched; the exact boundary fits and lands.
+        let mut e = subscription_funded_escrow();
+        assert_eq!(
+            e.amend_subscription_period_secs(ALICE, BOB, 600_000_001),
+            Err(EscrowError::InvalidSubscription)
+        );
+        assert_eq!(
+            e.subscription_schedule().unwrap().period_secs,
+            86_400,
+            "failed call changes nothing"
+        );
+        e.amend_subscription_period_secs(ALICE, BOB, 600_000_000)
+            .unwrap();
+        assert_eq!(
+            e.subscription_schedule().unwrap().period_secs,
+            600_000_000,
+            "(periods - 1) * new == expires_at fits exactly"
+        );
+    }
+
+    #[test]
+    fn amend_subscription_period_secs_noop_on_same_period() {
+        // AV-481: re-affirming the current period is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = subscription_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_subscription_period_secs(ALICE, BOB, 86_400)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-period re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(
+            e.subscription_schedule().unwrap().period_secs,
+            86_400
+        );
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_subscription_period_secs(ALICE, BOB, 43_200)
+            .unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_subscription_period_secs(ALICE, BOB, 43_200)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised period writes nothing either"
+        );
+        assert_eq!(
+            e.subscription_schedule().unwrap().period_secs,
+            43_200
+        );
+    }
+
+    #[test]
+    fn amend_subscription_period_secs_emits_only_on_change() {
+        // AV-481: the program handler emits
+        // `SubscriptionPeriodSecsAmended` only when the cadence
+        // actually changes — the before/after comparison in the
+        // handler skips the event on a no-op re-affirmation (mirrors
+        // `amend_price_gate`). At the state-machine level the
+        // same-period call writes nothing — the encoded escrow is
+        // byte-identical before and after, so there is nothing to
+        // emit about — while a real change moves the field, which
+        // is what the handler's emission keys on. The
+        // INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_subscription_period_secs")
+            .expect("INSTRUCTIONS carries amend_subscription_period_secs");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = subscription_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_subscription_period_secs(ALICE, BOB, 86_400)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-period re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_subscription_period_secs(ALICE, BOB, 43_200)
+            .unwrap();
+        assert_eq!(
+            e.subscription_schedule().unwrap().period_secs,
+            43_200
+        );
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_subscription_period_secs_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-481: the program handler emits
+        // `SubscriptionPeriodSecsAmended` only when the cadence
+        // actually changes — the indexed wrapper is the event-layer
+        // mirror of the handler's before/after comparison. A failed
+        // revision emits nothing, a no-op re-affirmation emits
+        // nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const AT: u64 = EXPIRES_AT - 3_500;
+        let mut e = IndexedEscrow::wrap([0x1D; 32], subscription_funded_escrow());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_subscription_period_secs(MALLORY, BOB, 43_200, AT),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_subscription_period_secs(ALICE, BOB, 43_200, AT)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::SubscriptionPeriodSecsAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same period is a no-op: no new event.
+        e.amend_subscription_period_secs(ALICE, BOB, 43_200, AT + 1)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_subscription_period_secs_program_retunes_cadence_and_next_due_reads_live_cadence() {
+        // AV-481: the next claim reads the live cadence — due dates
+        // of unreleased periods move with the new period when
+        // back-scheduled from `expires_at`, with the last period
+        // pinned to expiry. A period already released is history:
+        // the amendment neither reopens it nor moves the
+        // next-period cursor.
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut e = subscription_funded_escrow();
+        // Back-scheduled from expires_at: period 0 due first, the
+        // last pinned to expiry.
+        assert_eq!(
+            e.subscription_period_due_at(0),
+            Some(EXPIRES_AT - 3 * 86_400)
+        );
+        assert_eq!(
+            e.subscription_period_due_at(1),
+            Some(EXPIRES_AT - 2 * 86_400)
+        );
+        assert_eq!(e.subscription_period_due_at(3), Some(EXPIRES_AT));
+        // Release period 0 at fund time (it is already due); it is
+        // history now.
+        e.release_period(ALICE, FUND_AT, 0, None, BOB).unwrap();
+        assert_eq!(e.subscription_next_period(), 1);
+        assert_eq!(e.subscription_released_periods(), 1);
+        assert_eq!(e.released_amount(), 250_000);
+        e.amend_subscription_period_secs(ALICE, BOB, 43_200)
+            .unwrap();
+        let schedule = e.subscription_schedule().unwrap();
+        assert_eq!(schedule.period_secs, 43_200, "cadence revised");
+        assert_eq!(schedule.periods, 4, "period count untouched");
+        assert_eq!(schedule.per_period, 250_000, "per-period untouched");
+        assert_eq!(
+            e.subscription_next_period(),
+            1,
+            "released periods never reopen"
+        );
+        assert_eq!(e.subscription_released_periods(), 1);
+        assert_eq!(e.released_amount(), 250_000);
+        // Unreleased periods move with the new cadence; the last
+        // stays pinned to expires_at.
+        assert_eq!(
+            e.subscription_period_due_at(1),
+            Some(EXPIRES_AT - 2 * 43_200)
+        );
+        assert_eq!(
+            e.subscription_period_due_at(2),
+            Some(EXPIRES_AT - 43_200)
+        );
+        assert_eq!(e.subscription_period_due_at(3), Some(EXPIRES_AT));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_subscription_period_secs_delayed_routing_gate() {
+        // AV-481: on a delay-opted-in escrow the cadence moves
+        // only through the propose/execute protocol
+        // (GovernanceAction kind 10) — the direct call is refused,
+        // whatever the period; the delayed path then lands it.
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_subscription(86_400, 4, 250_000)
+            .unwrap();
+        delayed.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(delayed.state(), EscrowState::Funded);
+        assert_eq!(
+            delayed.amend_subscription_period_secs(ALICE, BOB, 43_200),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(EscrowError::GovernanceActionNotProposed.code(), 219);
+        assert_eq!(
+            delayed.subscription_schedule().unwrap().period_secs,
+            86_400
+        );
+        delayed
+            .propose_governance(
+                ALICE,
+                GovernanceAction::AmendSubscriptionPeriodSecs {
+                    new_period_secs: 43_200,
+                },
+                FUND_AT + 10,
+            )
+            .unwrap();
+        delayed
+            .execute_governance(BOB, FUND_AT + 10 + 3_600)
+            .unwrap();
+        assert_eq!(
+            delayed.subscription_schedule().unwrap().period_secs,
+            43_200
+        );
+        assert!(delayed.governance_proposal().is_none());
+    }
+
+    #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
         // new_delegate <- param; caller <-
@@ -69194,6 +69713,17 @@ pub(crate) mod anchor_idl_tests {
         let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
             .unwrap()
             .with_settlement_mint(mint)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    fn subscription_funded_escrow() -> Escrow {
+        // 4 periods x 250_000 == 1_000_000, 86_400s cadence.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_subscription(86_400, 4, 250_000)
             .unwrap();
         e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
         assert_eq!(e.state(), EscrowState::Funded);
@@ -72271,6 +72801,27 @@ pub(crate) mod anchor_idl_tests {
             "new_settle_mint",
             "settlement_mint",
         ),
+        // AV-481: the post-funding subscription-cadence revision
+        // rewrites `subscription.period_secs` inside the configured
+        // schedule in place — a second param source for the
+        // sub-field, like `amend_arbitration_deadline`'s
+        // `default_judgment.deadline_secs`. The field's initial
+        // value comes from the `with_subscription` builder param
+        // (Uninitialized only); this entry documents the revision
+        // source. Only period_secs moves — `periods`, `per_period`,
+        // the amount conservation, `subscription_next` and
+        // `subscription_released` are untouched, so due dates of
+        // unreleased periods move with the new cadence at the next
+        // `subscription_period_due_at` call while a period already
+        // released keeps the due date it released under, and an
+        // unconfigured schedule or a zero period is
+        // InvalidSubscription (code 130, the same rejection as the
+        // builder).
+        (
+            "amend_subscription_period_secs",
+            "new_period_secs",
+            "subscription.period_secs",
+        ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
         // for `delegation` (the whole grant region, like
@@ -73091,6 +73642,17 @@ pub(crate) mod anchor_idl_tests {
                 // whole region.
                 paths.push(name);
                 paths.push("default_judgment.deadline_secs");
+            } else if *name == "subscription" {
+                // AV-481: the whole schedule region (the builder's
+                // target) plus its cadence sub-field, for the dotted
+                // param mapping `subscription.period_secs`
+                // (the post-funding cadence revision's target).
+                // The period-count and per-period-amount sub-fields
+                // have no param that maps to them as sub-fields (the
+                // builder maps all three terms to the whole region),
+                // so they stay folded into the whole region.
+                paths.push(name);
+                paths.push("subscription.period_secs");
             } else {
                 paths.push(name);
             }
@@ -102465,6 +103027,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_settlement_mint"),
             [126, 142, 67, 196, 194, 88, 37, 79]
+        );
+    }
+
+    #[test]
+    fn amend_subscription_period_secs_instruction_discriminator_is_pinned() {
+        // AV-481. IDL:
+        // sha256("global:amend_subscription_period_secs")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_subscription_period_secs"),
+            [170, 23, 105, 193, 38, 129, 89, 179]
         );
     }
 

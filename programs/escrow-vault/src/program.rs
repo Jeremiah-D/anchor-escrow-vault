@@ -9139,6 +9139,84 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise a subscription's period cadence after funding (AV-481;
+    /// mirrors `Escrow::amend_subscription_period_secs`, the AV-289
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot move
+    /// the cadence on the other's share. `Funded` only — the builder
+    /// owns the initial schedule via `with_subscription`, and only an
+    /// escrow with a subscription plan already configured may amend —
+    /// an unconfigured escrow is `InvalidSubscription` (code 130,
+    /// fail-closed: post-funding installation would add a payout
+    /// schedule the taker never funded under). The new period reuses
+    /// the `with_subscription` gates (a zero period is
+    /// `InvalidSubscription`, code 130, and if
+    /// `(periods - 1) * new_period_secs > expires_at` the plan would
+    /// overflow the escrow lifetime, so the revision is refused with
+    /// the same error) leaving the original period untouched. A paused
+    /// escrow fails fast (`Paused`, before the authority gate). On a
+    /// delay-opted-in escrow the direct call is refused
+    /// (`GovernanceActionNotProposed`, code 219) — the cadence moves
+    /// only through the propose/execute protocol, with no new proposal
+    /// variant (the `AmendSubscriptionPeriodSecs` variant, kind 10, is
+    /// already there). Re-affirming the current period is a no-op: it
+    /// succeeds, writes nothing and emits nothing. Emits
+    /// `SubscriptionPeriodSecsAmended` (from == to == the current
+    /// state) only on an actual change. Only `subscription.period_secs`
+    /// changes — `periods`, `per_period`, the amount conservation
+    /// (`periods * per_period == amount`), `subscription_next` and
+    /// `subscription_released` are untouched, and the new cadence
+    /// governs from the next claim (`subscription_period_due_at` /
+    /// `SubscriptionSchedule::due_at` read the live `period_secs`, so
+    /// due dates of unreleased periods move with the new cadence when
+    /// computed backwards from `expires_at`, with the last period
+    /// pinned to `expires_at`, while a period already released keeps
+    /// the due date it released under). `now` comes from the clock
+    /// sysvar, never an instruction param (mirrors
+    /// `amend_funding_start`) — here only for the event timestamp,
+    /// since the pure logic takes no `now`.
+    pub fn amend_subscription_period_secs(
+        ctx: Context<AmendSubscriptionPeriodSecs>,
+        new_period_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.subscription_schedule().map(|s| s.period_secs);
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_subscription_period_secs(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_period_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 8-byte `subscription.period_secs` field in
+        // place — no realloc. Only the cadence moves; the period
+        // count, the per-period amount, the next-period cursor and
+        // the released bitmap are untouched.
+        // Emits only on an actual change; a no-op re-affirmation
+        // stays silent (mirrors `amend_price_gate`).
+        if escrow.subscription_schedule().map(|s| s.period_secs) != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::SubscriptionPeriodSecsAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -16729,6 +16807,22 @@ pub struct AmendEventCapacity<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendSettlementMint<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-481: accounts for `amend_subscription_period_secs` — the
+/// subscription-cadence revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendSubscriptionPeriodSecs<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

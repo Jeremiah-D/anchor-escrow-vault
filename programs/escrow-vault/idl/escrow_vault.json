@@ -1588,6 +1588,14 @@
       ]
     },
     {
+      "name": "amend_subscription_period_secs",
+      "discriminator": [170, 23, 105, 193, 38, 129, 89, 179],
+      "accounts": [],
+      "args": [
+        {"name": "new_period_secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
