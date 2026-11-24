@@ -8908,6 +8908,76 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the bound rent payer after funding (AV-484;
+    /// mirrors `Escrow::amend_rent_payer`, the AV-255
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot
+    /// re-point the other's rent. `Funded` only — the builder owns
+    /// the initial binding via `with_rent_payer`, and the dispute
+    /// window settles under the frozen payee. A zero payer is
+    /// refused with `InvalidRentPayer` (the builder's gate,
+    /// unchanged — a bound payer must be a real key, or the close
+    /// would have nowhere to send the rent). A paused escrow fails
+    /// fast (`Paused`, before the authority gate). No delay path
+    /// covers this method — `GovernanceAction` has no
+    /// `AmendRentPayer` variant, so the direct call is the only
+    /// entry point and stays open on a delay-opted-in escrow
+    /// (the AV-471 `amend_twap_gate` precedent: the method carries
+    /// no `via_delayed` gate, so gating it here would self-lock
+    /// exactly the escrows that need it). Re-affirming the current
+    /// payer is a no-op: it succeeds, writes nothing and emits
+    /// nothing. An unbound escrow gains its first payer here
+    /// (`None` -> `Some`), and there is deliberately no
+    /// unbind-to-`None` path (an unbound escrow keeps the
+    /// initializer-reclaims default). Emits `RentPayerAmended`
+    /// (from == to == the current state) only on an actual change.
+    /// Only the `rent_payer` field changes — the close authority
+    /// is untouched (only the initializer may call `close_vault`),
+    /// no closed state is touched, and no rent is recomputed, so
+    /// a close after the amendment pays the new payer while a
+    /// close before it paid the old one — the amendment never
+    /// rewrites a close already made. `now` comes from the clock
+    /// sysvar, never an instruction param (mirrors
+    /// `amend_funding_start`) — here only for the event timestamp,
+    /// since the pure logic takes no `now`.
+    pub fn amend_rent_payer(ctx: Context<AmendRentPayer>, new_payer: Pubkey) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.rent_payer();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_rent_payer(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_payer.to_bytes(),
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 33-byte `Option<Pubkey>` rent-payer region in
+        // place — no realloc. Only the payer moves; the close
+        // authority, any closed state, and the rent itself are
+        // untouched. Emits only on an actual change; a no-op
+        // re-affirmation stays silent (mirrors `amend_price_gate`).
+        if escrow.rent_payer() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::RentPayerAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -16908,6 +16978,22 @@ pub struct AmendCompoundInterest<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendInterestRate<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-484: accounts for `amend_rent_payer` — the
+/// rent-payer revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendRentPayer<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

@@ -1564,6 +1564,14 @@
       ]
     },
     {
+      "name": "amend_rent_payer",
+      "discriminator": [83, 107, 65, 245, 28, 1, 91, 4],
+      "accounts": [],
+      "args": [
+        {"name": "new_payer", "type": "publicKey"}
+      ]
+    },
+    {
       "name": "amend_panel_threshold",
       "discriminator": [192, 166, 186, 13, 85, 249, 94, 78],
       "accounts": [],

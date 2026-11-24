@@ -43126,6 +43126,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "rate_bps <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial set and the dispute window settles under the frozen rate); no delay path covers this method — GovernanceAction has no AmendInterestRate variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); a rate above 10_000 is InvalidInterestRate (code 165, the builder's gate — the rate can never exceed 100% APR) and leaves the escrow untouched; 0 is legal and pauses all future accrual (the builder's 0 semantics — settle_interest returns early at rate 0 without advancing interest_accrual_base, so a paused window is repriced at the resumed rate on the next settlement, never skipped); re-affirming the current rate is a no-op (succeeds, writes nothing, emits no event, paralleling amend_penalty_bps); only interest_rate_bps changes — interest_accrued, interest_paid, interest_compounded and interest_accrual_base are never restated, so a rate cut can never claw back yield already accrued and a rate hike never reprices it, and the next settle_interest prices the next slice at the live rate the moment the amendment lands, while a slice already settled keeps the rate it settled under (and in compound mode the yield already folded stays principal with the next accrual pricing the grown principal at the new rate); emits the InterestRateAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 2-byte interest_rate_bps field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-484: revise the bound rent payer after
+            // funding — the program-level entry point for the
+            // AV-255 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_rent_payer")[..8]
+            // = [83, 107, 65, 245, 28, 1, 91, 4] — the Anchor
+            // instruction discriminator for the
+            // amend_rent_payer handler (pinned by the
+            // discriminator test below).
+            name: "amend_rent_payer",
+            params: &[(
+                "new_payer",
+                "Pubkey",
+                "instruction param; the replacement rent payer — the zero address is refused (InvalidRentPayer, code 352, the builder's gate); an unbound escrow gains its first payer here and re-affirming the current payer is a no-op",
+            )],
+            method: "Escrow::amend_rent_payer",
+            input_mapping: "new_payer <- param (Pubkey -> [u8; 32] conversion); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial binding via with_rent_payer); a zero payer is InvalidRentPayer (code 352, the builder's gate — a bound payer must be a real key, or the close would have nowhere to send the rent) and leaves the escrow untouched; an unbound escrow gains its first payer here (None -> Some) and there is deliberately no unbind-to-None path (an unbound escrow keeps the initializer-reclaims default); no delay path covers this method — GovernanceAction has no AmendRentPayer variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current payer is a no-op (succeeds, writes nothing, emits no event, paralleling amend_milestones); only rent_payer changes — the close authority is untouched, no closed state is touched, and no rent is recomputed, so a close after the amendment pays the new payer while a close before it paid the old one, and the amendment never rewrites a close already made; emits the RentPayerAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 33-byte Option<Pubkey> rent-payer region is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-477: revise the arbiter panel's judgment threshold
             // after funding — the program-level entry point for the
             // AV-378 pure-logic revision. IDL:
@@ -44294,6 +44313,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-260 pure-logic
             // revision wired to the chain).
             "Escrow::amend_interest_rate",
+            // AV-484: the program-level rent-payer
+            // revision (the AV-255 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_rent_payer",
             // AV-477: the program-level arbiter-panel
             // threshold revision (the AV-378 pure-logic
             // revision wired to the chain).
@@ -44985,6 +45008,15 @@ pub(crate) mod anchor_idl_tests {
                 // without advancing the base; re-affirming the
                 // current rate is a no-op.
                 &"amend_interest_rate",
+                // AV-484: the rent-payer revision carries the
+                // replacement payer (Pubkey) — the payer alone;
+                // the close reads the recipient live through the
+                // amended payer, so a close after the amendment
+                // pays the new payer while a close before it paid
+                // the old one, and an unbound escrow gains its
+                // first payer here; re-affirming the current payer
+                // is a no-op.
+                &"amend_rent_payer",
                 // AV-477: the panel-threshold revision carries
                 // the replacement threshold (u8) — the threshold
                 // alone; the next dispute tallies under the live
@@ -67009,6 +67041,409 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(e.claim_interest(BOB, FUND_AT + YEAR).unwrap(), 50_000);
     }
 
+    fn rent_payer_funded_escrow(payer: [u8; 32]) -> Escrow {
+        // A Funded escrow with a rent payer bound — the AV-484
+        // program-surface fixture, paralleling the AV-255
+        // `funded_with_payer` helper in `rent_payer_amend_tests`.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_rent_payer(payer)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn amend_rent_payer_program_maps_param_to_payer_field() {
+        // IDL: amend_rent_payer(new_payer: Pubkey) —
+        // new_payer <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `rent_payer` field in place
+        // (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the single Pubkey param and the AV-255 pure-logic method.
+        const P1: [u8; 32] = [0x11; 32];
+        const P2: [u8; 32] = [0x22; 32];
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_rent_payer")
+            .expect("INSTRUCTIONS carries amend_rent_payer");
+        assert_eq!(spec.method, "Escrow::amend_rent_payer");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "new_payer");
+        assert_eq!(spec.params[0].1, "Pubkey");
+        assert!(
+            spec.input_mapping.contains("RentPayerAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single Pubkey arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_rent_payer\""),
+            "checked-in IDL carries amend_rent_payer"
+        );
+        assert!(
+            idl.contains("[83, 107, 65, 245, 28, 1, 91, 4]"),
+            "checked-in IDL pins the AV-484 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"new_payer\", \"type\": \"publicKey\"}"),
+            "checked-in IDL carries the new_payer arg"
+        );
+        // Only the payer moves: the state, the amount, the close
+        // authority and the encoded length are untouched.
+        let mut e = rent_payer_funded_escrow(P1);
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.rent_payer(), Some(P1));
+        assert_eq!(e.rent_recipient(), P1);
+        e.amend_rent_payer(ALICE, BOB, P2).unwrap();
+        assert_eq!(e.rent_payer(), Some(P2), "payer revised");
+        assert_eq!(
+            e.rent_recipient(),
+            P2,
+            "recipient follows the live payer"
+        );
+        assert_eq!(e.amount(), 1_000_000, "amount untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "payer region rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the payer is
+        // bound there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_rent_payer(P1)
+            .unwrap();
+        assert_eq!(
+            bare.amend_rent_payer(ALICE, BOB, P2),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_rent_payer_program_rejects_single_party_and_strangers() {
+        // AV-484: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // re-point the other's rent.
+        const P1: [u8; 32] = [0x11; 32];
+        const P2: [u8; 32] = [0x22; 32];
+        let mut e = rent_payer_funded_escrow(P1);
+        assert_eq!(
+            e.amend_rent_payer(ALICE, ALICE, P2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_rent_payer(MALLORY, BOB, P2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_rent_payer(MALLORY, MALLORY, P2),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.rent_payer(),
+            Some(P1),
+            "failed revisions move nothing"
+        );
+        e.amend_rent_payer(ALICE, BOB, P2).unwrap();
+        assert_eq!(e.rent_payer(), Some(P2));
+    }
+
+    #[test]
+    fn amend_rent_payer_program_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-484: the builder owns the initial binding and the
+        // dispute window settles under the frozen payee. The pause
+        // guard fires before the authority and state gates — and
+        // unpausing a Funded escrow re-opens the revision (Funded
+        // is the allowed state).
+        const P1: [u8; 32] = [0x11; 32];
+        const P2: [u8; 32] = [0x22; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        // Activated: funding is the lock-in point, not activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_rent_payer(P1)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_rent_payer(ALICE, BOB, P2),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: the dispute window settles under the frozen
+        // payee.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_rent_payer(P1)
+            .unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        let disputed_at = EXPIRES_AT - 3_500;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_rent_payer(ALICE, BOB, P2),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.rent_payer(),
+            Some(P1),
+            "disputed revision moves nothing"
+        );
+        // Terminal: a released escrow's payee is history, not
+        // policy.
+        let mut released = rent_payer_funded_escrow(P1);
+        released
+            .release(ALICE, FUND_AT, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_rent_payer(ALICE, BOB, P2),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(released.rent_payer(), Some(P1));
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_rent_payer(P1)
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_rent_payer(ALICE, BOB, P2),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_rent_payer(MALLORY, BOB, P2),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.rent_payer(),
+            Some(P1),
+            "paused revision moves nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — and Funded is the
+        // allowed state, so the revision now lands.
+        paused.amend_rent_payer(ALICE, BOB, P2).unwrap();
+        assert_eq!(paused.rent_payer(), Some(P2));
+    }
+
+    #[test]
+    fn amend_rent_payer_program_rejects_zero_payer() {
+        // AV-484: the builder's gate, unchanged — a bound payer
+        // must be a real key, or the close would have nowhere to
+        // send the rent; a failed amendment leaves the stored
+        // payer as it was.
+        const P1: [u8; 32] = [0x11; 32];
+        let mut e = rent_payer_funded_escrow(P1);
+        assert_eq!(
+            e.amend_rent_payer(ALICE, BOB, [0u8; 32]),
+            Err(EscrowError::InvalidRentPayer)
+        );
+        assert_eq!(EscrowError::InvalidRentPayer.code(), 352);
+        assert_eq!(
+            e.rent_payer(),
+            Some(P1),
+            "failed revisions move nothing"
+        );
+        assert_eq!(e.rent_recipient(), P1);
+    }
+
+    #[test]
+    fn amend_rent_payer_program_binds_first_payer_on_unbound_escrow() {
+        // AV-484: an escrow that never bound a payer (the
+        // initializer reclaims by default) gains its first payer
+        // on amendment, and the recipient flips from the
+        // initializer to the new payer.
+        const P1: [u8; 32] = [0x11; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.rent_payer(), None);
+        assert_eq!(e.rent_recipient(), ALICE);
+        e.amend_rent_payer(ALICE, BOB, P1).unwrap();
+        assert_eq!(e.rent_payer(), Some(P1));
+        assert_eq!(e.rent_recipient(), P1);
+    }
+
+    #[test]
+    fn amend_rent_payer_program_noop_on_same_payer() {
+        // AV-484: re-affirming the current payer is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        const P1: [u8; 32] = [0x11; 32];
+        const P2: [u8; 32] = [0x22; 32];
+        let mut e = rent_payer_funded_escrow(P1);
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_rent_payer(ALICE, BOB, P1).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-payer re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.rent_payer(), Some(P1));
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_rent_payer(ALICE, BOB, P2).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_rent_payer(ALICE, BOB, P2).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised payer writes nothing either"
+        );
+        assert_eq!(e.rent_payer(), Some(P2));
+    }
+
+    #[test]
+    fn amend_rent_payer_program_emits_only_on_change() {
+        // AV-484: the program handler emits
+        // `RentPayerAmended` only when the payer
+        // actually changes — the before/after comparison in the
+        // handler skips the event on a no-op re-affirmation
+        // (mirrors `amend_price_gate`). At the state-machine level
+        // the same-payer call writes nothing — the encoded escrow
+        // is byte-identical before and after, so there is nothing
+        // to emit about — while a real change rewrites the payer,
+        // which is what the handler's emission keys on. The
+        // INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        const P1: [u8; 32] = [0x11; 32];
+        const P2: [u8; 32] = [0x22; 32];
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_rent_payer")
+            .expect("INSTRUCTIONS carries amend_rent_payer");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = rent_payer_funded_escrow(P1);
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_rent_payer(ALICE, BOB, P1).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-payer re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_rent_payer(ALICE, BOB, P2).unwrap();
+        assert_eq!(e.rent_payer(), Some(P2));
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change rewrites the payer, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_rent_payer_program_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-484: the program handler emits
+        // `RentPayerAmended` only when the payer
+        // actually changes — the indexed wrapper is the event-layer
+        // mirror of the handler's before/after comparison. A failed
+        // revision emits nothing, a no-op re-affirmation emits
+        // nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const P1: [u8; 32] = [0x11; 32];
+        const P2: [u8; 32] = [0x22; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let funded = rent_payer_funded_escrow(P1);
+        let mut e = IndexedEscrow::wrap([0x1D; 32], funded);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_rent_payer(ALICE, ALICE, P2, FUND_AT),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_rent_payer(ALICE, BOB, P2, FUND_AT).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::RentPayerAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same payer is a no-op: no new event.
+        e.amend_rent_payer(ALICE, BOB, P2, FUND_AT).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_rent_payer_program_rebinds_payer_and_close_pays_new_payer() {
+        // AV-484: the bound payer moves P1 -> P2 in place, the
+        // close authority is untouched, and the close at the end
+        // pays the live recipient — the amended payer, not the
+        // original.
+        const P1: [u8; 32] = [0x11; 32];
+        const P2: [u8; 32] = [0x22; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut e = rent_payer_funded_escrow(P1);
+        assert_eq!(e.rent_recipient(), P1);
+        e.amend_rent_payer(ALICE, BOB, P2).unwrap();
+        assert_eq!(e.rent_payer(), Some(P2));
+        assert_eq!(e.rent_recipient(), P2);
+        assert_eq!(e.state(), EscrowState::Funded, "amending moves no state");
+        e.cancel(ALICE, None, ALICE, FUND_AT).unwrap();
+        assert_eq!(e.rent_recipient(), P2, "close reads the live payer");
+        e.close_vault(ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Closed);
+    }
+
+    #[test]
+    fn amend_rent_payer_program_allows_direct_on_delay_opted_in() {
+        // AV-484: no delay path covers this method —
+        // `GovernanceAction` has no `AmendRentPayer`
+        // variant and the pure logic carries no `via_delayed`
+        // gate, so the direct call is the only entry point and
+        // stays open on a delay-opted-in escrow (the AV-471
+        // `amend_twap_gate` precedent — gating it here would
+        // self-lock exactly the escrows that need it, since no
+        // delayed path could take the revision instead).
+        const P1: [u8; 32] = [0x11; 32];
+        const P2: [u8; 32] = [0x22; 32];
+        const FUND_AT: u64 = 1_700_000_000;
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_rent_payer(P1)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap();
+        delayed.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(delayed.state(), EscrowState::Funded);
+        delayed.amend_rent_payer(ALICE, BOB, P2).unwrap();
+        assert_eq!(
+            delayed.rent_payer(),
+            Some(P2),
+            "direct call stays open on a delay-opted-in escrow"
+        );
+        // And back again — the payer stays revisable.
+        delayed.amend_rent_payer(ALICE, BOB, P1).unwrap();
+        assert_eq!(delayed.rent_payer(), Some(P1));
+    }
+
     #[test]
     fn amend_panel_threshold_maps_params_to_arbiter_panel_field() {
         // IDL: amend_panel_threshold(new_threshold: u8) —
@@ -73834,6 +74269,23 @@ pub(crate) mod anchor_idl_tests {
             "rate_bps",
             "interest_rate_bps",
         ),
+        // AV-484: the post-funding rent-payer revision
+        // rewrites the 33-byte `Option<Pubkey>` rent-payer region
+        // in place — a second param source for the field, like
+        // `amend_settlement_mint`'s new_settle_mint. The field's
+        // *initial* value comes from the `with_rent_payer` builder
+        // (a state-machine method, not an instruction param, so it
+        // cannot appear in the param table); the param entry
+        // documents the revision source. Only the payer moves —
+        // the close authority, any closed state, and the rent
+        // itself are untouched, so the next `close_vault` pays
+        // the live payer while a close already made keeps the
+        // payer it paid.
+        (
+            "amend_rent_payer",
+            "new_payer",
+            "rent_payer",
+        ),
         // AV-477: the post-funding arbiter-panel threshold
         // revision rewrites the 1-byte `threshold` field of the
         // `arbiter_panel` region in place — a second param source
@@ -74646,17 +75098,15 @@ pub(crate) mod anchor_idl_tests {
              deposit-path switch and by cancel_expired as the \
              partial-refund qualifier",
         ),
-        // AV-222: the rent payer — `None` by `initialize`
-        // (initializer reclaims the rent); set by
-        // `with_rent_payer` (Uninitialized only, non-zero key);
-        // read by `close_vault` / `close_vaults` as the rent
-        // recipient. Same field-source rationale as above.
-        (
-            "rent_payer",
-            "None by initialize; set by with_rent_payer \
-             (Uninitialized only, non-zero key); read by \
-             close_vault and close_vaults as the rent recipient",
-        ),
+        // AV-484: the rent payer was a field source
+        // (`None` by `initialize`; set by
+        // `with_rent_payer`, Uninitialized only; read by
+        // `close_vault` / `close_vaults` as the rent recipient)
+        // until AV-484 added the `amend_rent_payer`
+        // instruction param that rewrites it — the field is now
+        // param-sourced (see PARAM_FIELD_MAP), like
+        // `settlement_mint`, so it is not listed here: every
+        // field gets exactly one source kind.
         // AV-223: the funding-chain downstream link — `None` by
         // `initialize` (unchained); set by `link_chain`
         // (Uninitialized only, non-zero downstream id); read by
@@ -104121,6 +104571,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_interest_rate"),
             [254, 248, 51, 126, 73, 126, 19, 122]
+        );
+    }
+
+    #[test]
+    fn amend_rent_payer_instruction_discriminator_is_pinned() {
+        // AV-484. IDL:
+        // sha256("global:amend_rent_payer")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_rent_payer"),
+            [83, 107, 65, 245, 28, 1, 91, 4]
         );
     }
 
