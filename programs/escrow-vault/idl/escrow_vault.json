@@ -1572,6 +1572,14 @@
       ]
     },
     {
+      "name": "amend_event_capacity",
+      "discriminator": [158, 15, 115, 132, 26, 42, 158, 231],
+      "accounts": [],
+      "args": [
+        {"name": "new_capacity", "type": "u8"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

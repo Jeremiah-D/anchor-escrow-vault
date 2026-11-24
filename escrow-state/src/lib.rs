@@ -43144,6 +43144,26 @@ pub(crate) mod anchor_idl_tests {
             method: "Escrow::amend_jury_panel_size",
             input_mapping: "new_panel_size <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial size via with_jury and the draw has not happened yet, since draw_panel runs only on a Disputed escrow, so there is no in-flight panel to re-draw); only an escrow already carrying a jury may amend — an unconfigured escrow is InvalidJurySize (code 294, fail-closed: post-funding installation would add a settlement mechanism the taker never funded under); an escrow with a bound single arbiter is JuryArbiterConflict (code 298, mirroring draw_panel's mutual-exclusion gate, checked before configuration so an arbiter-settled escrow reports the conflict rather than the missing jury); the new size reuses the with_jury gate (1..=MAX_JURORS, otherwise InvalidJurySize, code 294) leaving the original size untouched, and the registry's size-vs-registration check stays at draw time (k > n is InvalidJurySize there — a size above today's registration count may become drawable as jurors register); on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219 — the size moves only through the propose/execute protocol, GovernanceAction kind 6, with no new proposal variant); re-affirming the current size is a no-op (succeeds, writes nothing, emits no event, paralleling update_quorum); only the size changes — the arbiter slot, the arbiter panel and the juror registry are untouched; the new size governs from the next dispute draw (draw_panel reads the live jury_panel_size at every call, so a panel drawn after the amendment seats the new size while no panel is ever re-drawn in flight); emits the JuryPanelSizeAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 1-byte jury_panel_size field is rewritten in place - no layout / rent change",
         },
+
+        InstructionSpec {
+            // AV-479: revise the event-history ring capacity
+            // after funding — the program-level entry point for
+            // the AV-282 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_event_capacity")[..8]
+            // = [158, 15, 115, 132, 26, 42, 158, 231] — the Anchor
+            // instruction discriminator for the
+            // amend_event_capacity handler (pinned by the
+            // discriminator test below).
+            name: "amend_event_capacity",
+            params: &[(
+                "new_capacity",
+                "u8",
+                "instruction param; the replacement event-history ring capacity — 1 <= K <= MAX_EVENT_HISTORY (64, the with_event_capacity gate), 0 or above 64 is InvalidEventCapacity; the new capacity must also cover every retained entry (new_capacity >= event_count, otherwise InvalidEventCapacity); re-affirming the current capacity on a filling ring is a no-op",
+            )],
+            method: "Escrow::amend_event_capacity",
+            input_mapping: "new_capacity <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial capacity via with_event_capacity); only a ring that has not wrapped may amend — once the ring is full (event_count == event_capacity) the head has started advancing modulo the old capacity, so a new capacity would re-interpret the head modulo a different modulus and scramble the window, and the amendment is InvalidStateTransition (fail-closed, and the refusal precedes even the no-op check, so a re-affirmation on a wrapped ring is refused rather than silently succeeding); the new capacity reuses the with_event_capacity gate (1..=MAX_EVENT_HISTORY, otherwise InvalidEventCapacity, code 132) and must also cover every retained entry (new_capacity >= event_count, otherwise InvalidEventCapacity) leaving the original capacity untouched; on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219 — the capacity moves only through the propose/execute protocol, GovernanceAction kind 7, with no new proposal variant); re-affirming the current capacity on a filling ring is a no-op (succeeds, writes nothing, emits no event, paralleling update_quorum); only the capacity changes — the slots, the head, the count and the total are untouched, so the retained entries survive verbatim, and the new capacity governs from the next record_history call (record_history and event_history both read the live capacity at every call, so a ring amended while filling keeps filling under the new bound and wraps modulo the new capacity once it fills); emits the EventCapacityAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 1-byte event_capacity field is rewritten in place - no layout / rent change",
+        },
         InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
@@ -44195,6 +44215,11 @@ pub(crate) mod anchor_idl_tests {
             // panel-size revision (the AV-281 pure-logic
             // revision wired to the chain).
             "Escrow::amend_jury_panel_size",
+
+            // AV-479: the program-level event-history ring
+            // capacity revision (the AV-282 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_event_capacity",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44869,6 +44894,17 @@ pub(crate) mod anchor_idl_tests {
                 // already drawn is never re-drawn; re-affirming
                 // the current size is a no-op.
                 &"amend_jury_panel_size",
+
+                // AV-479: the capacity revision carries the
+                // replacement capacity (u8) — the capacity
+                // alone; the new capacity governs from the next
+                // record_history call, so a ring amended while
+                // filling keeps filling under the new bound and
+                // wraps modulo the new capacity once it fills,
+                // while a wrapped ring never revises at all;
+                // re-affirming the current capacity on a
+                // filling ring is a no-op.
+                &"amend_event_capacity",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -67245,6 +67281,452 @@ pub(crate) mod anchor_idl_tests {
         );
     }
 
+
+    #[test]
+    fn amend_event_capacity_maps_params_to_event_capacity_field() {
+        // IDL: amend_event_capacity(new_capacity: u8) —
+        // new_capacity <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `event_capacity` tail field in
+        // place (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the single u8 param and the AV-282 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_event_capacity")
+            .expect("INSTRUCTIONS carries amend_event_capacity");
+        assert_eq!(spec.method, "Escrow::amend_event_capacity");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "new_capacity");
+        assert_eq!(spec.params[0].1, "u8");
+        assert!(
+            spec.input_mapping.contains("EventCapacityAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single u8 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_event_capacity\""),
+            "checked-in IDL carries amend_event_capacity"
+        );
+        assert!(
+            idl.contains("[158, 15, 115, 132, 26, 42, 158, 231]"),
+            "checked-in IDL pins the AV-479 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"new_capacity\", \"type\": \"u8\"}"),
+            "checked-in IDL carries the new_capacity arg"
+        );
+        // Only the capacity moves: the slots, the head, the count
+        // and the total are untouched.
+        let mut e = event_capacity_funded_escrow(8);
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.event_capacity(), 8);
+        e.amend_event_capacity(ALICE, BOB, 4).unwrap();
+        assert_eq!(e.event_capacity(), 4, "capacity revised");
+        assert_eq!(e.event_count(), 0, "count untouched");
+        assert_eq!(e.event_total(), 0, "total untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "capacity rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the capacity is
+        // set there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_event_capacity(8)
+            .unwrap();
+        assert_eq!(
+            bare.amend_event_capacity(ALICE, BOB, 4),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_event_capacity_rejects_single_party_and_strangers() {
+        // AV-479: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // resize the audit window on the other's history.
+        let mut e = event_capacity_funded_escrow(8);
+        assert_eq!(
+            e.amend_event_capacity(ALICE, ALICE, 4),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_event_capacity(MALLORY, BOB, 4),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_event_capacity(MALLORY, MALLORY, 4),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.event_capacity(),
+            8,
+            "failed revisions move nothing"
+        );
+        e.amend_event_capacity(ALICE, BOB, 4).unwrap();
+        assert_eq!(e.event_capacity(), 4);
+    }
+
+    #[test]
+    fn amend_event_capacity_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-479: the builder owns the initial capacity and a
+        // wrapped ring is frozen. The pause guard fires before
+        // the authority and state gates — and unpausing a Funded
+        // escrow re-opens the revision (Funded is the allowed
+        // state).
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        // Activated: funding is the lock-in point, not activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_event_capacity(8)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_event_capacity(ALICE, BOB, 4),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: the ring is frozen for this dispute. The
+        // escrow carries a jury so the dispute can open at all
+        // (escalate needs an adjudication mechanism configured).
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_event_capacity(8)
+            .unwrap()
+            .with_jury(5)
+            .unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(d.state(), EscrowState::Funded);
+        d.escalate(ALICE, FUND_AT + 10, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_event_capacity(ALICE, BOB, 4),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.event_capacity(),
+            8,
+            "disputed revision moves nothing"
+        );
+        // Terminal: a released escrow's capacity is history, not
+        // policy.
+        let mut released = event_capacity_funded_escrow(8);
+        released
+            .release(ALICE, FUND_AT + 10, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_event_capacity(ALICE, BOB, 4),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(released.event_capacity(), 8);
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_event_capacity(8)
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_event_capacity(ALICE, BOB, 4),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_event_capacity(MALLORY, BOB, 4),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.event_capacity(),
+            8,
+            "paused revision moves nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — and Funded is the
+        // allowed state, so the revision now lands.
+        paused.amend_event_capacity(ALICE, BOB, 4).unwrap();
+        assert_eq!(paused.event_capacity(), 4);
+    }
+
+    #[test]
+    fn amend_event_capacity_refuses_wrapped_ring() {
+        // AV-479: a wrapped ring never revises its capacity —
+        // the head already advances modulo the old capacity, so
+        // a new modulus would scramble the retained window. The
+        // refusal precedes even the no-op check, so a
+        // re-affirmation on a wrapped ring is refused rather
+        // than silently succeeding.
+        let mut full = event_capacity_funded_escrow(4);
+        record_history_entries(&mut full, 4, HIST_T0);
+        assert_eq!(full.event_count(), 4, "ring just filled");
+        assert_eq!(
+            full.amend_event_capacity(ALICE, BOB, 8),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            full.amend_event_capacity(ALICE, BOB, 4),
+            Err(EscrowError::InvalidStateTransition),
+            "re-affirmation on a wrapped ring is refused, not a no-op"
+        );
+        assert_eq!(full.event_capacity(), 4);
+        // A ring wrapped past overwrites is refused the same way.
+        let mut wrapped = event_capacity_funded_escrow(4);
+        record_history_entries(&mut wrapped, 6, HIST_T0);
+        assert_eq!(wrapped.event_total(), 6);
+        assert_eq!(
+            wrapped.amend_event_capacity(ALICE, BOB, 8),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(wrapped.event_capacity(), 4);
+    }
+
+    #[test]
+    fn amend_event_capacity_refuses_zero_or_over_64() {
+        // AV-479: the builder's capacity validation, reused —
+        // K in 1..=MAX_EVENT_HISTORY (64); a rejected K leaves
+        // the live capacity untouched.
+        let mut e = event_capacity_funded_escrow(8);
+        assert_eq!(
+            e.amend_event_capacity(ALICE, BOB, 0),
+            Err(EscrowError::InvalidEventCapacity)
+        );
+        assert_eq!(
+            e.amend_event_capacity(ALICE, BOB, 65),
+            Err(EscrowError::InvalidEventCapacity)
+        );
+        assert_eq!(EscrowError::InvalidEventCapacity.code(), 132);
+        assert_eq!(
+            e.event_capacity(),
+            8,
+            "failed call changes nothing"
+        );
+    }
+
+    #[test]
+    fn amend_event_capacity_refuses_below_event_count() {
+        // AV-479: the no-drop rule — the new capacity must
+        // cover every retained entry, so shrinking below the
+        // retained count is InvalidEventCapacity; shrinking to
+        // exactly the retained count is allowed, and the ring
+        // is then exactly full.
+        let mut e = event_capacity_funded_escrow(8);
+        record_history_entries(&mut e, 3, HIST_T0);
+        assert_eq!(
+            e.amend_event_capacity(ALICE, BOB, 2),
+            Err(EscrowError::InvalidEventCapacity)
+        );
+        assert_eq!(
+            e.event_capacity(),
+            8,
+            "failed call changes nothing"
+        );
+        assert_eq!(
+            e.event_history().len(),
+            3,
+            "entries survive the refusal"
+        );
+        e.amend_event_capacity(ALICE, BOB, 3).unwrap();
+        assert_eq!(e.event_capacity(), 3);
+        assert_eq!(e.event_count(), 3, "ring now exactly full");
+    }
+
+    #[test]
+    fn amend_event_capacity_noop_on_same_capacity() {
+        // AV-479: re-affirming the current capacity on a
+        // filling ring is a no-op — it succeeds, writes
+        // nothing, and (by the handler's before/after
+        // comparison) emits nothing.
+        let mut e = event_capacity_funded_escrow(8);
+        record_history_entries(&mut e, 3, HIST_T0);
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_event_capacity(ALICE, BOB, 8).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-capacity re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.event_capacity(), 8);
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_event_capacity(ALICE, BOB, 4).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_event_capacity(ALICE, BOB, 4).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised capacity writes nothing either"
+        );
+        assert_eq!(e.event_capacity(), 4);
+    }
+
+    #[test]
+    fn amend_event_capacity_emits_only_on_change() {
+        // AV-479: the program handler emits
+        // `EventCapacityAmended` only when the capacity actually
+        // changes — the before/after comparison in the handler
+        // skips the event on a no-op re-affirmation (mirrors
+        // `amend_price_gate`). At the state-machine level the
+        // same-capacity call writes nothing — the encoded escrow
+        // is byte-identical before and after, so there is nothing
+        // to emit about — while a real change moves the field,
+        // which is what the handler's emission keys on. The
+        // INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_event_capacity")
+            .expect("INSTRUCTIONS carries amend_event_capacity");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = event_capacity_funded_escrow(8);
+        record_history_entries(&mut e, 3, HIST_T0);
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_event_capacity(ALICE, BOB, 8).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-capacity re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_event_capacity(ALICE, BOB, 4).unwrap();
+        assert_eq!(e.event_capacity(), 4);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the field, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_event_capacity_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-479: the program handler emits
+        // `EventCapacityAmended` only when the capacity actually
+        // changes — the indexed wrapper is the event-layer
+        // mirror of the handler's before/after comparison. A failed
+        // revision emits nothing, a no-op re-affirmation emits
+        // nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const AT: u64 = EXPIRES_AT - 3_500;
+        let mut e = IndexedEscrow::wrap([0x1D; 32], event_capacity_funded_escrow(8));
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_event_capacity(MALLORY, BOB, 4, AT),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_event_capacity(ALICE, BOB, 4, AT).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::EventCapacityAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same capacity is a no-op: no new event.
+        e.amend_event_capacity(ALICE, BOB, 4, AT + 1).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_event_capacity_retunes_capacity_and_next_record_reads_live_capacity() {
+        // AV-479: a ring amended while filling keeps filling
+        // under the new bound, then wraps modulo the new
+        // capacity — the oldest entry ages out and the window
+        // stays chronological. The new capacity governs from
+        // the next `record_history` call, since both
+        // `record_history` and `event_history` read the live
+        // capacity at every call.
+        let mut e = event_capacity_funded_escrow(8);
+        record_history_entries(&mut e, 3, HIST_T0);
+        e.amend_event_capacity(ALICE, BOB, 4).unwrap();
+        e.record_history(
+            crate::events::EscrowEventKind::Released,
+            HIST_T0 + 3,
+            Some(BOB),
+        );
+        assert_eq!(e.event_count(), 4, "ring filled under the new bound");
+        assert_eq!(
+            e.event_history()
+                .iter()
+                .map(|en| en.at)
+                .collect::<Vec<_>>(),
+            vec![HIST_T0, HIST_T0 + 1, HIST_T0 + 2, HIST_T0 + 3],
+            "full but unwrapped: still in fill order"
+        );
+        e.record_history(
+            crate::events::EscrowEventKind::Released,
+            HIST_T0 + 4,
+            Some(BOB),
+        );
+        assert_eq!(e.event_count(), 4, "count capped at the new bound");
+        assert_eq!(e.event_total(), 5, "total keeps growing past the wrap");
+        assert_eq!(
+            e.event_history()
+                .iter()
+                .map(|en| en.at)
+                .collect::<Vec<_>>(),
+            vec![HIST_T0 + 1, HIST_T0 + 2, HIST_T0 + 3, HIST_T0 + 4],
+            "oldest entry aged out, window stays chronological"
+        );
+    }
+
+    #[test]
+    fn amend_event_capacity_delayed_routing_gate() {
+        // AV-479: on a delay-opted-in escrow the capacity moves
+        // only through the propose/execute protocol
+        // (GovernanceAction kind 7) — the direct call is refused,
+        // whatever the capacity; the delayed path then lands it.
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_event_capacity(8)
+            .unwrap();
+        delayed.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(delayed.state(), EscrowState::Funded);
+        assert_eq!(
+            delayed.amend_event_capacity(ALICE, BOB, 4),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(EscrowError::GovernanceActionNotProposed.code(), 219);
+        assert_eq!(delayed.event_capacity(), 8);
+        delayed
+            .propose_governance(
+                ALICE,
+                GovernanceAction::AmendEventCapacity { new_capacity: 4 },
+                FUND_AT + 10,
+            )
+            .unwrap();
+        delayed
+            .execute_governance(BOB, FUND_AT + 10 + 3_600)
+            .unwrap();
+        assert_eq!(delayed.event_capacity(), 4);
+        assert!(delayed.governance_proposal().is_none());
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -68221,6 +68703,29 @@ pub(crate) mod anchor_idl_tests {
             r.register([i; 32], 1_000 * i as u64).unwrap();
         }
         r
+    }
+
+
+    fn event_capacity_funded_escrow(capacity: u8) -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_event_capacity(capacity)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    const HIST_T0: u64 = 1_700_000_000;
+
+    fn record_history_entries(e: &mut Escrow, n: u8, t0: u64) {
+        for i in 0..n {
+            e.record_history(
+                crate::events::EscrowEventKind::Funded,
+                t0 + i as u64,
+                Some(ALICE),
+            );
+        }
     }
 
     fn panel_members(e: &Escrow) -> Vec<[u8; 32]> {
@@ -71246,6 +71751,24 @@ pub(crate) mod anchor_idl_tests {
             "new_panel_size",
             "jury_panel_size",
         ),
+
+        // AV-479: the post-funding event-history ring-capacity
+        // revision rewrites the 1-byte `event_capacity` tail
+        // field in place — the first param source for the field.
+        // The capacity's *initial* value comes from the
+        // `with_event_capacity` builder (a state-machine method,
+        // not an instruction param, so it cannot appear in the
+        // param table); the param entry documents the revision
+        // source. Only the capacity moves — the slots, the head,
+        // the count and the total are untouched, so the retained
+        // entries survive verbatim, and the new capacity governs
+        // from the next `record_history` call while a wrapped
+        // ring never revises at all.
+        (
+            "amend_event_capacity",
+            "new_capacity",
+            "event_capacity",
+        ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
         // for `delegation` (the whole grant region, like
@@ -71518,11 +72041,6 @@ pub(crate) mod anchor_idl_tests {
             "event_count",
             "zeroed by initialize; grown by every successful \\
              transition's ring append, up to the configured capacity",
-        ),
-        (
-            "event_capacity",
-            "64 by default; set once by with_event_capacity \\
-             (Uninitialized only)",
         ),
         (
             "event_slots",
@@ -101423,6 +101941,19 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_jury_panel_size"),
             [112, 8, 17, 155, 181, 32, 0, 32]
+        );
+    }
+
+
+    #[test]
+    fn amend_event_capacity_instruction_discriminator_is_pinned() {
+        // AV-479. IDL:
+        // sha256("global:amend_event_capacity")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_event_capacity"),
+            [158, 15, 115, 132, 26, 42, 158, 231]
         );
     }
 

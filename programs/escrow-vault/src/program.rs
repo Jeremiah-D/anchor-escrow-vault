@@ -8988,6 +8988,83 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the event-history ring capacity after funding (AV-479;
+    /// mirrors `Escrow::amend_event_capacity`, the AV-282
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot resize
+    /// the audit window on the other's history. `Funded` only — the
+    /// builder owns the initial capacity via `with_event_capacity`,
+    /// and the ring must not have wrapped: once the ring is full
+    /// (`event_count == event_capacity`) the head has started
+    /// advancing modulo the old capacity, so a new capacity would
+    /// re-interpret the head modulo a different modulus and scramble
+    /// the window — the amendment is `InvalidStateTransition`
+    /// (fail-closed, and the refusal precedes even the no-op check,
+    /// so a re-affirmation on a wrapped ring is refused rather than
+    /// silently succeeding). A paused escrow fails fast (`Paused`,
+    /// before the authority gate). On a delay-opted-in escrow the
+    /// direct call is refused (`GovernanceActionNotProposed`, code
+    /// 219) — the capacity moves only through the propose/execute
+    /// protocol, with no new proposal variant (the
+    /// `AmendEventCapacity` variant, kind 7, is already there). The
+    /// new capacity reuses the `with_event_capacity` gate
+    /// (`1..=MAX_EVENT_HISTORY`, otherwise `InvalidEventCapacity`,
+    /// code 132) and must also cover every retained entry
+    /// (`new_capacity >= event_count`, otherwise
+    /// `InvalidEventCapacity`). Re-affirming the current capacity on
+    /// a filling ring is a no-op: it succeeds, writes nothing and
+    /// emits nothing. Emits `EventCapacityAmended` (from == to == the
+    /// current state) only on an actual change. Only the capacity
+    /// changes — the slots, the head, the count and the total are
+    /// untouched, so the retained entries survive verbatim, and the
+    /// new capacity governs from the next `record_history` call
+    /// (`record_history` and `event_history` both read the live
+    /// capacity at every call, so a ring amended while filling keeps
+    /// filling under the new bound and wraps modulo the new capacity
+    /// once it fills). `now` comes from the clock sysvar, never an
+    /// instruction param (mirrors `amend_funding_start`) — here only
+    /// for the event timestamp, since the pure logic takes no `now`.
+    pub fn amend_event_capacity(
+        ctx: Context<AmendEventCapacity>,
+        new_capacity: u8,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.event_capacity();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_event_capacity(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_capacity,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 1-byte `event_capacity` tail field in
+        // place — no realloc. Only the capacity moves; the slots,
+        // the head, the count and the total are untouched.
+        // Emits only on an actual change; a no-op re-affirmation
+        // stays silent (mirrors `amend_price_gate`).
+        if escrow.event_capacity() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::EventCapacityAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -16546,6 +16623,22 @@ pub struct AmendPanelThreshold<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendJuryPanelSize<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-479: accounts for `amend_event_capacity` — the
+/// event-history ring-capacity revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendEventCapacity<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
