@@ -1596,6 +1596,15 @@
       ]
     },
     {
+      "name": "amend_default_judgment",
+      "discriminator": [232, 134, 154, 194, 147, 140, 125, 67],
+      "accounts": [],
+      "args": [
+        {"name": "deadline_secs", "type": "u64"},
+        {"name": "default_taker_amount", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

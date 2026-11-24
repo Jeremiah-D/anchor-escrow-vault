@@ -43203,6 +43203,32 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_period_secs <- param (u64); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial schedule via with_subscription); only an escrow with a subscription plan already configured may revise — an unconfigured escrow is InvalidSubscription (code 130, fail-closed: post-funding installation would add a payout schedule the taker never funded under); the new period reuses the with_subscription gates (a zero period is InvalidSubscription, code 130, and if (periods - 1) * new_period_secs > expires_at the plan would overflow the escrow lifetime, so the revision is refused with the same error) leaving the original period untouched; on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219 — the cadence moves only through the propose/execute protocol, GovernanceAction kind 10, with no new proposal variant); re-affirming the current period is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only subscription.period_secs changes — periods, per_period, the amount conservation (periods * per_period == amount), subscription_next and subscription_released are untouched, and the new cadence governs from the next claim (subscription_period_due_at / SubscriptionSchedule::due_at read the live period_secs, so due dates of unreleased periods move with the new cadence when computed backwards from expires_at, with the last period pinned to expires_at, while a period already released keeps the due date it released under); emits the SubscriptionPeriodSecsAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 8-byte subscription.period_secs field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-482: revise the pre-agreed arbitration default
+            // judgment's terms after funding — the program-level
+            // entry point for the AV-286 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_default_judgment")[..8]
+            // = [232, 134, 154, 194, 147, 140, 125, 67] — the Anchor
+            // instruction discriminator for the
+            // amend_default_judgment handler (pinned by the
+            // discriminator test below).
+            name: "amend_default_judgment",
+            params: &[
+                (
+                    "deadline_secs",
+                    "u64",
+                    "instruction param; the replacement arbitration deadline in seconds — zero is DefaultJudgmentNotDue, the same rejection as the builder; re-affirming the current deadline alone is not a no-op unless the taker share also matches",
+                ),
+                (
+                    "default_taker_amount",
+                    "u64",
+                    "instruction param; the replacement taker share of the remaining locked funds — above the locked amount is ReleaseExceedsLocked; re-affirming the current share alone is not a no-op unless the deadline also matches",
+                ),
+            ],
+            method: "Escrow::amend_default_judgment",
+            input_mapping: "deadline_secs <- param (u64); default_taker_amount <- param (u64); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial terms via with_arbitration_deadline); only an escrow with a default judgment already configured may revise — an unconfigured escrow is DefaultJudgmentNotDue (code 129, fail-closed: post-funding installation would add a fallback split the taker never funded under); the new terms reuse the with_arbitration_deadline gates (a zero deadline is DefaultJudgmentNotDue, code 129, and a taker share above the locked amount is ReleaseExceedsLocked, code 106) leaving the original terms and confirmation untouched; on a delay-opted-in escrow the direct call is refused (GovernanceActionNotProposed, code 219 — the terms move only through the propose/execute protocol, GovernanceAction kind 11, with no new proposal variant); re-affirming the identical terms is a no-op (succeeds, writes nothing, resets nothing, emits no event, paralleling rotate_arbiter); only default_judgment{deadline_secs, default_taker_amount} changes — and default_confirmed resets to false (the old confirmation covered the old terms only, so the revised fallback needs a fresh taker countersign before trigger_default_judgment can fire on it, and until then the trigger fails DefaultJudgmentNotDue); a dispute escalated after the amendment measures its window from the new terms (trigger_default_judgment reads the terms and the confirmation live) while a live dispute's fallback is untouched; emits the DefaultJudgmentAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 17-byte default_judgment region is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -44266,6 +44292,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-289 pure-logic
             // revision wired to the chain).
             "Escrow::amend_subscription_period_secs",
+            // AV-482: the program-level default-judgment-terms
+            // revision (the AV-286 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_default_judgment",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -44969,6 +44999,16 @@ pub(crate) mod anchor_idl_tests {
                 // released keeps the due date it released under);
                 // re-affirming the current period is a no-op.
                 &"amend_subscription_period_secs",
+                // AV-482: the default-judgment-terms revision carries
+                // the replacement deadline (u64) and the replacement
+                // taker share (u64) — both terms together; the
+                // trigger reads the live terms and the live
+                // confirmation, so a real change resets the
+                // confirmation (the old confirmation covered the old
+                // terms only) while a live dispute's fallback is
+                // untouched; re-affirming the current terms is a
+                // no-op.
+                &"amend_default_judgment",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -68721,6 +68761,630 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn amend_default_judgment_maps_params_to_default_judgment_fields() {
+        // IDL: amend_default_judgment(deadline_secs: u64,
+        // default_taker_amount: u64) — deadline_secs <- param
+        // (u64); default_taker_amount <- param (u64);
+        // initializer <- accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The params rewrite `default_judgment.deadline_secs` and
+        // `default_judgment.default_taker_amount` in place (see
+        // PARAM_FIELD_MAP) — no layout change. The INSTRUCTIONS
+        // spec entry pins the program-level wiring: two u64 params
+        // and the AV-286 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_default_judgment")
+            .expect("INSTRUCTIONS carries amend_default_judgment");
+        assert_eq!(spec.method, "Escrow::amend_default_judgment");
+        assert_eq!(spec.params.len(), 2);
+        assert_eq!(spec.params[0].0, "deadline_secs");
+        assert_eq!(spec.params[0].1, "u64");
+        assert_eq!(spec.params[1].0, "default_taker_amount");
+        assert_eq!(spec.params[1].1, "u64");
+        assert!(
+            spec.input_mapping.contains("DefaultJudgmentAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the two u64 args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_default_judgment\""),
+            "checked-in IDL carries amend_default_judgment"
+        );
+        assert!(
+            idl.contains("[232, 134, 154, 194, 147, 140, 125, 67]"),
+            "checked-in IDL pins the AV-482 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"deadline_secs\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the deadline_secs arg"
+        );
+        assert!(
+            idl.contains("{\"name\": \"default_taker_amount\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the default_taker_amount arg"
+        );
+        // Only the terms move — and the confirmation resets: the
+        // state, the amount, the released counters and the encoded
+        // length are untouched.
+        let mut e = arbitration_deadline_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: ARBITRATION_DEADLINE,
+                default_taker_amount: ARBITRATION_TAKER_SHARE,
+            })
+        );
+        assert!(e.default_judgment_confirmed());
+        e.amend_default_judgment(ALICE, BOB, 7_200, 400_000)
+            .unwrap();
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: 7_200,
+                default_taker_amount: 400_000,
+            }),
+            "both terms replaced"
+        );
+        assert!(
+            !e.default_judgment_confirmed(),
+            "the old confirmation covered the old terms only"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_000_000, "lockup untouched");
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "terms region rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the terms are
+        // configured there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITRATION_ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(
+                ARBITRATION_DEADLINE,
+                ARBITRATION_TAKER_SHARE,
+            )
+            .unwrap();
+        assert_eq!(
+            bare.amend_default_judgment(ALICE, BOB, 7_200, 400_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_default_judgment_rejects_single_party_and_strangers() {
+        // AV-482: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // re-price the fallback split on the other's share.
+        let mut e = arbitration_deadline_funded_escrow();
+        assert_eq!(
+            e.amend_default_judgment(ALICE, ALICE, 7_200, 400_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_default_judgment(MALLORY, BOB, 7_200, 400_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_default_judgment(MALLORY, MALLORY, 7_200, 400_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: ARBITRATION_DEADLINE,
+                default_taker_amount: ARBITRATION_TAKER_SHARE,
+            }),
+            "failed revisions write nothing"
+        );
+        assert!(
+            e.default_judgment_confirmed(),
+            "failed revisions reset nothing"
+        );
+        e.amend_default_judgment(ALICE, BOB, 7_200, 400_000)
+            .unwrap();
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: 7_200,
+                default_taker_amount: 400_000,
+            })
+        );
+    }
+
+    #[test]
+    fn amend_default_judgment_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-482: Funded-only — the Uninitialized builder owns the
+        // initial terms set, and a live dispute or a terminal
+        // escrow settles under the terms it started under. The
+        // pause guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        // Uninitialized: the terms are still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITRATION_ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(
+                ARBITRATION_DEADLINE,
+                ARBITRATION_TAKER_SHARE,
+            )
+            .unwrap();
+        assert_eq!(
+            bare.amend_default_judgment(ALICE, BOB, 7_200, 400_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            bare.default_judgment().unwrap().deadline_secs,
+            ARBITRATION_DEADLINE
+        );
+        // Activated: both parties signed, funds not yet locked.
+        let mut activated =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_dual_sig()
+                .unwrap()
+                .with_arbiter(ARBITRATION_ARBITER)
+                .unwrap()
+                .with_arbitration_deadline(
+                    ARBITRATION_DEADLINE,
+                    ARBITRATION_TAKER_SHARE,
+                )
+                .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_default_judgment(ALICE, BOB, 7_200, 400_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            activated.default_judgment().unwrap().deadline_secs,
+            ARBITRATION_DEADLINE
+        );
+        // Disputed: the fallback stays while the dispute is in
+        // flight — the dispute settles on the terms it started
+        // under, and the in-flight trigger still reads them.
+        let mut d = arbitration_deadline_funded_escrow();
+        let disputed_at = ARBITRATION_T0 + 100;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_default_judgment(ALICE, BOB, 7_200, 400_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            d.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: ARBITRATION_DEADLINE,
+                default_taker_amount: ARBITRATION_TAKER_SHARE,
+            }),
+            "disputed revision writes nothing"
+        );
+        assert_eq!(
+            d.trigger_default_judgment(BOB, disputed_at + ARBITRATION_DEADLINE, None, BOB)
+                .unwrap()
+                .0,
+            ARBITRATION_TAKER_SHARE,
+            "live dispute still triggers on the original terms"
+        );
+        // Terminal: a cancelled escrow's fallback is history, not
+        // a live bar to retune.
+        let mut e = arbitration_deadline_funded_escrow();
+        e.cancel(ALICE, None, ALICE, 0).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        assert_eq!(
+            e.amend_default_judgment(ALICE, BOB, 7_200, 400_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.default_judgment().unwrap().deadline_secs,
+            ARBITRATION_DEADLINE
+        );
+        // The pause guard fires before the authority gate.
+        let mut paused =
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_pause_authority(PAUSER)
+                .unwrap()
+                .with_arbiter(ARBITRATION_ARBITER)
+                .unwrap()
+                .with_arbitration_deadline(
+                    ARBITRATION_DEADLINE,
+                    ARBITRATION_TAKER_SHARE,
+                )
+                .unwrap();
+        paused.confirm_default_judgment(BOB).unwrap();
+        paused.fund(ALICE, ARBITRATION_T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_default_judgment(ALICE, BOB, 7_200, 400_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_default_judgment(MALLORY, BOB, 7_200, 400_000),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.default_judgment().unwrap().deadline_secs,
+            ARBITRATION_DEADLINE,
+            "paused revision writes nothing"
+        );
+        assert!(
+            paused.default_judgment_confirmed(),
+            "paused revision resets nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        paused
+            .amend_default_judgment(ALICE, BOB, 7_200, 400_000)
+            .unwrap();
+        assert_eq!(
+            paused.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: 7_200,
+                default_taker_amount: 400_000,
+            })
+        );
+        assert!(
+            !paused.default_judgment_confirmed(),
+            "the unpaused revision resets the confirmation"
+        );
+    }
+
+    #[test]
+    fn amend_default_judgment_refuses_unconfigured_judgment() {
+        // AV-482: fail-closed — only an escrow with a default
+        // judgment already configured may revise; post-funding
+        // installation would add a fallback split the taker never
+        // funded under. The unconfigured gate fires before the
+        // value gates, so even a zero deadline on an unconfigured
+        // escrow reports DefaultJudgmentNotDue.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITRATION_ARBITER)
+            .unwrap();
+        plain.fund(ALICE, ARBITRATION_T0).unwrap();
+        assert_eq!(plain.state(), EscrowState::Funded);
+        assert_eq!(
+            plain.amend_default_judgment(ALICE, BOB, 7_200, 400_000),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+        assert_eq!(
+            plain.amend_default_judgment(ALICE, BOB, 0, 400_000),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+        assert_eq!(EscrowError::DefaultJudgmentNotDue.code(), 129);
+        assert_eq!(plain.default_judgment(), None);
+    }
+
+    #[test]
+    fn amend_default_judgment_rejects_zero_deadline() {
+        // AV-482: the builder's value gate, reused — a zero
+        // deadline is not a window; a rejected deadline leaves the
+        // original terms and confirmation untouched.
+        let mut e = arbitration_deadline_funded_escrow();
+        assert_eq!(
+            e.amend_default_judgment(ALICE, BOB, 0, 400_000),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+        assert_eq!(EscrowError::DefaultJudgmentNotDue.code(), 129);
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: ARBITRATION_DEADLINE,
+                default_taker_amount: ARBITRATION_TAKER_SHARE,
+            }),
+            "failed call changes nothing"
+        );
+        assert!(e.default_judgment_confirmed());
+    }
+
+    #[test]
+    fn amend_default_judgment_rejects_over_amount_taker_share() {
+        // AV-482: the builder's value gate, reused — a taker share
+        // above the lockup is not a split; a rejected share leaves
+        // the original terms and confirmation untouched, while a
+        // share of exactly the lockup fits and lands.
+        let mut e = arbitration_deadline_funded_escrow();
+        assert_eq!(
+            e.amend_default_judgment(ALICE, BOB, 7_200, 1_000_001),
+            Err(EscrowError::ReleaseExceedsLocked)
+        );
+        assert_eq!(EscrowError::ReleaseExceedsLocked.code(), 106);
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: ARBITRATION_DEADLINE,
+                default_taker_amount: ARBITRATION_TAKER_SHARE,
+            }),
+            "failed call changes nothing"
+        );
+        assert!(e.default_judgment_confirmed());
+        e.amend_default_judgment(ALICE, BOB, 7_200, 1_000_000)
+            .unwrap();
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: 7_200,
+                default_taker_amount: 1_000_000,
+            }),
+            "a share of exactly the lockup fits"
+        );
+        assert!(!e.default_judgment_confirmed());
+    }
+
+    #[test]
+    fn amend_default_judgment_noop_on_same_terms() {
+        // AV-482: re-affirming the current terms is a no-op — it
+        // succeeds, writes nothing, resets nothing, and (by the
+        // handler's before/after comparison) emits nothing.
+        let mut e = arbitration_deadline_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_default_judgment(
+            ALICE,
+            BOB,
+            ARBITRATION_DEADLINE,
+            ARBITRATION_TAKER_SHARE,
+        )
+        .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-terms re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert!(e.default_judgment_confirmed());
+        // Re-affirming again after a real change is the same no-op —
+        // and it does not re-confirm the revised terms.
+        e.amend_default_judgment(ALICE, BOB, 7_200, 400_000)
+            .unwrap();
+        assert!(!e.default_judgment_confirmed());
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_default_judgment(ALICE, BOB, 7_200, 400_000)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised terms writes nothing either"
+        );
+        assert!(
+            !e.default_judgment_confirmed(),
+            "a no-op never re-confirms"
+        );
+    }
+
+    #[test]
+    fn amend_default_judgment_emits_only_on_change() {
+        // AV-482: the program handler emits
+        // `DefaultJudgmentAmended` only when the terms actually
+        // change — the before/after comparison in the handler skips
+        // the event on a no-op re-affirmation (mirrors
+        // `amend_price_gate`). At the state-machine level the
+        // same-terms call writes nothing — the encoded escrow is
+        // byte-identical before and after, so there is nothing to
+        // emit about — while a real change moves the terms and
+        // resets the confirmation, which is what the handler's
+        // emission keys on. The INSTRUCTIONS entry pins the
+        // change-only event in the spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_default_judgment")
+            .expect("INSTRUCTIONS carries amend_default_judgment");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = arbitration_deadline_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_default_judgment(
+            ALICE,
+            BOB,
+            ARBITRATION_DEADLINE,
+            ARBITRATION_TAKER_SHARE,
+        )
+        .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-terms re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_default_judgment(ALICE, BOB, 7_200, 400_000)
+            .unwrap();
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: 7_200,
+                default_taker_amount: 400_000,
+            })
+        );
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the terms, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_default_judgment_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-482: the program handler emits
+        // `DefaultJudgmentAmended` only when the terms actually
+        // change — the indexed wrapper is the event-layer mirror of
+        // the handler's before/after comparison. A failed revision
+        // emits nothing, a no-op re-affirmation emits nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const AT: u64 = ARBITRATION_T0 + 100;
+        let mut e = IndexedEscrow::wrap(
+            [0x1D; 32],
+            arbitration_deadline_funded_escrow(),
+        );
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_default_judgment(MALLORY, BOB, 7_200, 400_000, AT),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_default_judgment(ALICE, BOB, 7_200, 400_000, AT)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::DefaultJudgmentAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same terms is a no-op: no new event.
+        e.amend_default_judgment(ALICE, BOB, 7_200, 400_000, AT + 1)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_default_judgment_program_retunes_terms_and_trigger_reads_live_terms() {
+        // AV-482: the trigger reads the live terms and the live
+        // confirmation — a single-field change still counts as a
+        // change (the handler's before/after comparison covers the
+        // whole Option<DefaultJudgment>), so it resets the
+        // confirmation, and the trigger settles on the new split
+        // only once re-confirmed.
+        const DISPUTED_AT: u64 = ARBITRATION_T0 + 1_000;
+        let mut e = arbitration_deadline_funded_escrow();
+        // Deadline-only change: the share stays, the confirmation
+        // still resets.
+        e.amend_default_judgment(ALICE, BOB, 7_200, ARBITRATION_TAKER_SHARE)
+            .unwrap();
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: 7_200,
+                default_taker_amount: ARBITRATION_TAKER_SHARE,
+            })
+        );
+        assert!(
+            !e.default_judgment_confirmed(),
+            "a deadline-only change resets the confirmation"
+        );
+        // Share-only change: the deadline stays, the confirmation
+        // still resets.
+        e.confirm_default_judgment(BOB).unwrap();
+        assert!(e.default_judgment_confirmed());
+        e.amend_default_judgment(ALICE, BOB, 7_200, 400_000)
+            .unwrap();
+        assert_eq!(
+            e.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: 7_200,
+                default_taker_amount: 400_000,
+            })
+        );
+        assert!(
+            !e.default_judgment_confirmed(),
+            "a share-only change resets the confirmation"
+        );
+        // Re-confirm, then escalate: the trigger refuses at the old
+        // deadline (the new terms govern) and settles on the new
+        // split once the new deadline passes.
+        e.confirm_default_judgment(BOB).unwrap();
+        e.escalate(ALICE, DISPUTED_AT, e.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Disputed);
+        assert_eq!(
+            e.trigger_default_judgment(
+                ALICE,
+                DISPUTED_AT + ARBITRATION_DEADLINE,
+                None,
+                BOB
+            ),
+            Err(EscrowError::DefaultJudgmentNotDue)
+        );
+        let (payout, fee, refund) = e
+            .trigger_default_judgment(ALICE, DISPUTED_AT + 7_200, None, BOB)
+            .unwrap();
+        assert_eq!((payout, fee, refund), (400_000, 0, 600_000));
+        assert_eq!(e.released_amount(), 400_000, "gross is the new share");
+        assert_eq!(e.state(), EscrowState::Settled);
+    }
+
+    #[test]
+    fn amend_default_judgment_delayed_routing_gate() {
+        // AV-482: on a delay-opted-in escrow the terms move only
+        // through the propose/execute protocol
+        // (GovernanceAction kind 11) — the direct call is refused,
+        // whatever the terms; the delayed path then lands them and
+        // resets the confirmation.
+        const FUND_AT: u64 = ARBITRATION_T0;
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap()
+            .with_arbiter(ARBITRATION_ARBITER)
+            .unwrap()
+            .with_arbitration_deadline(
+                ARBITRATION_DEADLINE,
+                ARBITRATION_TAKER_SHARE,
+            )
+            .unwrap();
+        delayed.confirm_default_judgment(BOB).unwrap();
+        delayed.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(delayed.state(), EscrowState::Funded);
+        assert_eq!(
+            delayed.amend_default_judgment(ALICE, BOB, 7_200, 400_000),
+            Err(EscrowError::GovernanceActionNotProposed)
+        );
+        assert_eq!(EscrowError::GovernanceActionNotProposed.code(), 219);
+        assert_eq!(
+            delayed.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: ARBITRATION_DEADLINE,
+                default_taker_amount: ARBITRATION_TAKER_SHARE,
+            })
+        );
+        assert!(
+            delayed.default_judgment_confirmed(),
+            "refused revision resets nothing"
+        );
+        delayed
+            .propose_governance(
+                ALICE,
+                GovernanceAction::AmendDefaultJudgment {
+                    deadline_secs: 7_200,
+                    default_taker_amount: 400_000,
+                },
+                FUND_AT + 10,
+            )
+            .unwrap();
+        delayed
+            .execute_governance(BOB, FUND_AT + 10 + 3_600)
+            .unwrap();
+        assert_eq!(
+            delayed.default_judgment(),
+            Some(DefaultJudgment {
+                deadline_secs: 7_200,
+                default_taker_amount: 400_000,
+            })
+        );
+        assert!(
+            !delayed.default_judgment_confirmed(),
+            "the delayed revision resets the confirmation too"
+        );
+        assert!(delayed.governance_proposal().is_none());
+    }
+
+    #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
         // new_delegate <- param; caller <-
@@ -72822,6 +73486,30 @@ pub(crate) mod anchor_idl_tests {
             "new_period_secs",
             "subscription.period_secs",
         ),
+        // AV-482: the post-funding default-judgment revision rewrites
+        // `default_judgment.deadline_secs` and
+        // `default_judgment.default_taker_amount` in place — the
+        // deadline is a second param source for its sub-field, like
+        // `amend_arbitration_deadline`'s (AV-458), and the taker
+        // amount is the first param source for its sub-field (the
+        // builder maps both terms to the whole region). Only the
+        // terms move — and the confirmation resets — so a dispute
+        // escalated after the amendment measures its window from the
+        // new terms and settles on the new split once re-confirmed,
+        // while a live dispute's fallback is untouched, and an
+        // unconfigured judgment or a zero deadline is
+        // DefaultJudgmentNotDue (code 129) and an over-lockup taker
+        // share is ReleaseExceedsLocked (code 106).
+        (
+            "amend_default_judgment",
+            "deadline_secs",
+            "default_judgment.deadline_secs",
+        ),
+        (
+            "amend_default_judgment",
+            "default_taker_amount",
+            "default_judgment.default_taker_amount",
+        ),
         // AV-388: the rotation param rewrites the delegate key of
         // the `delegation` region in place — a second param source
         // for `delegation` (the whole grant region, like
@@ -73063,7 +73751,8 @@ pub(crate) mod anchor_idl_tests {
         (
             "default_confirmed",
             "zeroed by initialize; set by confirm_default_judgment \\
-             (taker signer only)",
+             (taker signer only); reset by amend_default_judgment on \\
+             a real terms change (AV-482)",
         ),
         // AV-56: no instruction param writes this field directly — the
         // `period_index` param maps to `subscription_released` (see
@@ -73636,12 +74325,14 @@ pub(crate) mod anchor_idl_tests {
                 // target) plus its deadline sub-field, for the dotted
                 // param mapping `default_judgment.deadline_secs`
                 // (the post-funding deadline-only revision's target).
-                // The taker-amount sub-field has no param that maps
-                // to it as a sub-field (the builder maps both terms
-                // to the whole region), so it stays folded into the
-                // whole region.
+                // AV-482: plus the taker-amount sub-field, for the
+                // dotted param mapping
+                // `default_judgment.default_taker_amount` (the
+                // post-funding two-term revision's target — the
+                // builder maps both terms to the whole region).
                 paths.push(name);
                 paths.push("default_judgment.deadline_secs");
+                paths.push("default_judgment.default_taker_amount");
             } else if *name == "subscription" {
                 // AV-481: the whole schedule region (the builder's
                 // target) plus its cadence sub-field, for the dotted
@@ -103039,6 +103730,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_subscription_period_secs"),
             [170, 23, 105, 193, 38, 129, 89, 179]
+        );
+    }
+
+    #[test]
+    fn amend_default_judgment_instruction_discriminator_is_pinned() {
+        // AV-482. IDL:
+        // sha256("global:amend_default_judgment")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_default_judgment"),
+            [232, 134, 154, 194, 147, 140, 125, 67]
         );
     }
 

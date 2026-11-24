@@ -9217,6 +9217,83 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the pre-agreed arbitration default judgment's terms after funding (AV-482;
+    /// mirrors `Escrow::amend_default_judgment`, the AV-286
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot
+    /// re-price the fallback split on the other's share. `Funded`
+    /// only — the builder owns the initial terms via
+    /// `with_arbitration_deadline`, and only an escrow with a
+    /// default judgment already configured may amend — an
+    /// unconfigured escrow is `DefaultJudgmentNotDue` (code 129,
+    /// fail-closed: post-funding installation would add a fallback
+    /// split the taker never funded under). The new terms reuse the
+    /// `with_arbitration_deadline` gates (a zero deadline is
+    /// `DefaultJudgmentNotDue`, code 129, and a taker share above the
+    /// locked amount is `ReleaseExceedsLocked`, code 106) leaving the
+    /// original terms and confirmation untouched. A paused escrow
+    /// fails fast (`Paused`, before the authority gate). On a
+    /// delay-opted-in escrow the direct call is refused
+    /// (`GovernanceActionNotProposed`, code 219) — the terms move
+    /// only through the propose/execute protocol, with no new proposal
+    /// variant (the `AmendDefaultJudgment` variant, kind 11, is
+    /// already there). Re-affirming the current terms is a no-op: it
+    /// succeeds, writes nothing, resets nothing and emits nothing.
+    /// Emits `DefaultJudgmentAmended` (from == to == the current
+    /// state) only on an actual change. Only
+    /// `default_judgment{deadline_secs, default_taker_amount}`
+    /// changes — and `default_confirmed` resets to `false`: the old
+    /// confirmation covered the old terms only, so the revised
+    /// fallback needs a fresh taker countersign before
+    /// `trigger_default_judgment` can fire on it, and until then the
+    /// trigger fails `DefaultJudgmentNotDue`. `now` comes from the clock
+    /// sysvar, never an instruction param (mirrors
+    /// `amend_funding_start`) — here only for the event timestamp,
+    /// since the pure logic takes no `now`.
+    pub fn amend_default_judgment(
+        ctx: Context<AmendDefaultJudgment>,
+        deadline_secs: u64,
+        default_taker_amount: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.default_judgment();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_default_judgment(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                deadline_secs,
+                default_taker_amount,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 17-byte `default_judgment` region in
+        // place — no realloc. Only the terms move, and the
+        // confirmation resets; the state, the amount and the
+        // released counters are untouched.
+        // Emits only on an actual change; a no-op re-affirmation
+        // stays silent (mirrors `amend_price_gate`).
+        if escrow.default_judgment() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::DefaultJudgmentAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the protocol fee rate and ceiling after funding (AV-401;
     /// mirrors `Escrow::amend_protocol_fee`). Unconditional
     /// dual-signature governance: both initializer and taker sign —
@@ -16823,6 +16900,22 @@ pub struct AmendSettlementMint<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendSubscriptionPeriodSecs<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-482: accounts for `amend_default_judgment` — the
+/// default-judgment-terms revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendDefaultJudgment<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
