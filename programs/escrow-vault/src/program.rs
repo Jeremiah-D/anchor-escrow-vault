@@ -8836,6 +8836,78 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the interest rate after funding (AV-483;
+    /// mirrors `Escrow::amend_interest_rate`, the AV-260
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot retune
+    /// the other's yield. `Funded` only — the builder owns the
+    /// initial set, and the dispute window settles under the frozen
+    /// rate. A paused escrow fails fast (`Paused`, before the authority
+    /// gate). No delay path covers this method — `GovernanceAction`
+    /// has no `AmendInterestRate` variant, so the direct call is
+    /// the only entry point and stays open on a delay-opted-in escrow
+    /// (the AV-471 `amend_twap_gate` precedent: the method carries no
+    /// `via_delayed` gate, so gating it here would self-lock exactly
+    /// the escrows that need it). A rate above `10_000` is refused
+    /// with `InvalidInterestRate` (the builder's gate, unchanged —
+    /// the rate can never exceed 100% APR); `0` is legal and pauses
+    /// all future accrual (the builder's `0` semantics, not a
+    /// forfeiture). Re-affirming the current rate is a no-op: it
+    /// succeeds, writes nothing and emits nothing. Emits
+    /// `InterestRateAmended` (from == to == the current state) only
+    /// on an actual change. Only the `interest_rate_bps` field
+    /// changes — `interest_accrued`, `interest_paid`,
+    /// `interest_compounded` and `interest_accrual_base` are never
+    /// restated, so a rate cut can never claw back yield already
+    /// accrued, and the next `settle_interest` prices the next slice
+    /// at the live rate the moment the amendment lands — while a
+    /// slice already settled keeps the rate it settled at, and in
+    /// compound mode the yield already folded stays principal with
+    /// the next accrual pricing the grown principal at the new rate.
+    /// `now` comes from the clock sysvar, never an instruction param
+    /// (mirrors `amend_funding_start`) — here only for the event
+    /// timestamp, since the pure logic takes no `now`.
+    pub fn amend_interest_rate(
+        ctx: Context<AmendInterestRate>,
+        rate_bps: u16,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.interest_rate_bps();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_interest_rate(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                rate_bps,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 2-byte `interest_rate_bps` field in place — no
+        // realloc. Only the rate moves; the amounts, the state and the
+        // initializer/taker identities are untouched. Emits only on an
+        // actual change; a no-op re-affirmation stays silent (mirrors
+        // `amend_price_gate`).
+        if escrow.interest_rate_bps() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::InterestRateAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -16820,6 +16892,22 @@ pub struct AmendFundingStart<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendCompoundInterest<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-483: accounts for `amend_interest_rate` — the
+/// interest-rate revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendInterestRate<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

@@ -43107,6 +43107,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "enabled <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial opt-in and the dispute window settles under the frozen mode); no delay path covers this method — GovernanceAction has no AmendCompoundInterest variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current mode is a no-op (succeeds, writes nothing, emits no event, paralleling amend_interest_rate); only the compound_interest flag flips — amount, interest_compounded, interest_paid and interest_accrued are never restated, so yield already folded stays principal and yield already paid stays paid, and the next take_accrued_interest / settle_dispute_interest / claim_interest reads the live flag, so a flip governs the very next settlement while a settlement already made keeps the mode it settled under (and claim_interest is refused with CompoundInterestActive, code 178, while compounding is on); emits the CompoundInterestAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 1-byte compound_interest flag is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-483: revise the interest rate after
+            // funding — the program-level entry point for the
+            // AV-260 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_interest_rate")[..8]
+            // = [254, 248, 51, 126, 73, 126, 19, 122] — the Anchor
+            // instruction discriminator for the
+            // amend_interest_rate handler (pinned by the
+            // discriminator test below).
+            name: "amend_interest_rate",
+            params: &[(
+                "rate_bps",
+                "u16",
+                "instruction param; the replacement annual interest rate in basis points — 0 pauses all future accrual (the builder's 0 semantics, not a forfeiture) and above 10_000 is refused (InvalidInterestRate, code 165, the builder's gate); re-affirming the current rate is a no-op",
+            )],
+            method: "Escrow::amend_interest_rate",
+            input_mapping: "rate_bps <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial set and the dispute window settles under the frozen rate); no delay path covers this method — GovernanceAction has no AmendInterestRate variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); a rate above 10_000 is InvalidInterestRate (code 165, the builder's gate — the rate can never exceed 100% APR) and leaves the escrow untouched; 0 is legal and pauses all future accrual (the builder's 0 semantics — settle_interest returns early at rate 0 without advancing interest_accrual_base, so a paused window is repriced at the resumed rate on the next settlement, never skipped); re-affirming the current rate is a no-op (succeeds, writes nothing, emits no event, paralleling amend_penalty_bps); only interest_rate_bps changes — interest_accrued, interest_paid, interest_compounded and interest_accrual_base are never restated, so a rate cut can never claw back yield already accrued and a rate hike never reprices it, and the next settle_interest prices the next slice at the live rate the moment the amendment lands, while a slice already settled keeps the rate it settled under (and in compound mode the yield already folded stays principal with the next accrual pricing the grown principal at the new rate); emits the InterestRateAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 2-byte interest_rate_bps field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-477: revise the arbiter panel's judgment threshold
             // after funding — the program-level entry point for the
             // AV-378 pure-logic revision. IDL:
@@ -44271,6 +44290,10 @@ pub(crate) mod anchor_idl_tests {
             // mode revision (the AV-333 pure-logic
             // revision wired to the chain).
             "Escrow::amend_compound_interest",
+            // AV-483: the program-level interest-rate
+            // revision (the AV-260 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_interest_rate",
             // AV-477: the program-level arbiter-panel
             // threshold revision (the AV-378 pure-logic
             // revision wired to the chain).
@@ -44953,6 +44976,15 @@ pub(crate) mod anchor_idl_tests {
                 // keeps the mode it settled under; re-affirming
                 // the current mode is a no-op.
                 &"amend_compound_interest",
+                // AV-483: the interest-rate revision carries the
+                // replacement rate (u16, basis points) — the rate
+                // alone; the next settle_interest prices the next
+                // slice at the live rate, so a cut never claws
+                // back yield already accrued and a hike never
+                // reprices it, while a 0 rate pauses accrual
+                // without advancing the base; re-affirming the
+                // current rate is a no-op.
+                &"amend_interest_rate",
                 // AV-477: the panel-threshold revision carries
                 // the replacement threshold (u8) — the threshold
                 // alone; the next dispute tallies under the live
@@ -66587,6 +66619,397 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn amend_interest_rate_maps_param_to_rate_field() {
+        // IDL: amend_interest_rate(rate_bps: u16) —
+        // rate_bps <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `interest_rate_bps` field in place
+        // (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the single u16 param and the AV-260 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_interest_rate")
+            .expect("INSTRUCTIONS carries amend_interest_rate");
+        assert_eq!(spec.method, "Escrow::amend_interest_rate");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "rate_bps");
+        assert_eq!(spec.params[0].1, "u16");
+        assert!(
+            spec.input_mapping.contains("InterestRateAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single u16 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_interest_rate\""),
+            "checked-in IDL carries amend_interest_rate"
+        );
+        assert!(
+            idl.contains("[254, 248, 51, 126, 73, 126, 19, 122]"),
+            "checked-in IDL pins the AV-483 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"rate_bps\", \"type\": \"u16\"}"),
+            "checked-in IDL carries the rate_bps arg"
+        );
+        // Only the rate moves: the amounts, the state and the layout
+        // are untouched.
+        let mut e = funded_interest_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.interest_rate_bps(), 500);
+        e.amend_interest_rate(ALICE, BOB, 1_000).unwrap();
+        assert_eq!(e.interest_rate_bps(), 1_000, "rate revised");
+        assert_eq!(e.amount(), 1_000_000, "amount untouched");
+        assert_eq!(e.interest_accrued(), 0, "amending books no yield");
+        assert_eq!(e.interest_paid(), 0, "nothing paid yet");
+        assert_eq!(e.interest_compounded(), 0, "nothing folded yet");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "rate rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the rate is set
+        // there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        assert_eq!(
+            bare.amend_interest_rate(ALICE, BOB, 1_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_interest_rate_rejects_single_party_and_strangers() {
+        // AV-483: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // retune the other's yield.
+        let mut e = funded_interest_escrow();
+        assert_eq!(
+            e.amend_interest_rate(ALICE, ALICE, 1_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_interest_rate(MALLORY, BOB, 1_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_interest_rate(MALLORY, MALLORY, 1_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.interest_rate_bps(),
+            500,
+            "failed revisions retune nothing"
+        );
+        e.amend_interest_rate(ALICE, BOB, 1_000).unwrap();
+        assert_eq!(e.interest_rate_bps(), 1_000);
+    }
+
+    #[test]
+    fn amend_interest_rate_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-483: the builder owns the initial set and the
+        // dispute window settles under the frozen rate. The pause
+        // guard fires before the authority and state gates — and
+        // unpausing a Funded escrow re-opens the revision (Funded
+        // is the allowed state, the AV-475 contrast where an
+        // unpaused Funded escrow still refuses).
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = 1_700_000_000;
+        // Activated: funded money is the lock-in point, not
+        // activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, u64::MAX)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_interest_rate(ALICE, BOB, 1_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: the dispute window settles under the frozen
+        // rate.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        d.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        let disputed_at = EXPIRES_AT - 3_500;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_interest_rate(ALICE, BOB, 1_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.interest_rate_bps(),
+            500,
+            "disputed revision retunes nothing"
+        );
+        // Terminal: a released escrow's rate is history, not
+        // policy.
+        let mut released = funded_interest_escrow();
+        released
+            .release(ALICE, FUND_AT, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_interest_rate(ALICE, BOB, 1_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(released.interest_rate_bps(), 500);
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_interest(500)
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_interest_rate(ALICE, BOB, 1_000),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_interest_rate(MALLORY, BOB, 1_000),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.interest_rate_bps(),
+            500,
+            "paused revision retunes nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — and Funded is the
+        // allowed state, so the revision now lands.
+        paused.amend_interest_rate(ALICE, BOB, 1_000).unwrap();
+        assert_eq!(paused.interest_rate_bps(), 1_000);
+    }
+
+    #[test]
+    fn amend_interest_rate_allows_direct_on_delay_opted_in() {
+        // AV-483: no delay path covers this method —
+        // `GovernanceAction` has no `AmendInterestRate`
+        // variant and the pure logic carries no `via_delayed`
+        // gate, so the direct call is the only entry point and
+        // stays open on a delay-opted-in escrow (the AV-471
+        // `amend_twap_gate` precedent — gating it here would
+        // self-lock exactly the escrows that need it, since no
+        // delayed path could take the revision instead).
+        const FUND_AT: u64 = 1_700_000_000;
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_interest(500)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap();
+        delayed.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(delayed.state(), EscrowState::Funded);
+        delayed.amend_interest_rate(ALICE, BOB, 1_000).unwrap();
+        assert_eq!(
+            delayed.interest_rate_bps(),
+            1_000,
+            "direct call stays open on a delay-opted-in escrow"
+        );
+        // And back again — the rate stays revisable.
+        delayed.amend_interest_rate(ALICE, BOB, 500).unwrap();
+        assert_eq!(delayed.interest_rate_bps(), 500);
+    }
+
+    #[test]
+    fn amend_interest_rate_noop_on_same_rate() {
+        // AV-483: re-affirming the current rate is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = funded_interest_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_interest_rate(ALICE, BOB, 500).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-rate re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.interest_rate_bps(), 500);
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_interest_rate(ALICE, BOB, 1_000).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_interest_rate(ALICE, BOB, 1_000).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised rate writes nothing either"
+        );
+        assert_eq!(e.interest_rate_bps(), 1_000);
+    }
+
+    #[test]
+    fn amend_interest_rate_emits_only_on_change() {
+        // AV-483: the program handler emits
+        // `InterestRateAmended` only when the rate
+        // actually changes — the before/after comparison in the
+        // handler skips the event on a no-op re-affirmation
+        // (mirrors `amend_price_gate`). At the state-machine level
+        // the same-rate call writes nothing — the encoded escrow
+        // is byte-identical before and after, so there is nothing
+        // to emit about — while a real change rewrites the rate,
+        // which is what the handler's emission keys on. The
+        // INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_interest_rate")
+            .expect("INSTRUCTIONS carries amend_interest_rate");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = funded_interest_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_interest_rate(ALICE, BOB, 500).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-rate re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_interest_rate(ALICE, BOB, 1_000).unwrap();
+        assert_eq!(e.interest_rate_bps(), 1_000);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change rewrites the rate, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_interest_rate_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-483: the program handler emits
+        // `InterestRateAmended` only when the rate
+        // actually changes — the indexed wrapper is the event-layer
+        // mirror of the handler's before/after comparison. A failed
+        // revision emits nothing, a no-op re-affirmation emits
+        // nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const FUND_AT: u64 = 1_700_000_000;
+        let funded = funded_interest_escrow();
+        let mut e = IndexedEscrow::wrap([0x1D; 32], funded);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_interest_rate(ALICE, ALICE, 1_000, FUND_AT),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_interest_rate(ALICE, BOB, 1_000, FUND_AT)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::InterestRateAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same rate is a no-op: no new event.
+        e.amend_interest_rate(ALICE, BOB, 1_000, FUND_AT)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_interest_rate_rejects_above_10000_bps() {
+        // AV-483: the builder's gate, unchanged — the rate can
+        // never exceed 100% APR; a failed amendment leaves the
+        // stored rate as it was, and the ceiling itself is legal.
+        let mut e = funded_interest_escrow();
+        assert_eq!(
+            e.amend_interest_rate(ALICE, BOB, 10_001),
+            Err(EscrowError::InvalidInterestRate)
+        );
+        assert_eq!(EscrowError::InvalidInterestRate.code(), 165);
+        assert_eq!(
+            e.interest_rate_bps(),
+            500,
+            "failed revisions retune nothing"
+        );
+        e.amend_interest_rate(ALICE, BOB, 10_000).unwrap();
+        assert_eq!(
+            e.interest_rate_bps(),
+            10_000,
+            "the ceiling itself is legal"
+        );
+    }
+
+    #[test]
+    fn amend_interest_rate_accepts_zero_as_accrual_paused() {
+        // AV-483: 0 is legal and pauses all future accrual — the
+        // pinned AV-260 pause semantics: `settle_interest`
+        // returns early at rate 0 without advancing the accrual
+        // base, so a paused window is repriced at the resumed
+        // rate — it is never skipped or forfeited.
+        const FUND_AT: u64 = 1_700_000_000;
+        const YEAR: u64 = 31_536_000;
+        let mut e = funded_interest_escrow();
+        e.amend_interest_rate(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.interest_rate_bps(), 0);
+        // A harvest attempted while paused fails and settles
+        // nothing, leaving the base where funding left it.
+        assert_eq!(
+            e.claim_interest(BOB, FUND_AT + YEAR / 2),
+            Err(EscrowError::InterestNotEnabled)
+        );
+        assert_eq!(EscrowError::InterestNotEnabled.code(), 166);
+        assert_eq!(e.interest_accrued(), 0);
+        e.amend_interest_rate(ALICE, BOB, 1_000).unwrap();
+        // The whole year prices at the resumed 10%: 100_000 —
+        // the paused half-year is included at the new rate.
+        assert_eq!(e.claim_interest(BOB, FUND_AT + YEAR).unwrap(), 100_000);
+    }
+
+    #[test]
+    fn amend_interest_rate_retunes_rate_and_next_settlement_prices_live_rate() {
+        // AV-483: a rate retune prices only the next slice — the
+        // new rate governs the next settlement the moment the
+        // amendment lands, while yield already settled keeps the
+        // rate it settled under.
+        const FUND_AT: u64 = 1_700_000_000;
+        const YEAR: u64 = 31_536_000;
+        let mut e = funded_interest_escrow();
+        // First half-year settles at 5%: 25_000 booked.
+        assert_eq!(e.claim_interest(BOB, FUND_AT + YEAR / 2).unwrap(), 25_000);
+        assert_eq!(e.interest_paid(), 25_000);
+        e.amend_interest_rate(ALICE, BOB, 1_000).unwrap();
+        assert_eq!(e.interest_rate_bps(), 1_000);
+        assert_eq!(e.interest_accrued(), 0, "amending books no yield");
+        assert_eq!(e.interest_paid(), 25_000, "settled yield is never repriced");
+        assert_eq!(e.state(), EscrowState::Funded, "amending moves no state");
+        // Second half-year at 10%: 50_000 — the new rate prices
+        // only the next slice, never the settled one.
+        assert_eq!(e.claim_interest(BOB, FUND_AT + YEAR).unwrap(), 50_000);
+    }
+
+    #[test]
     fn amend_panel_threshold_maps_params_to_arbiter_panel_field() {
         // IDL: amend_panel_threshold(new_threshold: u8) —
         // new_threshold <- param; initializer <-
@@ -73393,6 +73816,23 @@ pub(crate) mod anchor_idl_tests {
             "amend_compound_interest",
             "enabled",
             "compound_interest",
+        ),
+        // AV-483: the post-funding interest-rate revision
+        // rewrites the 2-byte `interest_rate_bps` tail field in
+        // place — a second param source for the field, like
+        // `amend_evidence_deadline`'s deadline_secs. The field's
+        // *initial* value comes from the `initialize_interest`
+        // rate_bps param (Uninitialized only); this entry
+        // documents the revision source. Only the rate moves —
+        // `interest_accrued` / `interest_paid` /
+        // `interest_compounded` / `interest_accrual_base` are
+        // never restated, so a rate cut can never claw back yield
+        // already accrued, and the next settle_interest prices
+        // the next slice at the live rate.
+        (
+            "amend_interest_rate",
+            "rate_bps",
+            "interest_rate_bps",
         ),
         // AV-477: the post-funding arbiter-panel threshold
         // revision rewrites the 1-byte `threshold` field of the
@@ -103669,6 +104109,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_compound_interest"),
             [217, 144, 80, 104, 246, 86, 61, 237]
+        );
+    }
+
+    #[test]
+    fn amend_interest_rate_instruction_discriminator_is_pinned() {
+        // AV-483. IDL:
+        // sha256("global:amend_interest_rate")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_interest_rate"),
+            [254, 248, 51, 126, 73, 126, 19, 122]
         );
     }
 

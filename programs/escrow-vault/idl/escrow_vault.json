@@ -1556,6 +1556,14 @@
       ]
     },
     {
+      "name": "amend_interest_rate",
+      "discriminator": [254, 248, 51, 126, 73, 126, 19, 122],
+      "accounts": [],
+      "args": [
+        {"name": "rate_bps", "type": "u16"}
+      ]
+    },
+    {
       "name": "amend_panel_threshold",
       "discriminator": [192, 166, 186, 13, 85, 249, 94, 78],
       "accounts": [],
