@@ -1589,6 +1589,14 @@
       ]
     },
     {
+      "name": "amend_governance_delay",
+      "discriminator": [238, 153, 186, 221, 162, 104, 225, 198],
+      "accounts": [],
+      "args": [
+        {"name": "new_delay_secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "amend_panel_threshold",
       "discriminator": [192, 166, 186, 13, 85, 249, 94, 78],
       "accounts": [],

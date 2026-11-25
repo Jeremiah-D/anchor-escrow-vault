@@ -9130,6 +9130,81 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the governance-delay window after funding (AV-487;
+    /// mirrors `Escrow::amend_governance_delay`, the AV-334
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot
+    /// move the other's veto window. `Funded` only — the builder owns
+    /// the initial opt-in via `with_governance_delay`, and the window
+    /// is locked in at funding. A paused escrow fails fast (`Paused`,
+    /// before the authority gate). A zero window is refused with
+    /// `InvalidGovernanceDelay` (the builder's gate — 0 is not a delay,
+    /// and there is deliberately no clearing path back to 0, which
+    /// would silently restore the immediate single-proposal path for
+    /// the routed config changes). Post-funding installation is allowed
+    /// (`0 -> X`), as are lengthening and shortening (`X -> Y`, `Y > 0`).
+    /// No delay path covers this method — `GovernanceAction` has no
+    /// `AmendGovernanceDelay` variant, so the direct call is the only
+    /// entry point and stays open on a delay-opted-in escrow
+    /// (the AV-471 `amend_twap_gate` precedent: the method carries
+    /// no `via_delayed` gate, so gating it here would self-lock
+    /// exactly the escrows that need it — dual signature *is* the
+    /// second signature, and a mis-set window is always fixable by
+    /// another dual-signed revision). Re-affirming the current window
+    /// is a no-op: it succeeds, writes nothing and emits nothing.
+    /// Emits `GovernanceDelayAmended`
+    /// (from == to == the current state) only on an actual change.
+    /// Only the `governance_delay_secs` window changes — the state,
+    /// the amount and the expiry are untouched; a proposal already
+    /// live keeps the `delay_secs` snapshotted at propose time and
+    /// executes off that snapshot, so a revision neither accelerates
+    /// nor delays a proposal in flight, and the new window governs
+    /// only proposals staged after the revision, while the 16 routed
+    /// config changes keep following the live window. `now` comes
+    /// from the clock sysvar, never an instruction param (mirrors
+    /// `amend_funding_start`) — here only for the event timestamp,
+    /// since the pure logic takes no `now`.
+    pub fn amend_governance_delay(
+        ctx: Context<AmendGovernanceDelay>,
+        new_delay_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.governance_delay_secs();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_governance_delay(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_delay_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 8-byte `governance_delay_secs` window in place — no
+        // realloc. Only the window moves; a proposal already live keeps
+        // the snapshot it staged under. Emits only on an actual change;
+        // a no-op re-affirmation stays silent (mirrors
+        // `amend_compound_interest`).
+        if escrow.governance_delay_secs() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::GovernanceDelayAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -17178,6 +17253,22 @@ pub struct AmendReferrer<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendInsurancePool<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-487: accounts for `amend_governance_delay` — the
+/// governance-delay window revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendGovernanceDelay<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

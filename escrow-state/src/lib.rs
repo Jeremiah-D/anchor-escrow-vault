@@ -43190,6 +43190,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "opt_in <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial opt-in via with_insurance_pool); only an escrow carrying a penalty clause (flat slash terms or a ladder) may revise the routing (SlashNotEligible, code 143, otherwise — the clause itself can never be installed after funding); the empty-pool gate refuses the flip while any settled pool accounting stands (InvalidPoolPayout, code 164 — pool_paid / pool_slashed / pool_inflow / pool_payout_paid must all be zero, since pool funds already settled have nowhere to go); no delay path covers this method — GovernanceAction has no AmendInsurancePool variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current opt-in is a no-op (succeeds, writes nothing, emits no event, paralleling amend_compound_interest); only insurance_pool changes — the slash terms, the deadline, the locked amount and the state are untouched, and the slash path reads the live flag, so the next slash lands in the pool (opted in) or the penalty account (opted out) while a slash already settled keeps the routing it settled under; opting out also closes the pool_payout door at once and restores the AV-385/AV-386 penalty-account rotations that a pooled escrow refuses; emits the InsurancePoolAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 1-byte insurance_pool flag is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-487: revise the governance-delay window after
+            // funding — the program-level entry point for the
+            // AV-334 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_governance_delay")[..8]
+            // = [238, 153, 186, 221, 162, 104, 225, 198] — the Anchor
+            // instruction discriminator for the
+            // amend_governance_delay handler (pinned by the
+            // discriminator test below).
+            name: "amend_governance_delay",
+            params: &[(
+                "new_delay_secs",
+                "u64",
+                "instruction param; the replacement governance-delay window in seconds — post-funding installation (0 -> X), lengthening and shortening (X -> Y, Y > 0) are allowed; 0 is refused (no clearing path back to zero); re-affirming the current window is a no-op",
+            )],
+            method: "Escrow::amend_governance_delay",
+            input_mapping: "new_delay_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial opt-in via with_governance_delay); a zero window is refused with InvalidGovernanceDelay (code 220, the builder's gate — 0 is not a delay, and there is deliberately no clearing path back to 0, which would silently restore the immediate single-proposal path for the routed config changes); post-funding installation is allowed (0 -> X), as are lengthening and shortening (X -> Y, Y > 0); no delay path covers this method — GovernanceAction has no AmendGovernanceDelay variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current window is a no-op (succeeds, writes nothing, emits no event, paralleling amend_interest_rate); only governance_delay_secs changes — the state, the amount and the expiry are untouched, and a proposal already live keeps the delay_secs snapshotted at propose time and executes off that snapshot, so a revision neither accelerates nor delays a proposal in flight, while the new window governs only proposals staged after the revision and the 16 routed config changes keep following the live window; emits the GovernanceDelayAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 8-byte governance_delay_secs window is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-477: revise the arbiter panel's judgment threshold
             // after funding — the program-level entry point for the
             // AV-378 pure-logic revision. IDL:
@@ -44370,6 +44389,10 @@ pub(crate) mod anchor_idl_tests {
             // opt-in revision (the AV-394 pure-logic
             // revision wired to the chain).
             "Escrow::amend_insurance_pool",
+            // AV-487: the program-level governance-delay
+            // window revision (the AV-334 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_governance_delay",
             // AV-477: the program-level arbiter-panel
             // threshold revision (the AV-378 pure-logic
             // revision wired to the chain).
@@ -45088,6 +45111,16 @@ pub(crate) mod anchor_idl_tests {
                 // slash already settled keeps the routing it settled
                 // under; re-affirming the current opt-in is a no-op.
                 &"amend_insurance_pool",
+                // AV-487: the governance-delay window revision carries
+                // the replacement window (u64, seconds) — the window
+                // alone; a proposal already live keeps the delay_secs
+                // snapshotted at propose time and executes off that
+                // snapshot, so the revision neither accelerates nor
+                // delays a proposal in flight, while the next proposal
+                // stages under the new window and the 16 routed config
+                // changes keep following the live window; re-affirming
+                // the current window is a no-op.
+                &"amend_governance_delay",
                 // AV-477: the panel-threshold revision carries
                 // the replacement threshold (u8) — the threshold
                 // alone; the next dispute tallies under the live
@@ -68364,6 +68397,455 @@ pub(crate) mod anchor_idl_tests {
         assert!(!delayed.insurance_pool());
     }
 
+    fn governance_delay_funded_escrow() -> Escrow {
+        // AV-487: a Funded escrow carrying the one-day governance
+        // delay — the program-level revision's home state.
+        const T0: u64 = 1_700_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_governance_delay(86_400)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    fn governance_delay_quorum_funded_escrow() -> Escrow {
+        // AV-487: a Funded escrow carrying both the quorum policy and
+        // the one-day governance delay, so a proposal can be staged
+        // and executed under the live window.
+        const T0: u64 = 1_700_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(
+                QuorumPolicy::new(
+                    &[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3],
+                    &[1, 1, 1],
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .with_governance_delay(86_400)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_governance_delay_program_maps_param_to_window_field() {
+        // IDL: amend_governance_delay(new_delay_secs: u64) —
+        // new_delay_secs <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `governance_delay_secs` window in
+        // place (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the single u64 param and the AV-334 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_governance_delay")
+            .expect("INSTRUCTIONS carries amend_governance_delay");
+        assert_eq!(spec.method, "Escrow::amend_governance_delay");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "new_delay_secs");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("GovernanceDelayAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single u64 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_governance_delay\""),
+            "checked-in IDL carries amend_governance_delay"
+        );
+        assert!(
+            idl.contains("[238, 153, 186, 221, 162, 104, 225, 198]"),
+            "checked-in IDL pins the AV-487 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"new_delay_secs\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the new_delay_secs arg"
+        );
+        // Only the window moves: the state, the amount, the expiry
+        // and the layout are untouched.
+        const DELAY: u64 = 86_400;
+        const HOUR: u64 = 3_600;
+        let mut e = governance_delay_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.governance_delay_secs(), DELAY);
+        e.amend_governance_delay(ALICE, BOB, HOUR).unwrap();
+        assert_eq!(e.governance_delay_secs(), HOUR, "window revised");
+        assert_eq!(e.amount(), 1_000_000, "amount untouched");
+        assert_eq!(e.expires_at(), EXPIRES_AT, "expiry untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "window rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the opt-in is set
+        // there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        assert_eq!(
+            bare.amend_governance_delay(ALICE, BOB, HOUR),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_governance_delay_program_rejects_single_party_and_strangers() {
+        // AV-487: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // move the other's veto window.
+        const DELAY: u64 = 86_400;
+        const HOUR: u64 = 3_600;
+        let mut e = governance_delay_funded_escrow();
+        assert_eq!(
+            e.amend_governance_delay(ALICE, ALICE, HOUR),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_governance_delay(MALLORY, BOB, HOUR),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_governance_delay(MALLORY, MALLORY, HOUR),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.governance_delay_secs(),
+            DELAY,
+            "failed revisions move nothing"
+        );
+        e.amend_governance_delay(ALICE, BOB, HOUR).unwrap();
+        assert_eq!(e.governance_delay_secs(), HOUR);
+    }
+
+    #[test]
+    fn amend_governance_delay_program_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-487: the builder owns the initial opt-in and the window
+        // is locked in at funding. The pause guard fires before the
+        // authority and state gates — and unpausing a Funded escrow
+        // re-opens the revision (Funded is the allowed state).
+        const DELAY: u64 = 86_400;
+        const HOUR: u64 = 3_600;
+        const T0: u64 = 1_700_000_000;
+        const PAUSER: [u8; 32] = [0xD0; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Activated: funding is the lock-in point, not activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_governance_delay(ALICE, BOB, HOUR),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: the dispute window settles under the frozen
+        // window.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        d.fund(ALICE, T0).unwrap();
+        let disputed_at = EXPIRES_AT - 3_500;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_governance_delay(ALICE, BOB, HOUR),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.governance_delay_secs(),
+            DELAY,
+            "disputed revision moves nothing"
+        );
+        // Terminal: a released escrow's window is history, not
+        // policy.
+        let mut released = governance_delay_funded_escrow();
+        released
+            .release(ALICE, T0, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_governance_delay(ALICE, BOB, HOUR),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(released.governance_delay_secs(), DELAY);
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_governance_delay(DELAY)
+            .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_governance_delay(ALICE, BOB, HOUR),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_governance_delay(MALLORY, BOB, HOUR),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.governance_delay_secs(),
+            DELAY,
+            "paused revision moves nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — and Funded is the
+        // allowed state, so the revision now lands.
+        paused.amend_governance_delay(ALICE, BOB, HOUR).unwrap();
+        assert_eq!(paused.governance_delay_secs(), HOUR);
+    }
+
+    #[test]
+    fn amend_governance_delay_program_rejects_zero_window() {
+        // AV-487: 0 is not a delay — the builder's gate, unchanged.
+        // There is deliberately no clearing path back to 0, so
+        // closing an existing window is refused exactly like
+        // installing a zero window on a delay-less escrow.
+        const DELAY: u64 = 86_400;
+        const T0: u64 = 1_700_000_000;
+        let mut e = governance_delay_funded_escrow();
+        assert_eq!(
+            e.amend_governance_delay(ALICE, BOB, 0),
+            Err(EscrowError::InvalidGovernanceDelay)
+        );
+        assert_eq!(EscrowError::InvalidGovernanceDelay.code(), 220);
+        assert_eq!(
+            e.governance_delay_secs(),
+            DELAY,
+            "failed calls move nothing"
+        );
+        // A delay-less funded escrow cannot install a zero window
+        // either — installation is 0 -> X, X > 0.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        bare.fund(ALICE, T0).unwrap();
+        assert_eq!(bare.governance_delay_secs(), 0);
+        assert_eq!(
+            bare.amend_governance_delay(ALICE, BOB, 0),
+            Err(EscrowError::InvalidGovernanceDelay)
+        );
+        assert_eq!(bare.governance_delay_secs(), 0);
+    }
+
+    #[test]
+    fn amend_governance_delay_program_noop_on_same_window() {
+        // AV-487: re-affirming the current window is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        const DELAY: u64 = 86_400;
+        const HOUR: u64 = 3_600;
+        let mut e = governance_delay_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_governance_delay(ALICE, BOB, DELAY).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-window re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.governance_delay_secs(), DELAY);
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_governance_delay(ALICE, BOB, HOUR).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_governance_delay(ALICE, BOB, HOUR).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised window writes nothing either"
+        );
+        assert_eq!(e.governance_delay_secs(), HOUR);
+    }
+
+    #[test]
+    fn amend_governance_delay_program_emits_only_on_change() {
+        // AV-487: the program handler emits
+        // `GovernanceDelayAmended` only when the window
+        // actually changes — the before/after comparison in the
+        // handler skips the event on a no-op re-affirmation
+        // (mirrors `amend_compound_interest`). At the state-machine
+        // level the same-window call writes nothing — the encoded
+        // escrow is byte-identical before and after, so there is
+        // nothing to emit about — while a real change moves the
+        // window, which is what the handler's emission keys on.
+        // The INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        const DELAY: u64 = 86_400;
+        const HOUR: u64 = 3_600;
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_governance_delay")
+            .expect("INSTRUCTIONS carries amend_governance_delay");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = governance_delay_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_governance_delay(ALICE, BOB, DELAY).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-window re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_governance_delay(ALICE, BOB, HOUR).unwrap();
+        assert_eq!(e.governance_delay_secs(), HOUR);
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change moves the window, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_governance_delay_program_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-487: the program handler emits
+        // `GovernanceDelayAmended` only when the window
+        // actually changes — the indexed wrapper is the event-layer
+        // mirror of the handler's before/after comparison. A failed
+        // revision emits nothing, a no-op re-affirmation emits
+        // nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const T0: u64 = 1_700_000_000;
+        const DELAY: u64 = 86_400;
+        const HOUR: u64 = 3_600;
+        let funded = governance_delay_funded_escrow();
+        let mut e = IndexedEscrow::wrap([0x1D; 32], funded);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_governance_delay(ALICE, ALICE, HOUR, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_governance_delay(ALICE, BOB, HOUR, T0).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::GovernanceDelayAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        assert_eq!(ev.amounts.refund, 0);
+        assert_eq!(ev.amounts.penalty, 0);
+        // Re-affirming the new window is a no-op: no new event.
+        e.amend_governance_delay(ALICE, BOB, HOUR, T0).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        assert_eq!(e.inner().governance_delay_secs(), HOUR);
+        let _ = DELAY;
+    }
+
+    #[test]
+    fn amend_governance_delay_program_new_window_governs_next_proposal_only() {
+        // AV-487: lengthening governs only proposals staged after
+        // the revision — a proposal already live keeps the delay
+        // snapshotted at propose time and executes off that snapshot.
+        const T0: u64 = 1_700_000_000;
+        const DELAY: u64 = 86_400;
+        const WEEK: u64 = 604_800;
+        let mut e = governance_delay_quorum_funded_escrow();
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        let p = e.governance_proposal().expect("proposal live");
+        assert_eq!(p.delay_secs, DELAY);
+        e.amend_governance_delay(ALICE, BOB, WEEK).unwrap();
+        assert_eq!(e.governance_delay_secs(), WEEK);
+        // Still executable at the old snapshot deadline, even though
+        // the new week-long window has not elapsed.
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+        assert!(e.governance_proposal().is_none());
+        // A proposal staged after the revision waits the new window.
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 2 },
+            T0 + DELAY,
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + DELAY + DELAY)
+                .unwrap_err(),
+            EscrowError::GovernanceDelayNotElapsed
+        );
+        e.execute_governance(ALICE, T0 + DELAY + WEEK).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 2);
+    }
+
+    #[test]
+    fn amend_governance_delay_program_opens_delay_after_funding() {
+        // AV-487: a delay-less escrow may opt in post-funding:
+        // proposing flips from refused (220) to staged, and the
+        // staged action executes under the new window.
+        const T0: u64 = 1_700_000_000;
+        const DELAY: u64 = 86_400;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_quorum(
+                QuorumPolicy::new(
+                    &[ATTESTOR_1, ATTESTOR_2, ATTESTOR_3],
+                    &[1, 1, 1],
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(e.governance_delay_secs(), 0);
+        assert_eq!(
+            e.propose_governance(
+                ALICE,
+                GovernanceAction::UpdateQuorum { new_threshold: 1 },
+                T0,
+            )
+            .unwrap_err(),
+            EscrowError::InvalidGovernanceDelay
+        );
+        e.amend_governance_delay(ALICE, BOB, DELAY).unwrap();
+        assert_eq!(e.governance_delay_secs(), DELAY);
+        e.propose_governance(
+            ALICE,
+            GovernanceAction::UpdateQuorum { new_threshold: 1 },
+            T0,
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute_governance(ALICE, T0 + DELAY - 1).unwrap_err(),
+            EscrowError::GovernanceDelayNotElapsed
+        );
+        e.execute_governance(ALICE, T0 + DELAY).unwrap();
+        assert_eq!(e.quorum().unwrap().threshold(), 1);
+        assert!(e.governance_proposal().is_none());
+    }
+
     #[test]
     fn amend_panel_threshold_maps_params_to_arbiter_panel_field() {
         // IDL: amend_panel_threshold(new_threshold: u8) —
@@ -75245,6 +75727,22 @@ pub(crate) mod anchor_idl_tests {
             "amend_insurance_pool",
             "opt_in",
             "insurance_pool",
+        ),
+        // AV-487: the post-funding governance-delay window revision
+        // rewrites the 8-byte `governance_delay_secs` window in place —
+        // a second param source for the field, like
+        // `amend_interest_rate`'s rate. The field's *initial* value
+        // comes from the `with_governance_delay` builder (a
+        // state-machine method, not an instruction param, so it cannot
+        // appear in the param table); the param entry documents the
+        // revision source. Only the window moves — the state, the
+        // amount and the expiry are untouched, so the next proposal
+        // stages under the live window while a proposal already live
+        // keeps the snapshot it staged under.
+        (
+            "amend_governance_delay",
+            "new_delay_secs",
+            "governance_delay_secs",
         ),
         // AV-477: the post-funding arbiter-panel threshold
         // revision rewrites the 1-byte `threshold` field of the
@@ -105570,6 +106068,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_insurance_pool"),
             [211, 64, 189, 53, 177, 1, 84, 74]
+        );
+    }
+
+    #[test]
+    fn amend_governance_delay_instruction_discriminator_is_pinned() {
+        // AV-487. IDL:
+        // sha256("global:amend_governance_delay")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_governance_delay"),
+            [238, 153, 186, 221, 162, 104, 225, 198]
         );
     }
 
