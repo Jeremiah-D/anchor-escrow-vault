@@ -1597,6 +1597,14 @@
       ]
     },
     {
+      "name": "amend_blind_panel_reveal_window",
+      "discriminator": [237, 97, 219, 38, 227, 185, 116, 35],
+      "accounts": [],
+      "args": [
+        {"name": "reveal_window_secs", "type": "u64"}
+      ]
+    },
+    {
       "name": "amend_panel_threshold",
       "discriminator": [192, 166, 186, 13, 85, 249, 94, 78],
       "accounts": [],

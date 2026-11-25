@@ -32063,8 +32063,9 @@ let fee = self.charge_protocol_fee(taker_amount)?;
     /// which refuses the same value). The 8-byte
     /// `reveal_window_secs` field is already resident, so the
     /// revision rewrites it in place with no layout change. No new
-    /// error code is needed. Pure logic only: this revision has
-    /// no Anchor instruction surface. Emits
+    /// error code is needed. AV-488 adds the program-level
+    /// `amend_blind_panel_reveal_window(reveal_window_secs)`
+    /// instruction — the chain entry point for this revision. Emits
     /// `BlindPanelRevealWindowAmended` on
     /// the event layer, except for the no-op re-affirmation.
     pub fn amend_blind_panel_reveal_window(
@@ -43209,6 +43210,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_delay_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial opt-in via with_governance_delay); a zero window is refused with InvalidGovernanceDelay (code 220, the builder's gate — 0 is not a delay, and there is deliberately no clearing path back to 0, which would silently restore the immediate single-proposal path for the routed config changes); post-funding installation is allowed (0 -> X), as are lengthening and shortening (X -> Y, Y > 0); no delay path covers this method — GovernanceAction has no AmendGovernanceDelay variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current window is a no-op (succeeds, writes nothing, emits no event, paralleling amend_interest_rate); only governance_delay_secs changes — the state, the amount and the expiry are untouched, and a proposal already live keeps the delay_secs snapshotted at propose time and executes off that snapshot, so a revision neither accelerates nor delays a proposal in flight, while the new window governs only proposals staged after the revision and the 16 routed config changes keep following the live window; emits the GovernanceDelayAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 8-byte governance_delay_secs window is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-488: revise the blind panel's reveal window after
+            // funding — the program-level entry point for the
+            // AV-319 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_blind_panel_reveal_window")[..8]
+            // = [237, 97, 219, 38, 227, 185, 116, 35] — the Anchor
+            // instruction discriminator for the
+            // amend_blind_panel_reveal_window handler (pinned by the
+            // discriminator test below).
+            name: "amend_blind_panel_reveal_window",
+            params: &[(
+                "reveal_window_secs",
+                "u64",
+                "instruction param; the replacement blind-panel reveal window in seconds — lengthening and shortening (X -> Y, Y > 0) are allowed; 0 is refused (no clearing path back to zero); re-affirming the current window is a no-op",
+            )],
+            method: "Escrow::amend_blind_panel_reveal_window",
+            input_mapping: "reveal_window_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial window via with_blind_panel); only an escrow with a blind panel already configured may revise — an escrow with no panel, or a plain (non-blind) panel, is InvalidArbiterPanel (code 136, fail-closed: post-funding installation would add commit-reveal voting the taker never funded under, and revision never turns a plain panel blind); a zero window is refused with the same error (code 136, the builder's gate — 0 would make every reveal instantly late), leaving the original window untouched; no delay path covers this method — GovernanceAction has no AmendBlindPanelRevealWindow variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current window is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only reveal_window_secs changes — the members, the threshold, the commitments, the commit times, the revealed flags, and the votes are untouched, and reveal_judgment reads the live window when the reveal lands, so the new window governs from the next commit-reveal round while no live deadline is ever restated (the revision is Funded-only and commits happen only in Disputed, so no commitment can be in flight); emits the BlindPanelRevealWindowAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 8-byte reveal_window_secs window is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-477: revise the arbiter panel's judgment threshold
             // after funding — the program-level entry point for the
             // AV-378 pure-logic revision. IDL:
@@ -44393,6 +44413,10 @@ pub(crate) mod anchor_idl_tests {
             // window revision (the AV-334 pure-logic
             // revision wired to the chain).
             "Escrow::amend_governance_delay",
+            // AV-488: the program-level blind-panel
+            // reveal-window revision (the AV-319 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_blind_panel_reveal_window",
             // AV-477: the program-level arbiter-panel
             // threshold revision (the AV-378 pure-logic
             // revision wired to the chain).
@@ -45121,6 +45145,15 @@ pub(crate) mod anchor_idl_tests {
                 // changes keep following the live window; re-affirming
                 // the current window is a no-op.
                 &"amend_governance_delay",
+                // AV-488: the blind-panel reveal-window revision
+                // carries the replacement window (u64, seconds) —
+                // the window alone; reveal_judgment reads the live
+                // window when the reveal lands, so the new window
+                // governs from the next commit-reveal round while no
+                // live deadline is ever restated (the revision is
+                // Funded-only and commits happen only in Disputed);
+                // re-affirming the current window is a no-op.
+                &"amend_blind_panel_reveal_window",
                 // AV-477: the panel-threshold revision carries
                 // the replacement threshold (u8) — the threshold
                 // alone; the next dispute tallies under the live
@@ -68846,6 +68879,483 @@ pub(crate) mod anchor_idl_tests {
         assert!(e.governance_proposal().is_none());
     }
 
+    fn blind_panel_reveal_window_funded_escrow() -> Escrow {
+        // AV-488: a Funded escrow carrying a 2-of-3 blind panel
+        // with the one-day reveal window — the program-level
+        // revision's home state.
+        const T0: u64 = 1_700_000_000;
+        const M1: [u8; 32] = [0xC1; 32];
+        const M2: [u8; 32] = [0xC2; 32];
+        const M3: [u8; 32] = [0xC3; 32];
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_blind_panel(&[M1, M2, M3], 2, 86_400)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_blind_panel_reveal_window_maps_param_to_window_field() {
+        // IDL: amend_blind_panel_reveal_window(reveal_window_secs:
+        // u64) — reveal_window_secs <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `reveal_window_secs` window of the
+        // `arbiter_panel` region in place (see PARAM_FIELD_MAP) — no
+        // layout change. The INSTRUCTIONS spec entry pins the
+        // program-level wiring: the single u64 param and the AV-319
+        // pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_blind_panel_reveal_window")
+            .expect("INSTRUCTIONS carries amend_blind_panel_reveal_window");
+        assert_eq!(spec.method, "Escrow::amend_blind_panel_reveal_window");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "reveal_window_secs");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("BlindPanelRevealWindowAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single u64 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_blind_panel_reveal_window\""),
+            "checked-in IDL carries amend_blind_panel_reveal_window"
+        );
+        assert!(
+            idl.contains("[237, 97, 219, 38, 227, 185, 116, 35]"),
+            "checked-in IDL pins the AV-488 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"reveal_window_secs\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the reveal_window_secs arg"
+        );
+        // Only the window moves: the state, the amount, the expiry
+        // and the layout are untouched.
+        const WINDOW: u64 = 86_400;
+        const NEW_WINDOW: u64 = 172_800;
+        let mut e = blind_panel_reveal_window_funded_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(
+            e.arbiter_panel().unwrap().reveal_window_secs,
+            WINDOW
+        );
+        e.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW)
+            .unwrap();
+        assert_eq!(
+            e.arbiter_panel().unwrap().reveal_window_secs,
+            NEW_WINDOW,
+            "window revised"
+        );
+        assert_eq!(e.amount(), 1_000_000, "amount untouched");
+        assert_eq!(e.expires_at(), EXPIRES_AT, "expiry untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "window rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the opt-in is set
+        // there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_blind_panel(&[[0xC1; 32], [0xC2; 32], [0xC3; 32]], 2, WINDOW)
+            .unwrap();
+        assert_eq!(
+            bare.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_blind_panel_reveal_window_rejects_single_party_and_strangers() {
+        // AV-488: unconditional dual signature — one party alone,
+        // a stranger, or the parties swapped is Unauthorized; one
+        // party alone cannot retune the other's reveal deadline.
+        const WINDOW: u64 = 86_400;
+        const NEW_WINDOW: u64 = 172_800;
+        let mut e = blind_panel_reveal_window_funded_escrow();
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(ALICE, ALICE, NEW_WINDOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(MALLORY, BOB, NEW_WINDOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(MALLORY, MALLORY, NEW_WINDOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(BOB, ALICE, NEW_WINDOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.arbiter_panel().unwrap().reveal_window_secs,
+            WINDOW,
+            "failed revisions move nothing"
+        );
+        e.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW)
+            .unwrap();
+        assert_eq!(
+            e.arbiter_panel().unwrap().reveal_window_secs,
+            NEW_WINDOW
+        );
+    }
+
+    #[test]
+    fn amend_blind_panel_reveal_window_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-488: the builder owns the initial window and the window
+        // is locked in at funding. The pause guard fires before the
+        // authority and state gates — and unpausing a Funded escrow
+        // re-opens the revision (Funded is the allowed state).
+        const WINDOW: u64 = 86_400;
+        const NEW_WINDOW: u64 = 172_800;
+        const T0: u64 = 1_700_000_000;
+        const PAUSER: [u8; 32] = [0xD0; 32];
+        const M1: [u8; 32] = [0xC1; 32];
+        const M2: [u8; 32] = [0xC2; 32];
+        const M3: [u8; 32] = [0xC3; 32];
+        // Activated: funding is the lock-in point, not activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_blind_panel(&[M1, M2, M3], 2, WINDOW)
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: the dispute window settles under the frozen
+        // window — a commit already in flight keeps its deadline.
+        let mut d = blind_panel_reveal_window_funded_escrow();
+        d.escalate(ALICE, T0, 1_000_000, None, None, 0).unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.arbiter_panel().unwrap().reveal_window_secs,
+            WINDOW,
+            "disputed revision moves nothing"
+        );
+        // Terminal: a released escrow's window is history, not
+        // policy.
+        let mut released = blind_panel_reveal_window_funded_escrow();
+        released
+            .release(ALICE, T0, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(
+            released.arbiter_panel().unwrap().reveal_window_secs,
+            WINDOW
+        );
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_blind_panel(&[M1, M2, M3], 2, WINDOW)
+            .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_blind_panel_reveal_window(MALLORY, BOB, NEW_WINDOW),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.arbiter_panel().unwrap().reveal_window_secs,
+            WINDOW,
+            "paused revision moves nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — and Funded is the
+        // allowed state, so the revision now lands.
+        paused
+            .amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW)
+            .unwrap();
+        assert_eq!(
+            paused.arbiter_panel().unwrap().reveal_window_secs,
+            NEW_WINDOW
+        );
+    }
+
+    #[test]
+    fn amend_blind_panel_reveal_window_refuses_paneless_and_non_blind() {
+        // AV-488: fail-closed both ways — revision never installs a
+        // blind panel, and never turns a plain panel blind. The panel
+        // gate fires before the value gate, so even a zero window on
+        // an unconfigured escrow reports InvalidArbiterPanel.
+        const WINDOW: u64 = 86_400;
+        const NEW_WINDOW: u64 = 172_800;
+        const T0: u64 = 1_700_000_000;
+        const M1: [u8; 32] = [0xC1; 32];
+        const M2: [u8; 32] = [0xC2; 32];
+        const M3: [u8; 32] = [0xC3; 32];
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            plain.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(
+            plain.amend_blind_panel_reveal_window(ALICE, BOB, 0),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(EscrowError::InvalidArbiterPanel.code(), 136);
+        assert!(plain.arbiter_panel().is_none());
+        let mut panel = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter_panel(&[M1, M2, M3], 2)
+            .unwrap();
+        panel.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            panel.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        let p = panel.arbiter_panel().unwrap();
+        assert!(!p.blind, "still plain");
+        assert_eq!(p.reveal_window_secs, 0, "no window installed");
+        let _ = WINDOW;
+    }
+
+    #[test]
+    fn amend_blind_panel_reveal_window_rejects_zero_window() {
+        // AV-488: 0 is not a window — the builder's gate, unchanged.
+        // A zero window would make every reveal instantly late, and
+        // a rejected window leaves the original exactly as it was.
+        const WINDOW: u64 = 86_400;
+        let mut e = blind_panel_reveal_window_funded_escrow();
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(ALICE, BOB, 0),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(EscrowError::InvalidArbiterPanel.code(), 136);
+        assert_eq!(
+            e.arbiter_panel().unwrap().reveal_window_secs,
+            WINDOW,
+            "failed calls move nothing"
+        );
+        // A tighter window refuses zero the same way — installation
+        // is 0 -> X, X > 0, never 0.
+        let mut tight = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_blind_panel(&[[0xC1; 32]], 1, 3_600)
+            .unwrap();
+        tight.fund(ALICE, 1_700_000_000).unwrap();
+        assert_eq!(
+            tight.amend_blind_panel_reveal_window(ALICE, BOB, 0),
+            Err(EscrowError::InvalidArbiterPanel)
+        );
+        assert_eq!(tight.arbiter_panel().unwrap().reveal_window_secs, 3_600);
+    }
+
+    #[test]
+    fn amend_blind_panel_reveal_window_program_retunes_future_reveals_only() {
+        // AV-488: the reveal reads the live window — after the
+        // revision a commit revealed past the old deadline but
+        // inside the new one settles, while an unrevised escrow
+        // with the old window refuses the same reveal with
+        // BlindRevealWindowClosed. The revision happens while
+        // Funded, so the commit-reveal round that follows is the
+        // first round under the new window.
+        const T0: u64 = 1_700_000_000;
+        const M1: [u8; 32] = [0xC1; 32];
+        let mut revised = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_blind_panel(&[M1], 1, 100)
+            .unwrap();
+        revised.fund(ALICE, T0).unwrap();
+        revised
+            .amend_blind_panel_reveal_window(ALICE, BOB, 10_000)
+            .unwrap();
+        let mut kept = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_blind_panel(&[M1], 1, 100)
+            .unwrap();
+        kept.fund(ALICE, T0).unwrap();
+        revised.escalate(ALICE, T0, 1_000_000, None, None, 0).unwrap();
+        kept.escalate(ALICE, T0, 1_000_000, None, None, 0).unwrap();
+        let salt = [0x11; 32];
+        let commitment = crate::blind_commitment(600_000, None, salt);
+        revised
+            .submit_judgment_commit(M1, commitment, T0)
+            .unwrap();
+        kept.submit_judgment_commit(M1, commitment, T0).unwrap();
+        // T0 + 1_000 is past the old 100-second window but inside
+        // the revised 10_000-second window.
+        let settled = revised
+            .reveal_judgment(M1, 600_000, None, salt, T0 + 1_000, T0 + 1_000, None, BOB)
+            .unwrap()
+            .expect("reveal inside the new window settles");
+        assert_eq!(revised.state(), EscrowState::Settled);
+        assert!(settled.0 > 0);
+        assert_eq!(
+            kept.reveal_judgment(M1, 600_000, None, salt, T0 + 1_000, T0 + 1_000, None, BOB),
+            Err(EscrowError::BlindRevealWindowClosed)
+        );
+        assert_eq!(kept.state(), EscrowState::Disputed);
+    }
+
+    #[test]
+    fn amend_blind_panel_reveal_window_program_leaves_live_reveal_untouched() {
+        // AV-488: a commitment already in flight keeps the deadline
+        // it committed under — the revision is Funded-only, so an
+        // in-flight commit can never be restated: attempting the
+        // revision while Disputed is refused, and the reveal still
+        // lands inside the old window and settles.
+        const T0: u64 = 1_700_000_000;
+        const M1: [u8; 32] = [0xC1; 32];
+        const WINDOW: u64 = 100;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_blind_panel(&[M1], 1, WINDOW)
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        e.escalate(ALICE, T0, 1_000_000, None, None, 0).unwrap();
+        let salt = [0x11; 32];
+        e.submit_judgment_commit(M1, crate::blind_commitment(600_000, None, salt), T0)
+            .unwrap();
+        // The live commit blocks the revision: Disputed is not
+        // Funded, so the window — and the live deadline — cannot
+        // move mid-flight.
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(ALICE, BOB, 10_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            e.arbiter_panel().unwrap().reveal_window_secs,
+            WINDOW,
+            "live deadline untouched"
+        );
+        // The reveal lands inside the old window and settles.
+        let settled = e
+            .reveal_judgment(M1, 600_000, None, salt, T0 + 50, T0 + 50, None, BOB)
+            .unwrap()
+            .expect("reveal inside the live window settles");
+        assert_eq!(e.state(), EscrowState::Settled);
+        assert!(settled.0 > 0);
+    }
+
+    #[test]
+    fn amend_blind_panel_reveal_window_noop_on_same_window() {
+        // AV-488: re-affirming the current window is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        const WINDOW: u64 = 86_400;
+        const NEW_WINDOW: u64 = 172_800;
+        let mut e = blind_panel_reveal_window_funded_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_blind_panel_reveal_window(ALICE, BOB, WINDOW)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-window re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.arbiter_panel().unwrap().reveal_window_secs, WINDOW);
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW)
+            .unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised window writes nothing either"
+        );
+        assert_eq!(
+            e.arbiter_panel().unwrap().reveal_window_secs,
+            NEW_WINDOW
+        );
+    }
+
+    #[test]
+    fn amend_blind_panel_reveal_window_emits_only_on_change() {
+        // AV-488: the program handler emits
+        // `BlindPanelRevealWindowAmended` only when the window
+        // actually changes — the before/after comparison in the
+        // handler skips the event on a no-op re-affirmation
+        // (mirrors `amend_compound_interest`). At the state-machine
+        // level the same-window call writes nothing — the encoded
+        // escrow is byte-identical before and after, so there is
+        // nothing to emit about — while a real change moves the
+        // window, which is what the handler's emission keys on.
+        // The INSTRUCTIONS entry pins the change-only event in the
+        // spec table, and the indexed wrapper is the event-layer
+        // mirror of the handler's before/after comparison: a failed
+        // revision emits nothing, a no-op re-affirmation emits
+        // nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const T0: u64 = 1_700_000_000;
+        const WINDOW: u64 = 86_400;
+        const NEW_WINDOW: u64 = 172_800;
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_blind_panel_reveal_window")
+            .expect("INSTRUCTIONS carries amend_blind_panel_reveal_window");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let funded = blind_panel_reveal_window_funded_escrow();
+        let mut e = IndexedEscrow::wrap([0xE0; 32], funded);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_blind_panel_reveal_window(ALICE, ALICE, NEW_WINDOW, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW, T0)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::BlindPanelRevealWindowAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        assert_eq!(ev.amounts.refund, 0);
+        assert_eq!(ev.amounts.penalty, 0);
+        // Re-affirming the new window is a no-op: no new event.
+        e.amend_blind_panel_reveal_window(ALICE, BOB, NEW_WINDOW, T0)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        assert_eq!(
+            e.inner().arbiter_panel().unwrap().reveal_window_secs,
+            NEW_WINDOW
+        );
+        let _ = WINDOW;
+    }
+
     #[test]
     fn amend_panel_threshold_maps_params_to_arbiter_panel_field() {
         // IDL: amend_panel_threshold(new_threshold: u8) —
@@ -75744,6 +76254,25 @@ pub(crate) mod anchor_idl_tests {
             "new_delay_secs",
             "governance_delay_secs",
         ),
+        // AV-488: the post-funding blind-panel reveal-window
+        // revision rewrites the 8-byte `reveal_window_secs` field of
+        // the `arbiter_panel` region in place — a second param source
+        // for the region, like `amend_panel_threshold`'s threshold.
+        // The field's *initial* value comes from the
+        // `with_blind_panel` builder (a state-machine method, not an
+        // instruction param, so it cannot appear in the param table);
+        // the param entry documents the revision source. Only the
+        // window moves — the members, the threshold, the commitments,
+        // the commit times, the revealed flags, and the votes are
+        // untouched, so the next reveal is judged against the live
+        // window while no live deadline is ever restated (the
+        // revision is Funded-only and commits happen only in
+        // Disputed).
+        (
+            "amend_blind_panel_reveal_window",
+            "reveal_window_secs",
+            "arbiter_panel",
+        ),
         // AV-477: the post-funding arbiter-panel threshold
         // revision rewrites the 1-byte `threshold` field of the
         // `arbiter_panel` region in place — a second param source
@@ -76010,6 +76539,11 @@ pub(crate) mod anchor_idl_tests {
         // `arbiter_panel.threshold` (a PARAM_FIELD_MAP param source),
         // and `submit_panel_judgment` mutates votes/voted in place as
         // transition side effects, not as instruction params.
+        // AV-488: `amend_blind_panel_reveal_window` rewrites only
+        // `arbiter_panel.reveal_window_secs` (a PARAM_FIELD_MAP param
+        // source) — the blind panel's window is retuned in place
+        // after funding without touching the roster, the threshold,
+        // or the votes.
         (
             "arbiter_panel.n",
             "set by initialize_arbiter_panel (member count 1..=8)",
@@ -106080,6 +106614,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_governance_delay"),
             [238, 153, 186, 221, 162, 104, 225, 198]
+        );
+    }
+
+    #[test]
+    fn amend_blind_panel_reveal_window_instruction_discriminator_is_pinned() {
+        // AV-488. IDL:
+        // sha256("global:amend_blind_panel_reveal_window")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_blind_panel_reveal_window"),
+            [237, 97, 219, 38, 227, 185, 116, 35]
         );
     }
 

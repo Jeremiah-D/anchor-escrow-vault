@@ -953,6 +953,17 @@ lapses). Only `reveal_window_secs` changes — the members, the
 threshold, the commitments, the commit times, the revealed flags, and
 the votes are untouched — and since the revision is `Funded`-only, no
 commitment can be in flight, so no live deadline is ever restated.
+AV-488 adds the program-level
+`amend_blind_panel_reveal_window(reveal_window_secs)` instruction
+(discriminator [237, 97, 219, 38, 227, 185, 116, 35]) — the chain entry
+point for the AV-319 revision; unconditional dual-signature governance,
+`Funded`-only, no delay path covers it (no `GovernanceAction` variant),
+a paneless or plain-panel escrow refused fail-closed
+(`InvalidArbiterPanel`, code 136) and a zero window refused the same
+way, same-window re-affirmation a no-op that emits nothing, and the
+`BlindPanelRevealWindowAmended` event only on an actual change; the new
+window rides as a single `u64` arg and the next reveal is judged against
+the live window, while no live deadline is ever restated.
 (Solana: blind-panel governance.)
 
 **Evidence-disclosure deadline (AV-68).** Arbitration stalls when the

@@ -9205,6 +9205,86 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the blind panel's reveal window after funding (AV-488;
+    /// mirrors `Escrow::amend_blind_panel_reveal_window`, the AV-319
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot
+    /// retune the other's reveal deadline. `Funded` only — the
+    /// builder owns the initial window via `with_blind_panel`, and
+    /// the window is locked in at funding. A paused escrow fails fast
+    /// (`Paused`, before the authority gate). Only an escrow with a
+    /// blind panel already configured may revise — an escrow with no
+    /// panel, or a plain (non-blind) panel, is refused with
+    /// `InvalidArbiterPanel` (code 136, fail-closed: revision never
+    /// installs a blind panel, and never turns a plain panel blind).
+    /// A zero window is refused the same way (the builder's gate — 0
+    /// would make every reveal instantly late, and there is
+    /// deliberately no clearing path back to 0). No delay path covers
+    /// this method — `GovernanceAction` has no
+    /// `AmendBlindPanelRevealWindow` variant, so the direct call is
+    /// the only entry point and stays open on a delay-opted-in escrow
+    /// (the AV-471 `amend_twap_gate` precedent: the method carries
+    /// no `via_delayed` gate, so gating it here would self-lock
+    /// exactly the escrows that need it — dual signature *is* the
+    /// second signature, and a mis-set window is always fixable by
+    /// another dual-signed revision). Re-affirming the current window
+    /// is a no-op: it succeeds, writes nothing and emits nothing.
+    /// Emits `BlindPanelRevealWindowAmended`
+    /// (from == to == the current state) only on an actual change.
+    /// Only `reveal_window_secs` changes — the members, the
+    /// threshold, the commitments, the commit times, the revealed
+    /// flags, and the votes are untouched; the new window governs
+    /// from the next commit-reveal round (`reveal_judgment` reads the
+    /// live window when the reveal lands), so a revision neither
+    /// accelerates nor delays a reveal in flight — and because the
+    /// revision is `Funded`-only, no commitment can be in flight at
+    /// revision time (commits only happen in `Disputed`), so no live
+    /// deadline is ever restated. `now` comes from the clock sysvar,
+    /// never an instruction param (mirrors `amend_funding_start`) —
+    /// here only for the event timestamp, since the pure logic takes
+    /// no `now`.
+    pub fn amend_blind_panel_reveal_window(
+        ctx: Context<AmendBlindPanelRevealWindow>,
+        reveal_window_secs: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.arbiter_panel().map(|p| p.reveal_window_secs);
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_blind_panel_reveal_window(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                reveal_window_secs,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 8-byte `reveal_window_secs` window in place — no
+        // realloc. Only the window moves; no commitment can be in
+        // flight (commits only happen in `Disputed`), so no live
+        // deadline is ever restated. Emits only on an actual change;
+        // a no-op re-affirmation stays silent (mirrors
+        // `amend_compound_interest`).
+        if escrow.arbiter_panel().map(|p| p.reveal_window_secs) != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::BlindPanelRevealWindowAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -17269,6 +17349,22 @@ pub struct AmendInsurancePool<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendGovernanceDelay<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-488: accounts for `amend_blind_panel_reveal_window` — the
+/// blind-panel reveal-window revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendBlindPanelRevealWindow<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
