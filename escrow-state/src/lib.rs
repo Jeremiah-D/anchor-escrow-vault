@@ -31412,8 +31412,12 @@ let fee = self.charge_protocol_fee(claimable)?;
     /// AV-166's `TransferChecked` assembly (that builds the
     /// instruction, this revises the metadata it asserts), and to
     /// AV-233's [`Escrow::amend_protocol_fee`] (same amend shape,
-    /// different field). No new Anchor instruction: pure logic
-    /// layer, like the other `amend_*` revisions.
+    /// different field). AV-489 adds the program-level
+    /// `amend_decimals(decimals)` instruction — the chain entry
+    /// point for this revision. No event is emitted: there is no
+    /// `DecimalsAmended` event, and none is needed, since
+    /// `display_amount`, the keeper reports and the snapshot export
+    /// all read the live precision.
     pub fn amend_decimals(
         &mut self,
         initializer: [u8; 32],
@@ -43229,6 +43233,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "reveal_window_secs <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial window via with_blind_panel); only an escrow with a blind panel already configured may revise — an escrow with no panel, or a plain (non-blind) panel, is InvalidArbiterPanel (code 136, fail-closed: post-funding installation would add commit-reveal voting the taker never funded under, and revision never turns a plain panel blind); a zero window is refused with the same error (code 136, the builder's gate — 0 would make every reveal instantly late), leaving the original window untouched; no delay path covers this method — GovernanceAction has no AmendBlindPanelRevealWindow variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current window is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only reveal_window_secs changes — the members, the threshold, the commitments, the commit times, the revealed flags, and the votes are untouched, and reveal_judgment reads the live window when the reveal lands, so the new window governs from the next commit-reveal round while no live deadline is ever restated (the revision is Funded-only and commits happen only in Disputed, so no commitment can be in flight); emits the BlindPanelRevealWindowAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 8-byte reveal_window_secs window is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-489: revise the token decimals after funding —
+            // the program-level entry point for the AV-376
+            // pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_decimals")[..8]
+            // = [145, 126, 213, 113, 158, 55, 236, 166] — the Anchor
+            // instruction discriminator for the
+            // amend_decimals handler (pinned by the
+            // discriminator test below).
+            name: "amend_decimals",
+            params: &[(
+                "decimals",
+                "u8",
+                "instruction param; the replacement token decimal places — 0..=18, the with_decimals gate reused; 0 is allowed and clears the precision back to \"undeclared\" (bare-integer rendering); re-affirming the current precision is a no-op",
+            )],
+            method: "Escrow::amend_decimals",
+            input_mapping: "decimals <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial precision via with_decimals); decimals > 18 is refused with InvalidDecimals (code 119, the with_decimals gate — SPL mints declare at most 9, so anything past 18 is not a valid token precision), leaving the original precision untouched; 0 is allowed and clears the precision back to \"undeclared\" (bare-integer rendering, matching the builder); no delay path covers this method — GovernanceAction has no AmendDecimals variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current precision is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only decimals changes — amount, released, fees_paid and state are untouched, and the revision never rescales a base-unit amount; display_amount renders under the new precision from the revision onward, while amounts already displayed in past reports or snapshots stay as history; the AV-166 TransferChecked path reads the live precision at settlement, so a later Token-2022 settlement asserts the new decimals against the mint on-chain (the plain-Transfer path asserts no decimals and is unaffected); no event is emitted — there is no DecimalsAmended event, and none is needed, since display_amount, the keeper reports and the snapshot export all read the live precision; the pure logic takes no now and there is no event timestamp, so the handler takes no Clock; the 1-byte decimals field is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-477: revise the arbiter panel's judgment threshold
             // after funding — the program-level entry point for the
             // AV-378 pure-logic revision. IDL:
@@ -44417,6 +44440,10 @@ pub(crate) mod anchor_idl_tests {
             // reveal-window revision (the AV-319 pure-logic
             // revision wired to the chain).
             "Escrow::amend_blind_panel_reveal_window",
+            // AV-489: the program-level token-decimals
+            // revision (the AV-376 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_decimals",
             // AV-477: the program-level arbiter-panel
             // threshold revision (the AV-378 pure-logic
             // revision wired to the chain).
@@ -45154,6 +45181,15 @@ pub(crate) mod anchor_idl_tests {
                 // Funded-only and commits happen only in Disputed);
                 // re-affirming the current window is a no-op.
                 &"amend_blind_panel_reveal_window",
+                // AV-489: the token-decimals revision carries the
+                // replacement precision (u8) — the precision
+                // alone; display_amount renders under the live
+                // precision, so the new precision governs from the
+                // next rendering while amounts already displayed
+                // stay as history, and the AV-166 TransferChecked
+                // path asserts the live precision at settlement;
+                // re-affirming the current precision is a no-op.
+                &"amend_decimals",
                 // AV-477: the panel-threshold revision carries
                 // the replacement threshold (u8) — the threshold
                 // alone; the next dispute tallies under the live
@@ -69357,6 +69393,388 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn amend_decimals_maps_param_to_decimals_field() {
+        // IDL: amend_decimals(decimals: u8) — decimals <- param;
+        // initializer <- accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the 1-byte `decimals` field in place
+        // (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the single u8 param and the AV-376 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_decimals")
+            .expect("INSTRUCTIONS carries amend_decimals");
+        assert_eq!(spec.method, "Escrow::amend_decimals");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "decimals");
+        assert_eq!(spec.params[0].1, "u8");
+        assert!(
+            spec.input_mapping.contains("InvalidDecimals"),
+            "input_mapping documents the > 18 ceiling"
+        );
+        assert!(
+            spec.input_mapping.contains("no event is emitted"),
+            "input_mapping documents the no-event design"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single u8 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_decimals\""),
+            "checked-in IDL carries amend_decimals"
+        );
+        assert!(
+            idl.contains("[145, 126, 213, 113, 158, 55, 236, 166]"),
+            "checked-in IDL pins the AV-489 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"decimals\", \"type\": \"u8\"}"),
+            "checked-in IDL carries the decimals arg"
+        );
+        // Only the precision moves: the state, the amount, the
+        // expiry and the layout are untouched.
+        let mut e = funded_decimals_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.decimals(), 6);
+        e.amend_decimals(ALICE, BOB, 9).unwrap();
+        assert_eq!(e.decimals(), 9, "precision revised");
+        assert_eq!(e.amount(), 1_000_000, "amount untouched");
+        assert_eq!(e.expires_at(), EXPIRES_AT, "expiry untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "precision rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the initial
+        // precision is set there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        assert_eq!(
+            bare.amend_decimals(ALICE, BOB, 9),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_decimals_rejects_single_party_and_strangers() {
+        // AV-489: unconditional dual signature — one party alone,
+        // a stranger, or the parties swapped is Unauthorized; one
+        // party alone cannot rewrite the precision the other's
+        // payouts are displayed under.
+        let mut e = funded_decimals_escrow();
+        assert_eq!(
+            e.amend_decimals(ALICE, ALICE, 9),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_decimals(MALLORY, BOB, 9),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_decimals(MALLORY, MALLORY, 9),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_decimals(BOB, ALICE, 9),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(e.decimals(), 6, "failed revisions move nothing");
+        assert_eq!(e.display_amount(), "1.000000");
+        e.amend_decimals(ALICE, BOB, 9).unwrap();
+        assert_eq!(e.decimals(), 9);
+    }
+
+    #[test]
+    fn amend_decimals_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-489: the builder owns the initial precision and the
+        // precision is locked in at funding. The pause guard fires
+        // before the authority and state gates — and unpausing a
+        // Funded escrow re-opens the revision (Funded is the
+        // allowed state).
+        const T0: u64 = 1_700_000_000;
+        const PAUSER: [u8; 32] = [0xD0; 32];
+        // Activated: funding is the lock-in point, not activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_decimals(ALICE, BOB, 9),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: a precision recorded wrong cannot be restated
+        // mid-dispute — settlement reads the frozen precision.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_decimals(6)
+            .unwrap()
+            .with_arbiter([0xA1; 32])
+            .unwrap();
+        d.fund(ALICE, T0).unwrap();
+        d.escalate(ALICE, T0, 1_000_000, None, None, 0).unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_decimals(ALICE, BOB, 9),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(d.decimals(), 6, "disputed revision moves nothing");
+        // Terminal: a released escrow's precision is history, not
+        // policy.
+        let mut released = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        released.fund(ALICE, T0).unwrap();
+        released
+            .release(ALICE, 1_750_000_000, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_decimals(ALICE, BOB, 9),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(released.decimals(), 6);
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_decimals(6)
+            .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_decimals(ALICE, BOB, 9),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_decimals(MALLORY, BOB, 9),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(paused.decimals(), 6, "paused revision moves nothing");
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — and Funded is the
+        // allowed state, so the revision now lands.
+        paused.amend_decimals(ALICE, BOB, 9).unwrap();
+        assert_eq!(paused.decimals(), 9);
+    }
+
+    #[test]
+    fn amend_decimals_rejects_over_18_decimals() {
+        // AV-489: the `with_decimals` ceiling is reused unchanged —
+        // 19 and 255 are refused with `InvalidDecimals`, the
+        // original precision untouched, and 18 (the ceiling itself)
+        // is accepted.
+        let mut e = funded_decimals_escrow();
+        assert_eq!(
+            e.amend_decimals(ALICE, BOB, 19),
+            Err(EscrowError::InvalidDecimals)
+        );
+        assert_eq!(
+            e.amend_decimals(ALICE, BOB, u8::MAX),
+            Err(EscrowError::InvalidDecimals)
+        );
+        assert_eq!(EscrowError::InvalidDecimals.code(), 119);
+        assert_eq!(e.decimals(), 6, "failed calls move nothing");
+        assert_eq!(e.display_amount(), "1.000000");
+        e.amend_decimals(ALICE, BOB, 18).unwrap();
+        assert_eq!(e.decimals(), 18, "the ceiling itself is legal");
+    }
+
+    #[test]
+    fn amend_decimals_noop_on_same_decimals() {
+        // AV-489: re-affirming the current precision is a no-op —
+        // it succeeds, writes nothing, and (there being no event
+        // at all) emits nothing.
+        let mut e = funded_decimals_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_decimals(ALICE, BOB, 6).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-precision re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.decimals(), 6);
+        assert_eq!(e.display_amount(), "1.000000");
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_decimals(ALICE, BOB, 9).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_decimals(ALICE, BOB, 9).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised precision writes nothing either"
+        );
+        assert_eq!(e.decimals(), 9);
+    }
+
+    #[test]
+    fn amend_decimals_clears_to_undeclared_on_zero() {
+        // AV-489: 0 is not an error — it clears the precision back
+        // to "undeclared" (bare-integer rendering), the same
+        // convention as the `with_decimals` builder; clearing is
+        // not one-way, a later revision can declare a precision
+        // again.
+        let mut e = funded_decimals_escrow();
+        assert_eq!(e.display_amount(), "1.000000");
+        e.amend_decimals(ALICE, BOB, 0).unwrap();
+        assert_eq!(e.decimals(), 0, "cleared to undeclared");
+        assert_eq!(e.display_amount(), "1000000");
+        assert_eq!(e.amount(), 1_000_000, "amount untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        // Re-declaring after a clear works — 0 is a value, not a
+        // lock.
+        e.amend_decimals(ALICE, BOB, 9).unwrap();
+        assert_eq!(e.decimals(), 9);
+        assert_eq!(e.display_amount(), "0.001000000");
+        // Clearing from an already-undeclared escrow is a no-op.
+        let mut bare = funded_decimals_escrow();
+        bare.amend_decimals(ALICE, BOB, 0).unwrap();
+        let encoded = super::account_space_tests::encode_escrow(&bare);
+        bare.amend_decimals(ALICE, BOB, 0).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&bare),
+            encoded,
+            "clearing an undeclared precision writes nothing"
+        );
+    }
+
+    #[test]
+    fn amend_decimals_program_rerenders_display_amount() {
+        // AV-489: `display_amount` reads the live precision — after
+        // the revision the same locked amount renders under the new
+        // precision, while an unrevised escrow keeps rendering under
+        // the old one; amounts already displayed in past reports
+        // stay as history. The AV-166 `TransferChecked` path reads
+        // the same live field at settlement, so a later Token-2022
+        // settlement asserts the revised precision against the mint
+        // on-chain.
+        let mut revised = funded_decimals_escrow();
+        let kept = funded_decimals_escrow();
+        assert_eq!(revised.display_amount(), "1.000000");
+        assert_eq!(kept.display_amount(), "1.000000");
+        revised.amend_decimals(ALICE, BOB, 9).unwrap();
+        assert_eq!(revised.display_amount(), "0.001000000");
+        assert_eq!(
+            kept.display_amount(),
+            "1.000000",
+            "unrevised escrow keeps the old rendering"
+        );
+        assert_eq!(revised.decimals(), 9);
+        assert_eq!(kept.decimals(), 6);
+        // Clearing re-renders as a bare integer.
+        revised.amend_decimals(ALICE, BOB, 0).unwrap();
+        assert_eq!(revised.display_amount(), "1000000");
+    }
+
+    #[test]
+    fn amend_decimals_program_leaves_amounts_untouched() {
+        // AV-489: the revision never rescales a base-unit amount —
+        // after a partial release the locked total, the released
+        // total and the fees are exactly what they were, only the
+        // precision moves (and the display with it).
+        let mut e = funded_decimals_escrow();
+        e.release(ALICE, 1_750_000_000, 400_000, None, BOB)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 400_000);
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(e.display_amount(), "1.000000");
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.amend_decimals(ALICE, BOB, 9).unwrap();
+        assert_eq!(e.amount(), 1_000_000, "locked total untouched");
+        assert_eq!(e.released_amount(), 400_000, "released untouched");
+        assert_eq!(e.fees_paid(), 0, "fees untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.display_amount(), "0.001000000");
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "precision rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_decimals_emits_nothing() {
+        // AV-489: there is no `DecimalsAmended` event — the program
+        // handler emits nothing on a real change and nothing on a
+        // no-op, because `display_amount`, the keeper reports and
+        // the snapshot export all read the live precision. The
+        // INSTRUCTIONS entry pins the no-event design in the spec
+        // table, and the state machine proves it structurally: a
+        // real change moves exactly one byte (the `decimals` byte
+        // itself), so there is no event payload to carry.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_decimals")
+            .expect("INSTRUCTIONS carries amend_decimals");
+        assert!(
+            spec.input_mapping.contains("no event is emitted"),
+            "input_mapping documents the no-event design"
+        );
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            !idl.contains("DecimalsAmended"),
+            "checked-in IDL carries no DecimalsAmended event"
+        );
+        let events = std::fs::read_to_string("src/events.rs")
+            .expect("read events.rs");
+        assert!(
+            !events.contains("DecimalsAmended"),
+            "events.rs defines no DecimalsAmended event"
+        );
+        // A real change moves exactly one encoded byte — the
+        // `decimals` byte, 6 -> 9 — and nothing else.
+        let mut e = funded_decimals_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_decimals(ALICE, BOB, 9).unwrap();
+        let after = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(before.len(), after.len());
+        let diffs: Vec<usize> = before
+            .iter()
+            .zip(after.iter())
+            .enumerate()
+            .filter_map(|(i, (a, b))| if a != b { Some(i) } else { None })
+            .collect();
+        assert_eq!(diffs.len(), 1, "exactly one byte moves");
+        assert_eq!(before[diffs[0]], 6);
+        assert_eq!(after[diffs[0]], 9);
+        // A failed revision moves nothing at all.
+        let mut f = funded_decimals_escrow();
+        let encoded = super::account_space_tests::encode_escrow(&f);
+        assert_eq!(
+            f.amend_decimals(ALICE, BOB, 19),
+            Err(EscrowError::InvalidDecimals)
+        );
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&f),
+            encoded,
+            "failed calls move nothing"
+        );
+    }
+
+    #[test]
     fn amend_panel_threshold_maps_params_to_arbiter_panel_field() {
         // IDL: amend_panel_threshold(new_threshold: u8) —
         // new_threshold <- param; initializer <-
@@ -76272,6 +76690,24 @@ pub(crate) mod anchor_idl_tests {
             "amend_blind_panel_reveal_window",
             "reveal_window_secs",
             "arbiter_panel",
+        ),
+        // AV-489: the post-funding token-decimals revision rewrites
+        // the 1-byte `decimals` field in place — a second param
+        // source for the field, like `amend_panel_threshold`'s
+        // threshold. The field's *initial* value comes from the
+        // `with_decimals` builder (a state-machine method, not an
+        // instruction param, so it cannot appear in the param table);
+        // the param entry documents the revision source. Only the
+        // precision moves — the amount, the released total, the
+        // fees and the state are untouched, so `display_amount`
+        // renders under the live precision from the revision onward
+        // while amounts already displayed stay as history, and the
+        // AV-166 `TransferChecked` path asserts the live precision
+        // at settlement.
+        (
+            "amend_decimals",
+            "decimals",
+            "decimals",
         ),
         // AV-477: the post-funding arbiter-panel threshold
         // revision rewrites the 1-byte `threshold` field of the
@@ -106626,6 +107062,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_blind_panel_reveal_window"),
             [237, 97, 219, 38, 227, 185, 116, 35]
+        );
+    }
+
+    #[test]
+    fn amend_decimals_instruction_discriminator_is_pinned() {
+        // AV-489. IDL:
+        // sha256("global:amend_decimals")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_decimals"),
+            [145, 126, 213, 113, 158, 55, 236, 166]
         );
     }
 

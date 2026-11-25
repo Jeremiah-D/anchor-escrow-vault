@@ -1605,6 +1605,14 @@
       ]
     },
     {
+      "name": "amend_decimals",
+      "discriminator": [145, 126, 213, 113, 158, 55, 236, 166],
+      "accounts": [],
+      "args": [
+        {"name": "decimals", "type": "u8"}
+      ]
+    },
+    {
       "name": "amend_panel_threshold",
       "discriminator": [192, 166, 186, 13, 85, 249, 94, 78],
       "accounts": [],

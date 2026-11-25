@@ -9285,6 +9285,64 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the token decimals after funding (AV-489;
+    /// mirrors `Escrow::amend_decimals`, the AV-376
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot
+    /// rewrite the precision the other's payouts are displayed
+    /// under. `Funded` only — the builder owns the initial
+    /// precision via `with_decimals`, and the revision corrects a
+    /// precision recorded wrong at build time without voiding and
+    /// rebuilding the escrow. A paused escrow fails fast (`Paused`,
+    /// before the authority gate). `decimals > 18` is refused with
+    /// `InvalidDecimals` (code 119, the `with_decimals` gate
+    /// unchanged); `0` is allowed and clears the precision back to
+    /// "undeclared" (bare-integer rendering, matching the builder).
+    /// Re-affirming the current precision is a no-op: it succeeds,
+    /// writes nothing and emits nothing. No delay path covers this
+    /// method — `GovernanceAction` has no `AmendDecimals` variant,
+    /// so the direct call is the only entry point and stays open on
+    /// a delay-opted-in escrow (the AV-471 `amend_twap_gate`
+    /// precedent). No event is emitted — there is no
+    /// `DecimalsAmended` event, and none is needed:
+    /// `display_amount`, the keeper reports and the snapshot export
+    /// all read the live precision, so the new precision governs
+    /// from the next rendering while amounts already displayed stay
+    /// as history; the AV-166 `TransferChecked` path asserts the
+    /// live precision at settlement, so a later Token-2022
+    /// settlement verifies the new decimals against the mint
+    /// on-chain (the plain-`Transfer` path asserts no decimals and
+    /// is unaffected). Only `decimals` changes — `amount`,
+    /// `released`, `fees_paid` and `state` are untouched, and the
+    /// revision never rescales a base-unit amount. The pure logic
+    /// takes no `now` and there is no event timestamp, so the
+    /// handler takes no `Clock` at all.
+    pub fn amend_decimals(
+        ctx: Context<AmendDecimals>,
+        decimals: u8,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        // Captured for symmetry with the amend family, but
+        // intentionally unused: no `DecimalsAmended` event exists,
+        // so there is no before/after comparison to key an emission
+        // on — a no-op re-affirmation and a real change alike emit
+        // nothing.
+        let _before = escrow.decimals();
+        escrow
+            .amend_decimals(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                decimals,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 1-byte `decimals` field in place — no
+        // realloc. Only the precision moves; the amount, the
+        // released total, the fees and the state are untouched, and
+        // no event is emitted (see above).
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -17365,6 +17423,21 @@ pub struct AmendGovernanceDelay<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendBlindPanelRevealWindow<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-489: accounts for `amend_decimals` — the token-decimals
+/// revision is unconditional dual-signature governance: both
+/// initializer and taker sign (the state machine enforces this —
+/// one party alone is `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendDecimals<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and
