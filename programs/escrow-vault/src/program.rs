@@ -9343,6 +9343,82 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the claimant roster after funding (AV-490;
+    /// mirrors `Escrow::amend_claimant_roster`, the AV-227
+    /// pure-logic revision). Initializer-only governance: the
+    /// roster is the initializer's declared distribution — the
+    /// taker and strangers cannot rewrite it. `Funded` only —
+    /// the builder owns the initial roster via
+    /// `with_claimants`, and the revision never creates one (a
+    /// roster-less escrow is `InvalidClaimantShares`,
+    /// fail-closed). A paused escrow fails fast (`Paused`,
+    /// before the authority gate). The caller passes the new
+    /// unclaimed legs as `ClaimantShare` values; the `share_bps`
+    /// wire field is read as a relative *weight*, not a final
+    /// share — the pure logic renormalizes the weights over the
+    /// unclaimed pool (`10_000` minus the claimed shares) by
+    /// largest-remainder apportionment, so the roster Σ is
+    /// exactly `10_000` bps again. Claimed legs are preserved
+    /// implicitly — never named in the call — with address,
+    /// share and claimed bit exactly locked, so a pulled leg can
+    /// never be repriced or pulled twice; an unclaimed leg is
+    /// removed by omitting it. Empty tables, zero addresses,
+    /// zero weights, duplicates, already-claimed addresses and
+    /// over-8 tables are `InvalidClaimantShares` (code 211),
+    /// and a failed amendment leaves the roster untouched.
+    /// Re-affirming the current roster is a no-op: it succeeds,
+    /// writes nothing and emits nothing. No delay path covers
+    /// this method — `GovernanceAction` has no
+    /// `AmendClaimantRoster` variant, so the direct call is the
+    /// only entry point and stays open on a delay-opted-in
+    /// escrow (the AV-471 `amend_twap_gate` precedent). Emits
+    /// `ClaimantRosterAmended` (from == to == the current
+    /// state; all amounts zero) only on an actual change. Only
+    /// the unclaimed legs change — `amount`, `released`,
+    /// `fees_paid` and `state` are untouched, and the later
+    /// `claim_share` pulls price against the new shares while a
+    /// leg already pulled keeps the payout it pulled under.
+    /// `now` comes from the clock sysvar — only for the event
+    /// timestamp, since the pure logic takes no `now`.
+    pub fn amend_claimant_roster(
+        ctx: Context<AmendClaimantRoster>,
+        new_legs: Vec<ClaimantShare>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.claimants();
+        let now = Clock::get()?.unix_timestamp as u64;
+        let legs: Vec<([u8; 32], u16)> =
+            new_legs.iter().map(|l| (l.claimant, l.share_bps)).collect();
+        escrow
+            .amend_claimant_roster(ctx.accounts.initializer.key().to_bytes(), &legs)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the roster region in place — no realloc.
+        // Only the unclaimed legs move; the claimed legs, the
+        // amount, the released total, the fees and the state are
+        // untouched. Emits only on an actual change; a same-roster
+        // no-op stays silent (mirrors `amend_vesting_curve`).
+        if escrow.claimants() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::ClaimantRosterAmended,
+                state,
+                state,
+                0,
+                0,
+                0,
+                now,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -17445,6 +17521,20 @@ pub struct AmendDecimals<'info> {
     /// is `Unauthorized`).
     pub initializer: Signer<'info>,
     pub taker: Signer<'info>,
+}
+
+/// AV-490: accounts for `amend_claimant_roster` — the claimant-roster
+/// revision is initializer-only governance: only the initializer
+/// signs (the state machine enforces this — the taker and strangers
+/// are `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendClaimantRoster<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Initializer-only governance: only the initializer signs (the
+    /// state machine enforces this — the taker and strangers are
+    /// `Unauthorized`).
+    pub initializer: Signer<'info>,
 }
 
 /// AV-477: accounts for `amend_panel_threshold` — the

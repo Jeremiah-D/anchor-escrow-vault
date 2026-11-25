@@ -21976,8 +21976,15 @@ let fee = self.charge_protocol_fee(claimable)?;
     ///    basis point is a shape error, like
     ///    [`ClaimantRoster::new`]'s zero-share rule) — all
     ///    [`EscrowError::InvalidClaimantShares`] (code 211).
-    ///    Validation completes before any write, so a failed
-    ///    amendment leaves the roster untouched.
+    ///    amendment leaves the roster untouched. AV-490 adds the
+    ///    program-level `amend_claimant_roster(new_legs)`
+    ///    instruction — the chain entry point for this revision;
+    ///    initializer-only governance, `Funded`-only, no delay path
+    ///    (no `GovernanceAction` variant covers it), and the
+    ///    `ClaimantRosterAmended` event only on an actual change;
+    ///    the legs ride as `Vec<ClaimantShare>` with the `share_bps`
+    ///    wire field read as a relative weight, renormalized to
+    ///    shares by this method.
     pub fn amend_claimant_roster(
         &mut self,
         initializer: [u8; 32],
@@ -43252,6 +43259,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "decimals <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial precision via with_decimals); decimals > 18 is refused with InvalidDecimals (code 119, the with_decimals gate — SPL mints declare at most 9, so anything past 18 is not a valid token precision), leaving the original precision untouched; 0 is allowed and clears the precision back to \"undeclared\" (bare-integer rendering, matching the builder); no delay path covers this method — GovernanceAction has no AmendDecimals variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current precision is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only decimals changes — amount, released, fees_paid and state are untouched, and the revision never rescales a base-unit amount; display_amount renders under the new precision from the revision onward, while amounts already displayed in past reports or snapshots stay as history; the AV-166 TransferChecked path reads the live precision at settlement, so a later Token-2022 settlement asserts the new decimals against the mint on-chain (the plain-Transfer path asserts no decimals and is unaffected); no event is emitted — there is no DecimalsAmended event, and none is needed, since display_amount, the keeper reports and the snapshot export all read the live precision; the pure logic takes no now and there is no event timestamp, so the handler takes no Clock; the 1-byte decimals field is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-490: revise the claimant roster after funding —
+            // the program-level entry point for the AV-227
+            // pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_claimant_roster")[..8]
+            // = [24, 50, 31, 33, 157, 142, 212, 32] — the Anchor
+            // instruction discriminator for the
+            // amend_claimant_roster handler (pinned by the
+            // discriminator test below).
+            name: "amend_claimant_roster",
+            params: &[(
+                "new_legs",
+                "Vec<ClaimantShare>",
+                "instruction param; the replacement unclaimed legs — (claimant, weight) pairs; the u16 rides in the ClaimantShare.share_bps wire field but is read as a relative weight, not a final share: the pure logic renormalizes the weights over the unclaimed pool by largest-remainder apportionment, so the roster Σ is exactly 10_000 bps again; claimed legs are never named here — they are preserved implicitly",
+            )],
+            method: "Escrow::amend_claimant_roster",
+            input_mapping: "new_legs <- param (Vec<ClaimantShare>, each leg's share_bps wire field read as a relative weight — see params); initializer <- accounts.initializer (signer) — initializer-only governance, the roster is the initializer's declared distribution (a stranger or the taker is Unauthorized, code 100); a paused escrow fails fast (Paused, code 124, before the authority gate); Funded only (InvalidStateTransition, code 101, otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial roster via with_claimants); only an escrow with a roster already configured may revise — a roster-less escrow is InvalidClaimantShares (code 211, fail-closed: post-funding installation would attach a pull table the taker never funded under); the new table must be non-empty, fit MAX_CLAIMANTS together with the claimed legs, and contain no zero address, zero weight, duplicate, or already-claimed address (InvalidClaimantShares, code 211, on any violation, and a failed amendment leaves the roster untouched); the claimed legs pin their slice and the unclaimed pool (10_000 minus claimed shares) is re-cut by weight with largest-remainder apportionment, so the Σ is exactly 10_000 bps; no delay path covers this method — GovernanceAction has no AmendClaimantRoster variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current roster is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only the unclaimed legs change — the claimed legs' addresses, shares and claimed bits are locked, and amount, released, fees_paid and state are untouched; the later claim_share pulls price against the new shares and still settle to exactly the locked amount, while a leg already pulled keeps the payout it pulled under; emits the ClaimantRosterAmended indexer event only on an actual change (from == to == the current state; all amounts zero — amending moves no funds); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the roster region is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-477: revise the arbiter panel's judgment threshold
             // after funding — the program-level entry point for the
             // AV-378 pure-logic revision. IDL:
@@ -44444,6 +44470,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-376 pure-logic
             // revision wired to the chain).
             "Escrow::amend_decimals",
+            // AV-490: the program-level claimant-roster
+            // revision (the AV-227 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_claimant_roster",
             // AV-477: the program-level arbiter-panel
             // threshold revision (the AV-378 pure-logic
             // revision wired to the chain).
@@ -45190,6 +45220,15 @@ pub(crate) mod anchor_idl_tests {
                 // path asserts the live precision at settlement;
                 // re-affirming the current precision is a no-op.
                 &"amend_decimals",
+                // AV-490: the claimant-roster revision carries the
+                // replacement unclaimed legs (Vec<ClaimantShare>) —
+                // the legs alone; claimed legs are preserved
+                // implicitly and never named, the unclaimed pool is
+                // re-cut by weight, and the later claim_share pulls
+                // price against the new shares while a leg already
+                // pulled keeps the payout it pulled under;
+                // re-affirming the current roster is a no-op.
+                &"amend_claimant_roster",
                 // AV-477: the panel-threshold revision carries
                 // the replacement threshold (u8) — the threshold
                 // alone; the next dispute tallies under the live
@@ -69774,6 +69813,448 @@ pub(crate) mod anchor_idl_tests {
         );
     }
 
+    fn funded_roster_escrow() -> Escrow {
+        const C1: [u8; 32] = [0xC1; 32];
+        const C2: [u8; 32] = [0xC2; 32];
+        const T0: u64 = 1_700_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_claimants(&[(C1, 5000), (C2, 5000)])
+            .unwrap();
+        e.fund(ALICE, T0).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn amend_claimant_roster_maps_param_to_claimants_field() {
+        // IDL: amend_claimant_roster(new_legs: Vec<ClaimantShare>) —
+        // new_legs <- param; initializer <-
+        // accounts.initializer (signer), enforced by the Anchor account
+        // constraint and the state machine's initializer-only gate.
+        // The param rewrites the `claimants` region in place (see
+        // PARAM_FIELD_MAP) — no layout change. The INSTRUCTIONS
+        // spec entry pins the program-level wiring: the single
+        // Vec<ClaimantShare> param and the AV-227 pure-logic method.
+        // The u16 rides in the ClaimantShare.share_bps wire field
+        // but is read as a relative weight — the pure logic
+        // renormalizes the weights over the unclaimed pool, so the
+        // roster Σ is exactly 10_000 bps again.
+        const C1: [u8; 32] = [0xC1; 32];
+        const C2: [u8; 32] = [0xC2; 32];
+        const C3: [u8; 32] = [0xC3; 32];
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_claimant_roster")
+            .expect("INSTRUCTIONS carries amend_claimant_roster");
+        assert_eq!(spec.method, "Escrow::amend_claimant_roster");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "new_legs");
+        assert_eq!(spec.params[0].1, "Vec<ClaimantShare>");
+        assert!(
+            spec.input_mapping.contains("InvalidClaimantShares"),
+            "input_mapping documents the shape gate"
+        );
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the emit-only-on-change design"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single Vec<ClaimantShare> arg.
+        let idl = std::fs::read_to_string("../programs/escrow-vault/idl/escrow_vault.json")
+            .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_claimant_roster\""),
+            "checked-in IDL carries amend_claimant_roster"
+        );
+        assert!(
+            idl.contains("[24, 50, 31, 33, 157, 142, 212, 32]"),
+            "checked-in IDL pins the AV-490 discriminator"
+        );
+        assert!(
+            idl.contains(
+                "{\"name\": \"new_legs\", \"type\": {\"vec\": {\"defined\": \"ClaimantShare\"}}}",
+            ),
+            "checked-in IDL carries the new_legs arg"
+        );
+        // Only the unclaimed legs move: the roster is rewritten in
+        // place, the state, the amount, the expiry and the layout
+        // are untouched — and an unclaimed leg is removed by
+        // omitting it.
+        let mut e = funded_roster_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.claimants().unwrap().share_bps[1], 5000);
+        e.amend_claimant_roster(ALICE, &[(C2, 1), (C3, 3)]).unwrap();
+        let r = e.claimants().unwrap();
+        assert_eq!(r.claimant_count, 2);
+        assert_eq!(r.find(C2), Some(0));
+        assert_eq!(r.share_bps[0], 2500, "weights 1:3 re-cut the pool");
+        assert_eq!(r.find(C3), Some(1));
+        assert_eq!(r.share_bps[1], 7500);
+        assert_eq!(r.find(C1), None, "an omitted leg is removed");
+        assert_eq!(e.amount(), 1_000_000, "amount untouched");
+        assert_eq!(e.expires_at(), EXPIRES_AT, "expiry untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "roster rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the initial roster
+        // is set there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_claimants(&[(C1, 5000), (C2, 5000)])
+            .unwrap();
+        assert_eq!(
+            bare.amend_claimant_roster(ALICE, &[(C2, 1), (C3, 3)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_claimant_roster_rejects_non_initializer() {
+        // AV-490: initializer-only governance — the taker, a
+        // stranger, or the parties swapped is Unauthorized; the
+        // roster is the initializer's declared distribution, and
+        // only the initializer may rewrite it.
+        const C2: [u8; 32] = [0xC2; 32];
+        const C3: [u8; 32] = [0xC3; 32];
+        let mut e = funded_roster_escrow();
+        assert_eq!(
+            e.amend_claimant_roster(BOB, &[(C2, 1), (C3, 3)]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_claimant_roster(MALLORY, &[(C2, 1), (C3, 3)]),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.claimants().unwrap().share_bps[1],
+            5000,
+            "failed revisions move nothing"
+        );
+        e.amend_claimant_roster(ALICE, &[(C2, 1), (C3, 3)]).unwrap();
+        assert_eq!(e.claimants().unwrap().share_bps[0], 2500);
+    }
+
+    #[test]
+    fn amend_claimant_roster_refuses_non_funded_and_terminal_and_paused() {
+        // AV-490: the builder owns the initial roster and the roster
+        // is locked in at funding. The pause guard fires before the
+        // authority and state gates — and unpausing a Funded escrow
+        // re-opens the revision (Funded is the allowed state).
+        const C1: [u8; 32] = [0xC1; 32];
+        const C2: [u8; 32] = [0xC2; 32];
+        const C3: [u8; 32] = [0xC3; 32];
+        const T0: u64 = 1_700_000_000;
+        const PAUSER: [u8; 32] = [0xD0; 32];
+        // Activated: funding is the lock-in point, not activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap()
+            .with_claimants(&[(C1, 5000), (C2, 5000)])
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_claimant_roster(ALICE, &[(C2, 1), (C3, 3)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: a roster recorded wrong cannot be restated
+        // mid-dispute — settlement reads the frozen roster.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_claimants(&[(C1, 5000), (C2, 5000)])
+            .unwrap()
+            .with_arbiter([0xA1; 32])
+            .unwrap();
+        d.fund(ALICE, T0).unwrap();
+        d.escalate(ALICE, T0, 1_000_000, None, None, 0).unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_claimant_roster(ALICE, &[(C2, 1), (C3, 3)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            d.claimants().unwrap().share_bps[1],
+            5000,
+            "disputed revision moves nothing"
+        );
+        // Terminal: a released escrow's roster is history, not
+        // policy — the pulls already settled under it.
+        let mut released = funded_roster_escrow();
+        released.claim_share(C1, C1, T0 + 1).unwrap();
+        released.claim_share(C2, C2, T0 + 2).unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_claimant_roster(ALICE, &[(C2, 1), (C3, 3)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!(released.claimants().unwrap().share_bps[1], 5000);
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_claimants(&[(C1, 5000), (C2, 5000)])
+            .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_claimant_roster(ALICE, &[(C2, 1), (C3, 3)]),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_claimant_roster(MALLORY, &[(C2, 1), (C3, 3)]),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            paused.claimants().unwrap().share_bps[1],
+            5000,
+            "paused revision moves nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — and Funded is the
+        // allowed state, so the revision now lands.
+        paused
+            .amend_claimant_roster(ALICE, &[(C2, 1), (C3, 3)])
+            .unwrap();
+        assert_eq!(paused.claimants().unwrap().share_bps[0], 2500);
+    }
+
+    #[test]
+    fn amend_claimant_roster_rejects_bad_tables() {
+        // AV-490: the shape gate is reused unchanged — an empty
+        // table, a zero address, a zero weight, a duplicate
+        // address, a claimed address re-entering as unclaimed, or
+        // an over-8 table is InvalidClaimantShares, the original
+        // roster untouched, and a roster-less escrow can never
+        // gain a roster through amendment.
+        const C1: [u8; 32] = [0xC1; 32];
+        const C2: [u8; 32] = [0xC2; 32];
+        const C3: [u8; 32] = [0xC3; 32];
+        const C4: [u8; 32] = [0xC4; 32];
+        const C5: [u8; 32] = [0xC5; 32];
+        const C6: [u8; 32] = [0xC6; 32];
+        const C7: [u8; 32] = [0xC7; 32];
+        const C8: [u8; 32] = [0xC8; 32];
+        const C9: [u8; 32] = [0xC9; 32];
+        const ZERO: [u8; 32] = [0u8; 32];
+        const T0: u64 = 1_700_000_000;
+        let mut e = funded_roster_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        // Empty.
+        assert_eq!(
+            e.amend_claimant_roster(ALICE, &[]),
+            Err(EscrowError::InvalidClaimantShares)
+        );
+        // Zero address / zero weight.
+        assert_eq!(
+            e.amend_claimant_roster(ALICE, &[(ZERO, 1), (C3, 3)]),
+            Err(EscrowError::InvalidClaimantShares)
+        );
+        assert_eq!(
+            e.amend_claimant_roster(ALICE, &[(C2, 0), (C3, 3)]),
+            Err(EscrowError::InvalidClaimantShares)
+        );
+        // Duplicate address.
+        assert_eq!(
+            e.amend_claimant_roster(ALICE, &[(C2, 1), (C2, 3)]),
+            Err(EscrowError::InvalidClaimantShares)
+        );
+        // A weight too small to earn a whole basis point: 1 vs
+        // u16::MAX over the 10_000-bps pool floors to 0.
+        assert_eq!(
+            e.amend_claimant_roster(ALICE, &[(C2, 1), (C3, u16::MAX)]),
+            Err(EscrowError::InvalidClaimantShares)
+        );
+        assert_eq!(EscrowError::InvalidClaimantShares.code(), 211);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "failed revisions move nothing"
+        );
+        // A claimed address cannot re-enter as unclaimed.
+        let mut claimed = funded_roster_escrow();
+        claimed.claim_share(C1, C1, T0 + 1).unwrap();
+        assert_eq!(
+            claimed.amend_claimant_roster(ALICE, &[(C1, 1), (C3, 3)]),
+            Err(EscrowError::InvalidClaimantShares)
+        );
+        assert_eq!(
+            claimed.claimants().unwrap().share_bps[0],
+            5000,
+            "claimed leg untouched by the failed re-entry"
+        );
+        // Over 8 legs with the claimed ones.
+        let mut full = funded_roster_escrow();
+        full.claim_share(C1, C1, T0 + 1).unwrap();
+        assert_eq!(
+            full.amend_claimant_roster(
+                ALICE,
+                &[
+                    (C2, 1),
+                    (C3, 1),
+                    (C4, 1),
+                    (C5, 1),
+                    (C6, 1),
+                    (C7, 1),
+                    (C8, 1),
+                    (C9, 1)
+                ]
+            ),
+            Err(EscrowError::InvalidClaimantShares)
+        );
+        // A roster-less escrow can never gain a roster here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        bare.fund(ALICE, T0).unwrap();
+        assert_eq!(
+            bare.amend_claimant_roster(ALICE, &[(C2, 1), (C3, 3)]),
+            Err(EscrowError::InvalidClaimantShares)
+        );
+    }
+
+    #[test]
+    fn amend_claimant_roster_program_renormalizes_unclaimed_pool() {
+        // AV-490: C1 pulls first (5000 bps → 500_000), then the
+        // initializer re-cuts only the unclaimed pool: C2 keeps a
+        // leg at weight 1, C3 joins at weight 3. The claimed leg
+        // keeps its share and its claimed bit; the new legs split
+        // the 5000-bps pool 1250/3750, so the Σ is exactly 10_000.
+        // The next pulls price against the new shares and still
+        // settle to exactly the locked amount.
+        const C1: [u8; 32] = [0xC1; 32];
+        const C2: [u8; 32] = [0xC2; 32];
+        const C3: [u8; 32] = [0xC3; 32];
+        const T0: u64 = 1_700_000_000;
+        let mut e = funded_roster_escrow();
+        let (payout, _) = e.claim_share(C1, C1, T0 + 1).unwrap();
+        assert_eq!(payout, 500_000);
+        e.amend_claimant_roster(ALICE, &[(C2, 1), (C3, 3)]).unwrap();
+        let r = e.claimants().unwrap();
+        assert_eq!(r.claimant_count, 3);
+        assert_eq!(r.find(C1), Some(0), "claimed legs stay first");
+        assert_eq!(r.share_bps[0], 5000, "claimed share locked");
+        assert!(r.is_claimed(0), "claimed bit locked");
+        assert_eq!(r.find(C2), Some(1));
+        assert_eq!(r.share_bps[1], 1250);
+        assert!(!r.is_claimed(1));
+        assert_eq!(r.find(C3), Some(2));
+        assert_eq!(r.share_bps[2], 3750);
+        assert!(!r.is_claimed(2));
+        assert_eq!(r.unclaimed_bps(), 5000);
+        // The claimed leg cannot pull twice, and the new legs still
+        // settle pro rata to exactly the locked amount.
+        assert_eq!(
+            e.claim_share(C1, C1, T0 + 2),
+            Err(EscrowError::ClaimantAlreadyClaimed)
+        );
+        assert_eq!(EscrowError::ClaimantAlreadyClaimed.code(), 210);
+        let (p2, _) = e.claim_share(C2, C2, T0 + 3).unwrap();
+        assert_eq!(p2, 125_000);
+        let (p3, _) = e.claim_share(C3, C3, T0 + 4).unwrap();
+        assert_eq!(p3, 375_000, "last leg takes the whole remainder");
+        assert_eq!(payout + p2 + p3, 1_000_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_claimant_roster_noop_on_same_roster() {
+        // AV-490: re-affirming the current roster is a no-op — it
+        // succeeds, writes nothing, and (there being no actual
+        // change) emits nothing. Weights that renormalize to the
+        // same shares are the same no-op: 1:1 and 2:2 cut the same
+        // pool the same way.
+        const C1: [u8; 32] = [0xC1; 32];
+        const C2: [u8; 32] = [0xC2; 32];
+        let mut e = funded_roster_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_claimant_roster(ALICE, &[(C1, 1), (C2, 1)]).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-roster re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!(e.claimants().unwrap().share_bps[0], 5000);
+        assert_eq!(e.claimants().unwrap().share_bps[1], 5000);
+        // A real change moves the roster...
+        e.amend_claimant_roster(ALICE, &[(C1, 1), (C2, 3)]).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        assert_ne!(after_change, before, "a real re-cut moves the roster");
+        assert_eq!(e.claimants().unwrap().share_bps[0], 2500);
+        assert_eq!(e.claimants().unwrap().share_bps[1], 7500);
+        // ...and re-affirming the revised roster with
+        // proportionally identical weights is the same no-op.
+        e.amend_claimant_roster(ALICE, &[(C1, 2), (C2, 6)]).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "proportionally identical weights write nothing either"
+        );
+        assert_eq!(e.claimants().unwrap().share_bps[0], 2500);
+        assert_eq!(e.claimants().unwrap().share_bps[1], 7500);
+    }
+
+    #[test]
+    fn amend_claimant_roster_emits_only_on_change() {
+        // AV-490: the `ClaimantRosterAmended` event fires only on an
+        // actual change — the program handler compares the roster
+        // before and after, and a same-roster re-affirmation stays
+        // silent. The INSTRUCTIONS entry pins the design in the spec
+        // table, and the state machine proves the boundary
+        // structurally: a real change moves the roster bytes, a
+        // no-op moves nothing at all.
+        const C1: [u8; 32] = [0xC1; 32];
+        const C2: [u8; 32] = [0xC2; 32];
+        const C3: [u8; 32] = [0xC3; 32];
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_claimant_roster")
+            .expect("INSTRUCTIONS carries amend_claimant_roster");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the emit-only-on-change design"
+        );
+        let events = std::fs::read_to_string("src/events.rs").expect("read events.rs");
+        assert!(
+            events.contains("ClaimantRosterAmended"),
+            "events.rs defines the ClaimantRosterAmended event"
+        );
+        // A real change moves the roster bytes.
+        let mut e = funded_roster_escrow();
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_claimant_roster(ALICE, &[(C2, 1), (C3, 3)]).unwrap();
+        let after = super::account_space_tests::encode_escrow(&e);
+        assert_eq!(before.len(), after.len());
+        assert_ne!(before, after, "a real re-cut moves the roster");
+        // A no-op re-affirmation moves nothing at all.
+        let mut f = funded_roster_escrow();
+        let encoded = super::account_space_tests::encode_escrow(&f);
+        f.amend_claimant_roster(ALICE, &[(C1, 1), (C2, 1)]).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&f),
+            encoded,
+            "same-roster re-affirmation writes nothing"
+        );
+        // A failed revision moves nothing at all.
+        assert_eq!(
+            f.amend_claimant_roster(ALICE, &[]),
+            Err(EscrowError::InvalidClaimantShares)
+        );
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&f),
+            encoded,
+            "failed calls move nothing"
+        );
+    }
+
     #[test]
     fn amend_panel_threshold_maps_params_to_arbiter_panel_field() {
         // IDL: amend_panel_threshold(new_threshold: u8) —
@@ -76708,6 +77189,21 @@ pub(crate) mod anchor_idl_tests {
             "amend_decimals",
             "decimals",
             "decimals",
+        ),
+        // AV-490: the post-funding claimant-roster revision rewrites
+        // the `claimants` region in place — a third param source for
+        // the field, like `claim_share`'s claimant param. The field's
+        // *initial* value comes from the `with_claimants` builder (a
+        // state-machine method, not an instruction param, so it cannot
+        // appear in the param table); the param entry documents the
+        // revision source. Only the unclaimed legs move — the claimed
+        // legs' addresses, shares and claimed bits are locked, and
+        // the later `claim_share` pulls price against the new shares
+        // while a leg already pulled keeps the payout it pulled under.
+        (
+            "amend_claimant_roster",
+            "new_legs",
+            "claimants",
         ),
         // AV-477: the post-funding arbiter-panel threshold
         // revision rewrites the 1-byte `threshold` field of the
@@ -107074,6 +107570,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_decimals"),
             [145, 126, 213, 113, 158, 55, 236, 166]
+        );
+    }
+
+    #[test]
+    fn amend_claimant_roster_instruction_discriminator_is_pinned() {
+        // AV-490. IDL:
+        // sha256("global:amend_claimant_roster")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_claimant_roster"),
+            [24, 50, 31, 33, 157, 142, 212, 32]
         );
     }
 

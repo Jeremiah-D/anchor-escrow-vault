@@ -1613,6 +1613,14 @@
       ]
     },
     {
+      "name": "amend_claimant_roster",
+      "discriminator": [24, 50, 31, 33, 157, 142, 212, 32],
+      "accounts": [],
+      "args": [
+        {"name": "new_legs", "type": {"vec": {"defined": "ClaimantShare"}}}
+      ]
+    },
+    {
       "name": "amend_panel_threshold",
       "discriminator": [192, 166, 186, 13, 85, 249, 94, 78],
       "accounts": [],
