@@ -9055,6 +9055,81 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the penalty insurance-pool opt-in after funding (AV-486;
+    /// mirrors `Escrow::amend_insurance_pool`, the AV-394
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot
+    /// re-route the other's slash. `Funded` only — the builder owns
+    /// the initial opt-in via `with_insurance_pool`, and the dispute
+    /// window settles under the frozen routing. Only an escrow
+    /// carrying a penalty clause (flat slash terms or a ladder) may
+    /// revise the routing — a clause can never be installed after
+    /// funding, so an escrow with neither is refused with
+    /// `SlashNotEligible`. The empty-pool gate is what makes the
+    /// revision clean: all four pool counters must be zero, otherwise
+    /// the flip is refused with `InvalidPoolPayout` — pool funds
+    /// already settled have nowhere to go. A paused escrow fails
+    /// fast (`Paused`, before the authority gate). No delay path
+    /// covers this method — `GovernanceAction` has no
+    /// `AmendInsurancePool` variant, so the direct call is the only
+    /// entry point and stays open on a delay-opted-in escrow
+    /// (the AV-471 `amend_twap_gate` precedent: the method carries
+    /// no `via_delayed` gate, so gating it here would self-lock
+    /// exactly the escrows that need it). Re-affirming the current
+    /// opt-in is a no-op: it succeeds, writes nothing and emits
+    /// nothing. Emits `InsurancePoolAmended`
+    /// (from == to == the current state) only on an actual change.
+    /// Only the `insurance_pool` flag changes — the slash terms, the
+    /// deadline, the locked amount and the state are untouched, and
+    /// the slash path reads the live flag, so the next slash lands in
+    /// the pool (opted in) or the penalty account (opted out) while a
+    /// slash already settled keeps the routing it settled under;
+    /// opting out also closes the `pool_payout` door at once and
+    /// restores the AV-385/AV-386 penalty-account rotations that a
+    /// pooled escrow refuses. `now` comes from the clock sysvar, never
+    /// an instruction param (mirrors `amend_funding_start`) — here only
+    /// for the event timestamp, since the pure logic takes no `now`.
+    pub fn amend_insurance_pool(
+        ctx: Context<AmendInsurancePool>,
+        opt_in: bool,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.insurance_pool();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_insurance_pool(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                opt_in,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 1-byte `insurance_pool` flag in place — no
+        // realloc. Only the routing moves; the slash terms, any slash
+        // already settled and the pool counters are untouched. Emits
+        // only on an actual change; a no-op re-affirmation stays
+        // silent (mirrors `amend_compound_interest`).
+        if escrow.insurance_pool() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::InsurancePoolAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -17087,6 +17162,22 @@ pub struct AmendRentPayer<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendReferrer<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-486: accounts for `amend_insurance_pool` — the
+/// insurance-pool opt-in revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendInsurancePool<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

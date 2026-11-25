@@ -43171,6 +43171,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "referrer/referral_bps <- params (Pubkey -> [u8; 32] conversion); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial binding via with_referrer); a zero referrer or a rate above MAX_REFERRAL_BPS (2_000) is InvalidReferral (code 271, the builder's gates — a bound referrer must be a real key, and the 20% cap keeps the incentive from silently rerouting the whole payout) and leaves the escrow untouched; an unbound escrow gains its first referrer here (None -> Some) and there is deliberately no unbind-to-None path (an unbound escrow keeps the no-referrer default); no delay path covers this method — GovernanceAction has no AmendReferrer variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current (referrer, rate) pair is a no-op (succeeds, writes nothing, emits no event, paralleling amend_rent_payer); only referrer/referral_bps change — referral_paid is never rewritten, so a rate cut can never claw back referral already charged, and the release gate reads the binding live (referral_for computes from the live binding at every payout), so a release after the amendment charges the new referrer at the new rate while a release before it charged the old one; emits the ReferrerAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 33-byte Option<Pubkey> referrer region and the 2-byte referral_bps tail field are rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-486: revise the penalty insurance-pool opt-in after
+            // funding — the program-level entry point for the
+            // AV-394 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_insurance_pool")[..8]
+            // = [211, 64, 189, 53, 177, 1, 84, 74] — the Anchor
+            // instruction discriminator for the
+            // amend_insurance_pool handler (pinned by the
+            // discriminator test below).
+            name: "amend_insurance_pool",
+            params: &[(
+                "opt_in",
+                "bool",
+                "instruction param; the replacement insurance-pool opt-in — true routes the next slash to the pool, false routes it to the penalty account; re-affirming the current opt-in is a no-op",
+            )],
+            method: "Escrow::amend_insurance_pool",
+            input_mapping: "opt_in <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial opt-in via with_insurance_pool); only an escrow carrying a penalty clause (flat slash terms or a ladder) may revise the routing (SlashNotEligible, code 143, otherwise — the clause itself can never be installed after funding); the empty-pool gate refuses the flip while any settled pool accounting stands (InvalidPoolPayout, code 164 — pool_paid / pool_slashed / pool_inflow / pool_payout_paid must all be zero, since pool funds already settled have nowhere to go); no delay path covers this method — GovernanceAction has no AmendInsurancePool variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current opt-in is a no-op (succeeds, writes nothing, emits no event, paralleling amend_compound_interest); only insurance_pool changes — the slash terms, the deadline, the locked amount and the state are untouched, and the slash path reads the live flag, so the next slash lands in the pool (opted in) or the penalty account (opted out) while a slash already settled keeps the routing it settled under; opting out also closes the pool_payout door at once and restores the AV-385/AV-386 penalty-account rotations that a pooled escrow refuses; emits the InsurancePoolAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 1-byte insurance_pool flag is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-477: revise the arbiter panel's judgment threshold
             // after funding — the program-level entry point for the
             // AV-378 pure-logic revision. IDL:
@@ -44347,6 +44366,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-256 pure-logic
             // revision wired to the chain).
             "Escrow::amend_referrer",
+            // AV-486: the program-level insurance-pool
+            // opt-in revision (the AV-394 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_insurance_pool",
             // AV-477: the program-level arbiter-panel
             // threshold revision (the AV-378 pure-logic
             // revision wired to the chain).
@@ -45057,6 +45080,14 @@ pub(crate) mod anchor_idl_tests {
                 // gains its first referrer here; re-affirming the
                 // current pair is a no-op.
                 &"amend_referrer",
+                // AV-486: the insurance-pool opt-in revision carries
+                // the replacement opt-in (bool) — the flag alone; the
+                // next slash routes through the live flag, so an
+                // opt-in routes the next slash to the pool and an
+                // opt-out routes it to the penalty account, while a
+                // slash already settled keeps the routing it settled
+                // under; re-affirming the current opt-in is a no-op.
+                &"amend_insurance_pool",
                 // AV-477: the panel-threshold revision carries
                 // the replacement threshold (u8) — the threshold
                 // alone; the next dispute tallies under the live
@@ -67931,6 +67962,408 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!((delayed.referrer(), delayed.referral_bps()), (Some(R1), 1_000));
     }
 
+    fn insurance_pool_funded_escrow(opt_in: bool) -> Escrow {
+        // A Funded escrow carrying flat slash terms — the AV-486
+        // program-surface fixture, paralleling the AV-394
+        // `funded_plain` / `funded_pooled` helpers in
+        // `insurance_pool_amend_tests`. The slash deadline sits one
+        // day past funding, so a slash at the deadline is in-window.
+        const PENALTY: [u8; 32] = [0xDD; 32];
+        const T0: u64 = 1_700_000_000;
+        const DEADLINE: u64 = T0 + 86_400;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        if opt_in {
+            e = e.with_insurance_pool().unwrap();
+        }
+        e.fund(ALICE, T0).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_insurance_pool_program_maps_param_to_flag() {
+        // IDL: amend_insurance_pool(opt_in: bool) —
+        // opt_in <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param flips the `insurance_pool` flag in place
+        // (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the single bool param and the AV-394 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_insurance_pool")
+            .expect("INSTRUCTIONS carries amend_insurance_pool");
+        assert_eq!(spec.method, "Escrow::amend_insurance_pool");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "opt_in");
+        assert_eq!(spec.params[0].1, "bool");
+        assert!(
+            spec.input_mapping.contains("InsurancePoolAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single bool arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_insurance_pool\""),
+            "checked-in IDL carries amend_insurance_pool"
+        );
+        assert!(
+            idl.contains("[211, 64, 189, 53, 177, 1, 84, 74]"),
+            "checked-in IDL pins the AV-486 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"opt_in\", \"type\": \"bool\"}"),
+            "checked-in IDL carries the opt_in arg"
+        );
+        // Only the flag flips: the terms, the deadline, the amount,
+        // the state and the layout are untouched.
+        const T0: u64 = 1_700_000_000;
+        const DEADLINE: u64 = T0 + 86_400;
+        let mut e = insurance_pool_funded_escrow(false);
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert!(!e.insurance_pool());
+        assert_eq!(e.pool_paid(), 0);
+        e.amend_insurance_pool(ALICE, BOB, true).unwrap();
+        assert!(e.insurance_pool(), "flag revised");
+        assert_eq!(e.amount(), 1_000_000, "amount untouched");
+        assert_eq!(e.pool_paid(), 0, "no slash settled yet");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "flag rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the opt-in is set
+        // there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms([0xDD; 32], DEADLINE)
+            .unwrap();
+        assert_eq!(
+            bare.amend_insurance_pool(ALICE, BOB, true),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_insurance_pool_program_rejects_single_party_and_strangers() {
+        // AV-486: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // re-route the other's slash.
+        let mut e = insurance_pool_funded_escrow(false);
+        assert_eq!(
+            e.amend_insurance_pool(ALICE, ALICE, true),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_insurance_pool(MALLORY, BOB, true),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_insurance_pool(MALLORY, MALLORY, true),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert!(!e.insurance_pool(), "failed revisions move nothing");
+        e.amend_insurance_pool(ALICE, BOB, true).unwrap();
+        assert!(e.insurance_pool());
+    }
+
+    #[test]
+    fn amend_insurance_pool_program_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-486: the builder owns the initial opt-in and the
+        // dispute window settles under the frozen routing. The pause
+        // guard fires before the authority and state gates — and
+        // unpausing a Funded escrow re-opens the revision (Funded
+        // is the allowed state).
+        const PENALTY: [u8; 32] = [0xDD; 32];
+        const T0: u64 = 1_700_000_000;
+        const DEADLINE: u64 = T0 + 86_400;
+        const PAUSER: [u8; 32] = [0xD0; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Activated: funding is the lock-in point, not activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_insurance_pool(ALICE, BOB, true),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: the dispute window settles under the frozen
+        // routing.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        d.fund(ALICE, T0).unwrap();
+        let disputed_at = EXPIRES_AT - 3_500;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_insurance_pool(ALICE, BOB, true),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert!(!d.insurance_pool(), "disputed revision moves nothing");
+        // Terminal: a released escrow's routing is history, not
+        // policy.
+        let mut released = insurance_pool_funded_escrow(false);
+        released
+            .release(ALICE, T0, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_insurance_pool(ALICE, BOB, true),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert!(!released.insurance_pool());
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap();
+        paused.fund(ALICE, T0).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_insurance_pool(ALICE, BOB, true),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_insurance_pool(MALLORY, BOB, true),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert!(!paused.insurance_pool(), "paused revision moves nothing");
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — and Funded is the
+        // allowed state, so the revision now lands.
+        paused.amend_insurance_pool(ALICE, BOB, true).unwrap();
+        assert!(paused.insurance_pool());
+    }
+
+    #[test]
+    fn amend_insurance_pool_program_requires_slash_terms() {
+        // AV-486: an escrow with no penalty clause has no routing
+        // to revise — the clause itself can never be installed
+        // after funding.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert!(e.slash_terms().is_none());
+        assert_eq!(
+            e.amend_insurance_pool(ALICE, BOB, true),
+            Err(EscrowError::SlashNotEligible)
+        );
+        assert_eq!(EscrowError::SlashNotEligible.code(), 143);
+        assert!(!e.insurance_pool());
+    }
+
+    #[test]
+    fn amend_insurance_pool_program_refuses_nonempty_pool() {
+        // AV-486: the empty-pool gate — a slash already routed to
+        // the pool leaves settled accounting with nowhere to go,
+        // so the flip is refused until the pool is drained.
+        const SLASHED: u64 = 200_000;
+        const DEADLINE: u64 = 1_700_000_000 + 86_400;
+        let mut e = insurance_pool_funded_escrow(true);
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        assert_eq!(e.pool_paid(), SLASHED);
+        assert_eq!(e.pool_slashed(), SLASHED);
+        assert_eq!(e.pool_inflow(), SLASHED);
+        assert_eq!(
+            e.amend_insurance_pool(ALICE, BOB, false),
+            Err(EscrowError::InvalidPoolPayout)
+        );
+        assert_eq!(EscrowError::InvalidPoolPayout.code(), 164);
+        assert!(e.insurance_pool(), "flag untouched by the refusal");
+        assert_eq!(e.pool_paid(), SLASHED);
+        assert_eq!(e.pool_slashed(), SLASHED);
+        assert_eq!(e.pool_inflow(), SLASHED);
+    }
+
+    #[test]
+    fn amend_insurance_pool_program_noop_on_same_flag() {
+        // AV-486: re-affirming the current opt-in is a no-op — it
+        // succeeds, writes nothing, and (by the handler's
+        // before/after comparison) emits nothing.
+        let mut e = insurance_pool_funded_escrow(false);
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_insurance_pool(ALICE, BOB, false).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-flag re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert!(!e.insurance_pool());
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_insurance_pool(ALICE, BOB, true).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_insurance_pool(ALICE, BOB, true).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised flag writes nothing either"
+        );
+        assert!(e.insurance_pool());
+    }
+
+    #[test]
+    fn amend_insurance_pool_program_emits_only_on_change() {
+        // AV-486: the program handler emits
+        // `InsurancePoolAmended` only when the flag
+        // actually changes — the before/after comparison in the
+        // handler skips the event on a no-op re-affirmation
+        // (mirrors `amend_compound_interest`). At the state-machine
+        // level the same-flag call writes nothing — the encoded
+        // escrow is byte-identical before and after, so there is
+        // nothing to emit about — while a real change flips the
+        // flag, which is what the handler's emission keys on.
+        // The INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_insurance_pool")
+            .expect("INSTRUCTIONS carries amend_insurance_pool");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = insurance_pool_funded_escrow(false);
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_insurance_pool(ALICE, BOB, false).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-flag re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_insurance_pool(ALICE, BOB, true).unwrap();
+        assert!(e.insurance_pool());
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change flips the flag, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_insurance_pool_program_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-486: the program handler emits
+        // `InsurancePoolAmended` only when the flag
+        // actually changes — the indexed wrapper is the event-layer
+        // mirror of the handler's before/after comparison. A failed
+        // revision emits nothing, a no-op re-affirmation emits
+        // nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const T0: u64 = 1_700_000_000;
+        let funded = insurance_pool_funded_escrow(false);
+        let mut e = IndexedEscrow::wrap([0x1D; 32], funded);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_insurance_pool(ALICE, ALICE, true, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_insurance_pool(ALICE, BOB, true, T0).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::InsurancePoolAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the new opt-in is a no-op: no new event.
+        e.amend_insurance_pool(ALICE, BOB, true, T0).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_insurance_pool_program_opt_in_routes_next_slash_to_pool() {
+        // AV-486: a funded-without-pool escrow opts in, and the
+        // next slash lands in neutral custody — `penalty_paid`
+        // stays zero, so the Anchor layer must not transfer to
+        // the penalty account.
+        const SLASHED: u64 = 200_000;
+        const DEADLINE: u64 = 1_700_000_000 + 86_400;
+        let mut e = insurance_pool_funded_escrow(false);
+        assert!(!e.insurance_pool());
+        e.amend_insurance_pool(ALICE, BOB, true).unwrap();
+        assert!(e.insurance_pool());
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        assert_eq!(e.pool_paid(), SLASHED, "slash routes to the pool");
+        assert_eq!(e.pool_slashed(), SLASHED);
+        assert_eq!(e.pool_inflow(), SLASHED);
+        assert_eq!(e.penalty_paid(), 0);
+    }
+
+    #[test]
+    fn amend_insurance_pool_program_opt_out_routes_next_slash_to_penalty_account() {
+        // AV-486: a pooled escrow opts out before any slash, and
+        // the next slash pays the penalty account as before AV-106.
+        const SLASHED: u64 = 200_000;
+        const DEADLINE: u64 = 1_700_000_000 + 86_400;
+        let mut e = insurance_pool_funded_escrow(true);
+        assert!(e.insurance_pool());
+        e.amend_insurance_pool(ALICE, BOB, false).unwrap();
+        assert!(!e.insurance_pool());
+        e.slash(ALICE, SLASHED, None, DEADLINE).unwrap();
+        assert_eq!(e.penalty_paid(), SLASHED);
+        assert_eq!(e.pool_paid(), 0);
+        assert_eq!(e.pool_slashed(), 0);
+        assert_eq!(e.pool_inflow(), 0);
+    }
+
+    #[test]
+    fn amend_insurance_pool_program_allows_direct_on_delay_opted_in() {
+        // AV-486: no delay path covers this method —
+        // `GovernanceAction` has no `AmendInsurancePool`
+        // variant and the pure logic carries no `via_delayed`
+        // gate, so the direct call is the only entry point and
+        // stays open on a delay-opted-in escrow (the AV-471
+        // `amend_twap_gate` precedent — gating it here would
+        // self-lock exactly the escrows that need it, since no
+        // delayed path could take the revision instead).
+        const PENALTY: [u8; 32] = [0xDD; 32];
+        const T0: u64 = 1_700_000_000;
+        const DEADLINE: u64 = T0 + 86_400;
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_slash_terms(PENALTY, DEADLINE)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap();
+        delayed.fund(ALICE, T0).unwrap();
+        assert_eq!(delayed.state(), EscrowState::Funded);
+        delayed.amend_insurance_pool(ALICE, BOB, true).unwrap();
+        assert!(
+            delayed.insurance_pool(),
+            "direct call stays open on a delay-opted-in escrow"
+        );
+        // And back again — the flag stays revisable.
+        delayed.amend_insurance_pool(ALICE, BOB, false).unwrap();
+        assert!(!delayed.insurance_pool());
+    }
+
     #[test]
     fn amend_panel_threshold_maps_params_to_arbiter_panel_field() {
         // IDL: amend_panel_threshold(new_threshold: u8) —
@@ -74796,6 +75229,23 @@ pub(crate) mod anchor_idl_tests {
             "referral_bps",
             "referral_bps",
         ),
+        // AV-486: the post-funding insurance-pool opt-in revision
+        // rewrites the 1-byte `insurance_pool` flag in place — a
+        // second param source for the field, like
+        // `amend_compound_interest`'s enabled flag. The field's
+        // *initial* value comes from the `with_insurance_pool`
+        // builder (a state-machine method, not an instruction
+        // param, so it cannot appear in the param table); the param
+        // entry documents the revision source. Only the flag moves —
+        // the slash terms, the deadline, the locked amount and the
+        // state are untouched, so the next slash routes through the
+        // live flag while a slash already settled keeps the routing
+        // it settled under.
+        (
+            "amend_insurance_pool",
+            "opt_in",
+            "insurance_pool",
+        ),
         // AV-477: the post-funding arbiter-panel threshold
         // revision rewrites the 1-byte `threshold` field of the
         // `arbiter_panel` region in place — a second param source
@@ -75289,22 +75739,25 @@ pub(crate) mod anchor_idl_tests {
              overturn, forfeited on uphold) and by expire_appeal \
              (forfeited on window lapse)",
         ),
-        // AV-106: no instruction param writes these fields —
-        // `initialize_insurance_pool` flips the opt-in flag in place
-        // (the handler takes no params), and the counters move only as
-        // transition side effects: slash credits pool_paid /
-        // pool_slashed / pool_inflow, review_appeal (uphold) and
-        // expire_appeal credit forfeited bonds into pool_paid /
-        // pool_inflow, review_appeal (overturn) debits pool_paid /
-        // pool_slashed into `released`, and `pool_payout` debits
-        // pool_paid and accumulates `pool_payout_paid` (its `amount`
-        // param is the param source for that field, like `release`'s
-        // `amount` into `released`).
-        (
-            "insurance_pool",
-            "false by initialize; set true in place by \
-             initialize_insurance_pool (Uninitialized only)",
-        ),
+        // AV-106: the pool counters move only as transition side
+        // effects: slash credits pool_paid / pool_slashed /
+        // pool_inflow, review_appeal (uphold) and expire_appeal
+        // credit forfeited bonds into pool_paid / pool_inflow,
+        // review_appeal (overturn) debits pool_paid / pool_slashed
+        // into `released`, and `pool_payout` debits pool_paid and
+        // accumulates `pool_payout_paid` (its `amount` param is the
+        // param source for that field, like `release`'s `amount`
+        // into `released`).
+        // `insurance_pool` is rewritten by the
+        // `amend_insurance_pool` instruction param (see
+        // PARAM_FIELD_MAP), so it is not listed here — like
+        // `rent_payer`, every field gets exactly one source kind.
+        // The field's *initial* value comes from the
+        // `with_insurance_pool` builder (a state-machine method,
+        // not an instruction param, so it cannot appear in the
+        // param table); the param entry documents the revision
+        // source. `initialize_insurance_pool` flips the flag in
+        // place while Uninitialized (the handler takes no params).
         (
             "pool_paid",
             "zeroed by initialize; credited by slash-to-pool and \
@@ -105105,6 +105558,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_referrer"),
             [158, 192, 229, 107, 26, 208, 0, 137]
+        );
+    }
+
+    #[test]
+    fn amend_insurance_pool_instruction_discriminator_is_pinned() {
+        // AV-486. IDL:
+        // sha256("global:amend_insurance_pool")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_insurance_pool"),
+            [211, 64, 189, 53, 177, 1, 84, 74]
         );
     }
 

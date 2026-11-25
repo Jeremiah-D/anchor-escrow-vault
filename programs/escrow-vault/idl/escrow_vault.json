@@ -1581,6 +1581,14 @@
       ]
     },
     {
+      "name": "amend_insurance_pool",
+      "discriminator": [211, 64, 189, 53, 177, 1, 84, 74],
+      "accounts": [],
+      "args": [
+        {"name": "opt_in", "type": "bool"}
+      ]
+    },
+    {
       "name": "amend_panel_threshold",
       "discriminator": [192, 166, 186, 13, 85, 249, 94, 78],
       "accounts": [],

@@ -6189,7 +6189,7 @@ AV-385/AV-386 penalty-account rotations that a pooled escrow
 refuses. Re-affirming the current opt-in is a no-op that emits no
 event; a real flip emits `InsurancePoolAmended` (discriminant
 168), all amounts zero. No governance delay, no new error code,
-no Vault layout change.
+no Vault layout change. AV-486 adds the program-level `amend_insurance_pool(opt_in)` instruction (discriminator [211, 64, 189, 53, 177, 1, 84, 74]) — the chain entry point for the AV-394 revision; unconditional dual-signature governance, `Funded`-only, the direct call the only entry point (no delay path covers it), an escrow with no penalty clause refused (`SlashNotEligible`, code 143) and the empty-pool gate refusing any flip while settled pool accounting stands (`InvalidPoolPayout`, code 164), same-flag re-affirmation a no-op that emits nothing, and the next `slash` routes through the live flag (`slash` reads the amended flag at slash time). (Solana: slash-routing governance.)
 
 ## Interest-bearing escrow (AV-107)
 
