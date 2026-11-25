@@ -8978,6 +8978,83 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the bound referrer after funding (AV-485;
+    /// mirrors `Escrow::amend_referrer`, the AV-256
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot
+    /// re-point the other's referral. `Funded` only — the builder owns
+    /// the initial binding via `with_referrer`, and the dispute
+    /// window settles under the frozen binding. A zero referrer or a
+    /// rate above `MAX_REFERRAL_BPS` (2_000) is refused with
+    /// `InvalidReferral` (the builder's gates, unchanged — a bound
+    /// referrer must be a real key, and the 20% cap keeps the
+    /// incentive from silently rerouting the whole payout). A paused
+    /// escrow fails fast (`Paused`, before the authority gate). No delay path
+    /// covers this method — `GovernanceAction` has no
+    /// `AmendReferrer` variant, so the direct call is the only
+    /// entry point and stays open on a delay-opted-in escrow
+    /// (the AV-471 `amend_twap_gate` precedent: the method carries
+    /// no `via_delayed` gate, so gating it here would self-lock
+    /// exactly the escrows that need it). Re-affirming the current
+    /// (referrer, rate) pair is a no-op: it succeeds, writes nothing
+    /// and emits nothing. An unbound escrow gains its first referrer
+    /// here (`None` -> `Some`), and there is deliberately no
+    /// unbind-to-`None` path (an unbound escrow keeps the
+    /// no-referrer default). Emits `ReferrerAmended`
+    /// (from == to == the current state) only on an actual change.
+    /// Only the `referrer`/`referral_bps` fields change —
+    /// `referral_paid` is never rewritten, so a rate cut can never
+    /// claw back referral already charged; the release gate reads the
+    /// binding live (`referral_for` computes from the live binding at
+    /// every payout), so a release after the amendment charges the new
+    /// referrer at the new rate while a release before it charged the
+    /// old one. `now` comes from the clock sysvar, never an
+    /// instruction param (mirrors `amend_funding_start`) — here only
+    /// for the event timestamp, since the pure logic takes no `now`.
+    pub fn amend_referrer(
+        ctx: Context<AmendReferrer>,
+        referrer: Pubkey,
+        referral_bps: u16,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = (escrow.referrer(), escrow.referral_bps());
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_referrer(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                referrer.to_bytes(),
+                referral_bps,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 33-byte `Option<Pubkey>` referrer region and
+        // the 2-byte `referral_bps` tail field in place — no realloc.
+        // Only the binding moves; `referral_paid` and any release
+        // already made are untouched. Emits only on an actual change;
+        // a no-op re-affirmation stays silent (mirrors
+        // `amend_penalty_escalation`).
+        if (escrow.referrer(), escrow.referral_bps()) != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ReferrerAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -16994,6 +17071,22 @@ pub struct AmendInterestRate<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendRentPayer<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-485: accounts for `amend_referrer` — the
+/// referrer revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendReferrer<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

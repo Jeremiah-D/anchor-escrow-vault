@@ -1572,6 +1572,15 @@
       ]
     },
     {
+      "name": "amend_referrer",
+      "discriminator": [158, 192, 229, 107, 26, 208, 0, 137],
+      "accounts": [],
+      "args": [
+        {"name": "referrer", "type": "publicKey"},
+        {"name": "referral_bps", "type": "u16"}
+      ]
+    },
+    {
       "name": "amend_panel_threshold",
       "discriminator": [192, 166, 186, 13, 85, 249, 94, 78],
       "accounts": [],

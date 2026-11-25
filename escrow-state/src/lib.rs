@@ -43145,6 +43145,32 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_payer <- param (Pubkey -> [u8; 32] conversion); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial binding via with_rent_payer); a zero payer is InvalidRentPayer (code 352, the builder's gate — a bound payer must be a real key, or the close would have nowhere to send the rent) and leaves the escrow untouched; an unbound escrow gains its first payer here (None -> Some) and there is deliberately no unbind-to-None path (an unbound escrow keeps the initializer-reclaims default); no delay path covers this method — GovernanceAction has no AmendRentPayer variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current payer is a no-op (succeeds, writes nothing, emits no event, paralleling amend_milestones); only rent_payer changes — the close authority is untouched, no closed state is touched, and no rent is recomputed, so a close after the amendment pays the new payer while a close before it paid the old one, and the amendment never rewrites a close already made; emits the RentPayerAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 33-byte Option<Pubkey> rent-payer region is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-485: revise the bound referrer after
+            // funding — the program-level entry point for the
+            // AV-256 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_referrer")[..8]
+            // = [158, 192, 229, 107, 26, 208, 0, 137] — the Anchor
+            // instruction discriminator for the
+            // amend_referrer handler (pinned by the
+            // discriminator test below).
+            name: "amend_referrer",
+            params: &[
+                (
+                    "referrer",
+                    "Pubkey",
+                    "instruction param; the replacement referrer — the zero address is refused (InvalidReferral, code 271, the builder's gate); an unbound escrow gains its first referrer here and re-affirming the current (referrer, rate) pair is a no-op",
+                ),
+                (
+                    "referral_bps",
+                    "u16",
+                    "instruction param; the replacement revenue-share rate in basis points — above MAX_REFERRAL_BPS (2_000) is refused (InvalidReferral, code 271, the builder's gate); 0 is legal (no referral charged on later releases) and re-affirming the current pair is a no-op",
+                ),
+            ],
+            method: "Escrow::amend_referrer",
+            input_mapping: "referrer/referral_bps <- params (Pubkey -> [u8; 32] conversion); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial binding via with_referrer); a zero referrer or a rate above MAX_REFERRAL_BPS (2_000) is InvalidReferral (code 271, the builder's gates — a bound referrer must be a real key, and the 20% cap keeps the incentive from silently rerouting the whole payout) and leaves the escrow untouched; an unbound escrow gains its first referrer here (None -> Some) and there is deliberately no unbind-to-None path (an unbound escrow keeps the no-referrer default); no delay path covers this method — GovernanceAction has no AmendReferrer variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current (referrer, rate) pair is a no-op (succeeds, writes nothing, emits no event, paralleling amend_rent_payer); only referrer/referral_bps change — referral_paid is never rewritten, so a rate cut can never claw back referral already charged, and the release gate reads the binding live (referral_for computes from the live binding at every payout), so a release after the amendment charges the new referrer at the new rate while a release before it charged the old one; emits the ReferrerAmended indexer event only on an actual change (from == to == the current state); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the 33-byte Option<Pubkey> referrer region and the 2-byte referral_bps tail field are rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-477: revise the arbiter panel's judgment threshold
             // after funding — the program-level entry point for the
             // AV-378 pure-logic revision. IDL:
@@ -44317,6 +44343,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-255 pure-logic
             // revision wired to the chain).
             "Escrow::amend_rent_payer",
+            // AV-485: the program-level referrer
+            // revision (the AV-256 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_referrer",
             // AV-477: the program-level arbiter-panel
             // threshold revision (the AV-378 pure-logic
             // revision wired to the chain).
@@ -45017,6 +45047,16 @@ pub(crate) mod anchor_idl_tests {
                 // first payer here; re-affirming the current payer
                 // is a no-op.
                 &"amend_rent_payer",
+                // AV-485: the referrer revision carries the
+                // replacement referrer (Pubkey) + the new rate
+                // (u16) — the pair alone; the release gate reads
+                // the binding live through the amended pair, so a
+                // release after the amendment charges the new
+                // referrer at the new rate while a release before
+                // it charged the old one, and an unbound escrow
+                // gains its first referrer here; re-affirming the
+                // current pair is a no-op.
+                &"amend_referrer",
                 // AV-477: the panel-threshold revision carries
                 // the replacement threshold (u8) — the threshold
                 // alone; the next dispute tallies under the live
@@ -67444,6 +67484,453 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(delayed.rent_payer(), Some(P1));
     }
 
+    fn referrer_funded_escrow(referrer: [u8; 32], referral_bps: u16) -> Escrow {
+        // A Funded escrow with a referrer bound — the AV-485
+        // program-surface fixture, paralleling the AV-256
+        // `funded_referral_escrow` helper in `referral_tests`.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_referrer(referrer, referral_bps)
+            .unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        e
+    }
+
+    #[test]
+    fn amend_referrer_program_maps_params_to_referrer_fields() {
+        // IDL: amend_referrer(referrer: Pubkey, referral_bps: u16) —
+        // referrer/referral_bps <- params; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The pair rewrites the `referrer` / `referral_bps` fields
+        // in place (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the two params and the AV-256 pure-logic method.
+        const R1: [u8; 32] = [0x11; 32];
+        const R2: [u8; 32] = [0x22; 32];
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_referrer")
+            .expect("INSTRUCTIONS carries amend_referrer");
+        assert_eq!(spec.method, "Escrow::amend_referrer");
+        assert_eq!(spec.params.len(), 2);
+        assert_eq!(spec.params[0].0, "referrer");
+        assert_eq!(spec.params[0].1, "Pubkey");
+        assert_eq!(spec.params[1].0, "referral_bps");
+        assert_eq!(spec.params[1].1, "u16");
+        assert!(
+            spec.input_mapping.contains("ReferrerAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the two args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_referrer\""),
+            "checked-in IDL carries amend_referrer"
+        );
+        assert!(
+            idl.contains("[158, 192, 229, 107, 26, 208, 0, 137]"),
+            "checked-in IDL pins the AV-485 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"referrer\", \"type\": \"publicKey\"}"),
+            "checked-in IDL carries the referrer arg"
+        );
+        assert!(
+            idl.contains("{\"name\": \"referral_bps\", \"type\": \"u16\"}"),
+            "checked-in IDL carries the referral_bps arg"
+        );
+        // Only the binding moves: the state, the amount, the
+        // referral already charged and the encoded length are
+        // untouched.
+        let mut e = referrer_funded_escrow(R1, 1_000);
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.referrer(), Some(R1));
+        assert_eq!(e.referral_bps(), 1_000);
+        assert_eq!(e.referral_for(1_000_000), 100_000);
+        assert_eq!(e.referral_paid(), 0);
+        e.amend_referrer(ALICE, BOB, R2, 500).unwrap();
+        assert_eq!(e.referrer(), Some(R2), "referrer revised");
+        assert_eq!(e.referral_bps(), 500, "rate revised");
+        assert_eq!(
+            e.referral_for(1_000_000),
+            50_000,
+            "the next release prices at the live rate"
+        );
+        assert_eq!(e.referral_paid(), 0, "no history rewritten");
+        assert_eq!(e.amount(), 1_000_000, "amount untouched");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "binding fields rewritten in place, no layout change"
+        );
+        // Uninitialized is the builder's domain: the referrer is
+        // bound there, not revised here.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_referrer(R1, 1_000)
+            .unwrap();
+        assert_eq!(
+            bare.amend_referrer(ALICE, BOB, R2, 500),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_referrer_program_rejects_single_party_and_strangers() {
+        // AV-485: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // re-point the other's referral.
+        const R1: [u8; 32] = [0x11; 32];
+        const R2: [u8; 32] = [0x22; 32];
+        let mut e = referrer_funded_escrow(R1, 1_000);
+        assert_eq!(
+            e.amend_referrer(ALICE, ALICE, R2, 500),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_referrer(MALLORY, BOB, R2, 500),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_referrer(MALLORY, MALLORY, R2, 500),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            (e.referrer(), e.referral_bps()),
+            (Some(R1), 1_000),
+            "failed revisions move nothing"
+        );
+        e.amend_referrer(ALICE, BOB, R2, 500).unwrap();
+        assert_eq!((e.referrer(), e.referral_bps()), (Some(R2), 500));
+    }
+
+    #[test]
+    fn amend_referrer_program_refuses_unfunded_disputed_terminal_and_paused() {
+        // AV-485: the builder owns the initial binding and the
+        // dispute window settles under the frozen binding. The pause
+        // guard fires before the authority and state gates — and
+        // unpausing a Funded escrow re-opens the revision (Funded
+        // is the allowed state).
+        const R1: [u8; 32] = [0x11; 32];
+        const R2: [u8; 32] = [0x22; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        // Activated: funding is the lock-in point, not activation.
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_referrer(R1, 1_000)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.amend_referrer(ALICE, BOB, R2, 500),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Disputed: the dispute window settles under the frozen
+        // binding.
+        let mut d = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_arbiter(ARBITER)
+            .unwrap()
+            .with_referrer(R1, 1_000)
+            .unwrap();
+        d.fund(ALICE, FUND_AT).unwrap();
+        let disputed_at = EXPIRES_AT - 3_500;
+        d.escalate(BOB, disputed_at, d.remaining_amount(), None, None, 0)
+            .unwrap();
+        assert_eq!(d.state(), EscrowState::Disputed);
+        assert_eq!(
+            d.amend_referrer(ALICE, BOB, R2, 500),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            (d.referrer(), d.referral_bps()),
+            (Some(R1), 1_000),
+            "disputed revision moves nothing"
+        );
+        // Terminal: a released escrow's binding is history, not
+        // policy.
+        let mut released = referrer_funded_escrow(R1, 1_000);
+        released
+            .release(ALICE, FUND_AT, 1_000_000, None, BOB)
+            .unwrap();
+        assert_eq!(released.state(), EscrowState::Released);
+        assert_eq!(
+            released.amend_referrer(ALICE, BOB, R2, 500),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(EscrowError::InvalidStateTransition.code(), 101);
+        assert_eq!((released.referrer(), released.referral_bps()), (Some(R1), 1_000));
+        // The pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap()
+            .with_referrer(R1, 1_000)
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_referrer(ALICE, BOB, R2, 500),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_referrer(MALLORY, BOB, R2, 500),
+            Err(EscrowError::Paused),
+            "even a stranger's revision on a paused escrow is Paused"
+        );
+        assert_eq!(EscrowError::Paused.code(), 124);
+        assert_eq!(
+            (paused.referrer(), paused.referral_bps()),
+            (Some(R1), 1_000),
+            "paused revision moves nothing"
+        );
+        paused.unpause(PAUSER).unwrap();
+        // Unpausing lifts the pause gate — and Funded is the
+        // allowed state, so the revision now lands.
+        paused.amend_referrer(ALICE, BOB, R2, 500).unwrap();
+        assert_eq!((paused.referrer(), paused.referral_bps()), (Some(R2), 500));
+    }
+
+    #[test]
+    fn amend_referrer_program_rejects_zero_referrer() {
+        // AV-485: the builder's gate, unchanged — a bound referrer
+        // must be a real key, or the referral would have nowhere to
+        // go; a failed amendment leaves the stored binding as it was.
+        const R1: [u8; 32] = [0x11; 32];
+        let mut e = referrer_funded_escrow(R1, 1_000);
+        assert_eq!(
+            e.amend_referrer(ALICE, BOB, [0u8; 32], 1_000),
+            Err(EscrowError::InvalidReferral)
+        );
+        assert_eq!(EscrowError::InvalidReferral.code(), 271);
+        assert_eq!(
+            (e.referrer(), e.referral_bps()),
+            (Some(R1), 1_000),
+            "failed revisions move nothing"
+        );
+        assert_eq!(e.referral_for(1_000_000), 100_000);
+    }
+
+    #[test]
+    fn amend_referrer_program_rejects_over_cap_rate() {
+        // AV-485: the builder's 20% cap, unchanged — a rate above
+        // MAX_REFERRAL_BPS is refused, while the cap itself and a
+        // 0 rate (no referral charged on later releases) are legal;
+        // a failed amendment leaves the stored binding as it was.
+        const R1: [u8; 32] = [0x11; 32];
+        const R2: [u8; 32] = [0x22; 32];
+        let mut e = referrer_funded_escrow(R1, 1_000);
+        assert_eq!(
+            e.amend_referrer(ALICE, BOB, R2, 2_001),
+            Err(EscrowError::InvalidReferral)
+        );
+        assert_eq!(
+            (e.referrer(), e.referral_bps()),
+            (Some(R1), 1_000),
+            "failed revisions move nothing"
+        );
+        e.amend_referrer(ALICE, BOB, R2, 2_000).unwrap();
+        assert_eq!((e.referrer(), e.referral_bps()), (Some(R2), 2_000));
+        assert_eq!(e.referral_for(1_000_000), 200_000, "the cap rate prices");
+        e.amend_referrer(ALICE, BOB, R2, 0).unwrap();
+        assert_eq!((e.referrer(), e.referral_bps()), (Some(R2), 0));
+        assert_eq!(e.referral_for(1_000_000), 0, "a 0 rate charges nothing");
+    }
+
+    #[test]
+    fn amend_referrer_program_binds_first_referrer_on_unbound_escrow() {
+        // AV-485: an escrow that never bound a referrer (no
+        // referral charged by default) gains its first referrer on
+        // amendment, and the next release charges it.
+        const R1: [u8; 32] = [0x11; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        assert_eq!(e.referrer(), None);
+        assert_eq!(e.referral_bps(), 0);
+        assert_eq!(e.referral_for(1_000_000), 0);
+        e.amend_referrer(ALICE, BOB, R1, 1_000).unwrap();
+        assert_eq!(e.referrer(), Some(R1));
+        assert_eq!(e.referral_bps(), 1_000);
+        let (payout, fee) = e.release(ALICE, FUND_AT, 1_000_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (900_000, 100_000));
+        assert_eq!(e.referral_paid(), 100_000);
+    }
+
+    #[test]
+    fn amend_referrer_program_noop_on_same_pair() {
+        // AV-485: re-affirming the current (referrer, rate) pair is
+        // a no-op — it succeeds, writes nothing, and (by the
+        // handler's before/after comparison) emits nothing.
+        const R1: [u8; 32] = [0x11; 32];
+        const R2: [u8; 32] = [0x22; 32];
+        let mut e = referrer_funded_escrow(R1, 1_000);
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_referrer(ALICE, BOB, R1, 1_000).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-pair re-affirmation writes nothing, so the handler emits nothing"
+        );
+        assert_eq!((e.referrer(), e.referral_bps()), (Some(R1), 1_000));
+        // Re-affirming again after a real change is the same no-op.
+        e.amend_referrer(ALICE, BOB, R2, 500).unwrap();
+        let after_change = super::account_space_tests::encode_escrow(&e);
+        e.amend_referrer(ALICE, BOB, R2, 500).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            after_change,
+            "re-affirming the revised pair writes nothing either"
+        );
+        assert_eq!((e.referrer(), e.referral_bps()), (Some(R2), 500));
+    }
+
+    #[test]
+    fn amend_referrer_program_emits_only_on_change() {
+        // AV-485: the program handler emits
+        // `ReferrerAmended` only when the binding
+        // actually changes — the before/after comparison in the
+        // handler skips the event on a no-op re-affirmation
+        // (mirrors `amend_penalty_escalation`). At the state-machine
+        // level the same-pair call writes nothing — the encoded
+        // escrow is byte-identical before and after, so there is
+        // nothing to emit about — while a real change rewrites the
+        // binding, which is what the handler's emission keys on.
+        // The INSTRUCTIONS entry pins the change-only event in the
+        // spec table.
+        const R1: [u8; 32] = [0x11; 32];
+        const R2: [u8; 32] = [0x22; 32];
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_referrer")
+            .expect("INSTRUCTIONS carries amend_referrer");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the change-only event"
+        );
+        let mut e = referrer_funded_escrow(R1, 1_000);
+        let before = super::account_space_tests::encode_escrow(&e);
+        e.amend_referrer(ALICE, BOB, R1, 1_000).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "same-pair re-affirmation writes nothing, so the handler emits nothing"
+        );
+        e.amend_referrer(ALICE, BOB, R2, 500).unwrap();
+        assert_eq!((e.referrer(), e.referral_bps()), (Some(R2), 500));
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&e),
+            before,
+            "a real change rewrites the binding, so the handler emits"
+        );
+    }
+
+    #[test]
+    fn amend_referrer_program_indexed_emits_event_noop_and_failed_emit_nothing() {
+        // AV-485: the program handler emits
+        // `ReferrerAmended` only when the binding
+        // actually changes — the indexed wrapper is the event-layer
+        // mirror of the handler's before/after comparison. A failed
+        // revision emits nothing, a no-op re-affirmation emits
+        // nothing.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const R1: [u8; 32] = [0x11; 32];
+        const R2: [u8; 32] = [0x22; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let funded = referrer_funded_escrow(R1, 1_000);
+        let mut e = IndexedEscrow::wrap([0x1D; 32], funded);
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_referrer(ALICE, ALICE, R2, 500, FUND_AT),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_referrer(ALICE, BOB, R2, 500, FUND_AT).unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::ReferrerAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Funded, EscrowState::Funded)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the same pair is a no-op: no new event.
+        e.amend_referrer(ALICE, BOB, R2, 500, FUND_AT).unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+    }
+
+    #[test]
+    fn amend_referrer_program_rebinds_referrer_and_next_release_charges_new_rate() {
+        // AV-485: the bound referrer moves R1 -> R2 in place, the
+        // rate moves 1_000 -> 500, and the next release charges the
+        // live binding — while referral already charged is never
+        // rewritten.
+        const R1: [u8; 32] = [0x11; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut e = referrer_funded_escrow(R1, 1_000);
+        let (payout, fee) = e.release(ALICE, FUND_AT, 400_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (360_000, 40_000));
+        assert_eq!(e.referral_paid(), 40_000);
+        let new_referrer = [0xDD; 32];
+        e.amend_referrer(ALICE, BOB, new_referrer, 500).unwrap();
+        assert_eq!(e.referrer(), Some(new_referrer));
+        assert_eq!(e.referral_bps(), 500);
+        assert_eq!(e.referral_paid(), 40_000, "amending rewrites no history");
+        assert_eq!(e.state(), EscrowState::Funded, "amending moves no state");
+        assert_eq!(e.referral_for(600_000), 30_000, "live rate prices the next release");
+        let (payout, fee) = e.release(ALICE, FUND_AT, 600_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (570_000, 30_000));
+        assert_eq!(e.referral_paid(), 70_000);
+        assert_eq!(e.state(), EscrowState::Released);
+    }
+
+    #[test]
+    fn amend_referrer_program_allows_direct_on_delay_opted_in() {
+        // AV-485: no delay path covers this method —
+        // `GovernanceAction` has no `AmendReferrer`
+        // variant and the pure logic carries no `via_delayed`
+        // gate, so the direct call is the only entry point and
+        // stays open on a delay-opted-in escrow (the AV-471
+        // `amend_twap_gate` precedent — gating it here would
+        // self-lock exactly the escrows that need it, since no
+        // delayed path could take the revision instead).
+        const R1: [u8; 32] = [0x11; 32];
+        const R2: [u8; 32] = [0x22; 32];
+        const FUND_AT: u64 = 1_700_000_000;
+        let mut delayed = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_referrer(R1, 1_000)
+            .unwrap()
+            .with_governance_delay(3_600)
+            .unwrap();
+        delayed.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(delayed.state(), EscrowState::Funded);
+        delayed.amend_referrer(ALICE, BOB, R2, 500).unwrap();
+        assert_eq!(
+            (delayed.referrer(), delayed.referral_bps()),
+            (Some(R2), 500),
+            "direct call stays open on a delay-opted-in escrow"
+        );
+        // And back again — the binding stays revisable.
+        delayed.amend_referrer(ALICE, BOB, R1, 1_000).unwrap();
+        assert_eq!((delayed.referrer(), delayed.referral_bps()), (Some(R1), 1_000));
+    }
+
     #[test]
     fn amend_panel_threshold_maps_params_to_arbiter_panel_field() {
         // IDL: amend_panel_threshold(new_threshold: u8) —
@@ -74285,6 +74772,29 @@ pub(crate) mod anchor_idl_tests {
             "amend_rent_payer",
             "new_payer",
             "rent_payer",
+        ),
+        // AV-485: the post-funding referrer revision
+        // rewrites the 33-byte `Option<Pubkey>` referrer region and
+        // the 2-byte `referral_bps` tail field in place — a second
+        // param source for both fields, like
+        // `amend_penalty_escalation`'s rate/cap pair. The fields'
+        // *initial* values come from the `with_referrer` builder
+        // (a state-machine method, not an instruction param, so it
+        // cannot appear in the param table); the param entries
+        // document the revision source. Only the binding moves —
+        // `referral_paid` is never rewritten, so a rate cut can
+        // never claw back referral already charged, and the next
+        // release charges the live binding at the live rate while a
+        // release already made keeps the referral it charged.
+        (
+            "amend_referrer",
+            "referrer",
+            "referrer",
+        ),
+        (
+            "amend_referrer",
+            "referral_bps",
+            "referral_bps",
         ),
         // AV-477: the post-funding arbiter-panel threshold
         // revision rewrites the 1-byte `threshold` field of the
@@ -104583,6 +105093,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_rent_payer"),
             [83, 107, 65, 245, 28, 1, 91, 4]
+        );
+    }
+
+    #[test]
+    fn amend_referrer_instruction_discriminator_is_pinned() {
+        // AV-485. IDL:
+        // sha256("global:amend_referrer")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_referrer"),
+            [158, 192, 229, 107, 26, 208, 0, 137]
         );
     }
 
