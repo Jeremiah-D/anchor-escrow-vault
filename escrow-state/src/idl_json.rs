@@ -340,6 +340,11 @@ fn arg_idl_type(spec_ty: &str) -> IdlType {
         // curve — a whole VestingCurve by value (tiers only; the
         // window is judged against the live schedule).
         "VestingCurve" => IdlType::Named("VestingCurve"),
+        // AV-495: the amend_vesting_schedule instruction's
+        // replacement schedule — a whole VestingSchedule by value
+        // (the program-side Vesting mirror struct, same three u64s;
+        // the named type already exists, so no new type is needed).
+        "VestingSchedule" => IdlType::Named("VestingSchedule"),
         "Option<[u8; 32]>" => IdlType::Option(Box::new(IdlType::Array(ArrayElem::U8, 32))),
         // AV-130: the initiate_release instruction's optional SPL mint
         // binding (a real pubkey, not raw bytes).

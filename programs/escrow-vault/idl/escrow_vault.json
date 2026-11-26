@@ -1654,6 +1654,14 @@
       ]
     },
     {
+      "name": "amend_vesting_schedule",
+      "discriminator": [105, 46, 154, 102, 162, 135, 214, 155],
+      "accounts": [],
+      "args": [
+        {"name": "schedule", "type": {"defined": "VestingSchedule"}}
+      ]
+    },
+    {
       "name": "amend_panel_threshold",
       "discriminator": [192, 166, 186, 13, 85, 249, 94, 78],
       "accounts": [],

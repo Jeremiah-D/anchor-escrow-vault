@@ -8551,6 +8551,99 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the linear vesting schedule after funding (AV-495;
+    /// mirrors `Escrow::amend_vesting_schedule`, the AV-230
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both initializer and taker sign — one party alone cannot
+    /// rewrite the unlock timeline on the other's share, paralleling
+    /// `amend_vesting_curve`. `Funded` only — the builder owns the
+    /// initial table via `with_vesting` (`Uninitialized`-only), and a
+    /// schedule-less escrow has nothing to amend (`InvalidVesting`,
+    /// code 107 — amendment never creates a schedule mid-flight).
+    /// The submitted window must be a valid `VestingSchedule`
+    /// (`new_with_cliff` rejects `start >= end` and a cliff past
+    /// `end` with `InvalidVesting`, code 107). The anti-clawback
+    /// floor: the new schedule priced at `now` — through the
+    /// attached curve when one is configured, linearly otherwise,
+    /// the AV-51 cliff gating inside the pricing — must vest at
+    /// least what the taker already claimed (`InvalidVesting`
+    /// otherwise, the failed table untouched). There is deliberately
+    /// no clearing path: the schedule rides as a `Vesting` by value,
+    /// never an `Option`, so a configured schedule cannot be removed
+    /// to `None`. No delay path covers this method —
+    /// `GovernanceAction` has no `AmendVestingSchedule` variant, so
+    /// the direct call is the only entry point and stays open on a
+    /// delay-opted-in escrow (the AV-471 `amend_twap_gate`
+    /// precedent). Re-affirming the current schedule is a no-op: it
+    /// succeeds, writes nothing and emits nothing. Only `vesting`
+    /// changes — the attached curve, the locked amount and the state
+    /// are untouched — and the 25-byte schedule region is already
+    /// resident, so the revision rewrites it in place with no layout
+    /// change. An attached curve keeps pricing against the new window
+    /// and an AV-150 vesting pause keeps applying to the amended
+    /// schedule, so the next `claim` prices against the new table the
+    /// moment the amendment lands, while an amount already claimed
+    /// keeps the table it settled under. Emits
+    /// `VestingScheduleAmended` (from == to == the current state)
+    /// only on an actual change; a no-op re-affirmation stays silent
+    /// (mirrors `amend_vesting_curve`). `now` comes from the clock
+    /// sysvar, never an instruction param (mirrors
+    /// `amend_vesting_curve`).
+    pub fn amend_vesting_schedule(
+        ctx: Context<AmendVestingSchedule>,
+        schedule: Vesting,
+    ) -> Result<()> {
+        // The mirror schedule carries the window only — the
+        // conversion validates it here (`new_with_cliff` rejects an
+        // inverted window or a cliff past the end); the state
+        // machine re-checks the anti-clawback floor against the
+        // claimed amount. `new_with_cliff` normalizes a cliff at or
+        // before `start` to `start`, so a zero cliff is the no-cliff
+        // schedule (mirroring `initialize_vesting`).
+        let state_schedule = escrow_state::VestingSchedule::new_with_cliff(
+            schedule.start,
+            schedule.end,
+            schedule.cliff_at,
+        )
+        .map_err(|e| escrow_error(e))?;
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.vesting_schedule();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_vesting_schedule(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                state_schedule,
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 25-byte `vesting` region in place — no
+        // realloc. Only the schedule moves; the attached curve, the
+        // locked amount and the state are untouched. Emits only on an
+        // actual change; a same-schedule no-op stays silent (mirrors
+        // `amend_vesting_curve`).
+        if escrow.vesting_schedule() != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::VestingScheduleAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the Dutch auction's reserve floor after funding (AV-473;
     /// mirrors `Escrow::amend_dutch_auction_reserve_bps`, the AV-277
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -17549,6 +17642,23 @@ pub struct AmendPriceGate<'info> {
 /// `Unauthorized`).
 #[derive(Accounts)]
 pub struct AmendTwapGate<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
+}
+
+/// AV-495: accounts for `amend_vesting_schedule` — the
+/// linear-schedule revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`). The replacement schedule rides as an
+/// instruction param, not an account.
+#[derive(Accounts)]
+pub struct AmendVestingSchedule<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Unconditional dual-signature governance: both initializer and

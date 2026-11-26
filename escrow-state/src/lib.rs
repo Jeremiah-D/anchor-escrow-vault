@@ -43368,6 +43368,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "due_at <- param (Vec<u64>); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial table via with_milestone_due_dates); no delay path covers this method — GovernanceAction has no AmendMilestoneDueDates variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); no plan attached, a table-less escrow, a wrong tranche count, a zero or past due for an unsettled tranche, or a non-increasing final table is InvalidMilestones (code 110, the fail-closed gate) leaving the original table untouched — amendment never creates a table mid-flight; re-affirming the current table is a no-op (succeeds, writes nothing, emits no event, paralleling amend_milestones); only milestone_due_dates changes — the plan amounts, the AV-206 penalty rate and the AV-225 claim deadlines are untouched, so the next release_milestone prices late penalties against the amended dates for unsettled tranches while settled tranches keep the dues they settled under; emits the MilestoneDueDatesAmended indexer event only on an actual change (from == to == the current state, all amounts zero); `now` <- clock sysvar on the Anchor layer (never an instruction param — here both for the no-past-due rule and the event timestamp, read once); the 8-slot deadline table is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-495: revise the linear vesting schedule after
+            // funding — the program-level entry point for the
+            // AV-230 pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_vesting_schedule")[..8]
+            // = [105, 46, 154, 102, 162, 135, 214, 155] — the Anchor
+            // instruction discriminator for the
+            // amend_vesting_schedule handler (pinned by the
+            // discriminator test below).
+            name: "amend_vesting_schedule",
+            params: &[(
+                "schedule",
+                "VestingSchedule",
+                "instruction param; the replacement linear unlock window as a whole — start/end/cliff_at, the program-side Vesting mirror struct (same three u64s), validated by VestingSchedule::new_with_cliff at the program layer (an inverted window or a cliff past the end is InvalidVesting, code 107) and re-checked against the claimed amount by the state machine",
+            )],
+            method: "Escrow::amend_vesting_schedule",
+            input_mapping: "schedule <- param; initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial table via with_vesting); only a schedule already configured may be revised — a schedule-less escrow is InvalidVesting (code 107, fail-closed: post-funding installation would price the unlock under a window the taker never funded under); the new schedule must be a valid VestingSchedule (construction already rejects start >= end and cliff_at > end, InvalidVesting, code 107) and its vested amount at now — priced through the attached curve when one is configured, linearly otherwise, the AV-51 cliff gating inside the pricing — must be at least what the taker already claimed, otherwise InvalidVesting (the fail-closed anti-clawback floor) leaving the original schedule untouched; no delay path covers this method — GovernanceAction has no AmendVestingSchedule variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); there is deliberately no clearing path (the schedule rides as a Vesting by value, never an Option, so a configured schedule cannot be removed to None); re-affirming the current schedule is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only vesting changes — the attached curve, the locked amount and the state are untouched, so the next claim prices against the amended table (an attached curve keeps pricing against the new window and a vesting pause keeps applying to the amended schedule) while an amount already claimed keeps the table it settled under; emits the VestingScheduleAmended indexer event only on an actual change (from == to == the current state, all amounts zero); `now` <- clock sysvar on the Anchor layer (never an instruction param — here both for the anti-clawback floor and the event timestamp, read once); the 25-byte vesting region is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-477: revise the arbiter panel's judgment threshold
             // after funding — the program-level entry point for the
             // AV-378 pure-logic revision. IDL:
@@ -44580,6 +44598,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-231 pure-logic
             // revision wired to the chain).
             "Escrow::amend_milestone_due_dates",
+            // AV-495: the program-level linear-vesting-schedule
+            // revision (the AV-230 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_vesting_schedule",
             // AV-477: the program-level arbiter-panel
             // threshold revision (the AV-378 pure-logic
             // revision wired to the chain).
@@ -45365,6 +45387,14 @@ pub(crate) mod anchor_idl_tests {
                 // keeps the due it settled under; re-affirming the
                 // current table is a no-op.
                 &"amend_milestone_due_dates",
+                // AV-495: the schedule revision carries the
+                // replacement window (VestingSchedule) — the whole
+                // linear table, start/end/cliff_at; only the
+                // still-unvested part may move, so the next claim
+                // prices against the amended table while an amount
+                // already claimed keeps the table it settled under;
+                // re-affirming the current schedule is a no-op.
+                &"amend_vesting_schedule",
                 // AV-477: the panel-threshold revision carries
                 // the replacement threshold (u8) — the threshold
                 // alone; the next dispute tallies under the live
@@ -71679,6 +71709,307 @@ pub(crate) mod anchor_idl_tests {
         assert_eq!(e.milestone_due_at(0), Some(1_750_000_000));
     }
 
+    // AV-495: the program-level linear-vesting-schedule revision —
+    // the AV-230 pure-logic revision wired to the chain.
+    fn funded_vesting_escrow() -> Escrow {
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
+            .unwrap();
+        e = e.with_pause_authority([0xDD; 32]).unwrap();
+        e.fund(ALICE, EXPIRES_AT - 3_600).unwrap();
+        e
+    }
+
+    #[test]
+    fn amend_vesting_schedule_maps_param_to_vesting_field() {
+        // IDL: amend_vesting_schedule(schedule: VestingSchedule) —
+        // schedule <- param; initializer <- accounts.initializer
+        // (signer) AND taker <- accounts.taker (signer), enforced
+        // by the Anchor account constraints and the state machine's
+        // dual-signature gate. The param rewrites the `vesting`
+        // region in place (see PARAM_FIELD_MAP) — no layout change.
+        // The INSTRUCTIONS spec entry pins the program-level wiring:
+        // the single schedule param and the AV-230 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_vesting_schedule")
+            .expect("INSTRUCTIONS carries amend_vesting_schedule");
+        assert_eq!(spec.method, "Escrow::amend_vesting_schedule");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "schedule");
+        assert_eq!(spec.params[0].1, "VestingSchedule");
+        assert!(
+            spec.input_mapping.contains("VestingScheduleAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the schedule arg (the
+        // VestingSchedule named type — the program-side Vesting
+        // mirror, same three u64s).
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_vesting_schedule\""),
+            "checked-in IDL carries amend_vesting_schedule"
+        );
+        assert!(
+            idl.contains("[105, 46, 154, 102, 162, 135, 214, 155]"),
+            "checked-in IDL pins the AV-495 discriminator"
+        );
+        assert!(
+            idl.contains(
+                "{\"name\": \"schedule\", \"type\": {\"defined\": \"VestingSchedule\"}}"
+            ),
+            "checked-in IDL carries the schedule arg"
+        );
+        // The param maps to exactly the vesting region — and the
+        // region is no longer a field source (every field gets
+        // exactly one source kind).
+        assert!(
+            PARAM_FIELD_MAP.contains(&(
+                "amend_vesting_schedule",
+                "schedule",
+                "vesting"
+            )),
+            "PARAM_FIELD_MAP carries the schedule mapping"
+        );
+        // Only the schedule moves: the amounts, the state and the
+        // layout are untouched.
+        let mut e = funded_vesting_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let stretched = VestingSchedule::new(VEST_START - 25_000_000, VEST_END + 25_000_000)
+            .unwrap();
+        e.amend_vesting_schedule(ALICE, BOB, stretched, VEST_START)
+            .unwrap();
+        assert_eq!(e.vesting_schedule(), Some(stretched));
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.fees_paid(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "schedule rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_vesting_schedule_rejects_single_party_and_strangers() {
+        // AV-495: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // rewrite the unlock timeline on the other's funds.
+        let mut e = funded_vesting_escrow();
+        let stretched = VestingSchedule::new(VEST_START, VEST_END + 50_000_000).unwrap();
+        assert_eq!(
+            e.amend_vesting_schedule(ALICE, ALICE, stretched, VEST_START),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_vesting_schedule(MALLORY, BOB, stretched, VEST_START),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_vesting_schedule(MALLORY, MALLORY, stretched, VEST_START),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.vesting_schedule(),
+            Some(VestingSchedule::new(VEST_START, VEST_END).unwrap()),
+            "failed revisions write nothing"
+        );
+        e.amend_vesting_schedule(ALICE, BOB, stretched, VEST_START)
+            .unwrap();
+        assert_eq!(e.vesting_schedule(), Some(stretched));
+    }
+
+    #[test]
+    fn amend_vesting_schedule_refuses_unfunded_scheduleless_and_paused() {
+        // AV-495: Funded-only — the Uninitialized builder owns the
+        // initial schedule, and a schedule-less escrow has nothing
+        // to amend (amendment never creates a schedule). The pause
+        // guard fires before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        const NOW: u64 = VEST_START;
+        let stretched = VestingSchedule::new(VEST_START, VEST_END + 50_000_000).unwrap();
+        // Uninitialized: the schedule is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_vesting(VestingSchedule::new(VEST_START, VEST_END).unwrap())
+            .unwrap();
+        assert_eq!(
+            bare.amend_vesting_schedule(ALICE, BOB, stretched, NOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            bare.vesting_schedule(),
+            Some(VestingSchedule::new(VEST_START, VEST_END).unwrap())
+        );
+        // Funded but schedule-less: amendment never creates one.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            plain.amend_vesting_schedule(ALICE, BOB, stretched, NOW),
+            Err(EscrowError::InvalidVesting)
+        );
+        assert_eq!(EscrowError::InvalidVesting.code(), 107);
+        // A paused escrow refuses even for both parties, and the
+        // pause beats the authority gate for a stranger too.
+        let mut paused = funded_vesting_escrow();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_vesting_schedule(ALICE, BOB, stretched, NOW),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_vesting_schedule(MALLORY, MALLORY, stretched, NOW),
+            Err(EscrowError::Paused),
+            "pause beats authority"
+        );
+        assert_eq!(
+            paused.vesting_schedule(),
+            Some(VestingSchedule::new(VEST_START, VEST_END).unwrap()),
+            "failed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow settles under the schedule
+        // it had.
+        let mut cancelled = funded_vesting_escrow();
+        cancelled.cancel(ALICE, None, ALICE, FUND_AT).unwrap();
+        assert_eq!(cancelled.state(), EscrowState::Cancelled);
+        assert_eq!(
+            cancelled.amend_vesting_schedule(ALICE, BOB, stretched, NOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_vesting_schedule_program_rejects_clawback_untouched() {
+        // AV-495: every failed revision is refused with
+        // InvalidVesting (code 107) and the stored schedule is
+        // untouched — the program handler's before/after compare
+        // never sees a write on a failed call, so no event fires
+        // either.
+        let mut e = funded_vesting_escrow();
+        // Half claimed at the midpoint; a stretched window that
+        // would vest only a quarter at that moment rewrites the
+        // settled half backwards — refused, schedule untouched.
+        let (payout, _) = e.claim(BOB, VEST_MID, None, BOB).unwrap();
+        assert_eq!(payout, 500_000);
+        assert_eq!(e.released_amount(), 500_000);
+        let encoded = super::account_space_tests::encode_escrow(&e);
+        let stretched = VestingSchedule::new(VEST_START, VEST_END + 100_000_000).unwrap();
+        assert_eq!(
+            e.amend_vesting_schedule(ALICE, BOB, stretched, VEST_MID),
+            Err(EscrowError::InvalidVesting)
+        );
+        assert_eq!(
+            e.vesting_schedule(),
+            Some(VestingSchedule::new(VEST_START, VEST_END).unwrap()),
+            "a failed amendment leaves the schedule untouched"
+        );
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            encoded,
+            "failed revisions write nothing"
+        );
+        assert_eq!(e.released_amount(), 500_000);
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_vesting_schedule_program_reshapes_only_unvested() {
+        // AV-495: claim a quarter, then stretch the window
+        // backwards and forwards: the new schedule still vests at
+        // least the claimed quarter at amendment time, and later
+        // claims price against the new table, not the old one. The
+        // table is rewritten in place: the encoded length never
+        // moves, and an attached curve keeps pricing against the new
+        // window instead of being touched.
+        let mut e = funded_vesting_escrow();
+        let quarter = VEST_START + (VEST_END - VEST_START) / 4;
+        let (payout, _) = e.claim(BOB, quarter, None, BOB).unwrap();
+        assert_eq!(payout, 250_000);
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        let stretched = VestingSchedule::new(VEST_START - 25_000_000, VEST_END + 25_000_000)
+            .unwrap();
+        e.amend_vesting_schedule(ALICE, BOB, stretched, quarter)
+            .unwrap();
+        assert_eq!(e.vesting_schedule(), Some(stretched));
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "table rewritten in place, no layout change"
+        );
+        // At the old end the new table has vested 833_333, so the
+        // next pull is 833_333 - 250_000, not the old 750_000.
+        let (payout, _) = e.claim(BOB, VEST_END, None, BOB).unwrap();
+        assert_eq!(payout, 583_333);
+        assert_eq!(e.released_amount(), 833_333);
+        // An attached curve is untouched by a schedule revision and
+        // keeps pricing against the new window.
+        let mut e = funded_curved_vesting_escrow();
+        e.amend_vesting_schedule(ALICE, BOB, stretched, VEST_START)
+            .unwrap();
+        assert_eq!(e.vesting_schedule(), Some(stretched));
+        assert_eq!(
+            e.vesting_curve(),
+            Some(floor_curve()),
+            "the attached curve is untouched"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_vesting_schedule_noop_on_same_schedule() {
+        // AV-495: re-affirming the current schedule is a no-op — it
+        // succeeds, writes nothing and emits nothing, so the indexer
+        // is never re-notified for a revision that changed nothing.
+        // (The program handler compares the before/after schedules
+        // and only emits VestingScheduleAmended on a real change.)
+        let mut e = funded_vesting_escrow();
+        let encoded = super::account_space_tests::encode_escrow(&e);
+        e.amend_vesting_schedule(
+            ALICE,
+            BOB,
+            VestingSchedule::new(VEST_START, VEST_END).unwrap(),
+            VEST_START,
+        )
+        .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            encoded,
+            "same-schedule re-affirmation writes nothing"
+        );
+        assert_eq!(
+            e.vesting_schedule(),
+            Some(VestingSchedule::new(VEST_START, VEST_END).unwrap())
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        // A submission that differs only in a pre-start cliff is the
+        // same no-op: the constructor normalizes the cliff to `start`.
+        let encoded = super::account_space_tests::encode_escrow(&e);
+        e.amend_vesting_schedule(
+            ALICE,
+            BOB,
+            VestingSchedule::new_with_cliff(VEST_START, VEST_END, 0).unwrap(),
+            VEST_START,
+        )
+        .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            encoded,
+            "cliff-only difference writes nothing"
+        );
+        assert_eq!(
+            e.vesting_schedule(),
+            Some(VestingSchedule::new(VEST_START, VEST_END).unwrap())
+        );
+    }
+
     #[test]
     fn amend_panel_threshold_maps_params_to_arbiter_panel_field() {
         // IDL: amend_panel_threshold(new_threshold: u8) —
@@ -78437,6 +78768,19 @@ pub(crate) mod anchor_idl_tests {
             "curve",
             "vesting_curve",
         ),
+        // AV-495: the post-funding vesting-schedule revision
+        // rewrites the 25-byte `vesting` region in place — a
+        // second param source for `vesting`, like
+        // `initialize_vesting`'s start/end/cliff params. Only the
+        // schedule moves — the attached curve, the locked amount
+        // and the state are untouched, so the next claim prices
+        // through the new window live, while an amount already
+        // claimed keeps the table it settled under.
+        (
+            "amend_vesting_schedule",
+            "schedule",
+            "vesting",
+        ),
         // AV-473: the post-funding Dutch-auction reserve-floor
         // revision rewrites the 2-byte `reserve_bps` field in
         // place — a second param source for the `auction`
@@ -79572,7 +79916,8 @@ pub(crate) mod anchor_idl_tests {
 
     /// Every vault field path from `VAULT_FIELDS`, with `quorum` unfolded
     /// into its serialized subfields, `vesting` unfolded into
-    /// start/end/cliff_at (AV-51), and `milestones` unfolded into
+    /// start/end/cliff_at (AV-51) and kept as a whole region (AV-495:
+    /// the amend_vesting_schedule target), and `milestones` unfolded into
     /// amounts/count (order matches Borsh layout).
     fn vault_field_paths() -> Vec<&'static str> {
         let mut paths = Vec::new();
@@ -79586,6 +79931,11 @@ pub(crate) mod anchor_idl_tests {
                     "quorum.approvals",
                 ]);
             } else if *name == "vesting" {
+                // AV-495: the whole schedule region (the
+                // amend_vesting_schedule target) plus its sub-fields,
+                // for the dotted param mappings like `vesting.start`
+                // (the initialize_vesting builder's targets).
+                paths.push(name);
                 paths.extend(["vesting.start", "vesting.end", "vesting.cliff_at"]);
             } else if *name == "milestones" {
                 paths.extend(["milestones.amounts", "milestones.count"]);
@@ -109119,6 +109469,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_milestone_due_dates"),
             [203, 126, 234, 218, 113, 51, 111, 23]
+        );
+    }
+
+    #[test]
+    fn amend_vesting_schedule_instruction_discriminator_is_pinned() {
+        // AV-495. IDL:
+        // sha256("global:amend_vesting_schedule")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_vesting_schedule"),
+            [105, 46, 154, 102, 162, 135, 214, 155]
         );
     }
 
