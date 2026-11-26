@@ -43312,6 +43312,25 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "amount <- param; expiry <- param; authority <- accounts.taker (signer) — taker-only governance, the offer is the proposer's (the initializer or a stranger is Unauthorized, code 100, checked after pause and before state); a paused escrow fails fast (Paused, code 124, before the authority gate, with a due auto-recovery schedule lifting first, AV-133); CounterOffered only (InvalidStateTransition, code 101, otherwise — Funded has no live offer to revise, terminal states have no negotiation left; the builder owns the initial offer via propose_counter_offer); nothing may have been released yet (released != 0 is InvalidStateTransition); the new terms reuse the propose gates (amount == 0 or expiry <= now is InvalidCounterOffer, code 180, and the original offer is untouched); no delay path covers this method — GovernanceAction has no AmendCounterOffer variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current terms is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only counter_offer{amount, expiry} changes — the escrow's amount, expires_at, released total and state are untouched, and the next accept re-prices under the live offer (accept_counter_offer reads it at answer time) while an accept already settled keeps the terms it settled under; emits the CounterOfferAmended indexer event only on an actual change (from == to == the current state; all amounts zero — amending moves no funds); `now` <- clock sysvar on the Anchor layer (never an instruction param — it feeds both the pure logic's now, for terms validity against the clock, the deadman clock and auto-unpause, and the event timestamp); the 17-byte counter_offer region is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-492: revise the live operator grant's scope bitmap
+            // after funding — the program-level entry point for the
+            // AV-296 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_delegation_scopes")[..8]
+            // = [88, 193, 103, 254, 0, 9, 19, 44] — the Anchor
+            // instruction discriminator for the
+            // amend_delegation_scopes handler (pinned by the
+            // discriminator test below).
+            name: "amend_delegation_scopes",
+            params: &[(
+                "new_scopes",
+                "u32",
+                "instruction param; the replacement scope bitmap — the operator's powers from the next operator call; an empty bitmap or bits outside DELEGATION_SCOPE_MASK is InvalidDelegation (code 160)",
+            )],
+            method: "Escrow::amend_delegation_scopes",
+            input_mapping: "caller <- accounts.caller (signer) — either the initializer or the taker alone may revise (the operator being revised does not sign, so a compromised operator cannot block its own powers being cut, the rotate_arbiter reasoning); new_scopes <- param (u32); Uninitialized / Funded only (InvalidStateTransition otherwise — terminal states and Disputed); only an escrow with a live grant may revise (InvalidDelegation, code 160, when there is no grant to revise); an empty bitmap or bits outside DELEGATION_SCOPE_MASK is InvalidDelegation (code 160, the fail-closed gate) leaving the original bitmap untouched; revising to the current bitmap is an idempotent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); a paused escrow fails fast (Paused); no delay path covers this method — GovernanceAction has no AmendDelegationScopes variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); emits no event (the revision is an in-place bitmap rewrite of the same grant slot, like renew_delegation); only delegation.scopes changes — operator, spend_cap, spent and the expiry window are untouched, and spent is never cleared, so the cap keeps binding the grant's cumulative volume; the operator paths read the live bitmap on every call, so narrowing revokes a power at once while widening grants it at once, with no settled call ever re-judged; no clock/sysvar input to the method; the scopes field is rewritten in place — no layout / rent change",
+        },
+        InstructionSpec {
             // AV-477: revise the arbiter panel's judgment threshold
             // after funding — the program-level entry point for the
             // AV-378 pure-logic revision. IDL:
@@ -44512,6 +44531,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-285 pure-logic
             // revision wired to the chain).
             "Escrow::amend_counter_offer",
+            // AV-492: the program-level delegation-scope
+            // revision (the AV-296 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_delegation_scopes",
             // AV-477: the program-level arbiter-panel
             // threshold revision (the AV-378 pure-logic
             // revision wired to the chain).
@@ -45275,6 +45298,13 @@ pub(crate) mod anchor_idl_tests {
                 // state are untouched until the initializer answers;
                 // re-affirming the current terms is a no-op.
                 &"amend_counter_offer",
+                // AV-492: the scope revision carries the replacement
+                // bitmap (u32) — the bitmap alone; only the scopes
+                // move, so the operator paths re-judge the next call
+                // under the live bitmap while a call already settled
+                // is never re-judged; re-affirming the current
+                // bitmap is a no-op.
+                &"amend_delegation_scopes",
                 // AV-477: the panel-threshold revision carries
                 // the replacement threshold (u8) — the threshold
                 // alone; the next dispute tallies under the live
@@ -70599,6 +70629,348 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn amend_delegation_scopes_maps_param_to_delegation_field() {
+        // IDL: amend_delegation_scopes(new_scopes: u32) —
+        // new_scopes <- param; caller <-
+        // accounts.caller (signer), enforced by the Anchor account
+        // constraints and the state machine's party-only gate.
+        // The param rewrites the `scopes` field of the
+        // `delegation` region in place (see PARAM_FIELD_MAP) — no
+        // layout change. The INSTRUCTIONS spec entry pins the
+        // program-level wiring: the single u32 param and the
+        // AV-296 pure-logic method.
+        const OPERATOR: [u8; 32] = [0x0D; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        fn full_scopes() -> u32 {
+            DELEGATION_SCOPE_FUND | DELEGATION_SCOPE_RELEASE | DELEGATION_SCOPE_CANCEL
+        }
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_delegation_scopes")
+            .expect("INSTRUCTIONS carries amend_delegation_scopes");
+        assert_eq!(spec.method, "Escrow::amend_delegation_scopes");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "new_scopes");
+        assert_eq!(spec.params[0].1, "u32");
+        assert!(
+            spec.input_mapping.contains("InvalidDelegation"),
+            "input_mapping documents the fail-closed gate"
+        );
+        assert!(
+            spec.input_mapping.contains("emits no event"),
+            "input_mapping documents the no-event design"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single u32 arg.
+        let idl = std::fs::read_to_string("../programs/escrow-vault/idl/escrow_vault.json")
+            .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_delegation_scopes\""),
+            "checked-in IDL carries amend_delegation_scopes"
+        );
+        assert!(
+            idl.contains("[88, 193, 103, 254, 0, 9, 19, 44]"),
+            "checked-in IDL pins the AV-492 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"new_scopes\", \"type\": \"u32\"}"),
+            "checked-in IDL carries the new_scopes arg"
+        );
+        // Only the scopes move: the operator, the spend cap, the
+        // settled spent counter and the expiry window are untouched.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.delegate_authority(ALICE, OPERATOR, full_scopes()).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e.renew_delegation(ALICE, EXPIRES_AT + 1_000).unwrap();
+        e.amend_delegation_scopes(ALICE, DELEGATION_SCOPE_RELEASE)
+            .unwrap();
+        let grant = e.delegation().expect("grant survives the revision");
+        assert_eq!(grant.delegate(), OPERATOR, "operator untouched");
+        assert_eq!(grant.scopes(), DELEGATION_SCOPE_RELEASE, "scopes replaced");
+        assert_eq!(grant.spend_cap(), 0, "uncapped grant stays uncapped");
+        assert_eq!(grant.spent(), 0, "spent untouched");
+        assert_eq!(
+            e.delegation_expires_at(),
+            Some(EXPIRES_AT + 1_000),
+            "expiry untouched"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_delegation_scopes_rejects_strangers_and_operator() {
+        // AV-492: either party may revise — the initializer or the
+        // taker alone — but a stranger, or the operator themselves,
+        // is Unauthorized; the grant is the parties', and the
+        // operator must never be able to widen their own powers.
+        const OPERATOR: [u8; 32] = [0x0D; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        fn full_scopes() -> u32 {
+            DELEGATION_SCOPE_FUND | DELEGATION_SCOPE_RELEASE | DELEGATION_SCOPE_CANCEL
+        }
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.delegate_authority(ALICE, OPERATOR, full_scopes()).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            e.amend_delegation_scopes(MALLORY, DELEGATION_SCOPE_RELEASE),
+            Err(EscrowError::Unauthorized),
+            "stranger cannot revise"
+        );
+        assert_eq!(
+            e.amend_delegation_scopes(OPERATOR, DELEGATION_SCOPE_RELEASE),
+            Err(EscrowError::Unauthorized),
+            "the operator cannot revise their own grant"
+        );
+        assert_eq!(
+            e.delegation().unwrap().scopes(),
+            full_scopes(),
+            "failed revision writes nothing"
+        );
+        // Either party may revise: the initializer narrows, the
+        // taker widens back.
+        e.amend_delegation_scopes(ALICE, DELEGATION_SCOPE_RELEASE)
+            .unwrap();
+        assert_eq!(
+            e.delegation().unwrap().scopes(),
+            DELEGATION_SCOPE_RELEASE
+        );
+        e.amend_delegation_scopes(BOB, full_scopes()).unwrap();
+        assert_eq!(e.delegation().unwrap().scopes(), full_scopes());
+    }
+
+    #[test]
+    fn amend_delegation_scopes_refuses_without_grant_and_bad_bitmap() {
+        // AV-492: no live grant is InvalidDelegation (code 160), and
+        // the bitmap gate is fail-closed — an empty bitmap or bits
+        // outside DELEGATION_SCOPE_MASK is the same code, leaving the
+        // original bitmap untouched.
+        const OPERATOR: [u8; 32] = [0x0D; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        fn full_scopes() -> u32 {
+            DELEGATION_SCOPE_FUND | DELEGATION_SCOPE_RELEASE | DELEGATION_SCOPE_CANCEL
+        }
+        assert_eq!(EscrowError::InvalidDelegation.code(), 160);
+        // No live grant: a plain funded escrow refuses.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            plain.amend_delegation_scopes(ALICE, DELEGATION_SCOPE_RELEASE),
+            Err(EscrowError::InvalidDelegation)
+        );
+        // A revoked grant refuses too.
+        let mut revoked = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        revoked
+            .delegate_authority(ALICE, OPERATOR, full_scopes())
+            .unwrap();
+        revoked.fund(ALICE, FUND_AT).unwrap();
+        revoked.revoke_delegation(ALICE).unwrap();
+        assert_eq!(revoked.delegation(), None);
+        assert_eq!(
+            revoked.amend_delegation_scopes(ALICE, DELEGATION_SCOPE_RELEASE),
+            Err(EscrowError::InvalidDelegation)
+        );
+        // Bad bitmaps fail closed on a live grant.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.delegate_authority(ALICE, OPERATOR, full_scopes()).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        for bad in [0, DELEGATION_SCOPE_MASK + 1, u32::MAX] {
+            assert_eq!(
+                e.amend_delegation_scopes(ALICE, bad),
+                Err(EscrowError::InvalidDelegation),
+                "bitmap {bad:#x} must be refused"
+            );
+            assert_eq!(
+                e.delegation().unwrap().scopes(),
+                full_scopes(),
+                "failed revision writes nothing"
+            );
+        }
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_delegation_scopes_refuses_terminal_and_paused() {
+        // AV-492: only Uninitialized / Funded — a terminal escrow
+        // refuses with InvalidStateTransition, and the pause guard
+        // fires before the authority and state gates: even a party's
+        // own amendment on a paused escrow is Paused.
+        const OPERATOR: [u8; 32] = [0x0D; 32];
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        fn full_scopes() -> u32 {
+            DELEGATION_SCOPE_FUND | DELEGATION_SCOPE_RELEASE | DELEGATION_SCOPE_CANCEL
+        }
+        let mut cancelled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        cancelled
+            .delegate_authority(ALICE, OPERATOR, full_scopes())
+            .unwrap();
+        cancelled.fund(ALICE, FUND_AT).unwrap();
+        cancelled.cancel(ALICE, None, ALICE, FUND_AT).unwrap();
+        assert_eq!(cancelled.state(), EscrowState::Cancelled);
+        assert_eq!(
+            cancelled.amend_delegation_scopes(ALICE, DELEGATION_SCOPE_RELEASE),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            cancelled.delegation().unwrap().scopes(),
+            full_scopes(),
+            "failed revision writes nothing"
+        );
+        // A paused escrow refuses even for the initializer, and the
+        // pause beats the authority gate for a stranger too.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        paused
+            .delegate_authority(ALICE, OPERATOR, full_scopes())
+            .unwrap();
+        paused.fund(ALICE, FUND_AT).unwrap();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_delegation_scopes(ALICE, DELEGATION_SCOPE_RELEASE),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_delegation_scopes(MALLORY, DELEGATION_SCOPE_RELEASE),
+            Err(EscrowError::Paused),
+            "pause beats authority"
+        );
+        assert_eq!(
+            paused.delegation().unwrap().scopes(),
+            full_scopes(),
+            "failed revision writes nothing"
+        );
+        // Uninitialized is allowed: the grant may be retuned before
+        // funds move.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        bare.delegate_authority(ALICE, OPERATOR, full_scopes())
+            .unwrap();
+        bare.amend_delegation_scopes(BOB, DELEGATION_SCOPE_FUND)
+            .unwrap();
+        assert_eq!(
+            bare.delegation().unwrap().scopes(),
+            DELEGATION_SCOPE_FUND
+        );
+        assert_eq!(bare.state(), EscrowState::Uninitialized);
+    }
+
+    #[test]
+    fn amend_delegation_scopes_program_revises_only_scopes() {
+        // AV-492: the operator paths read the live bitmap on every
+        // call, so narrowing revokes a power at once while widening
+        // grants it at once — and only the scopes move: the
+        // operator, the spend cap, the settled spent counter and the
+        // expiry window are untouched, and the encoded length never
+        // moves (the scopes field is rewritten in place).
+        const OPERATOR: [u8; 32] = [0x0D; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        fn full_scopes() -> u32 {
+            DELEGATION_SCOPE_FUND | DELEGATION_SCOPE_RELEASE | DELEGATION_SCOPE_CANCEL
+        }
+        // Narrowing cuts the fund power at once; widening restores
+        // it at once — judged live at each call.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.delegate_authority(ALICE, OPERATOR, full_scopes()).unwrap();
+        e.amend_delegation_scopes(ALICE, DELEGATION_SCOPE_RELEASE)
+            .unwrap();
+        assert_eq!(
+            e.fund(OPERATOR, NOW),
+            Err(EscrowError::Unauthorized),
+            "fund bit revoked — operator cannot fund"
+        );
+        e.amend_delegation_scopes(BOB, full_scopes()).unwrap();
+        e.fund(OPERATOR, NOW).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        // Dropping the release bit cuts payouts at once, while the
+        // initializer's own release is unaffected.
+        e.amend_delegation_scopes(ALICE, DELEGATION_SCOPE_FUND)
+            .unwrap();
+        assert_eq!(
+            e.release(OPERATOR, NOW, 100_000, None, BOB),
+            Err(EscrowError::Unauthorized),
+            "release bit revoked — operator cannot release"
+        );
+        let (payout, fee) = e.release(ALICE, NOW, 100_000, None, BOB).unwrap();
+        assert_eq!((payout, fee), (100_000, 0));
+        // A capped grant with settled volume keeps its cap, spent
+        // and expiry across the revision.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.delegate_authority(ALICE, OPERATOR, full_scopes()).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e.delegate_authority_with_spend_cap(
+            ALICE,
+            OPERATOR,
+            DELEGATION_SCOPE_RELEASE,
+            500_000,
+        )
+        .unwrap();
+        e.release(OPERATOR, NOW, 400_000, None, BOB).unwrap();
+        assert_eq!(e.delegation().unwrap().spent(), 400_000);
+        e.renew_delegation(ALICE, EXPIRES_AT + 1_000).unwrap();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.amend_delegation_scopes(
+            ALICE,
+            DELEGATION_SCOPE_FUND | DELEGATION_SCOPE_RELEASE,
+        )
+        .unwrap();
+        let grant = e.delegation().expect("grant survives the revision");
+        assert_eq!(grant.delegate(), OPERATOR, "operator untouched");
+        assert_eq!(
+            grant.scopes(),
+            DELEGATION_SCOPE_FUND | DELEGATION_SCOPE_RELEASE
+        );
+        assert_eq!(grant.spend_cap(), 500_000, "cap untouched");
+        assert_eq!(grant.spent(), 400_000, "spent never cleared");
+        assert_eq!(
+            e.delegation_expires_at(),
+            Some(EXPIRES_AT + 1_000),
+            "expiry untouched"
+        );
+        assert_eq!(e.released_amount(), 400_000, "settled volume untouched");
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "scopes rewritten in place, no layout change"
+        );
+        // The cap still binds the grant's cumulative volume under
+        // the new bitmap: 100k more settles, 1 more is refused.
+        e.release(OPERATOR, NOW, 100_000, None, BOB).unwrap();
+        assert_eq!(e.delegation().unwrap().spent(), 500_000);
+        assert_eq!(
+            e.release(OPERATOR, NOW, 1, None, BOB),
+            Err(EscrowError::SpendCapExceeded),
+            "cap binds cumulative volume after the revision"
+        );
+    }
+
+    #[test]
+    fn amend_delegation_scopes_noop_on_same_bitmap() {
+        // AV-492: re-affirming the current bitmap is a no-op — it
+        // succeeds, writes nothing and emits nothing, so the
+        // operator is never re-notified for a revision that changed
+        // nothing.
+        const OPERATOR: [u8; 32] = [0x0D; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        fn full_scopes() -> u32 {
+            DELEGATION_SCOPE_FUND | DELEGATION_SCOPE_RELEASE | DELEGATION_SCOPE_CANCEL
+        }
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.delegate_authority(ALICE, OPERATOR, full_scopes()).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        let encoded = super::account_space_tests::encode_escrow(&e);
+        e.amend_delegation_scopes(ALICE, full_scopes()).unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            encoded,
+            "same-bitmap re-affirmation writes nothing"
+        );
+        assert_eq!(e.delegation().unwrap().scopes(), full_scopes());
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
     fn amend_panel_threshold_maps_params_to_arbiter_panel_field() {
         // IDL: amend_panel_threshold(new_threshold: u8) —
         // new_threshold <- param; initializer <-
@@ -77568,6 +77940,22 @@ pub(crate) mod anchor_idl_tests {
             "amend_counter_offer",
             "expiry",
             "counter_offer",
+        ),
+        // AV-492: the post-funding delegation-scope revision rewrites
+        // the 4-byte `scopes` field of the `delegation` region in
+        // place — a second param source for the region, like
+        // `delegate_authority`'s scopes param. The field's *initial*
+        // value comes from the `delegate_authority` instruction (a
+        // param source already in this table); the param entry
+        // documents the revision source. Only the scopes move — the
+        // operator, the spend cap, the settled `spent` counter and
+        // the expiry window are untouched, and the operator paths
+        // read the live bitmap on every call, so the new powers
+        // govern from the next operator call.
+        (
+            "amend_delegation_scopes",
+            "new_scopes",
+            "delegation",
         ),
         // AV-477: the post-funding arbiter-panel threshold
         // revision rewrites the 1-byte `threshold` field of the
@@ -107958,6 +108346,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_counter_offer"),
             [0, 176, 114, 53, 119, 139, 16, 211]
+        );
+    }
+
+    #[test]
+    fn amend_delegation_scopes_instruction_discriminator_is_pinned() {
+        // AV-492. IDL:
+        // sha256("global:amend_delegation_scopes")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_delegation_scopes"),
+            [88, 193, 103, 254, 0, 9, 19, 44]
         );
     }
 

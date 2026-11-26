@@ -9488,6 +9488,41 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the live operator grant's scope bitmap after funding (AV-492;
+    /// mirrors `Escrow::amend_delegation_scopes`, the AV-296
+    /// pure-logic revision). Either party may revise — the initializer or
+    /// the taker alone (the operator being revised does not sign, so a
+    /// compromised operator cannot block its own powers being cut). Only
+    /// `Uninitialized` / `Funded`; no live grant is
+    /// `InvalidDelegation` (code 160), and an empty bitmap or bits
+    /// outside `DELEGATION_SCOPE_MASK` is the same code leaving the
+    /// original bitmap untouched. Revising to the current bitmap is an
+    /// idempotent no-op. Only the scopes move — the operator, the spend
+    /// cap, the settled `spent` counter and the expiry window are
+    /// untouched, and `spent` is never cleared: the cap keeps binding
+    /// the grant's cumulative volume. The operator paths read the live
+    /// bitmap on every call, so narrowing revokes a power at once while
+    /// widening grants it at once. A paused escrow fails fast
+    /// (`Paused`). No delay path covers this method —
+    /// `GovernanceAction` has no `AmendDelegationScopes` variant, so
+    /// the direct call is the only entry point and stays open on a
+    /// delay-opted-in escrow (the AV-471 `amend_twap_gate` precedent).
+    /// No event is emitted — the revision is an in-place bitmap rewrite
+    /// of the same grant slot, like `renew_delegation` — so the handler
+    /// does no change-only detection: there is nothing to emit.
+    /// Rewrites the scopes field in place — no layout change.
+    pub fn amend_delegation_scopes(
+        ctx: Context<AmendDelegationScopes>,
+        new_scopes: u32,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .amend_delegation_scopes(ctx.accounts.caller.key().to_bytes(), new_scopes)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -17618,6 +17653,22 @@ pub struct AmendCounterOffer<'info> {
     /// machine enforces this — the initializer and strangers
     /// are `Unauthorized`).
     pub taker: Signer<'info>,
+}
+
+/// AV-492: accounts for `amend_delegation_scopes` — the
+/// delegation-scope revision is single-party governance by
+/// either party; the operator being revised does not sign (a
+/// compromised operator must not block its own powers being
+/// cut). The new bitmap rides as an instruction param, not an
+/// account.
+#[derive(Accounts)]
+pub struct AmendDelegationScopes<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker may revise (the state
+    /// machine enforces the party-only rule); a stranger — or the
+    /// operator themselves — is `Unauthorized`.
+    pub caller: Signer<'info>,
 }
 
 /// AV-477: accounts for `amend_panel_threshold` — the

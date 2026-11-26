@@ -1630,6 +1630,14 @@
       ]
     },
     {
+      "name": "amend_delegation_scopes",
+      "discriminator": [88, 193, 103, 254, 0, 9, 19, 44],
+      "accounts": [],
+      "args": [
+        {"name": "new_scopes", "type": "u32"}
+      ]
+    },
+    {
       "name": "amend_panel_threshold",
       "discriminator": [192, 166, 186, 13, 85, 249, 94, 78],
       "accounts": [],
