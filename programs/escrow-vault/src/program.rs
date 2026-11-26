@@ -9419,6 +9419,75 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the taker's live counter-offer in flight (AV-491;
+    /// mirrors `Escrow::amend_counter_offer`, the AV-285
+    /// pure-logic revision). Taker-only governance: the offer is
+    /// the proposer's — the initializer and strangers cannot
+    /// rewrite it. `CounterOffered` only — a `Funded` escrow has
+    /// no live offer to revise and a terminal escrow has no
+    /// negotiation left (`InvalidStateTransition`), and nothing
+    /// may have been released yet. A paused escrow fails fast
+    /// (`Paused`, before the authority gate), with a due
+    /// auto-recovery schedule lifting first (AV-133). The new
+    /// terms reuse the propose gates (`amount == 0` or
+    /// `expiry <= now` is `InvalidCounterOffer`, code 180, and
+    /// the original offer is untouched). Only
+    /// `counter_offer{amount, expiry}` moves — the escrow's
+    /// `amount`, `expires_at` and state are untouched, and the
+    /// next accept re-prices under the live offer (the accept
+    /// path reads it at answer time), while an accept already
+    /// settled keeps the terms it settled under. Re-affirming
+    /// the current terms byte-for-byte is a no-op: it succeeds,
+    /// writes nothing and emits nothing. No delay path covers
+    /// this method — `GovernanceAction` has no
+    /// `AmendCounterOffer` variant, so the direct call is the
+    /// only entry point and stays open on a delay-opted-in
+    /// escrow (the AV-471 `amend_twap_gate` precedent). Emits
+    /// `CounterOfferAmended` (from == to == the current state;
+    /// all amounts zero) only on an actual change. `now` comes
+    /// from the clock sysvar — never an instruction param — and
+    /// feeds both the pure logic's `now` (terms validity against
+    /// the clock, the deadman clock, auto-unpause) and the event
+    /// timestamp.
+    pub fn amend_counter_offer(
+        ctx: Context<AmendCounterOffer>,
+        amount: u64,
+        expiry: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.counter_offer();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_counter_offer(ctx.accounts.taker.key().to_bytes(), amount, expiry, now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 17-byte `counter_offer` region in place —
+        // no realloc. Only the offered amount and expiry move;
+        // the deal amount, the deal expiry, the released total
+        // and the state are untouched. Emits only on an actual
+        // change; a same-terms no-op stays silent (mirrors
+        // `amend_claimant_roster`).
+        if escrow.counter_offer() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::CounterOfferAmended,
+                state,
+                state,
+                0,
+                0,
+                0,
+                now,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -17535,6 +17604,20 @@ pub struct AmendClaimantRoster<'info> {
     /// state machine enforces this — the taker and strangers are
     /// `Unauthorized`).
     pub initializer: Signer<'info>,
+}
+
+/// AV-491: accounts for `amend_counter_offer` — the
+/// counter-offer revision is taker-only governance: only the
+/// taker signs (the state machine enforces this — the
+/// initializer and strangers are `Unauthorized`).
+#[derive(Accounts)]
+pub struct AmendCounterOffer<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Taker-only governance: only the taker signs (the state
+    /// machine enforces this — the initializer and strangers
+    /// are `Unauthorized`).
+    pub taker: Signer<'info>,
 }
 
 /// AV-477: accounts for `amend_panel_threshold` — the

@@ -31148,6 +31148,14 @@ let fee = self.charge_protocol_fee(claimable)?;
     ///
     /// The [`IndexedEscrow`](crate::IndexedEscrow) wrapper emits
     /// [`EscrowEventKind::CounterOfferAmended`](crate::EscrowEventKind::CounterOfferAmended).
+    /// AV-491 adds the program-level
+    /// `amend_counter_offer(amount, expiry)` instruction — the
+    /// chain entry point for this revision; taker-only
+    /// governance, `CounterOffered`-only, no delay path (no
+    /// `GovernanceAction` variant covers it), and the
+    /// `CounterOfferAmended` event only on an actual change;
+    /// the terms ride as two `u64` params and the accept path
+    /// re-prices from the live offer.
     pub fn amend_counter_offer(
         &mut self,
         authority: [u8; 32],
@@ -43278,6 +43286,32 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_legs <- param (Vec<ClaimantShare>, each leg's share_bps wire field read as a relative weight — see params); initializer <- accounts.initializer (signer) — initializer-only governance, the roster is the initializer's declared distribution (a stranger or the taker is Unauthorized, code 100); a paused escrow fails fast (Paused, code 124, before the authority gate); Funded only (InvalidStateTransition, code 101, otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial roster via with_claimants); only an escrow with a roster already configured may revise — a roster-less escrow is InvalidClaimantShares (code 211, fail-closed: post-funding installation would attach a pull table the taker never funded under); the new table must be non-empty, fit MAX_CLAIMANTS together with the claimed legs, and contain no zero address, zero weight, duplicate, or already-claimed address (InvalidClaimantShares, code 211, on any violation, and a failed amendment leaves the roster untouched); the claimed legs pin their slice and the unclaimed pool (10_000 minus claimed shares) is re-cut by weight with largest-remainder apportionment, so the Σ is exactly 10_000 bps; no delay path covers this method — GovernanceAction has no AmendClaimantRoster variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current roster is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only the unclaimed legs change — the claimed legs' addresses, shares and claimed bits are locked, and amount, released, fees_paid and state are untouched; the later claim_share pulls price against the new shares and still settle to exactly the locked amount, while a leg already pulled keeps the payout it pulled under; emits the ClaimantRosterAmended indexer event only on an actual change (from == to == the current state; all amounts zero — amending moves no funds); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, since the pure logic takes no now); the roster region is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-491: revise the taker's live counter-offer in
+            // flight — the program-level entry point for the
+            // AV-285 pure-logic revision. IDL:
+            // discriminator =
+            // sha256("global:amend_counter_offer")[..8]
+            // = [0, 176, 114, 53, 119, 139, 16, 211] — the Anchor
+            // instruction discriminator for the
+            // amend_counter_offer handler (pinned by the
+            // discriminator test below).
+            name: "amend_counter_offer",
+            params: &[
+                (
+                    "amount",
+                    "u64",
+                    "instruction param; the replacement offered amount — must be nonzero (the propose gate reused)",
+                ),
+                (
+                    "expiry",
+                    "u64",
+                    "instruction param; the replacement offered expiry (Unix seconds) — must be in the future (the propose gate reused)",
+                ),
+            ],
+            method: "Escrow::amend_counter_offer",
+            input_mapping: "amount <- param; expiry <- param; authority <- accounts.taker (signer) — taker-only governance, the offer is the proposer's (the initializer or a stranger is Unauthorized, code 100, checked after pause and before state); a paused escrow fails fast (Paused, code 124, before the authority gate, with a due auto-recovery schedule lifting first, AV-133); CounterOffered only (InvalidStateTransition, code 101, otherwise — Funded has no live offer to revise, terminal states have no negotiation left; the builder owns the initial offer via propose_counter_offer); nothing may have been released yet (released != 0 is InvalidStateTransition); the new terms reuse the propose gates (amount == 0 or expiry <= now is InvalidCounterOffer, code 180, and the original offer is untouched); no delay path covers this method — GovernanceAction has no AmendCounterOffer variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current terms is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only counter_offer{amount, expiry} changes — the escrow's amount, expires_at, released total and state are untouched, and the next accept re-prices under the live offer (accept_counter_offer reads it at answer time) while an accept already settled keeps the terms it settled under; emits the CounterOfferAmended indexer event only on an actual change (from == to == the current state; all amounts zero — amending moves no funds); `now` <- clock sysvar on the Anchor layer (never an instruction param — it feeds both the pure logic's now, for terms validity against the clock, the deadman clock and auto-unpause, and the event timestamp); the 17-byte counter_offer region is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-477: revise the arbiter panel's judgment threshold
             // after funding — the program-level entry point for the
             // AV-378 pure-logic revision. IDL:
@@ -44474,6 +44508,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-227 pure-logic
             // revision wired to the chain).
             "Escrow::amend_claimant_roster",
+            // AV-491: the program-level counter-offer
+            // revision (the AV-285 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_counter_offer",
             // AV-477: the program-level arbiter-panel
             // threshold revision (the AV-378 pure-logic
             // revision wired to the chain).
@@ -45229,6 +45267,14 @@ pub(crate) mod anchor_idl_tests {
                 // pulled keeps the payout it pulled under;
                 // re-affirming the current roster is a no-op.
                 &"amend_claimant_roster",
+                // AV-491: the counter-offer revision carries the
+                // replacement terms (amount u64 + expiry u64) —
+                // the terms alone; only the stored offer moves, so
+                // the next accept re-prices under the live offer
+                // while the deal amount, the deal expiry and the
+                // state are untouched until the initializer answers;
+                // re-affirming the current terms is a no-op.
+                &"amend_counter_offer",
                 // AV-477: the panel-threshold revision carries
                 // the replacement threshold (u8) — the threshold
                 // alone; the next dispute tallies under the live
@@ -70255,6 +70301,303 @@ pub(crate) mod anchor_idl_tests {
         );
     }
 
+    fn offered_escrow() -> Escrow {
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(PAUSER)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e.propose_counter_offer(BOB, 900_000, EXPIRES_AT + 3_600, FUND_AT)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::CounterOffered);
+        e
+    }
+
+    #[test]
+    fn amend_counter_offer_maps_params_to_offer_fields() {
+        // IDL: amend_counter_offer(amount: u64, expiry: u64) —
+        // amount <- param; expiry <- param; authority <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraint and the state machine's taker-only gate.
+        // The params rewrite the `counter_offer` region in place
+        // (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the two u64 params and the AV-285 pure-logic method.
+        const NOW: u64 = 1_750_000_000;
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_counter_offer")
+            .expect("INSTRUCTIONS carries amend_counter_offer");
+        assert_eq!(spec.method, "Escrow::amend_counter_offer");
+        assert_eq!(spec.params.len(), 2);
+        assert_eq!(spec.params[0].0, "amount");
+        assert_eq!(spec.params[0].1, "u64");
+        assert_eq!(spec.params[1].0, "expiry");
+        assert_eq!(spec.params[1].1, "u64");
+        assert!(
+            spec.input_mapping.contains("InvalidCounterOffer"),
+            "input_mapping documents the propose gates"
+        );
+        assert!(
+            spec.input_mapping.contains("CounterOffered only"),
+            "input_mapping documents the state gate"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the two u64 args.
+        let idl = std::fs::read_to_string("../programs/escrow-vault/idl/escrow_vault.json")
+            .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_counter_offer\""),
+            "checked-in IDL carries amend_counter_offer"
+        );
+        assert!(
+            idl.contains("[0, 176, 114, 53, 119, 139, 16, 211]"),
+            "checked-in IDL pins the AV-491 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"amount\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the amount arg"
+        );
+        assert!(
+            idl.contains("{\"name\": \"expiry\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the expiry arg"
+        );
+        // Only the live offer moves: the new terms land in the
+        // stored offer, and the deal amount, the deal expiry and
+        // the state are untouched until the initializer answers.
+        let mut e = offered_escrow();
+        e.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW)
+            .unwrap();
+        let offer = e.counter_offer().expect("offer still live");
+        assert_eq!(offer.amount, 850_000, "offer amount replaced");
+        assert_eq!(offer.expiry, EXPIRES_AT + 7_200, "offer expiry replaced");
+        assert_eq!(e.amount(), 1_000_000, "deal amount untouched");
+        assert_eq!(e.expires_at(), EXPIRES_AT, "deal expiry untouched");
+        assert_eq!(e.state(), EscrowState::CounterOffered);
+    }
+
+    #[test]
+    fn amend_counter_offer_rejects_initializer_and_strangers() {
+        // AV-491: taker-only governance — the initializer, a
+        // stranger, or the parties swapped is Unauthorized; the
+        // offer is the proposer's, and only the proposer may
+        // rewrite it.
+        const NOW: u64 = 1_750_000_000;
+        let mut e = offered_escrow();
+        assert_eq!(
+            e.amend_counter_offer(ALICE, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_counter_offer(MALLORY, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        let offer = e.counter_offer().expect("offer still live");
+        assert_eq!(offer.amount, 900_000, "original offer untouched");
+        assert_eq!(offer.expiry, EXPIRES_AT + 3_600);
+        assert_eq!(e.state(), EscrowState::CounterOffered);
+    }
+
+    #[test]
+    fn amend_counter_offer_refuses_non_counter_offered_and_terminal_and_paused() {
+        // AV-491: a Funded escrow has no offer to revise, and a
+        // terminal escrow has no negotiation left — both fail
+        // closed with InvalidStateTransition, not with a silent
+        // no-op. The pause guard fires before the authority and
+        // state gates: even the taker's own amendment on a
+        // manually paused escrow is Paused.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        const NOW: u64 = 1_750_000_000;
+        let mut funded = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        funded.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            funded.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        let mut cancelled = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        cancelled.fund(ALICE, FUND_AT).unwrap();
+        cancelled.cancel(ALICE, None, ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            cancelled.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        let mut paused = offered_escrow();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_counter_offer(MALLORY, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::Paused),
+            "pause beats authority"
+        );
+        let offer = paused.counter_offer().expect("offer still live");
+        assert_eq!(offer.amount, 900_000, "original offer untouched");
+        // A due auto-recovery schedule lifts first (AV-133): the
+        // same call at now >= t succeeds and consumes the schedule.
+        let mut scheduled = offered_escrow();
+        scheduled.pause(PAUSER, Some(NOW)).unwrap();
+        scheduled
+            .amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW)
+            .unwrap();
+        assert!(!scheduled.is_paused(), "schedule consumed");
+        assert_eq!(scheduled.auto_unpause_at(), None);
+        let offer = scheduled.counter_offer().expect("offer revised");
+        assert_eq!(offer.amount, 850_000);
+    }
+
+    #[test]
+    fn amend_counter_offer_rejects_zero_amount_and_expired_expiry() {
+        // AV-491: every propose gate, each leaving the original
+        // offer exactly as it was — the initializer still answers
+        // the terms they were shown, never a half-written revision.
+        const NOW: u64 = 1_750_000_000;
+        let mut e = offered_escrow();
+        for (amount, expiry) in [(0, EXPIRES_AT + 7_200), (850_000, NOW), (850_000, NOW - 1)] {
+            assert_eq!(
+                e.amend_counter_offer(BOB, amount, expiry, NOW),
+                Err(EscrowError::InvalidCounterOffer),
+                "amount {amount} expiry {expiry} must be refused"
+            );
+            let offer = e.counter_offer().expect("offer still live");
+            assert_eq!(offer.amount, 900_000, "original amount untouched");
+            assert_eq!(
+                offer.expiry,
+                EXPIRES_AT + 3_600,
+                "original expiry untouched"
+            );
+        }
+        assert_eq!(e.state(), EscrowState::CounterOffered);
+    }
+
+    #[test]
+    fn amend_counter_offer_program_reprices_accept_after_amendment() {
+        // AV-491: the accept path reads the live offer at answer
+        // time, so an acceptance after the amendment re-prices
+        // under the new terms — not the terms the escrow funded
+        // under or first proposed.
+        const NOW: u64 = 1_750_000_000;
+        let mut e = offered_escrow();
+        e.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW)
+            .unwrap();
+        e.accept_counter_offer(ALICE, NOW + 10).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 850_000, "accept re-prices under amended terms");
+        assert_eq!(e.expires_at(), EXPIRES_AT + 7_200);
+        assert_eq!(e.counter_offer(), None, "offer consumed");
+    }
+
+    #[test]
+    fn amend_counter_offer_program_leaves_amounts_and_expiry_untouched() {
+        // AV-491: only the stored offer moves — the deal amount,
+        // the deal expiry, the released total and the state are
+        // untouched, and the 17-byte offer region is rewritten in
+        // place, so the encoded length never moves.
+        const NOW: u64 = 1_750_000_000;
+        let mut e = offered_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW)
+            .unwrap();
+        assert_eq!(e.amount(), 1_000_000, "deal amount untouched");
+        assert_eq!(e.expires_at(), EXPIRES_AT, "deal expiry untouched");
+        assert_eq!(e.released_amount(), 0, "nothing released");
+        assert_eq!(e.state(), EscrowState::CounterOffered);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "offer rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn amend_counter_offer_noop_on_same_terms() {
+        // AV-491: re-affirming the current terms byte-for-byte is
+        // a no-op — it succeeds, writes nothing and emits
+        // nothing, so the initializer is never re-notified for a
+        // revision that changed nothing.
+        const NOW: u64 = 1_750_000_000;
+        let mut e = offered_escrow();
+        let encoded = super::account_space_tests::encode_escrow(&e);
+        e.amend_counter_offer(BOB, 900_000, EXPIRES_AT + 3_600, NOW)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            encoded,
+            "same-terms re-affirmation writes nothing"
+        );
+        let offer = e.counter_offer().expect("offer still live");
+        assert_eq!(offer.amount, 900_000);
+        assert_eq!(offer.expiry, EXPIRES_AT + 3_600);
+        assert_eq!(e.state(), EscrowState::CounterOffered);
+    }
+
+    #[test]
+    fn amend_counter_offer_emits_only_on_change() {
+        // AV-491: the `CounterOfferAmended` event fires only on an
+        // actual change — the program handler compares the offer
+        // before and after, and a same-terms re-affirmation stays
+        // silent. The INSTRUCTIONS entry pins the design in the
+        // spec table, and the indexer wrapper proves the boundary
+        // structurally: a real change pushes one event, a no-op
+        // and a failed call push none.
+        use crate::events::IndexedEscrow;
+        const NOW: u64 = 1_750_000_000;
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_counter_offer")
+            .expect("INSTRUCTIONS carries amend_counter_offer");
+        assert!(
+            spec.input_mapping.contains("only on an actual change"),
+            "input_mapping documents the emit-only-on-change design"
+        );
+        let events = std::fs::read_to_string("src/events.rs").expect("read events.rs");
+        assert!(
+            events.contains("CounterOfferAmended"),
+            "events.rs defines the CounterOfferAmended event"
+        );
+        let mut e = IndexedEscrow::wrap([0xE0; 32], offered_escrow());
+        let before = e.event_count();
+        assert_eq!(
+            e.amend_counter_offer(ALICE, 850_000, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_counter_offer(BOB, 0, EXPIRES_AT + 7_200, NOW),
+            Err(EscrowError::InvalidCounterOffer)
+        );
+        assert_eq!(e.event_count(), before, "failed calls emit nothing");
+        e.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1);
+        let ev = e.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::CounterOfferAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::CounterOffered, EscrowState::CounterOffered)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        // Re-affirming the amended terms is a no-op: no new event.
+        e.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW)
+            .unwrap();
+        assert_eq!(e.event_count(), before + 1, "no-op emits nothing");
+        // A real change moves the offer bytes; a no-op moves
+        // nothing at all.
+        let mut f = offered_escrow();
+        let encoded = super::account_space_tests::encode_escrow(&f);
+        f.amend_counter_offer(BOB, 850_000, EXPIRES_AT + 7_200, NOW)
+            .unwrap();
+        assert_ne!(
+            super::account_space_tests::encode_escrow(&f),
+            encoded,
+            "a real revision moves the offer"
+        );
+    }
+
     #[test]
     fn amend_panel_threshold_maps_params_to_arbiter_panel_field() {
         // IDL: amend_panel_threshold(new_threshold: u8) —
@@ -77204,6 +77547,27 @@ pub(crate) mod anchor_idl_tests {
             "amend_claimant_roster",
             "new_legs",
             "claimants",
+        ),
+        // AV-491: the post-funding counter-offer revision rewrites
+        // the 17-byte `counter_offer` region in place — a third
+        // param source for the field, like `propose_counter_offer`'s
+        // amount/expiry params. The field's *initial* value comes
+        // from the `propose_counter_offer` instruction (a param
+        // source already in this table); the param entries
+        // document the revision source. Only the offered amount
+        // and expiry move — the deal amount, the deal expiry and
+        // the state are untouched, and the next accept re-prices
+        // under the live offer while an accept already settled
+        // keeps the terms it settled under.
+        (
+            "amend_counter_offer",
+            "amount",
+            "counter_offer",
+        ),
+        (
+            "amend_counter_offer",
+            "expiry",
+            "counter_offer",
         ),
         // AV-477: the post-funding arbiter-panel threshold
         // revision rewrites the 1-byte `threshold` field of the
@@ -107582,6 +107946,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_claimant_roster"),
             [24, 50, 31, 33, 157, 142, 212, 32]
+        );
+    }
+
+    #[test]
+    fn amend_counter_offer_instruction_discriminator_is_pinned() {
+        // AV-491. IDL:
+        // sha256("global:amend_counter_offer")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_counter_offer"),
+            [0, 176, 114, 53, 119, 139, 16, 211]
         );
     }
 

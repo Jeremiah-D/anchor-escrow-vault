@@ -1621,6 +1621,15 @@
       ]
     },
     {
+      "name": "amend_counter_offer",
+      "discriminator": [0, 176, 114, 53, 119, 139, 16, 211],
+      "accounts": [],
+      "args": [
+        {"name": "amount", "type": "u64"},
+        {"name": "expiry", "type": "u64"}
+      ]
+    },
+    {
       "name": "amend_panel_threshold",
       "discriminator": [192, 166, 186, 13, 85, 249, 94, 78],
       "accounts": [],
