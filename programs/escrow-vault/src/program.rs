@@ -9523,6 +9523,43 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the live operator grant's spend cap after funding (AV-493;
+    /// mirrors `Escrow::amend_delegation_spend_cap`, the AV-295
+    /// pure-logic revision). Either party may revise — the initializer or
+    /// the taker alone (the operator being revised does not sign, so a
+    /// compromised operator cannot block its own bound being tightened).
+    /// Only `Uninitialized` / `Funded`; no live grant is
+    /// `InvalidDelegation` (code 160), and a new cap below the live
+    /// `spent` is the same code leaving the original cap untouched
+    /// (fail-closed — a revision can never retroactively declare
+    /// settled operator volume over-cap). `0` is uncapped (the AV-208
+    /// storage meaning). Revising to the current cap is an idempotent
+    /// no-op. Only the cap moves — the operator, the scopes, the
+    /// settled `spent` counter and the expiry window are untouched,
+    /// and `spent` is never cleared: the cap keeps binding the
+    /// grant's cumulative volume. The operator release path reads
+    /// the live cap on every call, so tightening binds the next
+    /// release at once while loosening frees it at once. A paused
+    /// escrow fails fast (`Paused`). No delay path covers this method —
+    /// `GovernanceAction` has no `AmendDelegationSpendCap` variant, so
+    /// the direct call is the only entry point and stays open on a
+    /// delay-opted-in escrow (the AV-471 `amend_twap_gate` precedent).
+    /// No event is emitted — the revision is an in-place cap rewrite
+    /// of the same grant slot, like `renew_delegation` — so the handler
+    /// does no change-only detection: there is nothing to emit.
+    /// Rewrites the spend-cap field in place — no layout change.
+    pub fn amend_delegation_spend_cap(
+        ctx: Context<AmendDelegationSpendCap>,
+        new_cap: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .amend_delegation_spend_cap(ctx.accounts.caller.key().to_bytes(), new_cap)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -17663,6 +17700,22 @@ pub struct AmendCounterOffer<'info> {
 /// account.
 #[derive(Accounts)]
 pub struct AmendDelegationScopes<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Either the initializer or the taker may revise (the state
+    /// machine enforces the party-only rule); a stranger — or the
+    /// operator themselves — is `Unauthorized`.
+    pub caller: Signer<'info>,
+}
+
+/// AV-493: accounts for `amend_delegation_spend_cap` — the
+/// delegation-spend-cap revision is single-party governance by
+/// either party; the operator being revised does not sign (a
+/// compromised operator must not block its own bound being
+/// tightened). The new cap rides as an instruction param, not an
+/// account.
+#[derive(Accounts)]
+pub struct AmendDelegationSpendCap<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Either the initializer or the taker may revise (the state

@@ -1638,6 +1638,14 @@
       ]
     },
     {
+      "name": "amend_delegation_spend_cap",
+      "discriminator": [96, 90, 249, 69, 29, 177, 63, 168],
+      "accounts": [],
+      "args": [
+        {"name": "new_cap", "type": "u64"}
+      ]
+    },
+    {
       "name": "amend_panel_threshold",
       "discriminator": [192, 166, 186, 13, 85, 249, 94, 78],
       "accounts": [],
