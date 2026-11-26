@@ -1646,6 +1646,14 @@
       ]
     },
     {
+      "name": "amend_milestone_due_dates",
+      "discriminator": [203, 126, 234, 218, 113, 51, 111, 23],
+      "accounts": [],
+      "args": [
+        {"name": "due_at", "type": {"vec": "u64"}}
+      ]
+    },
+    {
       "name": "amend_panel_threshold",
       "discriminator": [192, 166, 186, 13, 85, 249, 94, 78],
       "accounts": [],

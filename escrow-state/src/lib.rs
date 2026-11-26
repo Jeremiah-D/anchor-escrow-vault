@@ -43350,6 +43350,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "caller <- accounts.caller (signer) — either the initializer or the taker alone may revise (the operator being revised does not sign, so a compromised operator cannot block its own bound being tightened, the rotate_arbiter reasoning); new_cap <- param (u64); Uninitialized / Funded only (InvalidStateTransition otherwise — terminal states and Disputed); only an escrow with a live grant may revise (InvalidDelegation, code 160, when there is no grant to revise); the new cap must be 0 (uncapped, the AV-208 storage meaning) or at least the live spent — a cap below the volume already settled is InvalidDelegation (code 160, the fail-closed gate) leaving the original cap untouched, so a revision can never retroactively breach the grant; revising to the current cap is an idempotent no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); a paused escrow fails fast (Paused); no delay path covers this method — GovernanceAction has no AmendDelegationSpendCap variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); emits no event (the revision is an in-place cap rewrite of the same grant slot, like renew_delegation); only delegation.spend_cap changes — operator, scopes, spent and the expiry window are untouched, and spent is never cleared, so the cap keeps binding the grant's cumulative volume; the operator paths read the live cap on every release (record_operator_release checks new_spent > cap), so tightening binds the next release at once while loosening frees it at once, with no settled release ever re-judged; no clock/sysvar input to the method; the spend_cap field is rewritten in place — no layout / rent change",
         },
         InstructionSpec {
+            // AV-494: revise the milestone deadline table after
+            // funding — the program-level entry point for the
+            // AV-231 pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_milestone_due_dates")[..8]
+            // = [203, 126, 234, 218, 113, 51, 111, 23] — the Anchor
+            // instruction discriminator for the
+            // amend_milestone_due_dates handler (pinned by the
+            // discriminator test below).
+            name: "amend_milestone_due_dates",
+            params: &[(
+                "due_at",
+                "Vec<u64>",
+                "instruction param; the replacement per-tranche deadline table in release order — must have exactly the plan's tranche count, every new due for an unsettled tranche non-zero and no earlier than now, and the final table (retained settled dues plus new unsettled dues) strictly increasing; settled tranches keep their original dues verbatim whatever the caller submits for those slots",
+            )],
+            method: "Escrow::amend_milestone_due_dates",
+            input_mapping: "due_at <- param (Vec<u64>); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Funded only (InvalidStateTransition otherwise — Uninitialized, Activated, terminal states and Disputed; the builder owns the initial table via with_milestone_due_dates); no delay path covers this method — GovernanceAction has no AmendMilestoneDueDates variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); no plan attached, a table-less escrow, a wrong tranche count, a zero or past due for an unsettled tranche, or a non-increasing final table is InvalidMilestones (code 110, the fail-closed gate) leaving the original table untouched — amendment never creates a table mid-flight; re-affirming the current table is a no-op (succeeds, writes nothing, emits no event, paralleling amend_milestones); only milestone_due_dates changes — the plan amounts, the AV-206 penalty rate and the AV-225 claim deadlines are untouched, so the next release_milestone prices late penalties against the amended dates for unsettled tranches while settled tranches keep the dues they settled under; emits the MilestoneDueDatesAmended indexer event only on an actual change (from == to == the current state, all amounts zero); `now` <- clock sysvar on the Anchor layer (never an instruction param — here both for the no-past-due rule and the event timestamp, read once); the 8-slot deadline table is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-477: revise the arbiter panel's judgment threshold
             // after funding — the program-level entry point for the
             // AV-378 pure-logic revision. IDL:
@@ -44558,6 +44576,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-295 pure-logic
             // revision wired to the chain).
             "Escrow::amend_delegation_spend_cap",
+            // AV-494: the program-level milestone-due-date-table
+            // revision (the AV-231 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_milestone_due_dates",
             // AV-477: the program-level arbiter-panel
             // threshold revision (the AV-378 pure-logic
             // revision wired to the chain).
@@ -45335,6 +45357,14 @@ pub(crate) mod anchor_idl_tests {
                 // settled is never re-judged; re-affirming the
                 // current cap is a no-op.
                 &"amend_delegation_spend_cap",
+                // AV-494: the due-date revision carries the
+                // replacement table (Vec<u64>) — the table alone;
+                // only unsettled tranches move, so the next
+                // release_milestone prices late penalties against
+                // the amended dates while a tranche already settled
+                // keeps the due it settled under; re-affirming the
+                // current table is a no-op.
+                &"amend_milestone_due_dates",
                 // AV-477: the panel-threshold revision carries
                 // the replacement threshold (u8) — the threshold
                 // alone; the next dispute tallies under the live
@@ -71366,6 +71396,290 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn amend_milestone_due_dates_maps_param_to_due_date_table() {
+        // IDL: amend_milestone_due_dates(due_at: Vec<u64>) —
+        // due_at <- param; initializer <- accounts.initializer
+        // (signer) AND taker <- accounts.taker (signer), enforced
+        // by the Anchor account constraints and the state machine's
+        // dual-signature gate. The param rewrites the
+        // `milestone_due_dates` table in place (see PARAM_FIELD_MAP)
+        // — no layout change. The INSTRUCTIONS spec entry pins the
+        // program-level wiring: the single Vec<u64> param and the
+        // AV-231 pure-logic method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_milestone_due_dates")
+            .expect("INSTRUCTIONS carries amend_milestone_due_dates");
+        assert_eq!(spec.method, "Escrow::amend_milestone_due_dates");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "due_at");
+        assert_eq!(spec.params[0].1, "Vec<u64>");
+        assert!(
+            spec.input_mapping.contains("MilestoneDueDatesAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the Vec<u64> arg.
+        let idl = std::fs::read_to_string("../programs/escrow-vault/idl/escrow_vault.json")
+            .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_milestone_due_dates\""),
+            "checked-in IDL carries amend_milestone_due_dates"
+        );
+        assert!(
+            idl.contains("[203, 126, 234, 218, 113, 51, 111, 23]"),
+            "checked-in IDL pins the AV-494 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"due_at\", \"type\": {\"vec\": \"u64\"}}"),
+            "checked-in IDL carries the due_at arg"
+        );
+        // The param maps to exactly the due-date table — and the
+        // table is no longer a field source (every field gets
+        // exactly one source kind).
+        assert!(
+            PARAM_FIELD_MAP.contains(&(
+                "amend_milestone_due_dates",
+                "due_at",
+                "milestone_due_dates"
+            )),
+            "PARAM_FIELD_MAP carries the due_at mapping"
+        );
+        assert!(
+            !FIELD_SOURCES.iter().any(|(f, _)| *f == "milestone_due_dates"),
+            "milestone_due_dates retired from FIELD_SOURCES once param-sourced"
+        );
+        // Only the due dates move: the amounts, the penalty rate
+        // and the state are untouched.
+        let mut e = milestone_penalty_funded_escrow();
+        e.amend_milestone_due_dates(ALICE, BOB, &[1_750_000_000, 1_770_000_000], 1_740_000_000)
+            .unwrap();
+        assert_eq!(e.milestone_due_at(0), Some(1_750_000_000));
+        assert_eq!(e.milestone_due_at(1), Some(1_770_000_000), "due moved");
+        assert_eq!(
+            e.milestone_plan().unwrap().amount_at(0),
+            Some(400_000),
+            "amounts untouched"
+        );
+        assert_eq!(
+            e.milestone_late_penalty_bps(),
+            1000,
+            "penalty rate untouched"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.remaining_amount(), 1_000_000);
+        assert_eq!(e.released_amount(), 0);
+    }
+
+    #[test]
+    fn amend_milestone_due_dates_rejects_single_party_and_strangers() {
+        // AV-494: unconditional dual signature — one party alone,
+        // or a stranger, is Unauthorized; one party alone cannot
+        // rewrite the settlement calendar on the other's funds.
+        let mut e = milestone_penalty_funded_escrow();
+        let table = [1_750_000_000, 1_770_000_000];
+        assert_eq!(
+            e.amend_milestone_due_dates(ALICE, ALICE, &table, 1_740_000_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_milestone_due_dates(MALLORY, BOB, &table, 1_740_000_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.amend_milestone_due_dates(MALLORY, MALLORY, &table, 1_740_000_000),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert_eq!(
+            e.milestone_due_at(1),
+            Some(1_760_000_000),
+            "failed revisions write nothing"
+        );
+        e.amend_milestone_due_dates(ALICE, BOB, &table, 1_740_000_000)
+            .unwrap();
+        assert_eq!(e.milestone_due_at(1), Some(1_770_000_000));
+    }
+
+    #[test]
+    fn amend_milestone_due_dates_refuses_unfunded_tableless_and_paused() {
+        // AV-494: Funded-only — the Uninitialized builder owns the
+        // initial table, and a table-less escrow has nothing to amend
+        // (amendment never creates a table). The pause guard fires
+        // before the authority and state gates.
+        const PAUSER: [u8; 32] = [0xDD; 32];
+        const FUND_AT: u64 = EXPIRES_AT - 3_600;
+        const NOW: u64 = 1_740_000_000;
+        let table = [1_750_000_000, 1_770_000_000];
+        // Uninitialized: the table is still a builder decision.
+        let mut bare = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap()
+            .with_milestone_due_dates(&[1_750_000_000, 1_760_000_000])
+            .unwrap();
+        assert_eq!(
+            bare.amend_milestone_due_dates(ALICE, BOB, &table, NOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(bare.milestone_due_at(1), Some(1_760_000_000));
+        // Funded but table-less: amendment never creates one.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_milestones(MilestonePlan::new(&[400_000, 600_000]).unwrap())
+            .unwrap();
+        plain.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            plain.amend_milestone_due_dates(ALICE, BOB, &table, NOW),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(EscrowError::InvalidMilestones.code(), 110);
+        // Funded but plan-less: nothing to amend.
+        let mut no_plan = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        no_plan.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(
+            no_plan.amend_milestone_due_dates(ALICE, BOB, &table, NOW),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // A paused escrow refuses even for both parties, and the
+        // pause beats the authority gate for a stranger too.
+        let mut paused = milestone_penalty_funded_escrow();
+        paused.pause(PAUSER, None).unwrap();
+        assert_eq!(
+            paused.amend_milestone_due_dates(ALICE, BOB, &table, NOW),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.amend_milestone_due_dates(MALLORY, MALLORY, &table, NOW),
+            Err(EscrowError::Paused),
+            "pause beats authority"
+        );
+        assert_eq!(
+            paused.milestone_due_at(1),
+            Some(1_760_000_000),
+            "failed revision writes nothing"
+        );
+        // Terminal: a cancelled escrow settles under the table it had.
+        let mut cancelled = milestone_penalty_funded_escrow();
+        cancelled.cancel(ALICE, None, ALICE, FUND_AT).unwrap();
+        assert_eq!(cancelled.state(), EscrowState::Cancelled);
+        assert_eq!(
+            cancelled.amend_milestone_due_dates(ALICE, BOB, &table, NOW),
+            Err(EscrowError::InvalidStateTransition)
+        );
+    }
+
+    #[test]
+    fn amend_milestone_due_dates_program_rejects_bad_tables_untouched() {
+        // AV-494: every bad table is refused with InvalidMilestones
+        // (code 110) and the stored table is untouched — the
+        // program handler's before/after compare never sees a write
+        // on a failed call, so no event fires either.
+        const NOW: u64 = 1_740_000_000;
+        let mut e = milestone_penalty_funded_escrow();
+        let encoded = super::account_space_tests::encode_escrow(&e);
+        // Length mismatch.
+        assert_eq!(
+            e.amend_milestone_due_dates(ALICE, BOB, &[1_750_000_000], NOW),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // A new due in the past would ambush the tranche with an
+        // instant-late penalty on the next release.
+        assert_eq!(
+            e.amend_milestone_due_dates(ALICE, BOB, &[1_730_000_000, 1_760_000_000], NOW),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // A zero due is never a deadline (the AV-206 sentinel).
+        assert_eq!(
+            e.amend_milestone_due_dates(ALICE, BOB, &[1_750_000_000, 0], NOW),
+            Err(EscrowError::InvalidMilestones)
+        );
+        // Non-increasing final table.
+        assert_eq!(
+            e.amend_milestone_due_dates(ALICE, BOB, &[1_760_000_000, 1_750_000_000], NOW),
+            Err(EscrowError::InvalidMilestones)
+        );
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            encoded,
+            "failed revisions write nothing"
+        );
+        assert_eq!(e.milestone_due_at(0), Some(1_750_000_000));
+        assert_eq!(e.milestone_due_at(1), Some(1_760_000_000));
+        assert_eq!(e.state(), EscrowState::Funded);
+    }
+
+    #[test]
+    fn amend_milestone_due_dates_program_moves_only_unsettled_tranches() {
+        // AV-494: release tranche 0 (dual-confirmed), then move the
+        // table — the settled tranche keeps its original due whatever
+        // the caller submits for that slot, the open tranche moves,
+        // and the moved deadline prices the later release. The table
+        // is rewritten in place: the encoded length never moves.
+        const NOW: u64 = 1_740_000_000;
+        let mut e = milestone_penalty_funded_escrow();
+        confirm_milestone_both(&mut e, 0);
+        e.release_milestone(ALICE, 1_740_000_000, 0, None, BOB)
+            .unwrap();
+        assert!(e.milestone_settled(0));
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.amend_milestone_due_dates(ALICE, BOB, &[1_700_000_000, 1_770_000_000], NOW)
+            .unwrap();
+        assert_eq!(
+            e.milestone_due_at(0),
+            Some(1_750_000_000),
+            "settled due retained"
+        );
+        assert_eq!(e.milestone_due_at(1), Some(1_770_000_000), "open due moved");
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "table rewritten in place, no layout change"
+        );
+        // The moved deadline prices the later release: releasing
+        // tranche 1 before its new due is on time.
+        confirm_milestone_both(&mut e, 1);
+        e.release_milestone(ALICE, 1_765_000_000, 1, None, BOB)
+            .unwrap();
+        assert_eq!(e.released_amount(), 1_000_000);
+    }
+
+    #[test]
+    fn amend_milestone_due_dates_noop_on_same_table() {
+        // AV-494: re-affirming the current table is a no-op — it
+        // succeeds, writes nothing and emits nothing, so the indexer
+        // is never re-notified for a revision that changed nothing.
+        // (The program handler compares the before/after tables and
+        // only emits MilestoneDueDatesAmended on a real change.)
+        const NOW: u64 = 1_740_000_000;
+        let mut e = milestone_penalty_funded_escrow();
+        let encoded = super::account_space_tests::encode_escrow(&e);
+        e.amend_milestone_due_dates(ALICE, BOB, &[1_750_000_000, 1_760_000_000], NOW)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            encoded,
+            "same-table re-affirmation writes nothing"
+        );
+        assert_eq!(e.milestone_due_at(0), Some(1_750_000_000));
+        assert_eq!(e.milestone_due_at(1), Some(1_760_000_000));
+        assert_eq!(e.state(), EscrowState::Funded);
+        // A submission that differs only in a settled slot is the
+        // same no-op: settled dues are retained verbatim.
+        confirm_milestone_both(&mut e, 0);
+        e.release_milestone(ALICE, NOW, 0, None, BOB).unwrap();
+        let encoded = super::account_space_tests::encode_escrow(&e);
+        e.amend_milestone_due_dates(ALICE, BOB, &[1_700_000_000, 1_760_000_000], NOW)
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            encoded,
+            "settled-slot-only difference writes nothing"
+        );
+        assert_eq!(e.milestone_due_at(0), Some(1_750_000_000));
+    }
+
+    #[test]
     fn amend_panel_threshold_maps_params_to_arbiter_panel_field() {
         // IDL: amend_panel_threshold(new_threshold: u8) —
         // new_threshold <- param; initializer <-
@@ -77739,6 +78053,21 @@ pub(crate) mod anchor_idl_tests {
             "deadline_secs",
             "milestone_claim_deadlines",
         ),
+        // AV-494: the post-funding milestone-deadline-table
+        // revision rewrites the resident `milestone_due_dates`
+        // table in place — a second param source for the table,
+        // like `amend_milestones`' amounts. The table's initial
+        // values come from the `with_milestone_due_dates` builder
+        // (Uninitialized only, one deadline per tranche); this
+        // entry documents the revision source. Only unsettled
+        // tranches move — settled tranches keep their original dues
+        // verbatim, and a table-less escrow is refused outright
+        // (InvalidMilestones, code 110).
+        (
+            "amend_milestone_due_dates",
+            "due_at",
+            "milestone_due_dates",
+        ),
         // AV-452: the post-funding per-extension expiry-increase cap
         // revision rewrites the same tail field in place — a second
         // param source for `max_extension_secs`, like
@@ -79076,16 +79405,12 @@ pub(crate) mod anchor_idl_tests {
         // `initialize`; set by `with_milestone_due_dates`
         // (Uninitialized only, after `with_milestones`, one strictly
         // increasing deadline per tranche); read by
-        // `release_milestone` to price the late penalty. No
-        // instruction param writes this field — the builder is a
-        // pre-fund configuration, like the AV-203 gate above, so it
-        // is a field source, not a param mapping.
-        (
-            "milestone_due_dates",
-            "zeroed by initialize; set by with_milestone_due_dates \
-             (Uninitialized only, after with_milestones); read by \
-             release_milestone to price the late penalty",
-        ),
+        // `release_milestone` to price the late penalty. AV-494
+        // added the `amend_milestone_due_dates` instruction param
+        // that rewrites it — the field is now param-sourced (see
+        // PARAM_FIELD_MAP), like `milestone_late_penalty_bps`, so it
+        // is not listed here: every field gets exactly one source
+        // kind.
         // AV-206: the late-milestone penalty rate was a field source
         // (`0` by `initialize`; set by `with_late_penalty_bps`,
         // Uninitialized only, 0–10_000 bps; read by
@@ -108782,6 +109107,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_delegation_spend_cap"),
             [96, 90, 249, 69, 29, 177, 63, 168]
+        );
+    }
+
+    #[test]
+    fn amend_milestone_due_dates_instruction_discriminator_is_pinned() {
+        // AV-494. IDL:
+        // sha256("global:amend_milestone_due_dates")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_milestone_due_dates"),
+            [203, 126, 234, 218, 113, 51, 111, 23]
         );
     }
 

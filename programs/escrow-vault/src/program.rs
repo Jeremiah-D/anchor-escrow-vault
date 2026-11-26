@@ -9560,6 +9560,91 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the milestone deadline table after funding (AV-494;
+    /// mirrors `Escrow::amend_milestone_due_dates`, the AV-231
+    /// pure-logic revision). Unconditional dual-signature governance:
+    /// both the initializer and the taker must sign — one party
+    /// alone (or a stranger pair) is `Unauthorized`; the degenerate
+    /// initializer == taker self-escrow authorizes with one key
+    /// passed twice, like AV-12 activation. Only `Funded`: the
+    /// builder owns the initial table via `with_milestone_due_dates`
+    /// (`Uninitialized`-only), and a table-less escrow has nothing
+    /// to amend (`InvalidMilestones`, code 110 — amendment never
+    /// creates a table mid-flight). The submitted table must have
+    /// exactly the plan's tranche count, every new due for an
+    /// unsettled tranche must be non-zero and no earlier than `now`,
+    /// and the final table (retained settled dues plus new
+    /// unsettled dues) must be strictly increasing — a failed
+    /// revision leaves the table untouched. Settled tranches keep
+    /// their original dues verbatim, whatever the caller submits
+    /// for those slots, so the next `release_milestone` prices
+    /// late penalties against the amended dates for unsettled
+    /// tranches only. A paused escrow fails fast (`Paused`, before
+    /// the authority gate). No delay path covers this method —
+    /// `GovernanceAction` has no `AmendMilestoneDueDates` variant,
+    /// so the direct call is the only entry point and stays open on
+    /// a delay-opted-in escrow (the AV-471 `amend_twap_gate`
+    /// precedent). Emits `MilestoneDueDatesAmended` only on an
+    /// actual change (a no-op re-affirmation emits nothing),
+    /// mirroring `IndexedEscrow::amend_milestone_due_dates`; the
+    /// `now` for the no-past-due rule and the event timestamp is
+    /// read once from the clock sysvar. Rewrites the 8-slot
+    /// deadline table in place — no realloc, no rent change.
+    pub fn amend_milestone_due_dates(
+        ctx: Context<AmendMilestoneDueDates>,
+        due_at: Vec<u64>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before: Vec<u64> = escrow
+            .milestone_plan()
+            .map(|p| {
+                (0..p.count())
+                    .map(|i| escrow.milestone_due_at(i as usize).unwrap_or(0))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_milestone_due_dates(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &due_at,
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the `vault.milestone_due_dates` table in place (the
+        // 8-slot region is always reserved, zeroed when no table) — no
+        // realloc, no rent change.
+        let after: Vec<u64> = escrow
+            .milestone_plan()
+            .map(|p| {
+                (0..p.count())
+                    .map(|i| escrow.milestone_due_at(i as usize).unwrap_or(0))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if after != before {
+            emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::MilestoneDueDatesAmended,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        }
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -17722,6 +17807,23 @@ pub struct AmendDelegationSpendCap<'info> {
     /// machine enforces the party-only rule); a stranger — or the
     /// operator themselves — is `Unauthorized`.
     pub caller: Signer<'info>,
+}
+
+/// AV-494: accounts for `amend_milestone_due_dates` — the
+/// milestone-deadline-table revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`). The replacement table rides as an instruction
+/// param, not an account.
+#[derive(Accounts)]
+pub struct AmendMilestoneDueDates<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
 }
 
 /// AV-477: accounts for `amend_panel_threshold` — the
