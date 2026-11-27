@@ -7297,9 +7297,14 @@ no tranche consumed pre-funding). The new table governs from the next
 evaluation: `fund` books the new Σ and `release_basket` settles the new
 legs (an old mint settles as `InvalidBasket`). The change emits
 `BasketAmended` (discriminant 164) with zero amounts. No vault layout
-change, no new error code, and no new Anchor instruction — logic plus
-event layer only, with the event kind mirrored in the program for the
-indexer.
+change and no new error code. AV-497 adds the program-level
+`amend_basket(legs)` instruction (discriminator [113, 189, 53, 141, 69,
+72, 21, 46]) — the chain entry point for this revision; unconditional
+dual-signature governance by initializer + taker, the direct call the
+only entry point (no delay path covers it), same-table re-affirmation a
+no-op that emits nothing, and the `BasketAmended` event only on an
+actual change; the replacement leg table rides as a `Vec<BasketLeg>`
+instruction arg and the derived `amount` tracks the new Σ.
 
 ## Configuration templates (AV-72)
 

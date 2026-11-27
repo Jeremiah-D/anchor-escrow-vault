@@ -43526,6 +43526,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "new_at <- param (Option<u64>); authority <- accounts.pause_authority (signer) — only the bound pause authority may revise (a stranger, or either party, is Unauthorized, code 100; no authority bound is InvalidStateTransition, code 101); paused only (InvalidStateTransition otherwise — an unpaused escrow has no live schedule to revise, and there is no require_not_paused gate here, unlike every other transition, because this revision never lifts the pause); only an escrow with a live schedule may revise (a manual pause has no table to revise — amendment never creates a schedule, the schedule can only be built by pause, so a schedule-less pause is InvalidStateTransition); an already-expired schedule (now >= t) is InvalidStateTransition (the matured promise belongs to the next clock-bearing transition's try_auto_unpause, which still consumes it afterwards — the revision never consumes it); a new Some(t) at or before now is InvalidAutoUnpauseAt (code 359, the fail-closed gate) leaving the live schedule untouched, while an explicit None is always legal; no Funded gate, no dual signature, no delay path covers this method — GovernanceAction has no AmendAutoUnpauseAt variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the pause path is an emergency operation, like pause / unpause themselves, and the AV-158 delay gates governance configuration changes only); re-affirming the current moment is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only auto_unpause_at changes — paused stays true, pause_authority is untouched, and the state, the amount and the released counters are untouched, so the new schedule governs from the next clock-bearing transition (try_auto_unpause reads the live schedule, so a revised moment fires exactly once at the new time and a cleared schedule never fires) while a recovery already fired is never rewritten; emits the AutoUnpauseAtAmended indexer event only on an actual change (from == to == the current state, all amounts zero; the actor is the pause authority); `now` <- clock sysvar on the Anchor layer (never an instruction param — here both for the revision rule and the event timestamp, read once); the 9-byte auto_unpause_at region is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-497: revise the multi-mint basket leg table before
+            // funding — the program-level entry point for the
+            // AV-340 pure-logic revision. IDL: discriminator =
+            // sha256("global:amend_basket")[..8]
+            // = [113, 189, 53, 141, 69, 72, 21, 46] — the Anchor
+            // instruction discriminator for the
+            // amend_basket handler (pinned by the
+            // discriminator test below).
+            name: "amend_basket",
+            params: &[(
+                "legs",
+                "Vec<BasketLeg>",
+                "instruction param; the replacement leg table as a whole — the program-side BasketLegArg mirror (mint + amount per leg), converted to the ([u8; 32], u64) tuples the state machine validates; the table replaces the current legs wholesale, never partially",
+            )],
+            method: "Escrow::amend_basket",
+            input_mapping: "legs <- param (Vec<BasketLeg>); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Uninitialized / Activated only (InvalidStateTransition otherwise — Funded, terminal states and Disputed; the builder owns the initial table via with_basket); an escrow that already took money refuses even while its state still looks pre-funding (partial funding holds Uninitialized while deposits accumulate, so the funded-total bar is a second, independent gate); only an escrow already carrying a basket may revise — a basket-less escrow is InvalidBasket (code 152, fail-closed: amendment never installs a basket mid-flight); the whole new table is re-validated by BasketLegs::new before any write, so an illegal table (empty, over MAX_BASKET_LEGS legs, a zero mint, a zero leg amount, a duplicate mint, or a Σ overflowing u64) is InvalidBasket leaving the original legs untouched; no delay path covers this method — GovernanceAction has no AmendBasket variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current table is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only the leg table and the derived amount move (amount becomes the new Σ, like with_basket) — released, funded_total, state and expires_at are untouched, and an attached funding plan's total_amount is rebuilt to the new Σ (its tranche budget untouched, no tranche consumed pre-funding), so the next fund books the new Σ and the next release_basket settles the new legs (an old mint settles as InvalidBasket) while a settlement already made keeps the legs it settled under; emits the BasketAmended indexer event only on an actual change (from == to == the current state, all amounts zero); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, read once); the 386-byte basket region is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -44649,6 +44667,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-287 pure-logic
             // revision wired to the chain).
             "Escrow::amend_auto_unpause_at",
+            // AV-497: the program-level multi-mint basket leg-table
+            // revision (the AV-340 pure-logic
+            // revision wired to the chain).
+            "Escrow::amend_basket",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -45482,6 +45504,11 @@ pub(crate) mod anchor_idl_tests {
                 // rewritten; re-affirming the current moment is a
                 // no-op.
                 &"amend_auto_unpause_at",
+                // AV-497: the leg table rides as the instruction
+                // param (Vec<BasketLegArg>); authority <-
+                // accounts.initializer + accounts.taker (BOTH signers,
+                // unconditional).
+                &"amend_basket",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -75168,6 +75195,255 @@ pub(crate) mod anchor_idl_tests {
         );
     }
 
+    /// Basket mints for the AV-497 tests (AV-497): local to this
+    /// module — `error_code_tests` and `basket_tests` own their own
+    /// identically-named constants.
+    const MINT_A: [u8; 32] = [0xA6; 32];
+    const MINT_B: [u8; 32] = [0xB6; 32];
+
+    /// Pre-funding basket escrow (AV-497): the AV-340 pure-logic
+    /// fixture, local to this module — `basket_settlement_tests`
+    /// owns the identically-named helper.
+    fn pre_funding_basket_escrow() -> Escrow {
+        Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap()
+    }
+
+    #[test]
+    fn amend_basket_maps_param_to_leg_table() {
+        // IDL: amend_basket(legs: Vec<BasketLeg>) —
+        // legs <- param; initializer <- accounts.initializer
+        // (signer) AND taker <- accounts.taker (signer), enforced
+        // by the Anchor account constraints and the state machine's
+        // dual-signature gate. The param rewrites the `basket`
+        // region in place (see PARAM_FIELD_MAP) — no layout change.
+        // The INSTRUCTIONS spec entry pins the program-level wiring:
+        // the single Vec<BasketLeg> param and the AV-340 pure-logic
+        // method.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "amend_basket")
+            .expect("INSTRUCTIONS carries amend_basket");
+        assert_eq!(spec.method, "Escrow::amend_basket");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "legs");
+        assert_eq!(spec.params[0].1, "Vec<BasketLeg>");
+        assert!(
+            spec.input_mapping.contains("BasketAmended"),
+            "input_mapping documents the change-only event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the Vec<BasketLeg> arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"amend_basket\""),
+            "checked-in IDL carries amend_basket"
+        );
+        assert!(
+            idl.contains("[113, 189, 53, 141, 69, 72, 21, 46]"),
+            "checked-in IDL pins the AV-497 discriminator"
+        );
+        assert!(
+            idl.contains(
+                "{\"name\": \"legs\", \"type\": {\"vec\": {\"defined\": \"BasketLeg\"}}}"
+            ),
+            "checked-in IDL carries the legs arg"
+        );
+        // The param maps to exactly the leg table — and the table is
+        // no longer a field source (every field gets exactly one
+        // source kind).
+        assert!(
+            PARAM_FIELD_MAP.contains(&("amend_basket", "legs", "basket")),
+            "PARAM_FIELD_MAP carries the legs mapping"
+        );
+        assert!(
+            !FIELD_SOURCES.iter().any(|(f, _)| *f == "basket"),
+            "basket retired from FIELD_SOURCES once param-sourced"
+        );
+        // Only the legs and the derived amount move: the state, the
+        // counters and the deadline are untouched.
+        const MINT_C: [u8; 32] = [0xC3; 32];
+        let mut e = pre_funding_basket_escrow();
+        e.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_C, 3_500)])
+            .unwrap();
+        assert_eq!(e.amount(), 5_000, "derived amount tracks the new Σ");
+        let basket = e.basket().expect("basket attached");
+        assert_eq!(basket.len, 2);
+        assert_eq!(basket.as_slice()[0].mint, MINT_A);
+        assert_eq!(basket.as_slice()[0].amount, 1_500);
+        assert_eq!(basket.as_slice()[1].mint, MINT_C);
+        assert_eq!(basket.as_slice()[1].amount, 3_500);
+        assert!(basket.as_slice().iter().all(|l| l.released == 0));
+        assert_eq!(basket.total_amount(), 5_000);
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.funded_total(), 0);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.expires_at(), EXPIRES_AT, "deadline untouched");
+    }
+
+    #[test]
+    fn amend_basket_rejects_paused_funded_plain_and_invalid() {
+        // AV-497: the program layer inherits the pure-logic gates —
+        // pause first, then the funded-total bar, then the basket
+        // presence gate, then the table validation; every refusal
+        // leaves the original leg table untouched.
+        const NOW: u64 = 1_750_000_000;
+        // Paused: the pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 999, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap()
+            .with_basket(&[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_B, 2_000)]),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(paused.amount(), 3_000, "failed calls move nothing");
+        // Funded: each leg already carries a released counter and
+        // fund() booked funded_total against the old Σ.
+        let mut funded = pre_funding_basket_escrow();
+        funded.fund(ALICE, NOW).unwrap();
+        assert_eq!(
+            funded.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_B, 2_000)]),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(funded.amount(), 3_000, "failed calls move nothing");
+        // Plain: amendment never installs a basket mid-flight.
+        let mut plain = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            plain.amend_basket(ALICE, BOB, &[(MINT_A, 1_000)]),
+            Err(EscrowError::InvalidBasket)
+        );
+        assert_eq!(plain.basket(), None);
+        // Invalid table: a duplicate mint is InvalidBasket and the
+        // original legs stay untouched.
+        let mut e = pre_funding_basket_escrow();
+        assert_eq!(
+            e.amend_basket(ALICE, BOB, &[(MINT_A, 1_000), (MINT_A, 2_000)]),
+            Err(EscrowError::InvalidBasket)
+        );
+        assert_eq!(e.amount(), 3_000, "failed calls move nothing");
+        assert_eq!(e.basket().unwrap().as_slice()[0].amount, 1_000);
+        assert_eq!(e.basket().unwrap().as_slice()[1].amount, 2_000);
+    }
+
+    #[test]
+    fn amend_basket_noop_on_same_table() {
+        // AV-497: re-affirming the current leg table is a no-op — it
+        // succeeds, writes nothing and emits nothing, so the indexer
+        // is never re-notified for a revision that changed nothing.
+        // (The program handler compares the before/after table and
+        // only emits BasketAmended on a real change.)
+        use crate::events::IndexedEscrow;
+        const NOW: u64 = 1_750_000_000;
+        let mut e = pre_funding_basket_escrow();
+        let encoded = super::account_space_tests::encode_escrow(&e);
+        e.amend_basket(ALICE, BOB, &[(MINT_A, 1_000), (MINT_B, 2_000)])
+            .unwrap();
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e),
+            encoded,
+            "same-table re-affirmation writes nothing"
+        );
+        assert_eq!(e.amount(), 3_000);
+        // The indexed wrapper stays silent on the no-op too.
+        let mut indexed =
+            IndexedEscrow::wrap([0x1D; 32], pre_funding_basket_escrow());
+        let before = indexed.event_count();
+        indexed
+            .amend_basket(ALICE, BOB, &[(MINT_A, 1_000), (MINT_B, 2_000)], NOW)
+            .unwrap();
+        assert_eq!(indexed.event_count(), before, "no-op emits nothing");
+        assert_eq!(
+            indexed.inner().basket().unwrap().as_slice()[0].amount,
+            1_000,
+            "table untouched"
+        );
+    }
+
+    #[test]
+    fn amend_basket_program_moves_only_leg_table() {
+        // AV-497: the handler layer moves only the leg table and the
+        // derived amount — the state, the counters and the deadline
+        // are untouched, the 386-byte basket region is rewritten in
+        // place, and the BasketAmended event fires only on a real
+        // change (from == to == the current state, all amounts zero).
+        // The new table then governs the next evaluation: fund books
+        // the new Σ and release_basket settles the new legs.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const NOW: u64 = 1_750_000_000;
+        const MINT_C: [u8; 32] = [0xC3; 32];
+        let mut e = pre_funding_basket_escrow();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_C, 3_500)])
+            .unwrap();
+        assert_eq!(e.amount(), 5_000, "derived amount tracks the new Σ");
+        assert_eq!(e.state(), EscrowState::Uninitialized, "state untouched");
+        assert_eq!(e.funded_total(), 0);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.expires_at(), EXPIRES_AT, "deadline untouched");
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "table rewritten in place, no layout change"
+        );
+        // The new table governs the next evaluation: fund books the
+        // new Σ, and the old mint is no longer settleable.
+        e.fund(ALICE, NOW).unwrap();
+        assert_eq!(e.amount(), 5_000);
+        assert_eq!(
+            e.release_basket(ALICE, NOW, Some(MINT_B)),
+            Err(EscrowError::InvalidBasket),
+            "old mint settles as InvalidBasket"
+        );
+        // The indexed wrapper is the event-layer mirror of the
+        // handler's before/after comparison: a failed revision emits
+        // nothing, a real revision emits exactly one event, a no-op
+        // re-affirmation emits nothing.
+        let mut indexed =
+            IndexedEscrow::wrap([0x1D; 32], pre_funding_basket_escrow());
+        let before = indexed.event_count();
+        assert_eq!(
+            indexed.amend_basket(
+                MALLORY,
+                BOB,
+                &[(MINT_A, 1_500), (MINT_C, 3_500)],
+                NOW
+            ),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(indexed.event_count(), before, "failed calls emit nothing");
+        indexed
+            .amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_C, 3_500)], NOW)
+            .unwrap();
+        assert_eq!(indexed.event_count(), before + 1);
+        let ev = indexed.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::BasketAmended);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Uninitialized, EscrowState::Uninitialized)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        assert_eq!(ev.at, NOW, "at doubles as now and event timestamp");
+        indexed
+            .amend_basket(ALICE, BOB, &[(MINT_A, 1_500), (MINT_C, 3_500)], NOW)
+            .unwrap();
+        assert_eq!(indexed.event_count(), before + 1, "no-op emits nothing");
+        assert_eq!(
+            indexed.inner().basket().unwrap().total_amount(),
+            5_000,
+            "table untouched by the no-op"
+        );
+    }
+
     #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
@@ -79584,6 +79860,18 @@ pub(crate) mod anchor_idl_tests {
         // manual pause, and re-affirming the current moment is a
         // no-op.
         ("amend_auto_unpause_at", "new_at", "auto_unpause_at"),
+        // AV-497: the pre-funding basket leg-table revision rewrites
+        // the resident `basket` region in place — a second param
+        // source for the table, like `amend_milestone_due_dates`'
+        // table. The table's initial values come from the
+        // `initialize_basket` / `with_basket` builder
+        // (Uninitialized only, one (mint, amount) leg per mint);
+        // this entry documents the revision source. Only the legs
+        // and the derived amount move — released, funded_total,
+        // state and expires_at are untouched, and an attached
+        // funding plan's total tracks the new Σ; a basket-less
+        // escrow is refused outright (InvalidBasket, code 152).
+        ("amend_basket", "legs", "basket"),
         // AV-134: the funding amount bounds — the
         // `initialize_amount_bounds` params populate the vault's
         // `min_funding_amount` / `max_funding_amount` fields in place
@@ -109934,6 +110222,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_auto_unpause_at"),
             [149, 79, 226, 131, 1, 99, 50, 142]
+        );
+    }
+
+    #[test]
+    fn amend_basket_instruction_discriminator_is_pinned() {
+        // AV-497. IDL:
+        // sha256("global:amend_basket")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("amend_basket"),
+            [113, 189, 53, 141, 69, 72, 21, 46]
         );
     }
 

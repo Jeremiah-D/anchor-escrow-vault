@@ -1719,6 +1719,14 @@
       ]
     },
     {
+      "name": "amend_basket",
+      "discriminator": [113, 189, 53, 141, 69, 72, 21, 46],
+      "accounts": [],
+      "args": [
+        {"name": "legs", "type": {"vec": {"defined": "BasketLeg"}}}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

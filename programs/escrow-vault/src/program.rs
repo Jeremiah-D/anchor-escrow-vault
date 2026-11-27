@@ -9800,6 +9800,83 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the multi-mint basket leg table before funding (AV-497;
+    /// mirrors `Escrow::amend_basket`, the AV-340 pure-logic revision).
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign — one party alone cannot redefine the other's locked
+    /// composition, paralleling `amend_funding_start`. A paused escrow
+    /// fails fast (`Paused`, before the authority gate).
+    /// `Uninitialized` / `Activated` only (anything else is
+    /// `InvalidStateTransition`, code 101), and an escrow that already
+    /// took money refuses even while its state still looks pre-funding
+    /// — partial funding holds `Uninitialized` while deposits
+    /// accumulate, so the funded-total bar is a second, independent
+    /// gate. Only an escrow already carrying a basket may revise — a
+    /// plain escrow is `InvalidBasket` (code 152, fail-closed:
+    /// amendment never installs a basket mid-flight). The whole new
+    /// table is re-validated by `BasketLegs::new` before any write, so
+    /// an illegal table is code 152 and the original legs stay
+    /// untouched. Re-affirming the current table is a no-op: it
+    /// succeeds, writes nothing and emits nothing. No delay path covers
+    /// this method — `GovernanceAction` has no `AmendBasket` variant,
+    /// so the direct call is the only entry point and stays open on a
+    /// delay-opted-in escrow (the AV-471 `amend_twap_gate` precedent).
+    /// Only the leg table and the derived `amount` move (`amount`
+    /// becomes the new Σ, like `with_basket`); an attached funding
+    /// plan's `total_amount` is rebuilt to the new Σ. The new table
+    /// governs from the next evaluation: `fund` books the new Σ and
+    /// `release_basket` settles the new legs (an old mint settles as
+    /// `InvalidBasket`). Emits `BasketAmended` (from == to == the
+    /// current state, all amounts zero) only on an actual change.
+    /// `now` comes from the clock sysvar, never an instruction param
+    /// — here only for the event timestamp, since the pure logic takes
+    /// no `now` (mirrors `amend_vesting_schedule`). The 386-byte
+    /// basket region is rewritten in place — no layout change.
+    pub fn amend_basket(
+        ctx: Context<AmendBasket>,
+        legs: Vec<BasketLegArg>,
+    ) -> Result<()> {
+        let leg_tuples: Vec<([u8; 32], u64)> = legs
+            .iter()
+            .map(|l| (l.mint.to_bytes(), l.amount))
+            .collect();
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.basket();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_basket(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &leg_tuples,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 386-byte `basket` region in place — no
+        // realloc. Only the leg table and the derived `amount` move;
+        // an attached funding plan's total tracks the new Σ. Emits
+        // only on an actual change; a same-table no-op stays silent
+        // (mirrors `amend_vesting_schedule`).
+        if escrow.basket() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::BasketAmended,
+                state,
+                state,
+                0,
+                0,
+                0,
+                now,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -18012,6 +18089,23 @@ pub struct AmendAutoUnpauseAt<'info> {
     /// the opted-in address (`Unauthorized` for anyone else, and the
     /// switch must exist) — the same rule as `Pause` / `Unpause`.
     pub pause_authority: Signer<'info>,
+}
+
+/// AV-497: accounts for `amend_basket` — the
+/// multi-mint basket leg-table revision is unconditional
+/// dual-signature governance: both initializer and taker sign (the
+/// state machine enforces this — one party alone is
+/// `Unauthorized`). The replacement leg table rides as an
+/// instruction param (`Vec<BasketLegArg>`), not an account.
+#[derive(Accounts)]
+pub struct AmendBasket<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Unconditional dual-signature governance: both initializer and
+    /// taker sign (the state machine enforces this — one party alone
+    /// is `Unauthorized`).
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
 }
 
 /// AV-477: accounts for `amend_panel_threshold` — the
