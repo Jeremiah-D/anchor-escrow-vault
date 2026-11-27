@@ -1711,6 +1711,14 @@
       ]
     },
     {
+      "name": "amend_auto_unpause_at",
+      "discriminator": [149, 79, 226, 131, 1, 99, 50, 142],
+      "accounts": [],
+      "args": [
+        {"name": "new_at", "type": {"option": "u64"}}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],

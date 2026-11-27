@@ -9738,6 +9738,68 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Revise the scheduled auto-recovery timestamp while paused (AV-496;
+    /// mirrors `Escrow::amend_auto_unpause_at`, the AV-287
+    /// pure-logic revision). Pause-exclusive emergency revision: only
+    /// the bound pause authority signs — a stranger (or either
+    /// party) is `Unauthorized`, and an escrow with no bound
+    /// authority, an unpaused escrow, a manual pause (no schedule)
+    /// or an already-expired schedule is `InvalidStateTransition`
+    /// (an expired schedule belongs to the next clock-bearing
+    /// transition's `try_auto_unpause`, which still consumes it
+    /// afterwards — the revision never consumes it, and amendment
+    /// never creates a schedule). A new `Some(t)` at or before `now`
+    /// is `InvalidAutoUnpauseAt` (code 359); an explicit `None`
+    /// clears the schedule back to a manual pause (only `unpause`
+    /// releases it from then on). No `Funded` gate, no dual
+    /// signature, no delay path — `GovernanceAction` has no
+    /// `AmendAutoUnpauseAt` variant, so the direct call is the only
+    /// entry point and stays open on a delay-opted-in escrow (the
+    /// pause path is an emergency operation, like `pause` /
+    /// `unpause` themselves). Only `auto_unpause_at` moves — the
+    /// pause stays engaged and the authority is untouched, so the
+    /// new schedule governs from the next clock-bearing transition.
+    /// Emits `AutoUnpauseAtAmended` only on an actual change (a
+    /// no-op re-affirmation emits nothing), mirroring
+    /// `IndexedEscrow::amend_auto_unpause_at`; the `now` for the
+    /// revision rule and the event timestamp is read once from the
+    /// clock sysvar. Rewrites the 9-byte schedule region in
+    /// place — no realloc, no rent change.
+    pub fn amend_auto_unpause_at(
+        ctx: Context<AmendAutoUnpauseAt>,
+        new_at: Option<u64>,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let before = escrow.auto_unpause_at();
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .amend_auto_unpause_at(ctx.accounts.pause_authority.key().to_bytes(), new_at, now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Rewrites the 9-byte `auto_unpause_at` region in place (the
+        // 1-byte discriminant + 8-byte timestamp, always reserved,
+        // `None` when no schedule) — no realloc, no rent change.
+        if escrow.auto_unpause_at() != before {
+            emit_transition(
+                &ctx.accounts.vault,
+                escrow_state::EscrowEventKind::AutoUnpauseAtAmended,
+                state,
+                state,
+                0,
+                0,
+                0,
+                now,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// Revise the arbiter panel's judgment threshold after funding (AV-477;
     /// mirrors `Escrow::amend_panel_threshold`, the AV-378
     /// pure-logic revision). Unconditional dual-signature governance:
@@ -17934,6 +17996,22 @@ pub struct AmendMilestoneDueDates<'info> {
     /// is `Unauthorized`).
     pub initializer: Signer<'info>,
     pub taker: Signer<'info>,
+}
+
+/// AV-496: accounts for `amend_auto_unpause_at` — the
+/// scheduled-auto-recovery revision is pause-exclusive: only the
+/// bound pause authority signs (the state machine enforces this —
+/// a stranger, or either party, is `Unauthorized`). The
+/// initializer and taker do not sign. The replacement moment rides
+/// as an instruction param, not an account.
+#[derive(Accounts)]
+pub struct AmendAutoUnpauseAt<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The bound pause authority; the state machine checks it against
+    /// the opted-in address (`Unauthorized` for anyone else, and the
+    /// switch must exist) — the same rule as `Pause` / `Unpause`.
+    pub pause_authority: Signer<'info>,
 }
 
 /// AV-477: accounts for `amend_panel_threshold` — the
