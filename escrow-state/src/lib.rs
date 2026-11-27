@@ -43544,6 +43544,24 @@ pub(crate) mod anchor_idl_tests {
             input_mapping: "legs <- param (Vec<BasketLeg>); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate); Uninitialized / Activated only (InvalidStateTransition otherwise — Funded, terminal states and Disputed; the builder owns the initial table via with_basket); an escrow that already took money refuses even while its state still looks pre-funding (partial funding holds Uninitialized while deposits accumulate, so the funded-total bar is a second, independent gate); only an escrow already carrying a basket may revise — a basket-less escrow is InvalidBasket (code 152, fail-closed: amendment never installs a basket mid-flight); the whole new table is re-validated by BasketLegs::new before any write, so an illegal table (empty, over MAX_BASKET_LEGS legs, a zero mint, a zero leg amount, a duplicate mint, or a Σ overflowing u64) is InvalidBasket leaving the original legs untouched; no delay path covers this method — GovernanceAction has no AmendBasket variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow (the AV-471 AmendTwapGate precedent); re-affirming the current table is a no-op (succeeds, writes nothing, emits no event, paralleling rotate_arbiter); only the leg table and the derived amount move (amount becomes the new Σ, like with_basket) — released, funded_total, state and expires_at are untouched, and an attached funding plan's total_amount is rebuilt to the new Σ (its tranche budget untouched, no tranche consumed pre-funding), so the next fund books the new Σ and the next release_basket settles the new legs (an old mint settles as InvalidBasket) while a settlement already made keeps the legs it settled under; emits the BasketAmended indexer event only on an actual change (from == to == the current state, all amounts zero); `now` <- clock sysvar on the Anchor layer (never an instruction param — here only for the event timestamp, read once); the 386-byte basket region is rewritten in place - no layout / rent change",
         },
         InstructionSpec {
+            // AV-498: shorten the expiry deadline in place — the
+            // program-level entry point for the AV-338 pure-logic
+            // revision. IDL: discriminator =
+            // sha256("global:shorten_expiry")[..8]
+            // = [53, 53, 149, 214, 249, 26, 52, 220] — the Anchor
+            // instruction discriminator for the
+            // shorten_expiry handler (pinned by the
+            // discriminator test below).
+            name: "shorten_expiry",
+            params: &[(
+                "new_expires_at",
+                "u64",
+                "instruction param; the new deadline — must move strictly backward and strictly into the future",
+            )],
+            method: "Escrow::shorten_expiry",
+            input_mapping: "new_expires_at <- param (u64 -> the expires_at vault field, in place); initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) — both current parties must authorize (a stranger pair or one party alone is Unauthorized; the degenerate initializer == taker self-escrow authorizes with one key passed twice); a paused escrow fails fast (Paused, before the authority gate) unless a due auto-recovery schedule lifts first (AV-133 try_auto_unpause); only Uninitialized / Funded — Activated is deliberately excluded (a dual-sig escrow both parties activated has jointly committed to its terms), terminal states and Disputed are InvalidStateTransition; the escrow must not already be expiry-eligible (is_expiry_eligible — an expired escrow exits via cancel_expired, it cannot be resurrected, and the AV-21 grace window applies: eligibility is now >= expires_at + grace_period); the new deadline must move strictly backward (equal is not a restatement, larger is extend_expiry's job) and strictly into the future (at or before now would manufacture an immediately expiry-eligible escrow) — InvalidExpiryExtension (code 134) for any violation; no extension opt-in is needed — shortening consumes no max_extension_secs budget and extension_count does not move (shortening is not an extension); no delay path covers this method — GovernanceAction has no ShortenExpiry variant, so the direct call is the only entry point and stays open on a delay-opted-in escrow; only expires_at moves — amount, released, funded_total, state, extension_count and max_extension_secs are untouched, so the new deadline governs from the next evaluation (cancel_expired / escalate read the live value, and the dispute window closes at the live expires_at) while actions already executed keep the deadline they settled under; the new-value gate is now, not now + grace_period — expiry eligibility at the new deadline still requires now >= new_expires_at + grace_period, so a new value strictly after now can never be immediately cancel-eligible; emits the ExpiryShortened indexer event (from == to == the current state, all amounts zero) — always on success, since a valid call strictly moves the deadline: there is no no-op shortening; now <- clock sysvar on the Anchor layer (never an instruction param — here for the value gates and the event timestamp, read once); the expires_at u64 is rewritten in place - no layout / rent change",
+        },
+        InstructionSpec {
             // AV-388: the delegation-operator rotation — the
             // program-level entry point for the AV-301 pure-logic
             // rotation. IDL: discriminator =
@@ -44671,6 +44689,10 @@ pub(crate) mod anchor_idl_tests {
             // revision (the AV-340 pure-logic
             // revision wired to the chain).
             "Escrow::amend_basket",
+            // AV-498: the program-level expiry-shortening
+            // revision (the AV-338 pure-logic
+            // revision wired to the chain).
+            "Escrow::shorten_expiry",
             // AV-388: the program-level delegation-operator rotation
             // (the AV-301 pure-logic rotation wired to the chain).
             "Escrow::rotate_delegation_delegate",
@@ -45509,6 +45531,11 @@ pub(crate) mod anchor_idl_tests {
                 // accounts.initializer + accounts.taker (BOTH signers,
                 // unconditional).
                 &"amend_basket",
+                // AV-498: the replacement deadline rides as the
+                // instruction param (u64); authority <-
+                // accounts.initializer + accounts.taker (BOTH signers,
+                // unconditional).
+                &"shorten_expiry",
                 // AV-388: the delegate-rotation target (Pubkey) — the
                 // replacement operator; the only single-Pubkey-param
                 // item in the rotation family.
@@ -75445,6 +75472,282 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn shorten_expiry_maps_param_to_new_deadline() {
+        // IDL: shorten_expiry(new_expires_at: u64) —
+        // new_expires_at <- param; initializer <-
+        // accounts.initializer (signer) AND taker <-
+        // accounts.taker (signer), enforced by the Anchor account
+        // constraints and the state machine's dual-signature gate.
+        // The param rewrites the `expires_at` field in place (see
+        // PARAM_FIELD_MAP) — no layout change. The INSTRUCTIONS
+        // spec entry pins the program-level wiring: the single u64
+        // param and the AV-338 pure-logic method.
+        const T0: u64 = 1_700_000_000;
+        const NEW: u64 = EXPIRES_AT - 3_600;
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "shorten_expiry")
+            .expect("INSTRUCTIONS carries shorten_expiry");
+        assert_eq!(spec.method, "Escrow::shorten_expiry");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "new_expires_at");
+        assert_eq!(spec.params[0].1, "u64");
+        assert!(
+            spec.input_mapping.contains("ExpiryShortened"),
+            "input_mapping documents the always-fired event"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the u64 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"shorten_expiry\""),
+            "checked-in IDL carries shorten_expiry"
+        );
+        assert!(
+            idl.contains("[53, 53, 149, 214, 249, 26, 52, 220]"),
+            "checked-in IDL pins the AV-498 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"new_expires_at\", \"type\": \"u64\"}"),
+            "checked-in IDL carries the new_expires_at arg"
+        );
+        // The param maps to exactly the deadline — and the deadline
+        // is shared with `extend_expiry`'s param source (the two
+        // directions of the same field, one param source each).
+        assert!(
+            PARAM_FIELD_MAP
+                .contains(&("shorten_expiry", "new_expires_at", "expires_at")),
+            "PARAM_FIELD_MAP carries the deadline mapping"
+        );
+        assert!(
+            PARAM_FIELD_MAP
+                .contains(&("extend_expiry", "new_expires_at", "expires_at")),
+            "extend_expiry keeps its own deadline mapping"
+        );
+        // Only the deadline moves: the state, the counters, the
+        // extension budget and the amounts are untouched.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_max_extension_secs(7_200)
+            .unwrap();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.shorten_expiry(ALICE, BOB, NEW, T0).unwrap();
+        assert_eq!(e.expires_at(), NEW, "deadline moved");
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.funded_total(), 0);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.extension_count(), 0, "shortening is not an extension");
+        assert_eq!(e.max_extension_secs(), 7_200, "budget unconsumed");
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "deadline rewritten in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn shorten_expiry_rejects_paused_stranger_bad_state_and_bad_values() {
+        // AV-498: the program layer inherits the pure-logic gates —
+        // pause first, then the dual-signature authority gate, then
+        // state, then expiry eligibility, then the value gates; every
+        // refusal leaves the deadline untouched.
+        const T0: u64 = 1_700_000_000;
+        const NEW: u64 = EXPIRES_AT - 3_600;
+        // Paused: the pause guard fires before the authority gate.
+        let mut paused = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_pause_authority(ALICE)
+            .unwrap();
+        paused.pause(ALICE, None).unwrap();
+        assert_eq!(
+            paused.shorten_expiry(ALICE, BOB, NEW, T0),
+            Err(EscrowError::Paused)
+        );
+        assert_eq!(
+            paused.expires_at(),
+            EXPIRES_AT,
+            "failed calls move nothing"
+        );
+        // A due auto-recovery schedule lifts first (AV-133): the
+        // same paused escrow shortens once the clock passes the
+        // scheduled moment.
+        let mut scheduled = scheduled_pause_escrow();
+        scheduled
+            .shorten_expiry(ALICE, BOB, NEW, 1_760_000_000)
+            .unwrap();
+        assert!(!scheduled.is_paused(), "schedule lifted before the gate");
+        assert_eq!(scheduled.expires_at(), NEW);
+        // Stranger / single signer: either key mismatching is
+        // Unauthorized, and a swapped pair is too.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        assert_eq!(
+            e.shorten_expiry(MALLORY, BOB, NEW, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.shorten_expiry(ALICE, MALLORY, NEW, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.shorten_expiry(BOB, ALICE, NEW, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(e.expires_at(), EXPIRES_AT, "failed calls move nothing");
+        // Activated: a dual-sig escrow both parties activated has
+        // jointly committed to its terms (activation precedes
+        // funding on a dual-sig escrow).
+        let mut activated = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_dual_sig()
+            .unwrap();
+        activated.activate(ALICE).unwrap();
+        activated.activate(BOB).unwrap();
+        assert_eq!(activated.state(), EscrowState::Activated);
+        assert_eq!(
+            activated.shorten_expiry(ALICE, BOB, NEW, T0),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        assert_eq!(
+            activated.expires_at(),
+            EXPIRES_AT,
+            "failed calls move nothing"
+        );
+        // Grace (AV-21): the "already expired" gate uses
+        // is_expiry_eligible, so inside the grace window the escrow
+        // is not yet expired — but every valid shorten target is
+        // already past `now`, so the `new <= now` gate refuses.
+        let mut graced = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap();
+        assert_eq!(
+            graced.shorten_expiry(ALICE, BOB, EXPIRES_AT - 60, EXPIRES_AT + 120),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        // Already expiry-eligible (past deadline + grace): the exit
+        // path owns the expired state.
+        assert_eq!(
+            graced.shorten_expiry(ALICE, BOB, EXPIRES_AT - 60, EXPIRES_AT + 300),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(
+            graced.expires_at(),
+            EXPIRES_AT,
+            "failed calls move nothing"
+        );
+        // Equal is not a restatement; larger is extend_expiry's
+        // job; at-or-before now manufactures an immediately
+        // expirable escrow.
+        assert_eq!(
+            e.shorten_expiry(ALICE, BOB, EXPIRES_AT, T0),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(
+            e.shorten_expiry(ALICE, BOB, EXPIRES_AT + 1, T0),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(
+            e.shorten_expiry(ALICE, BOB, T0, T0),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(e.expires_at(), EXPIRES_AT, "failed calls move nothing");
+    }
+
+    #[test]
+    fn shorten_expiry_program_moves_only_deadline() {
+        // AV-498: the handler layer moves only the deadline — the
+        // state, the counters, the extension budget and the amounts
+        // are untouched, the `expires_at` u64 is rewritten in place,
+        // and the ExpiryShortened event fires on every success
+        // (from == to == the current state, all amounts zero) —
+        // there is no no-op shortening, so an equal value is a
+        // rejection, not a silent success. The new deadline then
+        // governs the next evaluation: cancel_expired reads the
+        // live value, and the AV-21 grace window still applies at
+        // the new deadline.
+        use crate::events::{EscrowEventKind, IndexedEscrow};
+        const T0: u64 = 1_700_000_000;
+        const NEW: u64 = EXPIRES_AT - 3_600;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_max_extension_secs(7_200)
+            .unwrap()
+            .with_grace_period(300)
+            .unwrap();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.shorten_expiry(ALICE, BOB, NEW, T0).unwrap();
+        assert_eq!(e.expires_at(), NEW);
+        assert_eq!(e.state(), EscrowState::Uninitialized, "state untouched");
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.funded_total(), 0);
+        assert_eq!(e.released_amount(), 0);
+        assert_eq!(e.extension_count(), 0);
+        assert_eq!(e.max_extension_secs(), 7_200);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "deadline rewritten in place, no layout change"
+        );
+        // The new deadline governs the next evaluation: the escrow
+        // is not yet expiry-eligible at the new deadline (the grace
+        // window still applies there), and becomes eligible only
+        // past new + grace — cancel_expired then exits at the new
+        // deadline, not the old one.
+        assert!(!e.is_expiry_eligible(NEW + 299));
+        assert!(e.is_expiry_eligible(NEW + 300));
+        e.fund(ALICE, T0 + 1).unwrap();
+        assert_eq!(
+            e.cancel_expired(ALICE, NEW + 299, None, ALICE),
+            Err(EscrowError::NotExpired),
+            "grace still guards the new deadline"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        e.cancel_expired(ALICE, NEW + 300, None, ALICE).unwrap();
+        assert_eq!(e.state(), EscrowState::Cancelled);
+        // The indexed wrapper is the event-layer mirror of the
+        // handler's unconditional emit: a failed revision emits
+        // nothing, a real revision emits exactly one event, and
+        // re-affirming the new deadline is a rejection (no silent
+        // no-op), so the event count stays put.
+        let mut indexed = IndexedEscrow::wrap(
+            [0x1D; 32],
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap(),
+        );
+        let before = indexed.event_count();
+        assert_eq!(
+            indexed.shorten_expiry(MALLORY, BOB, NEW, T0),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(indexed.event_count(), before, "failed calls emit nothing");
+        indexed.shorten_expiry(ALICE, BOB, NEW, T0).unwrap();
+        assert_eq!(indexed.event_count(), before + 1);
+        let ev = indexed.events().last().copied().expect("event pushed");
+        assert_eq!(ev.kind, EscrowEventKind::ExpiryShortened);
+        assert_eq!(
+            (ev.from, ev.to),
+            (EscrowState::Uninitialized, EscrowState::Uninitialized)
+        );
+        assert_eq!(ev.amounts.payout, 0);
+        assert_eq!(ev.amounts.fee, 0);
+        assert_eq!(ev.at, T0, "at doubles as now and event timestamp");
+        assert_eq!(indexed.inner().expires_at(), NEW);
+        assert_eq!(indexed.inner().extension_count(), 0);
+        assert_eq!(
+            indexed.shorten_expiry(ALICE, BOB, NEW, T0 + 1),
+            Err(EscrowError::InvalidExpiryExtension)
+        );
+        assert_eq!(
+            indexed.event_count(),
+            before + 1,
+            "rejected calls emit nothing"
+        );
+    }
+
+    #[test]
     fn rotate_delegation_delegate_maps_param_to_delegation_field() {
         // IDL: rotate_delegation_delegate(new_delegate: Pubkey) —
         // new_delegate <- param; caller <-
@@ -79872,6 +80175,14 @@ pub(crate) mod anchor_idl_tests {
         // funding plan's total tracks the new Σ; a basket-less
         // escrow is refused outright (InvalidBasket, code 152).
         ("amend_basket", "legs", "basket"),
+        // AV-498: the replacement deadline rewrites the resident
+        // `expires_at` field in place — a second param source for
+        // the deadline, like `extend_expiry`'s. Only `expires_at`
+        // moves — `extension_count` / `max_extension_secs` are
+        // untouched, and the new deadline governs from the next
+        // evaluation (`cancel_expired` / `escalate` read the live
+        // value).
+        ("shorten_expiry", "new_expires_at", "expires_at"),
         // AV-134: the funding amount bounds — the
         // `initialize_amount_bounds` params populate the vault's
         // `min_funding_amount` / `max_funding_amount` fields in place
@@ -110234,6 +110545,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("amend_basket"),
             [113, 189, 53, 141, 69, 72, 21, 46]
+        );
+    }
+
+    #[test]
+    fn shorten_expiry_instruction_discriminator_is_pinned() {
+        // AV-498. IDL:
+        // sha256("global:shorten_expiry")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("shorten_expiry"),
+            [53, 53, 149, 214, 249, 26, 52, 220]
         );
     }
 

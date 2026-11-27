@@ -11419,6 +11419,78 @@ pub mod escrow_vault {
         Ok(())
     }
 
+
+    /// Shorten the expiry deadline in place (AV-498; mirrors
+    /// `Escrow::shorten_expiry`, the AV-338 pure-logic revision).
+    /// The opposite direction of `extend_expiry` — extending only
+    /// lengthens the taker's window, so the initializer may do it
+    /// alone, but shortening cuts the window and brings forward
+    /// `cancel_expired` eligibility, so one side alone must never
+    /// rewrite the other's window: unconditional dual-signature
+    /// governance, both initializer and taker sign. Only
+    /// `Uninitialized` / `Funded` — `Activated` is deliberately
+    /// excluded (a dual-sig escrow both parties activated has
+    /// jointly committed to its terms), terminal states and
+    /// `Disputed` are `InvalidStateTransition`. The escrow must
+    /// not already be expiry-eligible (an expired escrow exits via
+    /// `cancel_expired`), the new deadline must move strictly
+    /// backward, and strictly into the future — equal is not a
+    /// restatement, larger is `extend_expiry`'s job, and a value
+    /// at or before `now` would manufacture an immediately
+    /// expiry-eligible escrow — `InvalidExpiryExtension` (code
+    /// 134) for any violation. No extension opt-in is needed:
+    /// shortening consumes no `max_extension_secs` budget and
+    /// `extension_count` does not move. A paused escrow fails
+    /// fast (`Paused`), unless a due auto-recovery schedule lifts
+    /// first (AV-133). On success only `expires_at` moves. The
+    /// new deadline governs from the next evaluation:
+    /// `cancel_expired` / `escalate` read the live value. Emits
+    /// `ExpiryShortened` (from == to == the current state) —
+    /// always on success, since a valid call strictly moves the
+    /// deadline: there is no no-op shortening. No delay path
+    /// covers this method — `GovernanceAction` has no
+    /// `ShortenExpiry` variant, so the direct call is the only
+    /// entry point. The `expires_at` u64 is rewritten in place —
+    /// no layout change.
+    pub fn shorten_expiry(
+        ctx: Context<ShortenExpiry>,
+        new_expires_at: u64,
+    ) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        let state = escrow.state() as u8;
+        let now = Clock::get()?.unix_timestamp as u64;
+        escrow
+            .shorten_expiry(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                new_expires_at,
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // Every valid call strictly moves the deadline backward
+        // into the future, so the event always fires on success —
+        // there is no no-op case (the IndexedEscrow wrapper is
+        // the event-layer mirror of this). The dead-man's clock
+        // follows the `extend_expiry` precedent (touched by the
+        // pure logic on a successful transition).
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::ExpiryShortened,
+            state,
+            state,
+            0,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
     /// Migrate the vault's persisted schema to the current revision
     /// (AV-75; AV-85: the one-shot catch-up is now the explicit N → M
     /// step chain — mirrors `Escrow::migrate_schema`). A unilateral
@@ -17196,6 +17268,23 @@ pub struct ExtendExpiry<'info> {
     /// lengthens the taker's window, so no counterparty signature is
     /// needed. A stranger is `Unauthorized`.
     pub initializer: Signer<'info>,
+}
+
+/// AV-498: accounts for `shorten_expiry` — the
+/// expiry-shortening revision is unconditional dual-signature
+/// governance: both initializer and taker sign (the state machine
+/// enforces this — one party alone is `Unauthorized`). The
+/// replacement deadline rides as an instruction param (`u64`),
+/// not an account.
+#[derive(Accounts)]
+pub struct ShortenExpiry<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Shortening cuts the taker's funding window and brings
+    /// forward `cancel_expired` eligibility, so one side alone
+    /// must not rewrite the other's window — both parties sign.
+    pub initializer: Signer<'info>,
+    pub taker: Signer<'info>,
 }
 
 /// AV-75: accounts for `migrate_schema` — the vault plus the

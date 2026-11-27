@@ -1727,6 +1727,14 @@
       ]
     },
     {
+      "name": "shorten_expiry",
+      "discriminator": [53, 53, 149, 214, 249, 26, 52, 220],
+      "accounts": [],
+      "args": [
+        {"name": "new_expires_at", "type": "u64"}
+      ]
+    },
+    {
       "name": "rotate_delegation_delegate",
       "discriminator": [200, 179, 190, 166, 27, 15, 73, 168],
       "accounts": [],
