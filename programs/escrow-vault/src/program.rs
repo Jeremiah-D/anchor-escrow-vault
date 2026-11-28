@@ -4205,6 +4205,121 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Open a social-recovery request (AV-502; mirrors
+    /// `Escrow::request_recovery`, the AV-195 pure-logic
+    /// transition). A guardian names the replacement
+    /// initializer; the requester's approval is recorded
+    /// immediately. Check order: pause -> configured
+    /// (`RecoveryNotConfigured`, code 287) -> state
+    /// (`Uninitialized` / `Activated` / `Funded`; `Disputed`
+    /// excluded — arbitration is in flight) -> guardian
+    /// (`RecoveryNotGuardian`, code 288) -> no live request
+    /// (`RecoveryRequestPending`, code 289 — a guardian cannot
+    /// front-run another guardian's request) -> non-zero
+    /// replacement authority (`InvalidSocialRecovery`, code
+    /// 286). `now` comes from the clock sysvar, not an
+    /// instruction param. No indexer event: the request is
+    /// keeper-observable via the vault account.
+    pub fn request_recovery(
+        ctx: Context<RequestRecovery>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp as u64;
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .request_recovery(
+                ctx.accounts.guardian.key().to_bytes(),
+                new_authority.to_bytes(),
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The pending request rides inside the 309-byte
+        // social-recovery tail region, so it is written in
+        // place — no realloc needed in the real build. No
+        // indexer event: the request is keeper-observable via
+        // the vault account.
+        Ok(())
+    }
+
+    /// Record a guardian's approval on the live recovery
+    /// request (AV-502; mirrors `Escrow::approve_recovery`, the
+    /// AV-195 pure-logic transition). Re-approving is an
+    /// idempotent no-op (`Ok(())`), not an error. Check order:
+    /// pause -> configured -> live request
+    /// (`RecoveryNoPendingRequest`, code 290) -> guardian
+    /// (`RecoveryNotGuardian`, code 288). No indexer event.
+    pub fn approve_recovery(ctx: Context<ApproveRecovery>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .approve_recovery(ctx.accounts.guardian.key().to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The approval bitmap rides inside the 309-byte
+        // social-recovery tail region, so it is written in
+        // place — no realloc needed in the real build. No
+        // indexer event.
+        Ok(())
+    }
+
+    /// Execute the live recovery request (AV-502; mirrors
+    /// `Escrow::execute_recovery`, the AV-195 pure-logic
+    /// transition). Permissionless crank — anyone may call once
+    /// the guardian threshold is met and the timelock has
+    /// elapsed (measured from the request opening, so the
+    /// original key gets the full delay from first signal), so
+    /// this instruction takes no signer. Check order: pause ->
+    /// configured -> live request -> approval threshold
+    /// (`RecoveryThresholdNotReached`, code 291) -> timelock
+    /// (`RecoveryTimelockNotElapsed`, code 292) -> state
+    /// (pre-release states; `Disputed` excluded like
+    /// `rotate_initializer`). The rotation carries
+    /// `rotate_initializer`'s side effects: the initializer's
+    /// activation signature bit is cleared (the new key never
+    /// signed) and the operator delegation is revoked (AV-104 —
+    /// the grant is party-bound), with the delegation expiry
+    /// cleared too (AV-215). The request is consumed. `now`
+    /// comes from the clock sysvar, not an instruction param.
+    /// No indexer event: the rotation is observable via the
+    /// vault account.
+    pub fn execute_recovery(ctx: Context<ExecuteRecovery>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp as u64;
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .execute_recovery(now)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The initializer region and the 309-byte
+        // social-recovery tail region are rewritten in place —
+        // no realloc needed in the real build. No indexer
+        // event: the rotation is observable via the vault
+        // account.
+        Ok(())
+    }
+
+    /// Veto the live recovery request (AV-502; mirrors
+    /// `Escrow::veto_recovery`, the AV-195 pure-logic
+    /// transition). Only the *current* initializer may veto —
+    /// the key-loss escape hatch must not fire against a live
+    /// key, and the veto is the collusion defense against
+    /// guardian capture. Check order: pause -> configured ->
+    /// live request (`RecoveryNoPendingRequest`, code 290) ->
+    /// authority is the current initializer (`Unauthorized`,
+    /// code 100, otherwise). The request is cancelled and a
+    /// fresh one starts clean. No indexer event.
+    pub fn veto_recovery(ctx: Context<VetoRecovery>) -> Result<()> {
+        let mut escrow = read_escrow(&ctx.accounts.vault);
+        escrow
+            .veto_recovery(ctx.accounts.initializer.key().to_bytes())
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The pending request rides inside the 309-byte
+        // social-recovery tail region, so its cancellation is
+        // written in place — no realloc needed in the real
+        // build. No indexer event.
+        Ok(())
+    }
+
     /// Opt into the referrer revenue share (AV-501; mirrors
     /// `Escrow::with_referrer`, the AV-191 pure-logic builder).
     /// The initializer binds the referrer while the escrow is
@@ -15405,6 +15520,51 @@ pub struct ConfigureSocialRecovery<'info> {
     pub vault: Account<'info, Vault>,
     /// Only the initializer opts into social recovery; the state
     /// machine rejects re-configuration once the escrow is funded.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-502: accounts for `request_recovery` — a guardian opens
+/// the recovery request naming the replacement initializer.
+/// The new authority rides as an instruction param (`Pubkey`),
+/// not an account; `now` comes from the clock sysvar.
+#[derive(Accounts)]
+pub struct RequestRecovery<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The requesting guardian; the state machine rejects a
+    /// non-guardian (`RecoveryNotGuardian`, code 288).
+    pub guardian: Signer<'info>,
+}
+
+/// AV-502: accounts for `approve_recovery` — a guardian
+/// approves the live recovery request. Re-approving is an
+/// idempotent no-op.
+#[derive(Accounts)]
+pub struct ApproveRecovery<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// The approving guardian; the state machine rejects a
+    /// non-guardian (`RecoveryNotGuardian`, code 288).
+    pub guardian: Signer<'info>,
+}
+
+/// AV-502: accounts for `execute_recovery` — the permissionless
+/// crank that rotates the initializer once the threshold is met
+/// and the timelock has elapsed. No signer: anyone may call.
+#[derive(Accounts)]
+pub struct ExecuteRecovery<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+}
+
+/// AV-502: accounts for `veto_recovery` — the current
+/// initializer cancels the live recovery request.
+#[derive(Accounts)]
+pub struct VetoRecovery<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the *current* initializer may veto; the state
+    /// machine rejects anyone else (`Unauthorized`, code 100).
     pub initializer: Signer<'info>,
 }
 

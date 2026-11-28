@@ -9401,7 +9401,17 @@ AV-500 adds the program-level
 instruction (discriminator [198, 228, 5, 9, 116, 147, 10, 221]) — the
 chain entry point for the AV-195 builder: initializer-only signer,
 `Uninitialized`-only, the 309-byte recovery tail region rewritten in
-place, no indexer event.
+place, no indexer event. AV-502 adds the four program-level flow
+instructions — `request_recovery(new_authority)` (discriminator
+[169, 44, 164, 157, 148, 175, 110, 130], guardian signer),
+`approve_recovery()` ([148, 96, 41, 38, 108, 189, 129, 214],
+guardian signer), `execute_recovery()` ([203, 133, 133, 228, 153,
+121, 182, 237], no signer — the permissionless crank) and
+`veto_recovery()` ([57, 30, 97, 87, 158, 139, 31, 7],
+current-initializer signer) — the chain entry points for the
+AV-195 transitions: `now` from the clock sysvar, the pending
+request and approvals written in place in the 309-byte tail, no
+indexer event, no new error codes.
 
 The policy persists in the vault account (the 309-byte
 `SocialRecovery` tail: 8 guardian slots + count + threshold +

@@ -72873,6 +72873,345 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn request_recovery_maps_params_to_recovery_field() {
+        // IDL: request_recovery(new_authority: Pubkey) —
+        // new_authority <- param; guardian <- accounts.guardian
+        // (signer), enforced by the Anchor account constraint,
+        // not the state machine; now <- clock sysvar (NOT an
+        // instruction param — see module docs). The param writes
+        // the pending request inside the `recovery` tail region
+        // in place (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the one param and the AV-195 pure-logic transition.
+        const G1: [u8; 32] = [0x11; 32];
+        const G2: [u8; 32] = [0x22; 32];
+        const G3: [u8; 32] = [0x33; 32];
+        const NEW_KEY: [u8; 32] = [0x99; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "request_recovery")
+            .expect("INSTRUCTIONS carries request_recovery");
+        assert_eq!(spec.method, "Escrow::request_recovery");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "new_authority");
+        assert_eq!(spec.params[0].1, "Pubkey");
+        assert!(
+            spec.input_mapping.contains("no indexer event"),
+            "input_mapping documents the keeper-observable silence"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the one arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"request_recovery\""),
+            "checked-in IDL carries request_recovery"
+        );
+        assert!(
+            idl.contains("[169, 44, 164, 157, 148, 175, 110, 130]"),
+            "checked-in IDL pins the AV-502 request discriminator"
+        );
+        assert!(
+            idl.contains(r#"{"name": "new_authority", "type": "publicKey"}"#),
+            "checked-in IDL carries the new_authority arg"
+        );
+        // The sibling flow instructions ride the same contract:
+        // no params, no signer for the crank, signer for the
+        // veto — all four already in the checked-in IDL.
+        for (name, method, disc) in [
+            (
+                "approve_recovery",
+                "Escrow::approve_recovery",
+                "[148, 96, 41, 38, 108, 189, 129, 214]",
+            ),
+            (
+                "execute_recovery",
+                "Escrow::execute_recovery",
+                "[203, 133, 133, 228, 153, 121, 182, 237]",
+            ),
+            (
+                "veto_recovery",
+                "Escrow::veto_recovery",
+                "[57, 30, 97, 87, 158, 139, 31, 7]",
+            ),
+        ] {
+            let spec = INSTRUCTIONS
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("INSTRUCTIONS carries {name}"));
+            assert_eq!(spec.method, method);
+            assert_eq!(spec.params.len(), 0, "{name} takes no params");
+            assert!(
+                spec.input_mapping.contains("no indexer event"),
+                "{name} documents the silence"
+            );
+            assert!(
+                idl.contains(&format!("\"name\": \"{name}\"")),
+                "checked-in IDL carries {name}"
+            );
+            assert!(
+                idl.contains(disc),
+                "checked-in IDL pins the AV-502 {name} discriminator"
+            );
+        }
+        // The param maps to the vault's `recovery` field — the
+        // pending request rides inside the policy.
+        assert!(
+            PARAM_FIELD_MAP
+                .contains(&("request_recovery", "new_authority", "recovery")),
+            "PARAM_FIELD_MAP carries the new_authority mapping"
+        );
+        // Only the pending request moves: the guardians, the
+        // threshold, the timelock, the state and the amounts are
+        // untouched, and the encoding length does not move.
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        assert_eq!(e.state(), EscrowState::Funded);
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        let policy = e.recovery().expect("policy still configured");
+        assert_eq!(policy.guardians(), &[G1, G2, G3], "guardians bound");
+        assert_eq!(policy.threshold(), 2, "threshold untouched");
+        assert_eq!(policy.timelock_secs(), 3_600, "timelock untouched");
+        assert_eq!(policy.approval_count(), 1, "requester counts first");
+        let req = policy.pending().expect("request opened");
+        assert_eq!(req.new_authority, NEW_KEY, "authority bound");
+        assert_eq!(req.requested_at, NOW, "opening timestamp bound");
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "request written in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn request_recovery_rejects_non_guardian_pending_request_and_zero_authority() {
+        // AV-502: the program layer inherits the pure-logic
+        // gates — a stranger cannot open a request, a second
+        // request cannot front-run a live one, and the zero
+        // address can never be the replacement authority.
+        const G1: [u8; 32] = [0x11; 32];
+        const G2: [u8; 32] = [0x22; 32];
+        const G3: [u8; 32] = [0x33; 32];
+        const NEW_KEY: [u8; 32] = [0x99; 32];
+        const ZERO: [u8; 32] = [0u8; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        // A stranger opening is refused before anything moves.
+        assert_eq!(
+            e.request_recovery(MALLORY, NEW_KEY, NOW),
+            Err(EscrowError::RecoveryNotGuardian)
+        );
+        assert!(e.recovery().unwrap().pending().is_none());
+        // The zero address is refused via the policy gate.
+        assert_eq!(
+            e.request_recovery(G1, ZERO, NOW),
+            Err(EscrowError::InvalidSocialRecovery)
+        );
+        assert!(e.recovery().unwrap().pending().is_none());
+        assert_eq!(EscrowError::RecoveryNotGuardian.code(), 288);
+        assert_eq!(EscrowError::InvalidSocialRecovery.code(), 286);
+        // A live request blocks a second one — no front-running.
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        assert_eq!(
+            e.request_recovery(G2, NEW_KEY, NOW),
+            Err(EscrowError::RecoveryRequestPending)
+        );
+        assert_eq!(EscrowError::RecoveryRequestPending.code(), 289);
+        assert_eq!(
+            e.recovery().unwrap().pending().unwrap().new_authority,
+            NEW_KEY,
+            "the first request survives the refused second"
+        );
+        assert_eq!(e.recovery().unwrap().approval_count(), 1);
+    }
+
+    #[test]
+    fn approve_recovery_reaches_threshold_and_reapprove_is_noop() {
+        // AV-502: approvals collect toward the threshold; the
+        // requester's opening vote counts, a second guardian
+        // reaches 2-of-3, and re-approving is an idempotent
+        // no-op — not an error, and it casts no second vote.
+        const G1: [u8; 32] = [0x11; 32];
+        const G2: [u8; 32] = [0x22; 32];
+        const G3: [u8; 32] = [0x33; 32];
+        const NEW_KEY: [u8; 32] = [0x99; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        // No live request: nothing to approve.
+        assert_eq!(
+            e.approve_recovery(G1),
+            Err(EscrowError::RecoveryNoPendingRequest)
+        );
+        assert_eq!(EscrowError::RecoveryNoPendingRequest.code(), 290);
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        assert_eq!(e.recovery().unwrap().approval_count(), 1);
+        // A stranger cannot approve.
+        assert_eq!(
+            e.approve_recovery(MALLORY),
+            Err(EscrowError::RecoveryNotGuardian)
+        );
+        assert_eq!(e.recovery().unwrap().approval_count(), 1);
+        // The second guardian reaches the threshold.
+        e.approve_recovery(G2).unwrap();
+        assert_eq!(e.recovery().unwrap().approval_count(), 2);
+        // Re-approving casts no second vote.
+        e.approve_recovery(G2).unwrap();
+        assert_eq!(e.recovery().unwrap().approval_count(), 2);
+        e.approve_recovery(G1).unwrap();
+        assert_eq!(e.recovery().unwrap().approval_count(), 2);
+        // The third guardian's vote is recorded but changes
+        // nothing about the threshold — the crank still needs
+        // the timelock.
+        e.approve_recovery(G3).unwrap();
+        assert_eq!(e.recovery().unwrap().approval_count(), 3);
+        assert_eq!(
+            e.execute_recovery(NOW + 3_599),
+            Err(EscrowError::RecoveryTimelockNotElapsed)
+        );
+    }
+
+    #[test]
+    fn execute_recovery_rejects_below_threshold_and_timelock_then_rotates_and_clears_delegation() {
+        // AV-502: the permissionless crank refuses below the
+        // threshold and before the timelock, then rotates the
+        // initializer — clearing the activation bit's party
+        // binding, revoking the operator delegation (AV-104) and
+        // its expiry (AV-215) — and consumes the request.
+        const G1: [u8; 32] = [0x11; 32];
+        const G2: [u8; 32] = [0x22; 32];
+        const G3: [u8; 32] = [0x33; 32];
+        const NEW_KEY: [u8; 32] = [0x99; 32];
+        const OPERATOR: [u8; 32] = [0x0D; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        fn full_scopes() -> u32 {
+            DELEGATION_SCOPE_FUND | DELEGATION_SCOPE_RELEASE | DELEGATION_SCOPE_CANCEL
+        }
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        e.delegate_authority_with_expiry(ALICE, OPERATOR, full_scopes(), NOW + 86_400)
+            .unwrap();
+        assert!(e.delegation().is_some(), "grant live before recovery");
+        assert_eq!(
+            e.delegation_expires_at(),
+            Some(NOW + 86_400),
+            "expiry live before recovery"
+        );
+        // One approval is not the threshold: the crank refuses.
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        assert_eq!(
+            e.execute_recovery(NOW + 3_600),
+            Err(EscrowError::RecoveryThresholdNotReached)
+        );
+        assert_eq!(EscrowError::RecoveryThresholdNotReached.code(), 291);
+        // Threshold met, timelock not elapsed: still refused.
+        e.approve_recovery(G2).unwrap();
+        assert_eq!(
+            e.execute_recovery(NOW + 3_599),
+            Err(EscrowError::RecoveryTimelockNotElapsed)
+        );
+        assert_eq!(EscrowError::RecoveryTimelockNotElapsed.code(), 292);
+        // At the boundary the crank fires: the initializer
+        // rotates, the grant dies with the old party, and the
+        // request is consumed.
+        e.execute_recovery(NOW + 3_600).unwrap();
+        assert_eq!(e.initializer(), NEW_KEY);
+        assert!(e.recovery().unwrap().pending().is_none());
+        assert_eq!(e.delegation(), None, "delegation revoked");
+        assert_eq!(
+            e.delegation_expires_at(),
+            None,
+            "delegation expiry dies with the grant"
+        );
+        assert_eq!(e.state(), EscrowState::Funded);
+        assert_eq!(e.amount(), 1_000_000);
+        // Degenerate no-op: a request naming the current key
+        // rotates to the same key and consumes itself.
+        let later = NOW + 7_200;
+        e.request_recovery(G1, NEW_KEY, later).unwrap();
+        e.approve_recovery(G2).unwrap();
+        e.execute_recovery(later + 3_600).unwrap();
+        assert_eq!(e.initializer(), NEW_KEY);
+        assert!(e.recovery().unwrap().pending().is_none());
+    }
+
+    #[test]
+    fn veto_recovery_rejects_stranger_and_cancels_then_reopens() {
+        // AV-502: only the *current* initializer may veto — the
+        // collusion defense against guardian capture. The veto
+        // cancels the request and a fresh one starts clean.
+        const G1: [u8; 32] = [0x11; 32];
+        const G2: [u8; 32] = [0x22; 32];
+        const G3: [u8; 32] = [0x33; 32];
+        const NEW_KEY: [u8; 32] = [0x99; 32];
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        // No live request: nothing to veto.
+        assert_eq!(
+            e.veto_recovery(ALICE),
+            Err(EscrowError::RecoveryNoPendingRequest)
+        );
+        e.request_recovery(G1, NEW_KEY, NOW).unwrap();
+        e.approve_recovery(G2).unwrap();
+        assert_eq!(e.recovery().unwrap().approval_count(), 2);
+        // A stranger's veto is refused — and a guardian cannot
+        // veto either; only the current initializer can.
+        assert_eq!(
+            e.veto_recovery(MALLORY),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(
+            e.veto_recovery(G1),
+            Err(EscrowError::Unauthorized)
+        );
+        assert_eq!(EscrowError::Unauthorized.code(), 100);
+        assert!(e.recovery().unwrap().pending().is_some());
+        // The current initializer vetoes: request gone, key
+        // unchanged, and the crank has nothing to execute.
+        e.veto_recovery(ALICE).unwrap();
+        assert!(e.recovery().unwrap().pending().is_none());
+        assert_eq!(e.initializer(), ALICE);
+        assert_eq!(
+            e.execute_recovery(NOW + 3_600),
+            Err(EscrowError::RecoveryNoPendingRequest)
+        );
+        // A fresh request starts clean after the veto.
+        e.request_recovery(G1, NEW_KEY, NOW + 1).unwrap();
+        assert_eq!(e.recovery().unwrap().approval_count(), 1);
+        e.approve_recovery(G2).unwrap();
+        e.execute_recovery(NOW + 1 + 3_600).unwrap();
+        assert_eq!(e.initializer(), NEW_KEY);
+    }
+
+    #[test]
     fn initialize_referrer_maps_params_to_referrer_fields() {
         // IDL: initialize_referrer(referrer: Pubkey, referral_bps:
         // u16) — referrer / referral_bps <- params; initializer <-
@@ -111058,6 +111397,54 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("configure_social_recovery"),
             [198, 228, 5, 9, 116, 147, 10, 221]
+        );
+    }
+
+    #[test]
+    fn request_recovery_instruction_discriminator_is_pinned() {
+        // AV-502. IDL:
+        // sha256("global:request_recovery")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("request_recovery"),
+            [169, 44, 164, 157, 148, 175, 110, 130]
+        );
+    }
+
+    #[test]
+    fn approve_recovery_instruction_discriminator_is_pinned() {
+        // AV-502. IDL:
+        // sha256("global:approve_recovery")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("approve_recovery"),
+            [148, 96, 41, 38, 108, 189, 129, 214]
+        );
+    }
+
+    #[test]
+    fn execute_recovery_instruction_discriminator_is_pinned() {
+        // AV-502. IDL:
+        // sha256("global:execute_recovery")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("execute_recovery"),
+            [203, 133, 133, 228, 153, 121, 182, 237]
+        );
+    }
+
+    #[test]
+    fn veto_recovery_instruction_discriminator_is_pinned() {
+        // AV-502. IDL:
+        // sha256("global:veto_recovery")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("veto_recovery"),
+            [57, 30, 97, 87, 158, 139, 31, 7]
         );
     }
 
