@@ -72873,6 +72873,170 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn initialize_referrer_maps_params_to_referrer_fields() {
+        // IDL: initialize_referrer(referrer: Pubkey, referral_bps:
+        // u16) — referrer / referral_bps <- params; initializer <-
+        // accounts.initializer (signer), enforced by the Anchor
+        // account constraint, not the state machine. The params
+        // write the `referrer` / `referral_bps` tail fields in
+        // place (see PARAM_FIELD_MAP) — no layout change. The
+        // INSTRUCTIONS spec entry pins the program-level wiring:
+        // the two params and the AV-191 pure-logic builder.
+        const REFERRER: [u8; 32] = [0x77; 32];
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "initialize_referrer")
+            .expect("INSTRUCTIONS carries initialize_referrer");
+        assert_eq!(spec.method, "Escrow::with_referrer");
+        assert_eq!(spec.params.len(), 2);
+        assert_eq!(spec.params[0].0, "referrer");
+        assert_eq!(spec.params[0].1, "Pubkey");
+        assert_eq!(spec.params[1].0, "referral_bps");
+        assert_eq!(spec.params[1].1, "u16");
+        assert!(
+            spec.input_mapping.contains("no indexer event"),
+            "input_mapping documents the pre-fund silence"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the two args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"initialize_referrer\""),
+            "checked-in IDL carries initialize_referrer"
+        );
+        assert!(
+            idl.contains("[125, 201, 84, 20, 221, 156, 40, 238]"),
+            "checked-in IDL pins the AV-501 discriminator"
+        );
+        assert!(
+            idl.contains(r#"{"name": "referrer", "type": "publicKey"}"#),
+            "checked-in IDL carries the referrer arg"
+        );
+        assert!(
+            idl.contains(r#"{"name": "referral_bps", "type": "u16"}"#),
+            "checked-in IDL carries the referral_bps arg"
+        );
+        // Each param maps to exactly its own vault field — and
+        // the rate is shared with `amend_referrer`'s param source
+        // (the builder sets it, the amendment revises it).
+        assert!(
+            PARAM_FIELD_MAP
+                .contains(&("initialize_referrer", "referrer", "referrer")),
+            "PARAM_FIELD_MAP carries the referrer mapping"
+        );
+        assert!(
+            PARAM_FIELD_MAP.contains(&(
+                "initialize_referrer",
+                "referral_bps",
+                "referral_bps"
+            )),
+            "PARAM_FIELD_MAP carries the referral_bps mapping"
+        );
+        assert!(
+            PARAM_FIELD_MAP.contains(&(
+                "amend_referrer",
+                "referral_bps",
+                "referral_bps"
+            )),
+            "amend_referrer keeps its own rate mapping"
+        );
+        // Only the binding moves: the state and the amounts are
+        // untouched, and nothing already charged is rewritten.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.referrer(), None, "no referrer before binding");
+        assert_eq!(e.referral_bps(), 0, "no rate before binding");
+        assert_eq!(e.referral_paid(), 0, "nothing charged yet");
+        let e = e.with_referrer(REFERRER, 2_000).unwrap();
+        assert_eq!(e.referrer(), Some(REFERRER), "referrer bound");
+        assert_eq!(e.referral_bps(), 2_000, "rate bound");
+        assert_eq!(e.referral_paid(), 0, "binding charges nothing");
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.funded_total(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "binding written in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn initialize_referrer_binds_referrer_and_shares_release() {
+        // AV-501: the bound pair drives the release-time rule —
+        // every release slices floor(gross * bps / 10_000) to the
+        // referrer, and the builder may re-point the binding
+        // while Uninitialized (the AV-191 builder semantics; the
+        // funded revision is amend_referrer's job).
+        const REFERRER: [u8; 32] = [0x77; 32];
+        const OTHER: [u8; 32] = [0x78; 32];
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_referrer(REFERRER, 2_000)
+            .unwrap();
+        assert_eq!(e.referral_for(1_000_000), 200_000, "20% of gross");
+        assert_eq!(e.referral_for(99), 19, "floor, never rounds up");
+        assert_eq!(e.referral_for(0), 0, "zero gross, zero share");
+        // Re-binding while Uninitialized re-points the pair.
+        let e = e.with_referrer(OTHER, 500).unwrap();
+        assert_eq!(e.referrer(), Some(OTHER), "referrer re-pointed");
+        assert_eq!(e.referral_bps(), 500, "rate re-pointed");
+        assert_eq!(e.referral_for(1_000_000), 50_000, "new rate applies");
+        // A zero rate binds the referrer but charges nothing.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_referrer(REFERRER, 0)
+            .unwrap();
+        assert_eq!(e.referrer(), Some(REFERRER), "zero rate still binds");
+        assert_eq!(e.referral_for(1_000_000), 0, "zero rate, zero share");
+    }
+
+    #[test]
+    fn initialize_referrer_rejects_zero_address_over_cap_and_funded() {
+        // AV-501: the program layer inherits the pure-logic gates —
+        // Uninitialized only, then the zero-address and rate-cap
+        // gates. The builder consumes the escrow, so a refused
+        // call drops the value instead of leaving a half-written
+        // one behind.
+        const REFERRER: [u8; 32] = [0x77; 32];
+        const ZERO: [u8; 32] = [0u8; 32];
+        // Zero referrer address.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_referrer(ZERO, 1_000),
+            Err(EscrowError::InvalidReferral)
+        );
+        // Rate above MAX_REFERRAL_BPS (2_000).
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_referrer(REFERRER, 2_001),
+            Err(EscrowError::InvalidReferral)
+        );
+        assert_eq!(EscrowError::InvalidReferral.code(), 271);
+        // Funded: the binding is fixed before funds move —
+        // post-funding revision is amend_referrer.
+        let funded = funded_escrow();
+        assert_eq!(
+            funded.with_referrer(REFERRER, 1_000),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Boundary-valid: a zero rate, and the full 2_000 cap.
+        assert!(Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_referrer(REFERRER, 0)
+            .is_ok());
+        assert!(Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_referrer(REFERRER, 2_000)
+            .is_ok());
+    }
+
+    #[test]
     fn amend_jury_panel_size_rejects_single_party_and_strangers() {
         // AV-478: unconditional dual signature — one party alone,
         // or a stranger, is Unauthorized; one party alone cannot
@@ -110894,6 +111058,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("configure_social_recovery"),
             [198, 228, 5, 9, 116, 147, 10, 221]
+        );
+    }
+
+    #[test]
+    fn initialize_referrer_instruction_discriminator_is_pinned() {
+        // AV-501. IDL:
+        // sha256("global:initialize_referrer")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("initialize_referrer"),
+            [125, 201, 84, 20, 221, 156, 40, 238]
         );
     }
 

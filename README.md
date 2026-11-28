@@ -4130,7 +4130,14 @@ via u128 math and folds it into the returned fee so
 `payout + fee == gross` still holds — the `Released` event, preview,
 and CPI plan are untouched. The share accumulates in a dedicated
 `referral_paid` counter (never mixed into `fees_paid`), and CPI
-rollback snapshots restore it alongside the other counters.
+rollback snapshots restore it alongside the other counters. AV-501
+adds the program-level `initialize_referrer(referrer, referral_bps)`
+instruction (discriminator [125, 201, 84, 20, 221, 156, 40, 238]) —
+the chain entry point for the AV-191 binding: initializer-only
+signer, `Uninitialized`-only, the 33-byte referrer region plus the
+2-byte `referral_bps` field rewritten in place, no indexer event;
+revising the binding after funding stays `amend_referrer`'s job
+(AV-485).
 
 ## Vault config drift detection (AV-175)
 

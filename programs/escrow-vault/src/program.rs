@@ -4205,6 +4205,38 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt into the referrer revenue share (AV-501; mirrors
+    /// `Escrow::with_referrer`, the AV-191 pure-logic builder).
+    /// The initializer binds the referrer while the escrow is
+    /// `Uninitialized` — the binding is fixed before any funds
+    /// move, like the other `initialize_*` opt-ins. A zero
+    /// referrer or a rate above `MAX_REFERRAL_BPS` (2_000) is
+    /// `InvalidReferral` (code 271); a funded escrow is
+    /// `InvalidStateTransition`. Once bound, every release slices
+    /// `floor(gross * referral_bps / 10_000)` to the referrer
+    /// (accumulated in `referral_paid`); revising the binding
+    /// after funding is `amend_referrer`'s job (AV-485). No
+    /// indexer event: pre-fund configuration, like the other
+    /// `initialize_*` opt-ins.
+    pub fn initialize_referrer(
+        ctx: Context<InitializeReferrer>,
+        referrer: Pubkey,
+        referral_bps: u16,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow
+            .with_referrer(referrer.to_bytes(), referral_bps)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the 33-byte referrer
+        // region (zeroed when no referrer is bound) plus the
+        // 2-byte `referral_bps` field, so the binding is written
+        // in place — no realloc needed in the real build. No
+        // indexer event: pre-fund configuration, like the other
+        // `initialize_*` opt-ins.
+        Ok(())
+    }
+
     /// Opt into the per-call release cap (AV-205; mirrors
     /// `Escrow::with_max_release_per_call`). The initializer arms
     /// the cap while the escrow is `Uninitialized` — the payout
@@ -15373,6 +15405,19 @@ pub struct ConfigureSocialRecovery<'info> {
     pub vault: Account<'info, Vault>,
     /// Only the initializer opts into social recovery; the state
     /// machine rejects re-configuration once the escrow is funded.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-501: accounts for `initialize_referrer` — the
+/// initializer binds the referrer while the escrow is
+/// `Uninitialized`. The referrer key and the rate ride as
+/// instruction params, not accounts.
+#[derive(Accounts)]
+pub struct InitializeReferrer<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer binds the referrer; the state machine
+    /// rejects re-configuration once the escrow is funded.
     pub initializer: Signer<'info>,
 }
 
