@@ -73641,6 +73641,239 @@ pub(crate) mod anchor_idl_tests {
         );
     }
 
+    /// AV-505: collect every `EscrowError::<Variant>` token named
+    /// in a source text, as a set of variant names. Purely textual
+    /// — `program.rs` is not compiled by cargo — so it also
+    /// catches tokens in doc comments, which is the point: a doc
+    /// naming a variant the program cannot produce is still a lie.
+    fn escrow_error_tokens(src: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let mut rest = src;
+        while let Some(at) = rest.find("EscrowError::") {
+            let after = &rest[at + "EscrowError::".len()..];
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                out.insert(name);
+            }
+            rest = after;
+        }
+        out
+    }
+
+    #[test]
+    fn program_convert_has_no_phantom_invalid_allowlist() {
+        // AV-505: the payout-allowlist over-long check named
+        // `EscrowError::InvalidAllowlist`, a variant that exists
+        // nowhere — not in the state machine, not in the IDL, not
+        // in `ErrorCode`. The real error is `InvalidPayoutAllowlist`
+        // (code 126). The plain substring is exact here:
+        // `EscrowError::InvalidPayoutAllowlist` and
+        // `EscrowError::InvalidSettlementMintAllowlist` do not
+        // contain `EscrowError::InvalidAllowlist` as a substring.
+        let src = include_str!("../../programs/escrow-vault/src/program.rs");
+        assert!(
+            !src.contains("EscrowError::InvalidAllowlist"),
+            "program still names the phantom InvalidAllowlist"
+        );
+        let start = src
+            .find("fn convert_governance_action(")
+            .expect("program side defines convert_governance_action");
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("convert_governance_action closes at column 0");
+        let body = &rest[..end];
+        let arm_start = body
+            .find("GovernanceAction::UpdatePayoutAllowlist")
+            .expect("convert has an UpdatePayoutAllowlist arm");
+        let arm_end = body[arm_start..]
+            .find("GovernanceAction::AmendFundingStart")
+            .expect("AmendFundingStart arm follows");
+        let arm = &body[arm_start..arm_start + arm_end];
+        assert!(
+            arm.contains("EscrowError::InvalidPayoutAllowlist"),
+            "over-long payout allowlist is refused with InvalidPayoutAllowlist (code 126)"
+        );
+    }
+
+    #[test]
+    fn program_error_tokens_are_all_declared_state_errors() {
+        // AV-505: every `EscrowError::X` the program names must be
+        // a variant the state machine declares with a `code()` arm
+        // — the `InvalidAllowlist` phantom was not, so the program
+        // could not even name the error it meant to raise. The
+        // state side is the authority: `code()` pins all 262.
+        let src = include_str!("../../programs/escrow-vault/src/program.rs");
+        let tokens = escrow_error_tokens(src);
+        let lib = include_str!("lib.rs");
+        let code_start = lib
+            .find("pub fn code(&self) -> u32 {")
+            .expect("EscrowError::code is declared");
+        let code_rest = &lib[code_start..];
+        let code_end = code_rest
+            .find("\n        }\n    }")
+            .expect("code() closes its match and fn");
+        let declared = escrow_error_tokens(&code_rest[..code_end]);
+        assert_eq!(declared.len(), 262, "code() declares 262 variants");
+        for token in &tokens {
+            assert!(
+                declared.contains(token),
+                "program names EscrowError::{token}, which the state machine never declares"
+            );
+        }
+    }
+
+    #[test]
+    fn program_error_tokens_all_have_escrow_error_arms() {
+        // AV-505: every `EscrowError::X` the program names must
+        // have an `escrow_error` mapping arm — otherwise the error
+        // can never surface on-chain with its real code, on any of
+        // the three paths that map through it (direct call, delayed
+        // proposal conversion, delayed execution).
+        // `InvalidSettlementMintAllowlist` (code 349) was named by
+        // the convert arm and the direct handler but had no arm, so
+        // those paths could not produce it. The duplicate
+        // `InvalidMultisigAuthority` arm is a pre-existing wart the
+        // set comparison tolerates; it is not this item's scope.
+        let src = include_str!("../../programs/escrow-vault/src/program.rs");
+        let tokens = escrow_error_tokens(src);
+        let fn_start = src
+            .find("fn escrow_error(")
+            .expect("program defines escrow_error");
+        let fn_rest = &src[fn_start..];
+        let fn_end = fn_rest
+            .find("\n}\n")
+            .expect("escrow_error closes at column 0");
+        let arms = escrow_error_tokens(&fn_rest[..fn_end]);
+        for token in &tokens {
+            assert!(
+                arms.contains(token),
+                "program names EscrowError::{token} but escrow_error has no arm for it"
+            );
+        }
+    }
+
+    #[test]
+    fn program_convert_maps_option_constructors_with_ok_or_else() {
+        // AV-505: the `UpdateAttestors` and `UpdatePayoutAllowlist`
+        // convert arms called `.map_err` on `Option`-returning
+        // constructors — `Option` has no `map_err`, so the program
+        // could not compile under the real Anchor toolchain. Both
+        // arms must use `.ok_or_else` (the form the sibling
+        // `UpdateTieredQuorum` / `UpdateSettlementMintAllowlist` /
+        // `UpdateMintAllowlist` arms already use). The arms' own
+        // comments name the forbidden shape, so comments are
+        // stripped before the check — the same pattern as the
+        // AV-504 convert test.
+        let src = include_str!("../../programs/escrow-vault/src/program.rs");
+        let start = src
+            .find("fn convert_governance_action(")
+            .expect("program side defines convert_governance_action");
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("convert_governance_action closes at column 0");
+        let body = &rest[..end];
+        let arm_code = |from: &str, to: &str| -> String {
+            let arm_start = body
+                .find(from)
+                .unwrap_or_else(|| panic!("convert has a {from} arm"));
+            let arm_end = body[arm_start..]
+                .find(to)
+                .unwrap_or_else(|| panic!("{to} arm follows {from}"));
+            body[arm_start..arm_start + arm_end]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let attestors = arm_code(
+            "GovernanceAction::UpdateAttestors",
+            "GovernanceAction::RotateTaker",
+        );
+        assert!(
+            !attestors.contains(".map_err"),
+            "UpdateAttestors arm must not call .map_err on the Option constructor"
+        );
+        assert!(
+            attestors
+                .contains(".ok_or_else(|| escrow_error(escrow_state::EscrowError::InvalidQuorum))"),
+            "UpdateAttestors None branch maps to InvalidQuorum"
+        );
+        let payout = arm_code(
+            "GovernanceAction::UpdatePayoutAllowlist",
+            "GovernanceAction::AmendFundingStart",
+        );
+        assert!(
+            !payout.contains(".map_err"),
+            "UpdatePayoutAllowlist arm must not call .map_err on the Option constructor"
+        );
+        assert!(
+            payout.contains(
+                ".ok_or_else(|| escrow_error(escrow_state::EscrowError::InvalidPayoutAllowlist))"
+            ),
+            "UpdatePayoutAllowlist None branch maps to InvalidPayoutAllowlist"
+        );
+    }
+
+    #[test]
+    fn governance_action_update_payout_allowlist_returns_none_over_four() {
+        // AV-505: the `None` the `UpdatePayoutAllowlist` convert
+        // arm maps with `ok_or_else` is exactly the over-long
+        // list — the constructor refuses more than
+        // `MAX_PAYOUT_ALLOWLIST` (4) addresses. The arm's
+        // pre-check refuses the same bound first, so the
+        // `ok_or_else` is the totality guard.
+        let addrs = [[0x11; 32]; 5];
+        assert!(
+            GovernanceAction::update_payout_allowlist(&addrs).is_none(),
+            "5 addresses (> MAX_PAYOUT_ALLOWLIST = 4) must return None"
+        );
+        let four = [[0x11; 32]; 4];
+        assert!(
+            GovernanceAction::update_payout_allowlist(&four).is_some(),
+            "4 addresses must build"
+        );
+    }
+
+    #[test]
+    fn governance_action_update_attestors_returns_none_for_empty_table() {
+        // AV-505: the `None` the `UpdateAttestors` convert arm maps
+        // with `ok_or_else` is the empty table — count > 8 is
+        // refused by the arm's pre-check, so only count == 0 can
+        // reach the constructor's `None`.
+        assert!(
+            GovernanceAction::update_attestors(&[], &[]).is_none(),
+            "an empty attestor table must return None"
+        );
+        assert!(
+            GovernanceAction::update_attestors(&[[0xA1; 32]], &[1]).is_some(),
+            "a one-attestor table must build"
+        );
+    }
+
+    #[test]
+    fn governance_action_update_settlement_mint_allowlist_returns_none_over_eight() {
+        // AV-505: the `None` the `UpdateSettlementMintAllowlist`
+        // convert arm already maps with `ok_or_else` is exactly
+        // the over-long list — the constructor refuses more than
+        // `MAX_SETTLEMENT_MINT_ALLOWLIST` (8) mints. Pins the
+        // `None` semantics the AV-505 mapping relies on.
+        let mints = [[0x11; 32]; 9];
+        assert!(
+            GovernanceAction::update_settlement_mint_allowlist(&mints).is_none(),
+            "9 mints (> MAX_SETTLEMENT_MINT_ALLOWLIST = 8) must return None"
+        );
+        let eight = [[0x11; 32]; 8];
+        assert!(
+            GovernanceAction::update_settlement_mint_allowlist(&eight).is_some(),
+            "8 mints must build"
+        );
+    }
+
     #[test]
     fn initialize_referrer_maps_params_to_referrer_fields() {
         // IDL: initialize_referrer(referrer: Pubkey, referral_bps:

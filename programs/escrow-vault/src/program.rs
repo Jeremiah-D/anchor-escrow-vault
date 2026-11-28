@@ -19411,23 +19411,32 @@ fn convert_governance_action(
             let mut w = [0u64; 8];
             a[..count as usize].copy_from_slice(&attestors[..count as usize]);
             w[..count as usize].copy_from_slice(&weights[..count as usize]);
+            // AV-505: `update_attestors` returns `Option` (there is
+            // no `map_err` on `Option`) — count > 8 is refused
+            // above, so `None` here is only the empty table, mapped
+            // to `InvalidQuorum` like the `UpdateTieredQuorum` arm.
             escrow_state::GovernanceAction::update_attestors(
                 &a[..count as usize],
                 &w[..count as usize],
             )
-            .map_err(|e| escrow_error(e))
+            .ok_or_else(|| escrow_error(escrow_state::EscrowError::InvalidQuorum))
         }
         GovernanceAction::RotateTaker { new_taker } => {
             Ok(escrow_state::GovernanceAction::RotateTaker { new_taker })
         }
         GovernanceAction::UpdatePayoutAllowlist { addrs, count } => {
             if count as usize > 4 {
-                return Err(escrow_error(escrow_state::EscrowError::InvalidAllowlist));
+                return Err(escrow_error(
+                    escrow_state::EscrowError::InvalidPayoutAllowlist,
+                ));
             }
+            // AV-505: `update_payout_allowlist` returns `Option`
+            // (there is no `map_err` on `Option`) — count > 4 is
+            // refused above, so `None` is only the over-long list.
             escrow_state::GovernanceAction::update_payout_allowlist(
                 &addrs[..count as usize],
             )
-            .map_err(|e| escrow_error(e))
+            .ok_or_else(|| escrow_error(escrow_state::EscrowError::InvalidPayoutAllowlist))
         }
         GovernanceAction::AmendFundingStart { new_start_at } => {
             Ok(escrow_state::GovernanceAction::AmendFundingStart { new_start_at })
@@ -20171,6 +20180,9 @@ fn escrow_error(e: escrow_state::EscrowError) -> Error {    // One program error
         escrow_state::EscrowError::InvalidShardMembership => {
             error!(ErrorCode::InvalidShardMembership)
         }
+        escrow_state::EscrowError::InvalidSettlementMintAllowlist => {
+            error!(ErrorCode::InvalidSettlementMintAllowlist)
+        }
     }
 }
 
@@ -20516,4 +20528,6 @@ pub enum ErrorCode {
     LeaseExpired,
     #[msg("Invalid shard membership (AV-177): the shard roster contains the zero key or a duplicate member (InvalidShardMembership, code 241)")]
     InvalidShardMembership,
+    #[msg("Invalid settlement mint allowlist (AV-218): empty list, more than 8 entries, a zero address, or a duplicate address (InvalidSettlementMintAllowlist, code 349)")]
+    InvalidSettlementMintAllowlist,
 }

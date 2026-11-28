@@ -2521,7 +2521,16 @@ kind: the generic `GovernanceProposed` (82) / `GovernanceExecuted`
 (83) / `GovernanceCancelled` (84) triple is reused, and no new
 error code — the inner transitions re-run at execute time, so a
 proposal that can no longer apply fails with the inner transition's
-own code and stays live for retry or cancel.
+own code and stays live for retry or cancel. AV-505 fixes three
+mapping drifts in `convert_governance_action` (the program-side
+proposal converter): the payout-allowlist over-long check named a
+nonexistent `InvalidAllowlist` instead of `InvalidPayoutAllowlist`
+(code 126), two `Option`-returning constructors were mapped with
+`.map_err` (which does not exist on `Option`) instead of
+`.ok_or_else`, and `InvalidSettlementMintAllowlist` (code 349) had no
+`ErrorCode` variant or `escrow_error` arm, so a failed
+settlement-allowlist conversion surfaced no real code on any of the
+three paths.
 
 | kind | action | direct method | state gate |
 |------|--------|---------------|------------|
