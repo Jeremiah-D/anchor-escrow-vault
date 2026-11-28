@@ -11759,6 +11759,161 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Split a funded escrow into N child escrows by dual-signed
+    /// governance (AV-503; mirrors `Escrow::split_escrow`, the AV-81
+    /// pure-logic transition). Both the initializer AND the taker must
+    /// sign — one party alone (or a stranger pair) is `Unauthorized`
+    /// (code 100); the degenerate initializer == taker self-escrow
+    /// authorizes with one key passed twice, like AV-12's activation.
+    /// Check order: pause (the AV-133 scheduled auto-unpause runs
+    /// first, then the AV-46 gate) -> reentrancy (`ReentrantCall`,
+    /// code 122 — a fund-moving transition) -> dual-signature
+    /// authority -> `Funded`-only (`InvalidStateTransition`, code 101
+    /// — `Disputed` rejects the split while arbitration is in flight,
+    /// terminal states reject a re-split) -> live swap link
+    /// (`SwapLinkActive`, code 163) -> amount table (`InvalidSplit`,
+    /// code 142 — empty, more than `MAX_SPLIT_CHILDREN` (16), a zero
+    /// entry, or a u128 sum != the parent's `remaining_amount`; a
+    /// partial release before the split shrinks the splittable pool)
+    /// -> per-child milestone-plan length (`InvalidSplit`) and
+    /// per-child tranche sums (`InvalidMilestones`, code 110, from the
+    /// builder's own validation). Every gate and every child build runs
+    /// before the parent's state flips — a failed child build leaves
+    /// the parent `Funded`: no half-split parent, no orphan children.
+    ///
+    /// The five instruction params map onto `SplitConfig` exactly as
+    /// the AV-81 spec pins them: `amounts` is the explicit per-child
+    /// table (amount-table order is child order); `vesting` /
+    /// `quorum` / `milestones` are the explicit opt-in inheritances
+    /// (`None` = not inherited — a split never silently copies the
+    /// parent's config); `dual_sig` activates every child for both
+    /// parties as part of the split. There is no `vesting_curve`
+    /// param: the IDL carries five params, and a curve without a
+    /// schedule is ignored by the state machine, so the handler builds
+    /// `SplitConfig` with `vesting_curve: None`.
+    ///
+    /// The N child vaults ride `ctx.remaining_accounts` in
+    /// amount-table order (N is caller-chosen, so the static account
+    /// struct cannot name them — the AV-141 `release_many`
+    /// precedent). The handler refuses a count mismatch
+    /// (`InvalidSplit`) before reading any vault, then requires every
+    /// child account fresh — program-owned, all-zero data, rent-exempt
+    /// for the full vault space — so a split can never overwrite a
+    /// live escrow. Each child is born `Funded` with the parent's
+    /// initializer / taker / `expires_at` and the explicitly inherited
+    /// config; child `i`'s escrow identity derives as
+    /// `H(parent_id || i)` (`derive_split_child_id`), stamped on the
+    /// written child state and on the event roster.
+    ///
+    /// `now` comes from the clock sysvar, not an instruction param —
+    /// it anchors each child's `fund_at`, the origin the AV-64
+    /// relative timelock measures from. The parent moves `Funded ->
+    /// Split` (terminal — only `close_vault` retires it to `Closed`
+    /// for the rent reclaim). Lamports: the real build moves each
+    /// child's amount from the parent vault PDA to the child vault
+    /// (the parent PDA signs via `invoke_signed` with the vault seeds,
+    /// the AV-31 settlement precedent); the Σ moved == the parent's
+    /// pre-split `remaining_amount`, so after the split the parent
+    /// carries nothing but its rent deposit. Emits `EscrowSplit` on
+    /// the parent vault (`from == Funded`, `to == Split`, `payout` =
+    /// the u128-exact Σ child amounts; the `(child_id, amount)`
+    /// roster is stamped on the event by the real build, mirroring
+    /// `IndexedEscrow::split_escrow` — the AV-93 `ReleasedSplit`
+    /// precedent). The actor is `None`: dual-signed governance, not
+    /// a single-actor call.
+    pub fn split_escrow(
+        ctx: Context<SplitEscrow>,
+        amounts: Vec<u64>,
+        vesting: Option<Vesting>,
+        quorum: Option<Quorum>,
+        dual_sig: bool,
+        milestones: Option<Vec<MilestonePlan>>,
+    ) -> Result<()> {
+        // One child vault per amount, in amount-table order — a shape
+        // mismatch is the caller's bug; fail closed before reading any
+        // vault (the AV-141 `release_many` precedent).
+        require!(
+            ctx.remaining_accounts.len() == amounts.len(),
+            ErrorCode::InvalidSplit
+        );
+        // Every child account must arrive fresh — a recycled vault
+        // fails closed before any state moves.
+        for info in ctx.remaining_accounts.iter() {
+            require_fresh_child_vault(info)?;
+        }
+        let now = read_clock_unix_timestamp(&ctx.accounts.clock);
+        let mut parent = read_escrow(&ctx.accounts.vault);
+        let from = parent.state() as u8;
+        // The mirror params convert through the state machine's own
+        // validated constructors: a bad vesting window is
+        // `InvalidVesting`, a bad quorum table `InvalidQuorum`, a bad
+        // milestone plan `InvalidMilestones` — all before the split
+        // runs, so a bad config can never half-split the parent.
+        let schedule = vesting
+            .map(|v| {
+                escrow_state::VestingSchedule::new_with_cliff(v.start, v.end, v.cliff_at)
+            })
+            .transpose()
+            .map_err(|e| escrow_error(e))?;
+        let policy = quorum
+            .map(|q| quorum_policy_from_mirror(&q))
+            .transpose()
+            .map_err(|e| escrow_error(e))?;
+        let plans: Option<Vec<escrow_state::MilestonePlan>> = milestones
+            .map(|ms| {
+                ms.iter()
+                    .map(|m| milestone_plan_from_mirror(m))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()
+            .map_err(|e| escrow_error(e))?;
+        let children = parent
+            .split_escrow(
+                ctx.accounts.initializer.key().to_bytes(),
+                ctx.accounts.taker.key().to_bytes(),
+                &amounts,
+                escrow_state::SplitConfig {
+                    vesting: schedule,
+                    vesting_curve: None,
+                    quorum: policy,
+                    dual_sig,
+                    milestones: plans.as_deref(),
+                },
+                now,
+            )
+            .map_err(|e| escrow_error(e))?;
+        // The split built every child in memory first; only now do
+        // the writes land — parent first, then each child into its
+        // remaining account in amount-table order. A failed write
+        // aborts the transaction, so no partial split ever persists.
+        write_escrow(&mut ctx.accounts.vault, &parent);
+        for (info, child) in ctx.remaining_accounts.iter().zip(children.iter()) {
+            write_escrow_info(info, child);
+        }
+        // AV-18: `payout` is the Σ child amounts — the gross
+        // re-locked into the children, equal to the parent's pre-split
+        // remaining lockup (the state machine validated the Σ, so the
+        // u64 sum cannot wrap); the parent's audit counters are
+        // preserved untouched. The roster rides the event (see above).
+        let payout: u64 = children.iter().map(|c| c.amount()).sum();
+        emit_transition(
+            &ctx.accounts.vault,
+            escrow_state::EscrowEventKind::EscrowSplit,
+            from,
+            parent.state() as u8,
+            payout,
+            0,
+            0,
+            now,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     /// Opt in to the default-penalty (slash) clause (AV-82; mirrors
     /// `Escrow::with_slash_terms`). `Uninitialized` only, like
     /// `initialize_arbiter`: the penalty account and the deadline are
@@ -14588,6 +14743,18 @@ pub enum EscrowVaultEventKind {
     /// pair. Mirrors
     /// `escrow_state::EscrowEventKind::SchemaMigrated`.
     SchemaMigrated,
+    /// AV-81: a funded escrow was split into N child escrows by
+    /// dual-signed governance (`Escrow::split_escrow`). `from ==
+    /// Funded`, `to == Split` (terminal). Amounts follow the
+    /// `Released` shape (the Σ child amounts, the gross re-locked
+    /// into the children — equal to the parent's pre-split remaining
+    /// lockup); the per-child `(child_id, amount)` roster rides the
+    /// event's `split_children` field in table order, so the whole
+    /// family is re-derivable from the one event (child `i`'s ID is
+    /// `H(parent_id || i)`). The actor is `None` — dual-signed
+    /// governance, not a single-actor call. Mirrors
+    /// `escrow_state::EscrowEventKind::EscrowSplit`.
+    EscrowSplit,
     /// AV-93: the locked funds were released split across several
     /// recipients by basis-point weights (`Escrow::release_split`).
     /// `from == Funded`, `to == Funded` on a partial split, `to ==
@@ -14854,6 +15021,9 @@ fn escrow_event_kind(kind: escrow_state::EscrowEventKind) -> EscrowVaultEventKin
         }
         escrow_state::EscrowEventKind::SchemaMigrated => {
             EscrowVaultEventKind::SchemaMigrated
+        }
+        escrow_state::EscrowEventKind::EscrowSplit => {
+            EscrowVaultEventKind::EscrowSplit
         }
         escrow_state::EscrowEventKind::ReleasedSplit => {
             EscrowVaultEventKind::ReleasedSplit
@@ -16862,6 +17032,30 @@ pub struct InitializeBlindPanel<'info> {
     /// `Uninitialized`. Mutually exclusive with the single arbiter —
     /// last-wins in both directions.
     pub initializer: Signer<'info>,
+}
+
+/// AV-503: accounts for `split_escrow` — the funded parent vault,
+/// both parties as signers (dual-signature governance), and the clock
+/// sysvar for the event timestamp and each child's `fund_at`. The N
+/// child vaults ride `ctx.remaining_accounts` in amount-table order
+/// (N is caller-chosen, so the static account struct cannot name
+/// them — the AV-141 `release_many` precedent); the handler refuses a
+/// count mismatch and requires every child account fresh
+/// (program-owned, all-zero data, rent-exempt) before any write.
+#[derive(Accounts)]
+pub struct SplitEscrow<'info> {
+    /// The funded parent vault: moves `Funded -> Split`, and after
+    /// the split carries nothing but its rent deposit.
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// One half of the dual signature; the state machine rejects any
+    /// other key (`Unauthorized`, code 100).
+    pub initializer: Signer<'info>,
+    /// The other half of the dual signature; same rejection.
+    pub taker: Signer<'info>,
+    /// CHECK: Solana clock sysvar, read for the event `at` timestamp
+    /// and each child's `fund_at` (never an instruction param).
+    pub clock: AccountInfo<'info>,
 }
 
 /// AV-82: opt in to the default-penalty (slash) clause at initialize
@@ -18935,6 +19129,72 @@ fn write_breaker(
 /// it exactly like `read_escrow`.
 fn read_escrow_info(_info: &AccountInfo) -> escrow_state::Escrow {
     unimplemented!("deserialize a remaining-accounts Vault into escrow_state::Escrow")
+}
+
+/// Skeleton helper for AV-503 `split_escrow`: write one of the N child
+/// vaults riding `ctx.remaining_accounts` (an `AccountInfo`, not a
+/// statically typed `Account<Vault>` — N is caller-chosen). The real
+/// build wraps each remaining account in Anchor `Account<Vault>` and
+/// serializes it exactly like `write_escrow`.
+fn write_escrow_info(_info: &AccountInfo, _escrow: &escrow_state::Escrow) {
+    unimplemented!("serialize a remaining-accounts Vault from escrow_state::Escrow")
+}
+
+/// AV-503: require a child vault account to arrive fresh — the real
+/// build's `init`-equivalent gate for the N caller-chosen child vaults
+/// riding `ctx.remaining_accounts` (no static `init` constraint can
+/// name them). Fresh means: owned by this program, all-zero data
+/// (created but never written — the parent's split is the first
+/// write), and rent-exempt for the full vault space (the caller funds
+/// the rent-exempt minimum at account creation, like `initialize`).
+/// A recycled vault — any live escrow's account — fails closed with
+/// `InvalidSplit` (code 142) before any write, so a split can never
+/// overwrite a live escrow.
+fn require_fresh_child_vault(info: &AccountInfo) -> Result<()> {
+    if info.owner != &crate::ID {
+        return Err(escrow_error(escrow_state::EscrowError::InvalidSplit));
+    }
+    let data = info.try_borrow_data()?;
+    if data.iter().any(|b| *b != 0) {
+        return Err(escrow_error(escrow_state::EscrowError::InvalidSplit));
+    }
+    if !Rent::get()?.is_exempt(info.lamports(), info.data_len()) {
+        return Err(escrow_error(escrow_state::EscrowError::InvalidSplit));
+    }
+    Ok(())
+}
+
+/// AV-503: convert the skeleton `Quorum` mirror into the state
+/// machine's `QuorumPolicy` through its validated constructor — an
+/// empty table, a duplicate attestor, a zero weight, or a threshold
+/// of 0 / above the total weight is `InvalidQuorum`. Only the first
+/// `registered` slots are read; the mirror's `approvals` bitmask is
+/// not carried over — a split child starts unattested, so the policy
+/// is built fresh (`approvals: 0`).
+fn quorum_policy_from_mirror(
+    q: &Quorum,
+) -> Result<escrow_state::QuorumPolicy, escrow_state::EscrowError> {
+    if q.registered as usize > escrow_state::MAX_ATTESTORS {
+        return Err(escrow_state::EscrowError::InvalidQuorum);
+    }
+    let n = q.registered as usize;
+    let keys: Vec<[u8; 32]> = q.attestors[..n].iter().map(|k| k.to_bytes()).collect();
+    escrow_state::QuorumPolicy::new(&keys, &q.weights[..n], q.threshold)
+}
+
+/// AV-503: convert the skeleton `MilestonePlan` mirror into the state
+/// machine's `MilestonePlan` through its validated constructor — an
+/// empty table, more than `MAX_MILESTONES` tranches, or a zero tranche
+/// is `InvalidMilestones`. Only the first `count` slots are read; the
+/// sum-to-child-amount check happens in `Escrow::with_milestones`
+/// during the split itself.
+fn milestone_plan_from_mirror(
+    m: &MilestonePlan,
+) -> Result<escrow_state::MilestonePlan, escrow_state::EscrowError> {
+    if m.count as usize > escrow_state::MAX_MILESTONES {
+        return Err(escrow_state::EscrowError::InvalidMilestones);
+    }
+    escrow_state::MilestonePlan::new(&m.amounts[..m.count as usize])
 }
 
 fn read_clock_unix_timestamp(_clock: &AccountInfo) -> u64 {

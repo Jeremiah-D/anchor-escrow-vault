@@ -41426,7 +41426,7 @@ pub(crate) mod anchor_idl_tests {
                 ),
             ],
             method: "Escrow::split_escrow",
-            input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) - both current parties must authorize (dual-signature governance: one party alone or a stranger pair is Unauthorized, checked before state validity; degenerate initializer == taker self-escrow authorizes with one key passed twice); Funded only (InvalidStateTransition otherwise - Disputed rejects the split while arbitration is in flight, terminal states reject a re-split); a paused escrow fails fast (Paused); the parent moves Funded -> Split (terminal - only close_vault retires it to Closed for the rent reclaim); each child is born Funded with the parent's initializer / taker / expires_at and the explicitly inherited config (vesting / quorum / dual_sig / per-child milestones - default: not inherited); child i's escrow identity derives as H(parent_id || i) (u64 little-endian index, SHA-256); now <- clock sysvar (NOT an instruction param - anchors each child's fund_at, the origin the AV-64 relative timelock measures from); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in Funded - no half-split); emits the EscrowSplit indexer event (from == Funded, to == Split, amounts.payout = the u128-exact child sum, the (child_id, amount) roster rides the event)",
+            input_mapping: "initializer <- accounts.initializer (signer) AND taker <- accounts.taker (signer) - both current parties must authorize (dual-signature governance: one party alone or a stranger pair is Unauthorized, checked before state validity; degenerate initializer == taker self-escrow authorizes with one key passed twice); Funded only (InvalidStateTransition otherwise - Disputed rejects the split while arbitration is in flight, terminal states reject a re-split); a paused escrow fails fast (Paused); the parent moves Funded -> Split (terminal - only close_vault retires it to Closed for the rent reclaim); each child is born Funded with the parent's initializer / taker / expires_at and the explicitly inherited config (vesting / quorum / dual_sig / per-child milestones - default: not inherited); child i's escrow identity derives as H(parent_id || i) (u64 little-endian index, SHA-256); now <- clock sysvar (NOT an instruction param - anchors each child's fund_at, the origin the AV-64 relative timelock measures from); every gate and child build runs before the parent's state flips (a failed child build leaves the parent in Funded - no half-split); the N child vaults ride ctx.remaining_accounts in amount-table order - the handler refuses a count mismatch (InvalidSplit) before any read and requires every child account fresh (program-owned, all-zero data, rent-exempt) before any write, so a split can never overwrite a live escrow; emits the EscrowSplit indexer event (from == Funded, to == Split, amounts.payout = the u128-exact child sum, the (child_id, amount) roster rides the event)",
         },
         InstructionSpec {
             // AV-82: opt-in default-penalty (slash) clause.
@@ -73209,6 +73209,229 @@ pub(crate) mod anchor_idl_tests {
         e.approve_recovery(G2).unwrap();
         e.execute_recovery(NOW + 1 + 3_600).unwrap();
         assert_eq!(e.initializer(), NEW_KEY);
+    }
+
+    #[test]
+    fn split_escrow_maps_params_to_split_config() {
+        // IDL: split_escrow(amounts: Vec<u64>, vesting:
+        // Option<VestingSchedule>, quorum: Option<QuorumPolicy>,
+        // dual_sig: bool, milestones: Option<Vec<MilestonePlan>>) —
+        // the five params map onto SplitConfig, the AV-81 pure-logic
+        // config: amounts is the explicit per-child table, vesting /
+        // quorum / milestones are the explicit opt-in inheritances
+        // (None = not inherited), dual_sig activates every child for
+        // both parties. initializer / taker <- accounts (signers),
+        // enforced by the Anchor account constraints, not the state
+        // machine; now <- clock sysvar (NOT an instruction param).
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the five args; the five params are
+        // transient (see TRANSIENT_PARAMS) — they birth child vaults,
+        // never a field of the parent. The AV-503 program surface
+        // adds only the handler for this already-listed instruction,
+        // so the IDL instruction count does not move.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "split_escrow")
+            .expect("INSTRUCTIONS carries split_escrow");
+        assert_eq!(spec.method, "Escrow::split_escrow");
+        assert_eq!(spec.params.len(), 5);
+        assert_eq!(spec.params[0].0, "amounts");
+        assert_eq!(spec.params[0].1, "Vec<u64>");
+        assert_eq!(spec.params[1].0, "vesting");
+        assert_eq!(spec.params[1].1, "Option<VestingSchedule>");
+        assert_eq!(spec.params[2].0, "quorum");
+        assert_eq!(spec.params[2].1, "Option<QuorumPolicy>");
+        assert_eq!(spec.params[3].0, "dual_sig");
+        assert_eq!(spec.params[3].1, "bool");
+        assert_eq!(spec.params[4].0, "milestones");
+        assert_eq!(spec.params[4].1, "Option<Vec<MilestonePlan>>");
+        assert!(
+            spec.input_mapping.contains("dual-signature"),
+            "input_mapping documents the dual-signature governance"
+        );
+        assert!(
+            spec.input_mapping.contains("EscrowSplit"),
+            "input_mapping documents the indexer event"
+        );
+        assert!(
+            spec.input_mapping.contains("remaining_accounts"),
+            "input_mapping documents the child-vault wiring"
+        );
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"split_escrow\""),
+            "checked-in IDL carries split_escrow"
+        );
+        assert!(
+            idl.contains("[103, 146, 190, 211, 86, 42, 207, 91]"),
+            "checked-in IDL pins the AV-503 split discriminator"
+        );
+        for arg in [
+            r#"{"name": "amounts", "type": {"vec": "u64"}}"#,
+            r#"{"name": "vesting", "type": {"option": {"defined": "VestingSchedule"}}}"#,
+            r#"{"name": "quorum", "type": {"option": {"defined": "QuorumPolicy"}}}"#,
+            r#"{"name": "dual_sig", "type": "bool"}"#,
+            r#"{"name": "milestones", "type": {"option": {"vec": {"defined": "MilestonePlan"}}}}"#,
+        ] {
+            assert!(idl.contains(arg), "checked-in IDL carries the {arg} arg");
+        }
+        // All five params are transient: they birth child vaults and
+        // persist as fields of the new child accounts, never of the
+        // parent.
+        for param in ["amounts", "vesting", "quorum", "dual_sig", "milestones"] {
+            assert!(
+                TRANSIENT_PARAMS.contains(&("split_escrow", param)),
+                "TRANSIENT_PARAMS carries the {param} param"
+            );
+        }
+        assert_eq!(INSTRUCTIONS.len(), 256, "no new IDL instruction");
+    }
+
+    #[test]
+    fn split_escrow_discriminator_is_sha256_of_global_name() {
+        // Anchor's name-derived discriminator:
+        // sha256("global:split_escrow")[..8]. Pinned byte-exact so a
+        // rename (or a hand-edited IDL) fails loudly instead of
+        // silently dispatching to another instruction.
+        let digest = sha256(b"global:split_escrow");
+        assert_eq!(
+            digest[..8],
+            [103, 146, 190, 211, 86, 42, 207, 91],
+            "discriminator is the sha256 name derivation"
+        );
+        // Cross-check against the sibling derivation the same way, so
+        // a broken sha256 helper fails here first.
+        assert_eq!(
+            sha256(b"global:request_recovery")[..8],
+            [169, 44, 164, 157, 148, 175, 110, 130]
+        );
+    }
+
+    #[test]
+    fn split_escrow_handler_builds_config_from_mirror_params() {
+        // The handler converts its five instruction params into the
+        // SplitConfig the state machine takes — this pins the
+        // conversion contract: the vesting window through
+        // new_with_cliff, the quorum table through QuorumPolicy::new,
+        // each milestone plan through MilestonePlan::new, and
+        // vesting_curve always None (the IDL carries no curve param —
+        // a curve without a schedule is ignored by the state machine,
+        // so the handler never passes one).
+        const T0: u64 = 1_700_000_000;
+        const NOW: u64 = 1_700_000_001;
+        const FUND_AT: u64 = 1_600_000_000;
+        let schedule = VestingSchedule::new_with_cliff(T0, T0 + 1_000, T0).unwrap();
+        let policy = QuorumPolicy::new(&[ATTESTOR_1, ATTESTOR_2], &[1, 1], 2).unwrap();
+        let plan0 = MilestonePlan::new(&[400_000, 200_000]).unwrap();
+        let plan1 = MilestonePlan::new(&[400_000]).unwrap();
+        let plans = [plan0, plan1];
+        let config = SplitConfig {
+            vesting: Some(schedule),
+            vesting_curve: None,
+            quorum: Some(policy),
+            dual_sig: true,
+            milestones: Some(&plans),
+        };
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, FUND_AT).unwrap();
+        let children = e
+            .split_escrow(ALICE, BOB, &[600_000, 400_000], config, NOW)
+            .unwrap();
+        assert_eq!(e.state(), EscrowState::Split);
+        assert_eq!(children.len(), 2);
+        for (i, c) in children.iter().enumerate() {
+            assert_eq!(c.state(), EscrowState::Funded);
+            assert_eq!(
+                c.amount(),
+                [600_000, 400_000][i],
+                "amount-table order is child order"
+            );
+            assert_eq!(c.vesting_schedule(), Some(schedule), "vesting inherited");
+            assert_eq!(c.vesting_curve(), None, "no curve param exists to inherit");
+            assert_eq!(c.quorum(), Some(policy), "quorum inherited");
+            assert!(c.dual_sig_required(), "dual_sig inherited");
+            assert!(
+                c.initializer_activated() && c.taker_activated(),
+                "the split dual-signs both activations"
+            );
+            assert_eq!(
+                c.fund_at(),
+                NOW,
+                "now comes from the clock sysvar, not a param"
+            );
+        }
+        assert_eq!(children[0].milestone_plan(), Some(plan0));
+        assert_eq!(children[1].milestone_plan(), Some(plan1));
+    }
+
+    #[test]
+    fn split_escrow_rejects_swap_linked_parent() {
+        // A live-linked escrow settles only through the pair path —
+        // the single-side split is refused like release / claim
+        // (AV-105), and the parent stays Funded.
+        const FUND_AT: u64 = 1_600_000_000;
+        const NOW: u64 = 1_700_000_000;
+        let mut a = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let mut b = Escrow::initialize(BOB, ALICE, 1_000_000, EXPIRES_AT).unwrap();
+        crate::link_swap(&mut a, &mut b, ALICE, [0xA1; 32], [0xB1; 32], 1_000_000, 1_000_000)
+            .unwrap();
+        a.fund(ALICE, FUND_AT).unwrap();
+        b.fund(BOB, FUND_AT).unwrap();
+        assert_eq!(
+            a.split_escrow(ALICE, BOB, &[1_000_000], SplitConfig::default(), NOW),
+            Err(EscrowError::SwapLinkActive)
+        );
+        assert_eq!(EscrowError::SwapLinkActive.code(), 163);
+        assert_eq!(a.state(), EscrowState::Funded, "state must be unchanged");
+    }
+
+    #[test]
+    fn split_escrow_curve_without_schedule_is_ignored() {
+        // The IDL carries no vesting_curve param, so the handler
+        // always builds SplitConfig with vesting_curve: None — and the
+        // state machine ignores a curve without a schedule anyway. Pin
+        // that a curve alone never lands on a child.
+        const T0: u64 = 1_700_000_000;
+        let curve =
+            VestingCurve::stepped(&[(T0 + 500, 5_000), (T0 + 1_000, 10_000)], T0, T0 + 1_000).unwrap();
+        let config = SplitConfig {
+            vesting: None,
+            vesting_curve: Some(curve),
+            ..SplitConfig::default()
+        };
+        let mut e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        e.fund(ALICE, T0 - 3_600).unwrap();
+        let children = e
+            .split_escrow(ALICE, BOB, &[600_000, 400_000], config, T0)
+            .unwrap();
+        for c in &children {
+            assert_eq!(c.vesting_schedule(), None);
+            assert_eq!(
+                c.vesting_curve(),
+                None,
+                "a curve without a schedule is ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn escrow_split_event_discriminant_is_41() {
+        // The EscrowSplit kind rides discriminant 41 in the serialized
+        // event history (appended after VaultsBatchClosed, AV-81) — the
+        // program-side EscrowVaultEventKind::EscrowSplit mirrors this
+        // kind, so the number is the cross-crate contract.
+        use crate::events::EscrowEventKind;
+        assert_eq!(
+            EscrowEventKind::from_discriminant(41),
+            Some(EscrowEventKind::EscrowSplit)
+        );
+        assert_eq!(
+            EscrowEventKind::from_discriminant(42),
+            Some(EscrowEventKind::Slashed)
+        );
     }
 
     #[test]
