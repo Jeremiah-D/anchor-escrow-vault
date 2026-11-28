@@ -73435,6 +73435,213 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn program_governance_action_mirror_lists_twenty_one_variants_in_kind_order() {
+        // AV-504: the program-side `GovernanceAction` mirror must
+        // declare the same 21 variants in the same order as the
+        // state-side `kind_byte` 0–20 — Borsh serializes the enum by
+        // declaration order, so a reorder would silently renumber
+        // kinds 18–20 and strand live proposals. The mirror is the
+        // only place the order is written twice, so this pins it.
+        // (program.rs is not compiled by cargo — see the package
+        // Cargo.toml — so the mirror is verified by source scan here,
+        // the same pattern as `discriminator.rs`'s account-name
+        // coverage test, not by a `#[cfg(test)]` module in program.rs
+        // that could never execute.)
+        let src = include_str!("../../programs/escrow-vault/src/program.rs");
+        let start = src
+            .find("pub enum GovernanceAction {")
+            .expect("program side declares GovernanceAction");
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("GovernanceAction enum closes at column 0");
+        let block = &rest[..end];
+        // The enum doc must name this item — the mirror header tracks
+        // which items extended it.
+        let head = &src[start.saturating_sub(600)..start];
+        assert!(head.contains("AV-504"), "enum doc header names AV-504");
+        let expected = [
+            "UpdateQuorum",
+            "UpdateAttestors",
+            "RotateTaker",
+            "UpdatePayoutAllowlist",
+            "AmendFundingStart",
+            "AmendSettlementMint",
+            "AmendJuryPanelSize",
+            "AmendEventCapacity",
+            "AmendVestingCurve",
+            "AmendDutchAuctionWindow",
+            "AmendSubscriptionPeriodSecs",
+            "AmendDefaultJudgment",
+            "UpdateSettlementMintAllowlist",
+            "UpdateTieredQuorum",
+            "UpdateArbiterPanelMembers",
+            "AmendPayoutSplitSharesFirst",
+            "AmendPayoutSplitSharesSecond",
+            "AmendPanelThreshold",
+            "UpdateMintAllowlist",
+            "DisableQuorum",
+            "DisableTieredQuorum",
+        ];
+        let mut prev = 0;
+        for (i, name) in expected.iter().enumerate() {
+            // The `\n    ` prefix matches the variant declaration
+            // itself, not a doc comment mentioning the name.
+            let decl = format!("\n    {name}");
+            let pos = block
+                .find(&decl)
+                .unwrap_or_else(|| panic!("program mirror is missing variant {name} (kind {i})"));
+            assert!(
+                pos > prev,
+                "program mirror variant {name} (kind {i}) is out of order"
+            );
+            prev = pos;
+        }
+    }
+
+    #[test]
+    fn program_convert_governance_action_covers_kinds_18_19_20() {
+        // AV-504: `convert_governance_action` must route the three
+        // new mirror variants into the state actions — otherwise a
+        // delay-opted-in escrow can propose kinds 18–20 (the enum
+        // now expresses them) but `propose_governance` fails to
+        // convert them. The `UpdateMintAllowlist` arm must use the
+        // AV-505-corrected `ok_or_else` form: the constructor returns
+        // `Option`, and `.map_err` on an `Option` does not compile —
+        // the two pre-existing `.map_err` arms are the AV-505 bug.
+        let src = include_str!("../../programs/escrow-vault/src/program.rs");
+        let start = src
+            .find("fn convert_governance_action(")
+            .expect("program side defines convert_governance_action");
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("convert_governance_action closes at column 0");
+        let body = &rest[..end];
+        assert!(
+            body.contains("GovernanceAction::UpdateMintAllowlist { mints, count } =>"),
+            "convert has an UpdateMintAllowlist arm"
+        );
+        assert!(
+            body.contains("update_mint_allowlist(&mints[..count as usize])"),
+            "arm builds the state action from mints[..count]"
+        );
+        assert!(
+            body.contains(".ok_or_else(|| escrow_error(escrow_state::EscrowError::InvalidMint))"),
+            "arm maps the None branch to InvalidMint (code 112)"
+        );
+        let arm_start = body
+            .find("GovernanceAction::UpdateMintAllowlist")
+            .expect("arm present");
+        let arm_end = body[arm_start..]
+            .find("GovernanceAction::DisableQuorum")
+            .expect("DisableQuorum arm follows");
+        let arm = &body[arm_start..arm_start + arm_end];
+        assert!(
+            arm.contains("if count as usize > 8 {"),
+            "arm pre-checks the 8-mint bound before slicing"
+        );
+        // Strip `//` comments first: the arm's own comment names the
+        // forbidden shape, and the check is about code, not prose.
+        let arm_code: String = arm
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !arm_code.contains(".map_err"),
+            "arm must not call .map_err on the Option constructor (AV-505)"
+        );
+        assert!(
+            body.contains("GovernanceAction::DisableQuorum =>"),
+            "convert has a DisableQuorum arm"
+        );
+        assert!(
+            body.contains("Ok(escrow_state::GovernanceAction::DisableQuorum)"),
+            "DisableQuorum arm passes the unit variant through"
+        );
+        assert!(
+            body.contains("GovernanceAction::DisableTieredQuorum =>"),
+            "convert has a DisableTieredQuorum arm"
+        );
+        assert!(
+            body.contains("Ok(escrow_state::GovernanceAction::DisableTieredQuorum)"),
+            "DisableTieredQuorum arm passes the unit variant through"
+        );
+    }
+
+    #[test]
+    fn program_governance_action_mirror_borsh_layout_matches_state_payload() {
+        // AV-504: the mirror's Borsh layout must match the state's
+        // kind+payload wire shape — `UpdateMintAllowlist` is 8 mint
+        // slots plus a count byte (257 bytes, the count at offset
+        // 256, exactly where the state's `encode_payload` writes
+        // it), and the two disables are unit variants with no
+        // payload. A real Borsh decode of the program enum needs the
+        // Anchor toolchain, so this pins the layout from both sides:
+        // the mirror declaration textually, and the state payload
+        // shape with real code.
+        let src = include_str!("../../programs/escrow-vault/src/program.rs");
+        let start = src
+            .find("pub enum GovernanceAction {")
+            .expect("program side declares GovernanceAction");
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("GovernanceAction enum closes at column 0");
+        let block = &rest[..end];
+        assert!(
+            block.contains("UpdateMintAllowlist { mints: [[u8; 32]; 8], count: u8 },"),
+            "mirror UpdateMintAllowlist is 8 mint slots + count byte"
+        );
+        assert!(
+            block.contains("\n    DisableQuorum,\n"),
+            "mirror DisableQuorum is a unit variant (no payload)"
+        );
+        // No trailing newline: this is the enum's last variant, so
+        // the block ends right after the comma.
+        assert!(
+            block.contains("\n    DisableTieredQuorum,"),
+            "mirror DisableTieredQuorum is a unit variant (no payload)"
+        );
+        let head = &src[start.saturating_sub(200)..start];
+        assert!(
+            head.contains("AnchorSerialize") && head.contains("AnchorDeserialize"),
+            "mirror enum carries the Borsh derives"
+        );
+        // State side: the 257-byte shape the mirror must match.
+        let action = GovernanceAction::update_mint_allowlist(&[[0x11; 32], [0x22; 32]]).unwrap();
+        assert_eq!(action.kind_byte(), 18, "kind 18");
+        let payload = action.encode_payload();
+        assert_eq!(payload[256], 2, "count byte sits at offset 256");
+        assert_eq!(&payload[..32], &[0x11; 32], "first mint at offset 0");
+        assert_eq!(&payload[32..64], &[0x22; 32], "second mint at offset 32");
+        assert_eq!(
+            GovernanceAction::update_mint_allowlist(&[])
+                .unwrap()
+                .kind_byte(),
+            18,
+            "empty list still kind 18 (clears the allowlist)"
+        );
+        assert_eq!(GovernanceAction::DisableQuorum.kind_byte(), 19, "kind 19");
+        assert_eq!(
+            GovernanceAction::DisableTieredQuorum.kind_byte(),
+            20,
+            "kind 20"
+        );
+        assert_eq!(
+            GovernanceAction::DisableQuorum.encode_payload(),
+            [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN],
+            "kind 19 payload is empty"
+        );
+        assert_eq!(
+            GovernanceAction::DisableTieredQuorum.encode_payload(),
+            [0u8; GOVERNANCE_ACTION_PAYLOAD_LEN],
+            "kind 20 payload is empty"
+        );
+    }
+
+    #[test]
     fn initialize_referrer_maps_params_to_referrer_fields() {
         // IDL: initialize_referrer(referrer: Pubkey, referral_bps:
         // u16) — referrer / referral_bps <- params; initializer <-

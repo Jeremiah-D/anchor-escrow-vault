@@ -13761,7 +13761,7 @@ pub struct MintAllowlist {
 }
 
 /// Skeleton mirror of `escrow_state::GovernanceAction` (AV-158,
-/// AV-335, AV-336): the staged governance action — one of the
+/// AV-335, AV-336, AV-504): the staged governance action — one of the
 /// dual-signed config changes. The `UpdateAttestors` variant carries
 /// fixed-size arrays (only the first `count` entries are live).
 #[derive(
@@ -13820,6 +13820,21 @@ pub enum GovernanceAction {
     /// Revise the arbiter panel's judgment threshold after funding
     /// (AV-378).
     AmendPanelThreshold { new_threshold: u8 },
+    /// Replace the funded-mint allowlist (AV-504): mirrors
+    /// `escrow_state::GovernanceAction::UpdateMintAllowlist` (kind
+    /// 18) — only `mints[..count]` are live, `count == 0` clears the
+    /// allowlist back to `None`.
+    UpdateMintAllowlist { mints: [[u8; 32]; 8], count: u8 },
+    /// Remove the plain attestor quorum policy (AV-504): mirrors
+    /// `escrow_state::GovernanceAction::DisableQuorum` (kind 19).
+    /// Unit variant — the disable carries no params, so it writes
+    /// no payload.
+    DisableQuorum,
+    /// Remove the tiered attestor quorum table (AV-504): mirrors
+    /// `escrow_state::GovernanceAction::DisableTieredQuorum` (kind
+    /// 20). Unit variant — the disable carries no params, so it
+    /// writes no payload.
+    DisableTieredQuorum,
 }
 
 /// Skeleton mirror of `escrow_state::Tier` (AV-335): one amount tier
@@ -19528,6 +19543,25 @@ fn convert_governance_action(
         }
         GovernanceAction::AmendPanelThreshold { new_threshold } => {
             Ok(escrow_state::GovernanceAction::AmendPanelThreshold { new_threshold })
+        }
+        GovernanceAction::UpdateMintAllowlist { mints, count } => {
+            // AV-504: the constructor returns `None` only past the
+            // 8-mint bound, already refused above — the `ok_or_else`
+            // is the totality guard, never `.map_err` on an `Option`
+            // (AV-505: `Option` has no `map_err`). The error is
+            // `InvalidMint` (code 112), the direct call's documented
+            // over-long-list error — there is no
+            // `InvalidMintAllowlist` variant anywhere (lib / program /
+            // IDL), so no new error is invented here.
+            if count as usize > 8 {
+                return Err(escrow_error(escrow_state::EscrowError::InvalidMint));
+            }
+            escrow_state::GovernanceAction::update_mint_allowlist(&mints[..count as usize])
+                .ok_or_else(|| escrow_error(escrow_state::EscrowError::InvalidMint))
+        }
+        GovernanceAction::DisableQuorum => Ok(escrow_state::GovernanceAction::DisableQuorum),
+        GovernanceAction::DisableTieredQuorum => {
+            Ok(escrow_state::GovernanceAction::DisableTieredQuorum)
         }
     }
 }

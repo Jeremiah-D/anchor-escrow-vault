@@ -2423,10 +2423,11 @@ is unchanged. The freeze is scoped to the taker's schedule-priced
 
 ### Delayed governance (AV-158)
 
-The eighteen dual-signed config changes — the original four
+The twenty-one dual-signed config changes — the original four
 (`update_quorum`, `update_attestors`, `rotate_taker`,
 `update_payout_allowlist`) plus the eleven AV-335 actions, the
-two AV-336 split-shares halves, and the one AV-378 action listed below — can opt in to a propose → delay → execute/cancel protocol via
+two AV-336 split-shares halves, the one AV-378 action, and the
+three AV-504 actions listed below — can opt in to a propose → delay → execute/cancel protocol via
 `initialize_governance_delay(delay_secs)`. The delay is a
 flash-governance defense: if an attestor goes dark, a malicious
 threshold change cannot take effect immediately.
@@ -2544,8 +2545,8 @@ own code and stays live for retry or cancel.
 
 `AmendFundingStart` is the only new action proposable before
 funding — the funding window moves only while no funds have landed.
-The sixteen `Funded`-only actions (the ten AV-335 actions plus the
-two AV-336 split-shares halves plus the one AV-378 action plus the one AV-390 action plus the one AV-424 action plus the one AV-427 action) are deliberately *not* proposable
+The nineteen `Funded`-only actions (the ten AV-335 actions plus the
+two AV-336 split-shares halves plus the one AV-378 action plus the one AV-390 action plus the one AV-424 action plus the one AV-427 action plus the three AV-504 actions) are deliberately *not* proposable
 pre-funding: staging one early would succeed at propose time and
 fail at execute time, breaking the propose-time fail-fast design.
 AV-378 later stages a thirteenth gated method — the post-funding
