@@ -4141,6 +4141,34 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt into dispute-jury settlement (AV-499; mirrors
+    /// `Escrow::with_jury`, the AV-196 pure-logic builder). The
+    /// initializer fixes the settlement mechanism while the escrow
+    /// is `Uninitialized` — the panel size is fixed before any
+    /// funds move, like the other `initialize_*` opt-ins. A zero
+    /// or over-64 panel size is `InvalidJurySize` (code 294); an
+    /// escrow with a bound single arbiter is `JuryArbiterConflict`
+    /// (code 298) — the jury and the AV-14 single arbiter are
+    /// mutually exclusive, either direction. Once funded the
+    /// mechanism is fixed (`InvalidStateTransition`); resizing a
+    /// configured jury after funding is `amend_jury_panel_size`'s
+    /// job (AV-478). After this, a `Disputed` escrow settles via
+    /// the drawn jury's majority verdict instead of an arbiter's
+    /// `resolve`. No indexer event: pre-fund configuration, like
+    /// the other `initialize_*` opt-ins.
+    pub fn configure_jury(ctx: Context<ConfigureJury>, panel_size: u8) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let escrow = escrow.with_jury(panel_size).map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the 1-byte jury
+        // panel-size tail field (zeroed when no jury is
+        // configured), so the size is written in place — no
+        // realloc needed in the real build. No indexer event:
+        // pre-fund configuration, like the other `initialize_*`
+        // opt-ins.
+        Ok(())
+    }
+
     /// Opt into the per-call release cap (AV-205; mirrors
     /// `Escrow::with_max_release_per_call`). The initializer arms
     /// the cap while the escrow is `Uninitialized` — the payout
@@ -15282,6 +15310,19 @@ pub struct InitializeDeliveryConfirmation<'info> {
     #[account(mut)]
     pub vault: Account<'info, Vault>,
     /// Only the initializer arms the gate; the state machine
+    /// rejects re-configuration once the escrow is funded.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-499: accounts for `configure_jury` — the
+/// initializer opts into dispute-jury settlement while the escrow
+/// is `Uninitialized`. The panel size rides as an instruction
+/// param (`u8`), not an account.
+#[derive(Accounts)]
+pub struct ConfigureJury<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts into the jury; the state machine
     /// rejects re-configuration once the escrow is funded.
     pub initializer: Signer<'info>,
 }

@@ -72560,6 +72560,139 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn configure_jury_maps_param_to_panel_size_field() {
+        // IDL: configure_jury(panel_size: u8) —
+        // panel_size <- param; initializer <-
+        // accounts.initializer (signer), enforced by the Anchor account
+        // constraint, not the state machine. The param writes the
+        // `jury_panel_size` tail field in place (see PARAM_FIELD_MAP)
+        // — no layout change. The INSTRUCTIONS spec entry pins the
+        // program-level wiring: the single u8 param and the AV-196
+        // pure-logic builder.
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "configure_jury")
+            .expect("INSTRUCTIONS carries configure_jury");
+        assert_eq!(spec.method, "Escrow::with_jury");
+        assert_eq!(spec.params.len(), 1);
+        assert_eq!(spec.params[0].0, "panel_size");
+        assert_eq!(spec.params[0].1, "u8");
+        assert!(
+            spec.input_mapping.contains("no indexer event"),
+            "input_mapping documents the pre-fund silence"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the single u8 arg.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"configure_jury\""),
+            "checked-in IDL carries configure_jury"
+        );
+        assert!(
+            idl.contains("[117, 180, 90, 182, 207, 32, 124, 201]"),
+            "checked-in IDL pins the AV-499 discriminator"
+        );
+        assert!(
+            idl.contains("{\"name\": \"panel_size\", \"type\": \"u8\"}"),
+            "checked-in IDL carries the panel_size arg"
+        );
+        // The param maps to exactly the jury size — and the size is
+        // shared with `amend_jury_panel_size`'s param source (the
+        // builder sets it, the amendment revises it).
+        assert!(
+            PARAM_FIELD_MAP
+                .contains(&("configure_jury", "panel_size", "jury_panel_size")),
+            "PARAM_FIELD_MAP carries the jury-size mapping"
+        );
+        assert!(
+            PARAM_FIELD_MAP.contains(&(
+                "amend_jury_panel_size",
+                "new_panel_size",
+                "jury_panel_size"
+            )),
+            "amend_jury_panel_size keeps its own size mapping"
+        );
+        // Only the size moves: the arbiter slot, the state and the
+        // amounts are untouched.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.jury_panel_size(), 0, "no jury before configuration");
+        let e = e.with_jury(5).unwrap();
+        assert_eq!(e.jury_panel_size(), 5, "size configured");
+        assert_eq!(e.arbiter(), None, "arbiter slot untouched");
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.funded_total(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "size written in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn configure_jury_rejects_out_of_range_arbiter_bound_and_funded() {
+        // AV-499: the program layer inherits the pure-logic gates —
+        // Uninitialized only, then the arbiter mutual-exclusion
+        // gate, then the size gate. The builder consumes the
+        // escrow, so a refused call drops the value instead of
+        // leaving a half-written one behind.
+        const ARBITER: [u8; 32] = [0xA8; 32];
+        // Zero or over-64 panel size.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_jury(0),
+            Err(EscrowError::InvalidJurySize)
+        );
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_jury(65),
+            Err(EscrowError::InvalidJurySize)
+        );
+        assert_eq!(EscrowError::InvalidJurySize.code(), 294);
+        // A bound single arbiter refuses the jury; a configured
+        // jury refuses the arbiter (either-or).
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_arbiter(ARBITER)
+                .unwrap()
+                .with_jury(5),
+            Err(EscrowError::JuryArbiterConflict)
+        );
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_jury(5)
+                .unwrap()
+                .with_arbiter(ARBITER),
+            Err(EscrowError::JuryArbiterConflict)
+        );
+        assert_eq!(EscrowError::JuryArbiterConflict.code(), 298);
+        // Funded: the settlement mechanism is fixed before funds
+        // move — post-funding resizing is amend_jury_panel_size.
+        let funded = jury_funded_escrow();
+        assert_eq!(
+            funded.with_jury(3),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Boundary-valid: 1 and 64.
+        assert!(Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_jury(1)
+            .is_ok());
+        assert!(Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_jury(64)
+            .is_ok());
+    }
+
+    #[test]
     fn amend_jury_panel_size_rejects_single_party_and_strangers() {
         // AV-478: unconditional dual signature — one party alone,
         // or a stranger, is Unauthorized; one party alone cannot
@@ -110557,6 +110690,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("shorten_expiry"),
             [53, 53, 149, 214, 249, 26, 52, 220]
+        );
+    }
+
+    #[test]
+    fn configure_jury_instruction_discriminator_is_pinned() {
+        // AV-499. IDL:
+        // sha256("global:configure_jury")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("configure_jury"),
+            [117, 180, 90, 182, 207, 32, 124, 201]
         );
     }
 

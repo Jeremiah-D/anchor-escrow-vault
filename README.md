@@ -9434,14 +9434,14 @@ registration order, the count, and every other juror are untouched and
 no draw is re-seated (the draw is uniform over registration order and
 never reads stake); an unknown key or a zero stake is refused (same
 code 293), and re-affirming the current stake is a no-op. When an escrow escalates with jury mode
-enabled (`configure_jury`: panel size 1–8, odd sizes recommended for
-clean majorities; `InvalidJuryPanelSize`, code 294), the panel is drawn
+enabled (`configure_jury`: panel size 1–64, odd sizes recommended for
+clean majorities; `InvalidJurySize`, code 294), the panel is drawn
 by deterministic sortition: `seed = SHA-256(slot_hash || escrow_id)`,
 jurors sorted by `SHA-256(seed || juror_key)` — anyone can recompute
 the draw from the public seed, no trusted dealer. The initializer's
 AV-14 single arbiter and the jury are mutually exclusive (configuring
-either when the other is set is `JuryArbiterConflict`, code 295, both
-directions).
+either when the other is set is `JuryArbiterConflict`, code 298, both
+directions). AV-499 adds the program-level `configure_jury(panel_size)` instruction (discriminator [117, 180, 90, 182, 207, 32, 124, 201]) — the chain entry point for the AV-196 builder: initializer-only signer, `Uninitialized`-only, the 1-byte `jury_panel_size` tail field rewritten in place, no indexer event.
 
 Each drawn juror votes once (`cast_vote`: the juror's taker-amount
 ballot; double-vote is `JuryDoubleVote`, code 296); when every panel
