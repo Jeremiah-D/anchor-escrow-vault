@@ -4169,6 +4169,42 @@ pub mod escrow_vault {
         Ok(())
     }
 
+    /// Opt into social recovery (AV-500; mirrors
+    /// `Escrow::with_social_recovery`, the AV-195 pure-logic
+    /// builder). The initializer names the M-of-N guardian set
+    /// while the escrow is `Uninitialized` — the policy is fixed
+    /// before any funds move, like the other `initialize_*`
+    /// opt-ins. A malformed guardian set (empty, over 8, zero or
+    /// duplicate key) or a threshold outside `1..=guardian count`
+    /// is `InvalidSocialRecovery` (code 286); a funded escrow is
+    /// `InvalidStateTransition`. Once configured, the guardians
+    /// may rotate a lost initializer key via `request_recovery` /
+    /// `approve_recovery` / `execute_recovery`, vetoed by the
+    /// current initializer via `veto_recovery` — the four flow
+    /// instructions are a separate item (AV-502), not this one.
+    /// No indexer event: pre-fund configuration, like the other
+    /// `initialize_*` opt-ins.
+    pub fn configure_social_recovery(
+        ctx: Context<ConfigureSocialRecovery>,
+        guardians: Vec<Pubkey>,
+        threshold: u8,
+        timelock_secs: u64,
+    ) -> Result<()> {
+        let escrow = read_escrow(&ctx.accounts.vault);
+        let guardian_keys: Vec<[u8; 32]> = guardians.iter().map(|g| g.to_bytes()).collect();
+        let escrow = escrow
+            .with_social_recovery(&guardian_keys, threshold, timelock_secs)
+            .map_err(|e| escrow_error(e))?;
+        write_escrow(&mut ctx.accounts.vault, &escrow);
+        // The vault account already reserves the full 309-byte
+        // social-recovery tail region (zeroed when no policy is
+        // configured), so the policy is written in place — no
+        // realloc needed in the real build. No indexer event:
+        // pre-fund configuration, like the other `initialize_*`
+        // opt-ins.
+        Ok(())
+    }
+
     /// Opt into the per-call release cap (AV-205; mirrors
     /// `Escrow::with_max_release_per_call`). The initializer arms
     /// the cap while the escrow is `Uninitialized` — the payout
@@ -15324,6 +15360,19 @@ pub struct ConfigureJury<'info> {
     pub vault: Account<'info, Vault>,
     /// Only the initializer opts into the jury; the state machine
     /// rejects re-configuration once the escrow is funded.
+    pub initializer: Signer<'info>,
+}
+
+/// AV-500: accounts for `configure_social_recovery` — the
+/// initializer opts into social recovery while the escrow is
+/// `Uninitialized`. The guardian set, threshold and timelock ride
+/// as instruction params, not accounts.
+#[derive(Accounts)]
+pub struct ConfigureSocialRecovery<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+    /// Only the initializer opts into social recovery; the state
+    /// machine rejects re-configuration once the escrow is funded.
     pub initializer: Signer<'info>,
 }
 

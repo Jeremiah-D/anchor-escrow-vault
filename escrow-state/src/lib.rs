@@ -72693,6 +72693,186 @@ pub(crate) mod anchor_idl_tests {
     }
 
     #[test]
+    fn configure_social_recovery_maps_params_to_recovery_field() {
+        // IDL: configure_social_recovery(guardians: Vec<Pubkey>,
+        // threshold: u8, timelock_secs: u64) — guardians /
+        // threshold / timelock_secs <- params; initializer <-
+        // accounts.initializer (signer), enforced by the Anchor
+        // account constraint, not the state machine. The params
+        // write the `recovery` tail region in place (see
+        // PARAM_FIELD_MAP) — no layout change. The INSTRUCTIONS
+        // spec entry pins the program-level wiring: the three
+        // params and the AV-195 pure-logic builder.
+        const G1: [u8; 32] = [0x11; 32];
+        const G2: [u8; 32] = [0x22; 32];
+        const G3: [u8; 32] = [0x33; 32];
+        let spec = INSTRUCTIONS
+            .iter()
+            .find(|s| s.name == "configure_social_recovery")
+            .expect("INSTRUCTIONS carries configure_social_recovery");
+        assert_eq!(spec.method, "Escrow::with_social_recovery");
+        assert_eq!(spec.params.len(), 3);
+        assert_eq!(spec.params[0].0, "guardians");
+        assert_eq!(spec.params[0].1, "Vec<Pubkey>");
+        assert_eq!(spec.params[1].0, "threshold");
+        assert_eq!(spec.params[1].1, "u8");
+        assert_eq!(spec.params[2].0, "timelock_secs");
+        assert_eq!(spec.params[2].1, "u64");
+        assert!(
+            spec.input_mapping.contains("no indexer event"),
+            "input_mapping documents the pre-fund silence"
+        );
+        // The checked-in IDL JSON carries the instruction with the
+        // pinned discriminator and the three args.
+        let idl = std::fs::read_to_string(
+            "../programs/escrow-vault/idl/escrow_vault.json",
+        )
+        .expect("read checked-in IDL");
+        assert!(
+            idl.contains("\"name\": \"configure_social_recovery\""),
+            "checked-in IDL carries configure_social_recovery"
+        );
+        assert!(
+            idl.contains("[198, 228, 5, 9, 116, 147, 10, 221]"),
+            "checked-in IDL pins the AV-500 discriminator"
+        );
+        assert!(
+            idl.contains(r#"{"name": "guardians", "type": {"vec": "publicKey"}}"#),
+            "checked-in IDL carries the guardians arg"
+        );
+        assert!(
+            idl.contains(r#"{"name": "threshold", "type": "u8"}"#),
+            "checked-in IDL carries the threshold arg"
+        );
+        assert!(
+            idl.contains(r#"{"name": "timelock_secs", "type": "u64"}"#),
+            "checked-in IDL carries the timelock_secs arg"
+        );
+        // Each param maps to the vault's `recovery` field — and
+        // the request's `new_authority` shares the same field (the
+        // pending request rides inside the policy).
+        assert!(
+            PARAM_FIELD_MAP
+                .contains(&("configure_social_recovery", "guardians", "recovery")),
+            "PARAM_FIELD_MAP carries the guardians mapping"
+        );
+        assert!(
+            PARAM_FIELD_MAP
+                .contains(&("configure_social_recovery", "threshold", "recovery")),
+            "PARAM_FIELD_MAP carries the threshold mapping"
+        );
+        assert!(
+            PARAM_FIELD_MAP.contains(&(
+                "configure_social_recovery",
+                "timelock_secs",
+                "recovery"
+            )),
+            "PARAM_FIELD_MAP carries the timelock mapping"
+        );
+        assert!(
+            PARAM_FIELD_MAP.contains(&("request_recovery", "new_authority", "recovery")),
+            "request_recovery keeps its own recovery mapping"
+        );
+        // Only the recovery policy moves: the arbiter slot, the
+        // state and the amounts are untouched.
+        let e = Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT).unwrap();
+        let len_before = super::account_space_tests::encode_escrow(&e).len();
+        assert_eq!(e.recovery(), None, "no policy before configuration");
+        let e = e
+            .with_social_recovery(&[G1, G2, G3], 2, 3_600)
+            .unwrap();
+        let policy = e.recovery().expect("policy configured");
+        assert_eq!(policy.guardians(), &[G1, G2, G3], "guardians bound");
+        assert_eq!(policy.guardian_count(), 3, "count bound");
+        assert_eq!(policy.threshold(), 2, "threshold bound");
+        assert_eq!(policy.timelock_secs(), 3_600, "timelock bound");
+        assert!(policy.pending().is_none(), "no request yet");
+        assert_eq!(e.arbiter(), None, "arbiter slot untouched");
+        assert_eq!(e.state(), EscrowState::Uninitialized);
+        assert_eq!(e.amount(), 1_000_000);
+        assert_eq!(e.funded_total(), 0);
+        assert_eq!(
+            super::account_space_tests::encode_escrow(&e).len(),
+            len_before,
+            "policy written in place, no layout change"
+        );
+    }
+
+    #[test]
+    fn configure_social_recovery_rejects_malformed_set_threshold_and_funded() {
+        // AV-500: the program layer inherits the pure-logic gates —
+        // Uninitialized only, then the guardian-set and threshold
+        // gates. The builder consumes the escrow, so a refused call
+        // drops the value instead of leaving a half-written one
+        // behind.
+        const G1: [u8; 32] = [0x11; 32];
+        const G2: [u8; 32] = [0x22; 32];
+        const G3: [u8; 32] = [0x33; 32];
+        const G4: [u8; 32] = [0x44; 32];
+        const G5: [u8; 32] = [0x55; 32];
+        const G6: [u8; 32] = [0x66; 32];
+        const G7: [u8; 32] = [0x77; 32];
+        const G8: [u8; 32] = [0x88; 32];
+        const ZERO: [u8; 32] = [0u8; 32];
+        // Empty, over-8, zero-key and duplicate guardian sets.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_social_recovery(&[], 1, 3_600),
+            Err(EscrowError::InvalidSocialRecovery)
+        );
+        let nine = [G1, G2, G3, G4, G5, G6, G7, G8, G1];
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_social_recovery(&nine, 2, 3_600),
+            Err(EscrowError::InvalidSocialRecovery)
+        );
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_social_recovery(&[ZERO, G2, G3], 2, 3_600),
+            Err(EscrowError::InvalidSocialRecovery)
+        );
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_social_recovery(&[G1, G1, G3], 2, 3_600),
+            Err(EscrowError::InvalidSocialRecovery)
+        );
+        // Threshold outside 1..=guardian count.
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_social_recovery(&[G1, G2, G3], 0, 3_600),
+            Err(EscrowError::InvalidSocialRecovery)
+        );
+        assert_eq!(
+            Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+                .unwrap()
+                .with_social_recovery(&[G1, G2, G3], 4, 3_600),
+            Err(EscrowError::InvalidSocialRecovery)
+        );
+        assert_eq!(EscrowError::InvalidSocialRecovery.code(), 286);
+        // Funded: the policy is fixed before funds move — a removed
+        // policy can never be re-installed after funding.
+        let funded = funded_escrow();
+        assert_eq!(
+            funded.with_social_recovery(&[G1, G2, G3], 2, 3_600),
+            Err(EscrowError::InvalidStateTransition)
+        );
+        // Boundary-valid: a single guardian, and the full set of 8.
+        assert!(Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_social_recovery(&[G1], 1, 0)
+            .is_ok());
+        assert!(Escrow::initialize(ALICE, BOB, 1_000_000, EXPIRES_AT)
+            .unwrap()
+            .with_social_recovery(&[G1, G2, G3, G4, G5, G6, G7, G8], 8, 3_600)
+            .is_ok());
+    }
+
+    #[test]
     fn amend_jury_panel_size_rejects_single_party_and_strangers() {
         // AV-478: unconditional dual signature — one party alone,
         // or a stranger, is Unauthorized; one party alone cannot
@@ -110702,6 +110882,18 @@ mod arbiter_rotation_tests {
         assert_eq!(
             instruction_discriminator("configure_jury"),
             [117, 180, 90, 182, 207, 32, 124, 201]
+        );
+    }
+
+    #[test]
+    fn configure_social_recovery_instruction_discriminator_is_pinned() {
+        // AV-500. IDL:
+        // sha256("global:configure_social_recovery")[..8] —
+        // the Anchor instruction discriminator, pinned here and in
+        // the generated escrow_vault.json.
+        assert_eq!(
+            instruction_discriminator("configure_social_recovery"),
+            [198, 228, 5, 9, 116, 147, 10, 221]
         );
     }
 

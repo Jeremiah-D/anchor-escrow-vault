@@ -9373,20 +9373,28 @@ that rotates the initializer to a fresh key after a timelock (Solana /
 wallet recovery UX).
 
 The initializer configures the policy (`configure_social_recovery`:
-1–8 guardian keys, threshold 1..=N, timelock in seconds; zero or
-duplicate guardians rejected as `InvalidRecoveryPolicy`, code 286;
-threshold above the guardian count is `InvalidRecoveryThreshold`,
-code 287). A guardian opens a recovery request naming the new
-authority (`request_recovery`; one live request at a time —
-`RecoveryAlreadyPending`, code 288); other guardians approve
+1–8 guardian keys, threshold 1..=N, timelock in seconds; a malformed
+guardian set — empty, over 8, zero or duplicate keys — or a threshold
+outside 1..=N is `InvalidSocialRecovery`, code 286). A guardian opens
+a recovery request naming the new authority (`request_recovery`; one
+live request at a time — a second request while one is pending is
+`RecoveryRequestPending`, code 289; a non-guardian opening or
+approving is `RecoveryNotGuardian`, code 288); other guardians approve
 (`approve_recovery`; the requester counts as the first approval;
-double-approval is `RecoveryAlreadyApproved`, code 289). Once the
-threshold is met AND the timelock has elapsed since the request opened,
-anyone can execute (`execute_recovery` — the permissionless crank;
-`RecoveryThresholdNotMet`, code 290, or `RecoveryTimelockNotElapsed`,
-code 291, before that). The current initializer can veto at any time
-before execution (`veto_recovery`; a stranger's veto is
-`RecoveryVetoDenied`, code 292).
+re-approving is an idempotent no-op). Once the threshold is met AND
+the timelock has elapsed since the request opened, anyone can execute
+(`execute_recovery` — the permissionless crank;
+`RecoveryThresholdNotReached`, code 291, or
+`RecoveryTimelockNotElapsed`, code 292, before that; no live request
+is `RecoveryNoPendingRequest`, code 290). The current initializer can
+veto at any time before execution (`veto_recovery`; a veto from
+anyone but the current initializer is `Unauthorized`, code 100).
+AV-500 adds the program-level
+`configure_social_recovery(guardians, threshold, timelock_secs)`
+instruction (discriminator [198, 228, 5, 9, 116, 147, 10, 221]) — the
+chain entry point for the AV-195 builder: initializer-only signer,
+`Uninitialized`-only, the 309-byte recovery tail region rewritten in
+place, no indexer event.
 
 The policy persists in the vault account (the 309-byte
 `SocialRecovery` tail: 8 guardian slots + count + threshold +
